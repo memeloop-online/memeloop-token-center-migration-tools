@@ -1,0 +1,21 @@
+auth-dir: "/root/.cli-proxy-api/auth"
+openai-compatibility:
+  - name: "fixture-openai-compatible"
+    disabled: false
+    base-url: "https://openai-compatible.example.test/v1"
+    proxy-url: "socks5://fixture-proxy.internal:1080"
+    api-key-entries:
+      - api-key: "fixture-only-cpa-openai-key-a"
+      - api-key: "fixture-only-cpa-openai-key-b"
+    models:
+      - name: "fixture-model"
+        alias: "fixture-model"
+gemini-api-key:
+  - api-key: "fixture-only-cpa-gemini-key"
+    base-url: "https://gemini.example.test"
+codex-api-key:
+  - api-key: "fixture-only-cpa-codex-key"
+    base-url: "https://codex.example.test/backend-api/codex"
+claude-api-key:
+  - api-key: "fixture-only-cpa-claude-key"
+    base-url: "https://claude.example.test"

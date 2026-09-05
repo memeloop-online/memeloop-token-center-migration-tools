@@ -1,0 +1,6 @@
+auth-dir: "/root/.cli-proxy-api/auth"
+openai-compatibility:
+  - name: "fixture-supported-before-oauth-gate"
+    base-url: "https://supported.example.test/v1"
+    api-key-entries:
+      - api-key: "fixture-only-cpa-supported-key"

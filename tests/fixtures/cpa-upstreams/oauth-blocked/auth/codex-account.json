@@ -1,0 +1,8 @@
+{
+  "type": "codex",
+  "email": "codex-user@example.test",
+  "access_token": "fixture-only-cpa-codex-access-token",
+  "refresh_token": "fixture-only-cpa-codex-refresh-token",
+  "id_token": "fixture-only-cpa-codex-id-token",
+  "expired": "2099-01-01T00:00:00Z"
+}

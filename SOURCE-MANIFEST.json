@@ -1,0 +1,300 @@
+{
+  "format_version": 1,
+  "source": {
+    "repository": "https://github.com/memeloop-online/memeloop-token-center",
+    "commit": "8cdd681246924debc5c9752422aa422c0afce331",
+    "license": "Apache-2.0",
+    "license_file": "LICENSE"
+  },
+  "extracted_on": "2026-09-05",
+  "imported_files": [
+    {
+      "path": "LICENSE",
+      "sha256": "28e5d2539f4badf72849732e4324a5eacec4eb8937e8d994baf86f402e3cdec8"
+    },
+    {
+      "path": "docs/operations/2026-08-24-importer-runtime-scan.md",
+      "sha256": "1f0ad7c719db3ec3c214eaca1869a73ef5c410eed52cbb80d7c8210de27d834d"
+    },
+    {
+      "path": "docs/operations/2026-08-24-release-runtime-preflight.md",
+      "sha256": "1afde4e1547583bd56aba83b426b3f12e5bd6a700e46a579fb85a8d529278041"
+    },
+    {
+      "path": "docs/operations/2026-08-26-legacy-source-compatibility.md",
+      "sha256": "782785b988fb2939a1fc16a9b20e86d48c893ef24c660d60048e181dd2af0e33"
+    },
+    {
+      "path": "docs/operations/backup-and-restore.md",
+      "sha256": "a90e2f27092ccdc5ac19eaab624d4882065b9f87c1493e3871529684a41f1b59"
+    },
+    {
+      "path": "docs/operations/collector-direct-archive-runbook.md",
+      "sha256": "fd0b096ec17f32cdc6950898515b683881f0780978372abf3eb6fa0077c6d64e"
+    },
+    {
+      "path": "docs/operations/cpa-upstream-import.md",
+      "sha256": "c83d45e2b46920a903a154d3b178f311e06ee24d8e56da0025d84a994aa9481f"
+    },
+    {
+      "path": "docs/operations/cpamp-cache-pricing-correction.md",
+      "sha256": "0e82a804dc82a356e3b2b9b080e45522bbc80a031a937f588af54856e4e0fe57"
+    },
+    {
+      "path": "docs/operations/cutover-runbook.md",
+      "sha256": "d9550c105cead609862ca980004845ab13c76180c80357a149c11c61fb92cb6f"
+    },
+    {
+      "path": "docs/operations/legacy-cpa-credentials.md",
+      "sha256": "9ccf1991aeca224135d087e28ea589d16e86f12708d0c631ea85dcaaca88ac0c"
+    },
+    {
+      "path": "docs/operations/legacy-cpa-key-policy.md",
+      "sha256": "c48fb686eaa4fb210de80921b017d88abde5946555df86ef956e87fadb22d8ae"
+    },
+    {
+      "path": "docs/operations/legacy-cpa-routes.md",
+      "sha256": "5ca92e11de11149d029d163a49bd1ccdc39ef0dadb0d802179b0bae36175b92a"
+    },
+    {
+      "path": "docs/session-archive-import.md",
+      "sha256": "8b1bba59829992e18a6e40f940e448f93020abb5aae79fe8fcdc5b996ecb6c2c"
+    },
+    {
+      "path": "migrations/common/0018_model_price_tiers.sql",
+      "sha256": "c742f4a86cabbfe060cdf5de809c6545eab96061db12e8985c6a42e718ea4801"
+    },
+    {
+      "path": "migrations/common/0019_session_archive_import.sql",
+      "sha256": "2e095bd7be558efc09e77de7fcbc0ab88c132cdd92dd6f9f8a71e6a9ab25a5e0"
+    },
+    {
+      "path": "migrations/common/0021_request_locators.sql",
+      "sha256": "b0fd803b519d5bf992060d82b8d021cc787eb06324037de9aa14321d96c6646c"
+    },
+    {
+      "path": "migrations/common/0022_budget_rollups.sql",
+      "sha256": "149ba78f443e188625d46d7289ba3d751280e707e50372c4ebe084fafe1afe4e"
+    },
+    {
+      "path": "migrations/common/0023_generation_daily_aggregates.sql",
+      "sha256": "e1eb132ba16c697bc70ac15858bac2fe731a42f39632532d2ddc90422a1adfe9"
+    },
+    {
+      "path": "migrations/common/0024_request_stats_rollups.sql",
+      "sha256": "027489b6c442631a03527a2a8cb668a53f71ac49111023bd236ff1baf7986b2f"
+    },
+    {
+      "path": "migrations/common/0027_cpamp_source_digests.sql",
+      "sha256": "47f08ffb3f24e343641da9ebd9f2d1a73e9be9e621486e65ecf7265980e8c321"
+    },
+    {
+      "path": "migrations/postgres/0001_initial.sql",
+      "sha256": "f0d681f4fca4c5a74892512b16b49261bfd07e7791917e37fe697e156dcba5c0"
+    },
+    {
+      "path": "migrations/postgres/0002_query_indexes.sql",
+      "sha256": "c828dbe2826e4212188b79ce5a704e43312055532ebb23d2d88764be1cadcbd6"
+    },
+    {
+      "path": "migrations/postgres/0004_request_events.sql",
+      "sha256": "cf7e480f0c67042ec80d723a6fed6f3db1db907472ff94388c7804b6e079562a"
+    },
+    {
+      "path": "migrations/postgres/0005_generation_jobs.sql",
+      "sha256": "00d7ada42f3484e54ce37f2f3ef54193d8effd63bd924f945e0e134122d06435"
+    },
+    {
+      "path": "ops/api2-target-rollback.ts",
+      "sha256": "aab3629b3e2b702266471277876de72c33c1245f9e12f037c850d157082c45a1"
+    },
+    {
+      "path": "ops/audit-cpa-migration.ts",
+      "sha256": "72985964dfa73bdaa8a51cb811d8e82499bfe79050ff92364ff54c5b1dc00c53"
+    },
+    {
+      "path": "ops/ci/build-importer-scripts.ts",
+      "sha256": "c9fea07db4cdc3c8e3f5c49815579fa57f8aacd87e05bfdaf9b68e1712198b96"
+    },
+    {
+      "path": "ops/ci/prepare-cpamp-acceptance-bundle.ts",
+      "sha256": "cacb98430cbd2c2fc6ba571e90de3d2d8a0917b1b0f17dd980f5c66e05fd5af6"
+    },
+    {
+      "path": "ops/cpa-upstreams/generate-source-identity-key.ts",
+      "sha256": "03e9f07ba5e1b222a8b39b8c6b2e718c6cd94a96981ad734de190104d227f1b7"
+    },
+    {
+      "path": "ops/cpa-upstreams/import-cpa-upstreams.ts",
+      "sha256": "88be57dd60abfe37c876237c0e62ce6210cde77215c1804d4c8a9cb2a597bc47"
+    },
+    {
+      "path": "ops/export-cpa-session-archive-delta.ts",
+      "sha256": "0bf351c52ffc1f7163f695b5502419f2b7b4faf75ecc812d79acaeb4bb617035"
+    },
+    {
+      "path": "ops/import-cpa-session-archive.ts",
+      "sha256": "e48ea70ce497409acfe4aa0178b8fa9f23dc511146205bdba0f847b76dbe7e73"
+    },
+    {
+      "path": "ops/legacy-credentials/attach-legacy-cpa-credentials.ts",
+      "sha256": "a3a94711df743ec7a9997eb1861fa87d3e0824b80baf6cbb7aa48b7535d90e16"
+    },
+    {
+      "path": "ops/legacy-policy/import-cpa-key-policy.ts",
+      "sha256": "7558614b0b5376c815314c73f41f114a98d3774b76e2ab976320785ca0913808"
+    },
+    {
+      "path": "ops/legacy-routes/import-cpa-model-routes.ts",
+      "sha256": "4c984416e76481e437c76a5081c6d372b5bbbdb9a02b482f661b5081873434b5"
+    },
+    {
+      "path": "ops/lib/strict-json.ts",
+      "sha256": "f8a99c5706eea92e1cb638326daf6d1487a1deea01d5d8ab0c63398e64eea291"
+    },
+    {
+      "path": "ops/migrate-cpamp.ts",
+      "sha256": "f7e50a7a331fef1adab804a82735a4dc35bc486d570ef22b34e2d2b38f33f68b"
+    },
+    {
+      "path": "ops/release/grant-legacy-max-balances.ts",
+      "sha256": "ede3acb266a2fb500c1ebf236a3c65a249d38ff224518649f133ba5a2a4fc2a3"
+    },
+    {
+      "path": "ops/sql/cpamp/apply.sql",
+      "sha256": "e370b7459d1996284a285335fc6a944d8d789d6a82d7990a07e15ec984ed7b0c"
+    },
+    {
+      "path": "ops/sql/cpamp/correct-plan.sql",
+      "sha256": "3f1e345fca1237994aa98324db43c38d1d4fb9e169dd63b5e763cf946fdfe286"
+    },
+    {
+      "path": "ops/sql/cpamp/correct-rebuild.sql",
+      "sha256": "af59c04f441cb3ec865ece1df85a92e04ed4576ee513747e6429e8c40f4807c3"
+    },
+    {
+      "path": "ops/sql/cpamp/correct.sql",
+      "sha256": "569a7b4cbf9c33a4548d578e51d86538fbcb556dd3b206d4516a4f7947f67a75"
+    },
+    {
+      "path": "ops/sql/cpamp/evaluate.sql",
+      "sha256": "ce3d7a4ef26d7aeeab1d3a5721f639fe70eba191862cbb99e0d54e6c671d04b5"
+    },
+    {
+      "path": "ops/sql/cpamp/prepare.sql",
+      "sha256": "26fba4bc43ee2a63ea4eb651869f7f63a64ae96b100d33ee2a0cdf20b601bebc"
+    },
+    {
+      "path": "ops/sql/cpamp/reset.sql",
+      "sha256": "334bdc63b884bf7d7714423e875515aeb9fe9ac63b39ec87d9bb091feac870f6"
+    },
+    {
+      "path": "tests/fixtures/cpa-upstreams/oauth-blocked/auth/codex-account.json",
+      "sha256": "a38c4d2960c2957b1d10535fc2391d37dec12513d6e4aedd139b1d556ba743ab"
+    },
+    {
+      "path": "tests/fixtures/cpa-upstreams/oauth-blocked/auth/gemini-account.json",
+      "sha256": "93cc8c4db7e76dfe227bd1d51d9f580e87991137e5e4d0690b6e36a7e73652dd"
+    },
+    {
+      "path": "tests/fixtures/cpa-upstreams/oauth-blocked/config.yaml",
+      "sha256": "a1b0229b723484da2ae003c023163189e0f922384bc04c1a4a1c30df8999506e"
+    },
+    {
+      "path": "tests/fixtures/cpa-upstreams/supported/auth/copilot-account.json",
+      "sha256": "7589d742613effe9b6036552c8f8dc5698ca19d3962cc63ddb9896d30de7abd2"
+    },
+    {
+      "path": "tests/fixtures/cpa-upstreams/supported/auth/cursor-account.json",
+      "sha256": "7f79513552643d28fa54d4c9b0b3f30b387b20a56ae663184b0a767acbcff21f"
+    },
+    {
+      "path": "tests/fixtures/cpa-upstreams/supported/auth/private-api-account.json",
+      "sha256": "edb82c1c05488bf694c846bd10ed44cb769432ad3db6daece53892f51a2f923b"
+    },
+    {
+      "path": "tests/fixtures/cpa-upstreams/supported/config.yaml",
+      "sha256": "c27baae5dd5b9ec5a90ab8ed050c1cdf7b22e94171ff9863b1d2e86f656903e1"
+    },
+    {
+      "path": "tests/fixtures/cpa-upstreams/unknown/auth/unknown-account.json",
+      "sha256": "fcf17037dd4971701cdd05a464b3bd0d0cfb52299662415c629daf1047c99d28"
+    },
+    {
+      "path": "tests/fixtures/cpa-upstreams/unknown/config.yaml",
+      "sha256": "56e33cebb4f0b57228b489a5deb47b67bbff2a0d741250b6ef5ff8618623b28e"
+    },
+    {
+      "path": "tests/fixtures/cpamp/initial.sql",
+      "sha256": "17ea4dc946f406f1ae0cab8e8662ac024c7c50b3d5fb2d83aef11f475b7d4a6a"
+    },
+    {
+      "path": "tests/fixtures/cpamp/late.sql",
+      "sha256": "9f0de3291d2fc653361da6f3765c12c3daeb4108fcb536cf7be8e90fad153b9b"
+    },
+    {
+      "path": "tests/fixtures/legacy-credentials/cpa-api-keys.json",
+      "sha256": "4d47d535a22e14a4cc2b7fe2101d4a7e44d17c0fa2a396ba67942da2fabd24f7"
+    },
+    {
+      "path": "tests/fixtures/legacy-credentials/cpamp-identities.csv",
+      "sha256": "c7324f6b90c901f96cd90228103e2c9dfd5af020b54b99074675c94f9cafb4a3"
+    },
+    {
+      "path": "tests/ops/api2-target-rollback.test.ts",
+      "sha256": "085eb2c4deeaecda431e7eed173746cb7bf600dade1467f30718ec20b00e7bd8"
+    },
+    {
+      "path": "tests/ops/contract-helpers.ts",
+      "sha256": "2dde250d4736a06b6480fa0e40c5751aa7b76e4798c9a6926f761e6e95dad311"
+    },
+    {
+      "path": "tests/ops/cpa-migration-audit-contract.test.ts",
+      "sha256": "696eb0260e0bb458460bd978ba3cb659d97cd5e38a932e065c2f4ac43d94377a"
+    },
+    {
+      "path": "tests/ops/cpamp-import-postgres-acceptance.test.ts",
+      "sha256": "3bc816ccea7702a07d32b3d937a0c93c45e837970e93d333fe3985c929246ab1"
+    },
+    {
+      "path": "tests/ops/grant-legacy-max-balances.test.ts",
+      "sha256": "ceab02ddc4a78314e1bc25c9afdb63f4d9d7b8e9cc390daad47845eb49ca7c44"
+    },
+    {
+      "path": "tests/ops/helpers/fake-psql-audit.ts",
+      "sha256": "54eb512b5e0f4b1a2b4cd74c48917a4aa42770c3be1f1e843d09d92fac189f2c"
+    },
+    {
+      "path": "tests/ops/helpers/fake-psql-legacy.ts",
+      "sha256": "b40d2ddfa74679ef01ca137c74f18100361bd6cf8cc135f36e6e23daa4e18df5"
+    },
+    {
+      "path": "tests/ops/helpers/prepare-cpa-upstream-fixture.ts",
+      "sha256": "3d5f11138c64a4c45172f891a4c9324e7bd33fdacf9b8b08ee31f90762ca2f83"
+    },
+    {
+      "path": "tests/ops/sanitize-cpa-upstream-fixtures.ts",
+      "sha256": "686773b026c88d7f1d49f1a6ac6c90d94f72ed66699c1ca7db6b3b874bc0fd75"
+    },
+    {
+      "path": "tests/ops/test-cpa-upstream-import.ts",
+      "sha256": "fa834836167c24980a127aa35e9d43c7a297450bc13791d0a3ebf69b083ac319"
+    },
+    {
+      "path": "tests/ops/test-legacy-credentials-bulk.ts",
+      "sha256": "66dfa08c6aa99751b801b329b794555246eeefbd0527302e24df4dbc43bd970e"
+    },
+    {
+      "path": "tests/ops/test-legacy-policy-import.ts",
+      "sha256": "023ae98df615f45665618a2b53900f2834309f43460596b61dbcb860ea46460e"
+    },
+    {
+      "path": "tests/ops/test-legacy-route-import.ts",
+      "sha256": "6f64e6795fd26733b558511cb59b95d7d9b0d7b9b23c31715c16231c79f9eeac"
+    },
+    {
+      "path": "tests/ops/test-session-archive-delta-export.ts",
+      "sha256": "78c331d9cd6fd1eb5002957952aabb45a3cb2043faf63c232c4e5600b601a472"
+    }
+  ]
+}

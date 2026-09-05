@@ -1,0 +1,10 @@
+{
+  "type": "api_key",
+  "name": "fixture-private-api",
+  "provider": "fixture-provider",
+  "base_url": "https://private-api.example.test/v1",
+  "api_key": "fixture-only-cpa-private-api-key",
+  "header": "x-api-key",
+  "prefix": "",
+  "disabled": false
+}

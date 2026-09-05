@@ -1,0 +1,5 @@
+# These three provenance-locked source files contain an intentional source byte
+# at EOF. Preserve the exact upstream SHA-256 while disabling only that check.
+migrations/postgres/0001_initial.sql whitespace=-blank-at-eof
+migrations/postgres/0002_query_indexes.sql whitespace=-blank-at-eof
+migrations/postgres/0004_request_events.sql whitespace=-blank-at-eof

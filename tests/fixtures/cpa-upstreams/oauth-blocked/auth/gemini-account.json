@@ -1,0 +1,10 @@
+{
+  "type": "gemini",
+  "email": "gemini-user@example.test",
+  "token": {
+    "access_token": "fixture-only-cpa-gemini-access-token",
+    "refresh_token": "fixture-only-cpa-gemini-refresh-token",
+    "token_type": "Bearer",
+    "expiry": "2099-01-01T00:00:00Z"
+  }
+}
