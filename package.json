@@ -9,7 +9,7 @@
   "scripts": {
     "build": "node ops/ci/build-importer-scripts.ts",
     "policy": "node ops/ci/verify-repository-policy.ts",
-    "test": "node --test tests/ops/api2-target-rollback.test.ts tests/ops/cpa-migration-audit-contract.test.ts tests/ops/cpamp-import-postgres-acceptance.test.ts tests/ops/final-session-archive-reconciliation.test.ts tests/ops/grant-legacy-max-balances.test.ts tests/ops/test-cpa-upstream-import.ts tests/ops/test-legacy-credentials-bulk.ts tests/ops/test-legacy-policy-import.ts tests/ops/test-legacy-route-import.ts tests/ops/test-session-archive-delta-export.ts",
+    "test": "node --test tests/ops/api2-target-rollback.test.ts tests/ops/cpa-migration-audit-contract.test.ts tests/ops/cpamp-import-postgres-acceptance.test.ts tests/ops/final-price-cache-reconciliation-contract.test.ts tests/ops/final-session-archive-reconciliation.test.ts tests/ops/grant-legacy-max-balances.test.ts tests/ops/test-cpa-upstream-import.ts tests/ops/test-legacy-credentials-bulk.ts tests/ops/test-legacy-policy-import.ts tests/ops/test-legacy-route-import.ts tests/ops/test-session-archive-delta-export.ts",
     "typecheck": "tsc -p tsconfig.json --pretty false",
     "verify": "npm run policy && npm run typecheck && npm test"
   },
