@@ -365,7 +365,7 @@ function main(): void {
     "-v", `tenant_external_id=${tenant}`,
     "-v", `import_source=${source}`,
     "-v", `currency=${currency}`,
-    "-v", `statement_timeout=${timeout}ms",
+    "-v", `statement_timeout=${timeout}ms`,
   ], {
     encoding: "utf8",
     input: reconciliationSql,
