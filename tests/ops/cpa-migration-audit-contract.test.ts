@@ -33,7 +33,7 @@ test("CPA migration audit fails closed and emits only aggregate evidence", () =>
   try {
     installExecutableHelper("tests/ops/helpers/fake-psql-audit.ts", workspace, "psql");
 
-    const good = runAudit(workspace, "4|4|5|5000|5|3|2|3|2|0|0|0|2|5|1");
+    const good = runAudit(workspace, "4|4|5|5000|5|3|2|3|2|0|0|0|2|1|2|5|1");
     assert.equal(good.status, 0, good.stderr);
     const evidence = JSON.parse(good.stdout) as Record<string, number>;
     assert.equal(evidence.cpamp_checkpoint, 4);
@@ -43,18 +43,22 @@ test("CPA migration audit fails closed and emits only aggregate evidence", () =>
     assert.equal(evidence.conversation_clusters, 2);
     assert.equal(evidence.conversation_observations, 5);
     assert.equal(evidence.conversation_edges, 1);
+    assert.equal(evidence.content_locators, 3);
+    assert.equal(evidence.exact_content_locators, 2);
+    assert.equal(evidence.unlinked_content_locators, 1);
     assert.equal(evidence.gap_locators, 0);
     const invocation = JSON.parse(readFileSync(join(workspace, "psql.json"), "utf8")) as { argv: string[]; sql: string };
     assert.equal(invocation.argv.some((value) => value.includes("fixture-only-password")), false);
     assert.match(invocation.sql, /BEGIN TRANSACTION READ ONLY/);
 
-    const mismatch = runAudit(workspace, "4|4|5|5000|5|3|2|3|2|0|0|0|2|5|1", "6");
+    const mismatch = runAudit(workspace, "4|4|5|5000|5|3|2|3|2|0|0|0|2|1|2|5|1", "6");
     assert.notEqual(mismatch.status, 0);
     assert.match(mismatch.stderr, /archive source, checkpoint, correlation, projection, or quarantine counts disagree/);
 
     for (const counts of [
-      "4|4|5|5000|5|3|2|3|2|1|0|0|2|5|1",
-      "4|4|5|5000|5|3|2|3|2|0|1|0|2|5|1",
+      "4|4|5|5000|5|3|2|3|2|1|0|0|2|1|2|5|1",
+      "4|4|5|5000|5|3|2|3|2|0|1|0|2|1|2|5|1",
+      "4|4|5|5000|5|3|2|3|2|0|0|0|0|0|2|5|1",
     ]) {
       const rejected = runAudit(workspace, counts);
       assert.notEqual(rejected.status, 0);

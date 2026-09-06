@@ -57,11 +57,13 @@ WITH selected_tenant AS (
     (SELECT count(*) FROM session_archive_quarantine_records q LEFT JOIN session_archive_quarantine_resolutions z ON z.quarantine_id = q.id WHERE q.tenant_id = (SELECT id FROM selected_tenant) AND q.source = :'archive_source' AND z.id IS NULL) AS unresolved_quarantine,
     (SELECT count(*) FROM session_archive_import_records a JOIN request_records r ON r.id = a.target_request_id WHERE a.tenant_id = (SELECT id FROM selected_tenant) AND a.source = :'archive_source' AND (r.request_object LIKE 'gap://%' OR r.response_object LIKE 'gap://%')) AS exact_gap_locators,
     (SELECT count(*) FROM session_archive_unlinked_requests u WHERE u.tenant_id = (SELECT id FROM selected_tenant) AND u.source = :'archive_source' AND (u.request_object LIKE 'gap://%' OR u.response_object LIKE 'gap://%')) AS unlinked_gap_locators,
+    (SELECT count(*) FROM session_archive_import_records a JOIN request_records r ON r.id = a.target_request_id WHERE a.tenant_id = (SELECT id FROM selected_tenant) AND a.source = :'archive_source' AND ((r.request_object IS NOT NULL AND r.request_object NOT LIKE 'gap://%') OR (r.response_object IS NOT NULL AND r.response_object NOT LIKE 'gap://%'))) AS exact_content_locators,
+    (SELECT count(*) FROM session_archive_unlinked_requests u WHERE u.tenant_id = (SELECT id FROM selected_tenant) AND u.source = :'archive_source' AND ((u.request_object IS NOT NULL AND u.request_object NOT LIKE 'gap://%') OR (u.response_object IS NOT NULL AND u.response_object NOT LIKE 'gap://%'))) AS unlinked_content_locators,
     (SELECT count(DISTINCT cluster_id) FROM migration_observations) AS correlated_clusters,
     (SELECT count(*) FROM migration_observations) AS correlated_observations,
     (SELECT count(*) FROM conversation_edges e WHERE e.to_observation_id IN (SELECT id FROM migration_observations) AND (e.from_observation_id IS NULL OR e.from_observation_id IN (SELECT id FROM migration_observations))) AS conversation_edges
 )
-SELECT cpamp_checkpoint || '|' || cpamp_links || '|' || archive_checkpoint || '|' || archive_watermark || '|' || archive_correlated || '|' || archive_exact || '|' || archive_unlinked || '|' || exact_provenance || '|' || unlinked_projection || '|' || unresolved_quarantine || '|' || exact_gap_locators || '|' || unlinked_gap_locators || '|' || correlated_clusters || '|' || correlated_observations || '|' || conversation_edges FROM measured;
+SELECT cpamp_checkpoint || '|' || cpamp_links || '|' || archive_checkpoint || '|' || archive_watermark || '|' || archive_correlated || '|' || archive_exact || '|' || archive_unlinked || '|' || exact_provenance || '|' || unlinked_projection || '|' || unresolved_quarantine || '|' || exact_gap_locators || '|' || unlinked_gap_locators || '|' || exact_content_locators || '|' || unlinked_content_locators || '|' || correlated_clusters || '|' || correlated_observations || '|' || conversation_edges FROM measured;
 COMMIT;
 `;
 
@@ -100,17 +102,17 @@ function main(): void {
     env: process.env,
     input: auditSql,
     shell: false,
-    stdio: ["pipe", "pipe", "inherit"],
+    stdio: ["pipe", "pipe", "pipe"],
   });
-  if (result.error || result.status !== 0) fail(result.error ? `psql is unavailable: ${result.error.message}` : "migration audit query failed", 1);
+  if (result.error || result.status !== 0) fail("migration audit query failed", 1);
   const values = String(result.stdout).trim().split("|");
-  if (values.length !== 15 || values.some((value) => !/^\d+$/.test(value ?? ""))) fail("migration audit returned invalid counts", 1);
-  const [cpampCheckpoint, cpampLinks, archiveCheckpoint, archiveWatermark, archiveCorrelated, archiveExact, archiveUnlinked, exactProvenance, unlinkedProjection, unresolvedQuarantine, exactGapLocators, unlinkedGapLocators, clusters, observations, edges] = values as [string, string, string, string, string, string, string, string, string, string, string, string, string, string, string];
+  if (values.length !== 17 || values.some((value) => !/^\d+$/.test(value ?? ""))) fail("migration audit returned invalid counts", 1);
+  const [cpampCheckpoint, cpampLinks, archiveCheckpoint, archiveWatermark, archiveCorrelated, archiveExact, archiveUnlinked, exactProvenance, unlinkedProjection, unresolvedQuarantine, exactGapLocators, unlinkedGapLocators, exactContentLocators, unlinkedContentLocators, clusters, observations, edges] = values as [string, string, string, string, string, string, string, string, string, string, string, string, string, string, string, string, string];
   if (cpampCheckpoint !== expectedCpamp || cpampLinks !== expectedCpamp) fail("migration audit failed: CPAMP source, checkpoint, and request links disagree", 1);
-  if (archiveCheckpoint !== expectedArchive || archiveCorrelated !== expectedArchive || exactProvenance !== archiveExact || unlinkedProjection !== archiveUnlinked || unresolvedQuarantine !== "0" || exactGapLocators !== "0" || unlinkedGapLocators !== "0") {
+  if (archiveCheckpoint !== expectedArchive || archiveCorrelated !== expectedArchive || exactProvenance !== archiveExact || unlinkedProjection !== archiveUnlinked || unresolvedQuarantine !== "0" || exactGapLocators !== "0" || unlinkedGapLocators !== "0" || (BigInt(exactContentLocators) + BigInt(unlinkedContentLocators) === 0n && BigInt(expectedArchive) > 0n)) {
     fail("migration audit failed: archive source, checkpoint, correlation, projection, or quarantine counts disagree", 1);
   }
-  process.stdout.write(`{"archive_checkpoint":${archiveCheckpoint},"archive_correlated":${archiveCorrelated},"archive_exact":${archiveExact},"archive_unlinked":${archiveUnlinked},"archive_watermark_ms":${archiveWatermark},"conversation_clusters":${clusters},"conversation_edges":${edges},"conversation_observations":${observations},"cpamp_checkpoint":${cpampCheckpoint},"cpamp_links":${cpampLinks},"gap_locators":0,"unresolved_quarantine":0}\n`);
+  process.stdout.write(`{"archive_checkpoint":${archiveCheckpoint},"archive_correlated":${archiveCorrelated},"archive_exact":${archiveExact},"archive_unlinked":${archiveUnlinked},"archive_watermark_ms":${archiveWatermark},"content_locators":${BigInt(exactContentLocators) + BigInt(unlinkedContentLocators)},"exact_content_locators":${exactContentLocators},"unlinked_content_locators":${unlinkedContentLocators},"conversation_clusters":${clusters},"conversation_edges":${edges},"conversation_observations":${observations},"cpamp_checkpoint":${cpampCheckpoint},"cpamp_links":${cpampLinks},"gap_locators":0,"unresolved_quarantine":0}\n`);
 }
 
 try {

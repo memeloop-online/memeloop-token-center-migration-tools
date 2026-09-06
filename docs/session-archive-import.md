@@ -139,6 +139,12 @@ bad future timestamp cannot advance the checkpoint past later traffic. Adjust
 Run the CPAMP usage/identity delta before the matching archive delta. Then use
 the normal importer dry-run, apply and same-file replay procedure below. Source
 overlap duplicates are intentional; target provenance makes them idempotent.
+For the final write-barrier snapshot plus delta sequence, use the sealed
+approval/reconciliation coordinator in
+[`final-session-archive-reconciliation.md`](final-session-archive-reconciliation.md)
+instead of invoking this single-artifact wrapper directly. It records aggregate
+checkpoint, correlation, provenance, quarantine, unlinked and locator receipts
+without decoding or printing archive content.
 Set `SESSION_ARCHIVE_OVERLAP_MS` to at least the manifest's
 `overlap_seconds * 1000`; a smaller target window breaks the shared cursor
 contract. Do not reduce either overlap until every earlier artifact has completed
