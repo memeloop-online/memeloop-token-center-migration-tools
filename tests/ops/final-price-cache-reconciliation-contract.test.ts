@@ -40,7 +40,11 @@ test("final price/cache reconciliation emits a read-only aggregate receipt", () 
     assert.equal(receipt.mode, "dry-run");
     assert.equal(receipt.outcome, "pass");
     assert.deepEqual(receipt.blockers, []);
-    assert.equal((receipt.scope as Record<string, string>).tenant_external_id_sha256.length, 64);
+    const scope = receipt.scope;
+    assert.ok(scope && typeof scope === "object");
+    const tenantExternalIdSha256 = (scope as Record<string, unknown>).tenant_external_id_sha256;
+    assert.ok(typeof tenantExternalIdSha256 === "string");
+    assert.equal(tenantExternalIdSha256.length, 64);
     const nested = receipt.receipt as Record<string, unknown>;
     assert.equal((nested.per_key_model_day as unknown[]).length, 1);
     assert.equal(result.stdout.includes("fixture-only-password"), false);
