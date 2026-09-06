@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 const chunks: Buffer[] = [];
 for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk));
@@ -8,10 +9,18 @@ if (!sql.includes("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
   || !sql.includes("missing_current_price_combinations")
   || /\b(?:INSERT|UPDATE|DELETE|ALTER|CREATE|DROP|LOCK)\b/u.test(sql)) process.exit(9);
 
-const log = process.env.FAKE_PSQL_LOG;
-const gaps = process.env.FAKE_CURRENT_PRICE_GAP_COUNT;
-if (log === undefined || gaps === undefined || !/^\d+$/u.test(gaps)) process.exit(9);
-const gapCount = Number(gaps);
+const passFile = process.env.PGPASSFILE;
+if (passFile === undefined) process.exit(9);
+let fixture: unknown;
+try {
+  fixture = JSON.parse(readFileSync(join(dirname(passFile), "price-cache-reconciliation-fixture.json"), "utf8"));
+} catch {
+  process.exit(9);
+}
+const gapCount = typeof fixture === "object" && fixture !== null && !Array.isArray(fixture)
+  ? (fixture as Record<string, unknown>).current_price_gap_count
+  : undefined;
+if (typeof gapCount !== "number" || !Number.isSafeInteger(gapCount) || gapCount < 0) process.exit(9);
 const zero = "0";
 const missing = Array.from({ length: gapCount }, (_, index) => ({
   pricing_model: `fixture-price-gap-${String(index + 1).padStart(2, "0")}`,
@@ -23,7 +32,7 @@ const missing = Array.from({ length: gapCount }, (_, index) => ({
   output_tokens: "3",
   historical_cost_micros: "42",
 }));
-writeFileSync(log, JSON.stringify({ argv: process.argv.slice(2), sql, pgpassfile: process.env.PGPASSFILE }));
+writeFileSync(join(dirname(passFile), "psql.json"), JSON.stringify({ argv: process.argv.slice(2), sql, pgpassfile: passFile }));
 process.stdout.write(`${JSON.stringify({
   aggregate_counts: {
     provenance_events: "3", import_links: "3", key_model_day_rows: "2",

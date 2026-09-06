@@ -12,6 +12,7 @@ function runReconciliation(workspace: string, gaps: number, args: readonly strin
   const passFile = join(workspace, "pgpass");
   writeFileSync(passFile, "fixture-host:5432:fixture:fixture:fixture-only-password\n", { mode: 0o600 });
   chmodSync(passFile, 0o600);
+  writeFileSync(join(workspace, "price-cache-reconciliation-fixture.json"), JSON.stringify({ current_price_gap_count: gaps }), { mode: 0o600 });
   return spawnSync(process.execPath, [script, ...args], {
     encoding: "utf8",
     shell: false,
@@ -24,8 +25,6 @@ function runReconciliation(workspace: string, gaps: number, args: readonly strin
       PRICE_RECON_TENANT_EXTERNAL_ID: "fixture-tenant",
       PRICE_RECON_IMPORT_SOURCE: "fixture-import-source",
       PRICE_RECON_CURRENCY: "USD",
-      FAKE_CURRENT_PRICE_GAP_COUNT: String(gaps),
-      FAKE_PSQL_LOG: join(workspace, "psql.json"),
     },
   });
 }
