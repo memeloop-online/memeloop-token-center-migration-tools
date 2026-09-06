@@ -143,7 +143,7 @@ function digestFile(path: string, label: string): { size: number; sha256: string
     return { size: total, sha256: digest.digest("hex") };
   } catch (error) {
     if (error instanceof FinalArchiveError) throw error;
-    fail(`${label} could not be sealed`);
+    return fail(`${label} could not be sealed`);
   } finally {
     if (descriptor >= 0) closeSync(descriptor);
   }
