@@ -298,7 +298,7 @@ function assertDestination(path: string, uid: number, gid: number, label: string
   if (!stat.isFile() || stat.isSymbolicLink()) fail(`${label} must be a regular non-symlink file`);
   if (stat.nlink !== 1n) fail(`${label} must have exactly one hard link`);
   if ((stat.mode & 0o777n) !== PRIVATE_MODE) fail(`${label} must have mode 0600`);
-  if (stat.uid !== uid || stat.gid !== gid) fail(`${label} has an unexpected owner`);
+  if (stat.uid !== BigInt(uid) || stat.gid !== BigInt(gid)) fail(`${label} has an unexpected owner`);
   return stat;
 }
 
@@ -332,7 +332,7 @@ function copyProtectedFile(request: CopyRequest, uid: number, gid: number, maxBy
     fchownRequested(targetFd, uid, gid);
     fsyncSync(targetFd);
     const copied = descriptorStat(targetFd, "staged input");
-    if (!copied.isFile() || copied.nlink !== 1n || (copied.mode & 0o777n) !== PRIVATE_MODE || copied.uid !== uid || copied.gid !== gid) {
+    if (!copied.isFile() || copied.nlink !== 1n || (copied.mode & 0o777n) !== PRIVATE_MODE || copied.uid !== BigInt(uid) || copied.gid !== BigInt(gid)) {
       fail("staged input could not be fenced");
     }
     const sourceAfter = descriptorStat(source.fd, "source input");
@@ -375,7 +375,7 @@ function createPrivateDirectory(path: string, uid: number, gid: number, label: s
   mkdirSync(path, { mode: 0o700 });
   chownRequested(path, uid, gid);
   const stat = privateDirectory(path, label);
-  if (stat.uid !== uid || stat.gid !== gid) fail(`${label} has an unexpected owner`);
+  if (stat.uid !== BigInt(uid) || stat.gid !== BigInt(gid)) fail(`${label} has an unexpected owner`);
 }
 
 type AuthTreeResult = Readonly<{
@@ -446,7 +446,7 @@ function fenceCheckpoint(path: string, uid: number, gid: number, required: boole
     descriptor = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
     const after = descriptorStat(descriptor, "checkpoint");
     if (after.dev !== before.dev || after.ino !== before.ino || after.nlink !== 1n) fail("checkpoint changed while being fenced");
-    if ((after.mode & 0o777n) !== PRIVATE_MODE || after.uid !== uid || after.gid !== gid) fail("checkpoint owner/mode fence failed");
+    if ((after.mode & 0o777n) !== PRIVATE_MODE || after.uid !== BigInt(uid) || after.gid !== BigInt(gid)) fail("checkpoint owner/mode fence failed");
   } finally {
     if (descriptor >= 0) closeSync(descriptor);
   }

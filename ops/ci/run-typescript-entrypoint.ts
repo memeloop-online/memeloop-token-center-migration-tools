@@ -25,7 +25,7 @@ const entrypoints = Object.freeze({
  * @param {string} entrypoint
  * @returns {string | undefined}
  */
-export function targetForEntrypoint(entrypoint) {
+export function targetForEntrypoint(entrypoint: string): string | undefined {
   return Object.entries(entrypoints).find(([name]) => name === entrypoint)?.[1];
 }
 
@@ -35,7 +35,11 @@ export function targetForEntrypoint(entrypoint) {
  * @param {string} binDirectory
  * @returns {Promise<void>}
  */
-export async function dispatch(entrypoint, argv = process.argv, binDirectory = "/usr/local/bin") {
+export async function dispatch(
+  entrypoint: string,
+  argv: string[] = process.argv,
+  binDirectory = "/usr/local/bin",
+): Promise<void> {
   const targetName = targetForEntrypoint(entrypoint);
   if (targetName === undefined) {
     process.stderr.write(`unknown TypeScript entrypoint: ${entrypoint}\n`);
