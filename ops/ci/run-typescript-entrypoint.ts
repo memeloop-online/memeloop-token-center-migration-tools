@@ -18,6 +18,7 @@ const entrypoints = Object.freeze({
   "import-cpa-model-routes": "import-cpa-model-routes.ts",
   "import-cpa-session-archive": "import-cpa-session-archive.ts",
   "import-cpa-upstreams": "import-cpa-upstreams.ts",
+  "reconcile-final-price-cache": "reconcile-final-price-cache.ts",
   "stage-protected-inputs": "stage-protected-inputs.ts",
 });
 

@@ -258,6 +258,10 @@ test("dispatches extensionless launchers by basename to explicit TypeScript targ
       targetForEntrypoint("export-cpa-source-route-inventory"),
       "export-cpa-source-route-inventory.ts",
     );
+    assert.equal(
+      targetForEntrypoint("reconcile-final-price-cache"),
+      "reconcile-final-price-cache.ts",
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -21,5 +21,6 @@
 !ops/finalize-session-archive-delta.ts
 !ops/import-cpa-session-archive.ts
 !ops/audit-cpa-migration.ts
+!ops/reconcile-final-price-cache.ts
 !ops/lib/
 !ops/lib/strict-json.ts

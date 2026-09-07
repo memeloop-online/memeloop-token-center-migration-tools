@@ -40,6 +40,7 @@ COPY ops/export-cpa-session-archive-delta.ts /usr/local/bin/export-cpa-session-a
 COPY ops/finalize-session-archive-delta.ts /usr/local/bin/finalize-session-archive-delta.ts
 COPY ops/import-cpa-session-archive.ts /usr/local/bin/import-cpa-session-archive.ts
 COPY ops/audit-cpa-migration.ts /usr/local/bin/audit-cpa-migration.ts
+COPY ops/reconcile-final-price-cache.ts /usr/local/bin/reconcile-final-price-cache.ts
 COPY ops/lib/strict-json.ts /usr/local/lib/strict-json.ts
 COPY ops/lib/strict-json.ts /usr/local/bin/lib/strict-json.ts
 
@@ -62,6 +63,7 @@ COPY ops/ci/run-typescript-entrypoint.ts /usr/local/bin/export-cpa-session-archi
 COPY ops/ci/run-typescript-entrypoint.ts /usr/local/bin/finalize-session-archive-delta
 COPY ops/ci/run-typescript-entrypoint.ts /usr/local/bin/import-cpa-session-archive
 COPY ops/ci/run-typescript-entrypoint.ts /usr/local/bin/audit-cpa-migration
+COPY ops/ci/run-typescript-entrypoint.ts /usr/local/bin/reconcile-final-price-cache
 
 RUN chmod 0555 \
     /usr/local/bin/run-typescript-entrypoint.ts \
@@ -75,6 +77,7 @@ RUN chmod 0555 \
     /usr/local/bin/finalize-session-archive-delta.ts \
     /usr/local/bin/import-cpa-session-archive.ts \
     /usr/local/bin/audit-cpa-migration.ts \
+    /usr/local/bin/reconcile-final-price-cache.ts \
     /usr/local/bin/stage-protected-inputs \
     /usr/local/bin/import-cpa-model-routes \
     /usr/local/bin/export-cpa-source-route-inventory \
@@ -85,6 +88,7 @@ RUN chmod 0555 \
     /usr/local/bin/finalize-session-archive-delta \
     /usr/local/bin/import-cpa-session-archive \
     /usr/local/bin/audit-cpa-migration \
+    /usr/local/bin/reconcile-final-price-cache \
     /usr/local/lib/strict-json.ts \
     /usr/local/bin/lib/strict-json.ts \
     /usr/local/cpa-upstreams/import-cpa-upstreams.ts \

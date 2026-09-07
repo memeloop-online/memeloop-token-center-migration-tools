@@ -94,6 +94,7 @@ jobs:
             /usr/local/bin/import-cpa-model-routes \
             /usr/local/bin/import-cpa-key-policy \
             /usr/local/bin/import-cpa-upstreams \
+            /usr/local/bin/reconcile-final-price-cache \
             /usr/local/bin/stage-protected-inputs \
             /usr/local/bin/export-cpa-session-archive-delta; do
             docker run --rm --read-only --tmpfs /tmp:rw,noexec,nosuid,size=8m \
