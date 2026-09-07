@@ -12,7 +12,7 @@ type Protocol = "openai" | "anthropic";
 type LiveProtocol = Protocol | "generation";
 type SourcePattern = Readonly<{ provider: string; model: string; group: string | null; upstreamPrefix: string | null; protocol: Protocol }>;
 type SourceAnomaly = Readonly<{ provider: string; model: string; reason: string }>;
-type SourceInventory = Readonly<{ mappings: readonly SourcePattern[]; reauthorizationRequired: number; anomalies: readonly SourceAnomaly[]; anomalyDigest: string }>;
+type SourceInventory = Readonly<{ version: 1 | 2; mappings: readonly SourcePattern[]; reauthorizationRequired: number; anomalies: readonly SourceAnomaly[]; anomalyDigest: string }>;
 type Upstream = Readonly<{ accountId: string; sourceStableId: string; sourceProvider: string | null; driver: string; status: "active"; updatedAt: number }>;
 type CandidateBinding = Readonly<{ accountId: string; sourceStableId: string }>;
 type ProviderCandidateSet = Readonly<{ source: SourcePattern; upstreamModel: string; protocol: Protocol; selection: "equal_round_robin"; candidates: readonly CandidateBinding[] }>;
@@ -84,19 +84,24 @@ export function readProtected(path: string, label: string): Buffer {
 
 export function parseSourceInventory(raw: Buffer): SourceInventory {
   const root = record(strictJson(raw, "source inventory"), ["version", "mappings", "reauthorization_required", "anomalies"], "source inventory");
-  if (root.version !== 1 || !Array.isArray(root.mappings) || !Array.isArray(root.reauthorization_required) || !Array.isArray(root.anomalies) || root.mappings.length > 1000) throw new RouteImportFailure("source inventory has an invalid schema");
+  const sourceVersion = root.version;
+  if ((sourceVersion !== 1 && sourceVersion !== 2) || !Array.isArray(root.mappings) || !Array.isArray(root.reauthorization_required) || !Array.isArray(root.anomalies) || root.mappings.length > 1000 || root.reauthorization_required.length > 1000 || root.anomalies.length > 1000) throw new RouteImportFailure("source inventory has an invalid schema");
   const mappings = root.mappings.map((item) => sourcePattern(item, "source mapping"));
   if (new Set(mappings.map(sourceKey)).size !== mappings.length) throw new RouteImportFailure("source inventory contains duplicate mappings");
   const anomalies: SourceAnomaly[] = [];
-  for (const [field, values] of [["reauthorization", root.reauthorization_required], ["anomaly", root.anomalies]] as const) {
-    for (const value of values) {
-      const item = record(value, ["provider", "model", "reason"], `source ${field}`);
-      const normalized = { provider: text(item.provider, `source ${field}`), model: text(item.model, `source ${field}`), reason: text(item.reason, `source ${field}`) };
-      if (field === "anomaly") anomalies.push(normalized);
-    }
+  const reauthorizationStableIds = new Set<string>();
+  for (const value of root.reauthorization_required) {
+    const item = record(value, sourceVersion === 1 ? ["provider", "model", "reason"] : ["provider", "source_stable_id"], "source reauthorization");
+    text(item.provider, "source reauthorization");
+    if (sourceVersion === 1) { text(item.model, "source reauthorization"); text(item.reason, "source reauthorization"); }
+    else { const stableId = text(item.source_stable_id, "source reauthorization", SHA); if (reauthorizationStableIds.has(stableId)) throw new RouteImportFailure("source inventory contains duplicate reauthorization bindings"); reauthorizationStableIds.add(stableId); }
+  }
+  for (const value of root.anomalies) {
+    const item = record(value, ["provider", "model", "reason"], "source anomaly");
+    anomalies.push({ provider: text(item.provider, "source anomaly"), model: text(item.model, "source anomaly"), reason: text(item.reason, "source anomaly") });
   }
   if (new Set(anomalies.map((item) => encode([item.provider, item.model, item.reason]))).size !== anomalies.length) throw new RouteImportFailure("source inventory contains duplicate anomalies");
-  return { mappings, reauthorizationRequired: root.reauthorization_required.length, anomalies, anomalyDigest: digest(encode(anomalies.map((item) => [item.provider, item.model, item.reason]))) };
+  return { version: sourceVersion, mappings, reauthorizationRequired: root.reauthorization_required.length, anomalies, anomalyDigest: digest(encode(anomalies.map((item) => [item.provider, item.model, item.reason]))) };
 }
 
 export function parseUpstreamInventory(raw: Buffer): UpstreamInventory {

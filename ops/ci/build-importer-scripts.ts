@@ -14,6 +14,7 @@ await build({
     'ops/import-cpa-session-archive.ts',
     'ops/legacy-credentials/attach-legacy-cpa-credentials.ts',
     'ops/legacy-policy/import-cpa-key-policy.ts',
+    'ops/legacy-routes/export-cpa-source-route-inventory.ts',
     'ops/legacy-routes/import-cpa-model-routes.ts',
     'ops/cpa-upstreams/import-cpa-upstreams.ts',
     'ops/cpa-upstreams/generate-source-identity-key.ts',
