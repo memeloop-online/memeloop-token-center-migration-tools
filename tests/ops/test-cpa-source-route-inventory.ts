@@ -22,15 +22,38 @@ function writeSource(root: string, invalidModel = false): { config: string; auth
   writeFileSync(config, [
     'auth-dir: "/sealed/auth"',
     "openai-compatibility:",
-    '  - name: "astra-provider"',
-    '    prefix: "astra"',
-    '    base-url: "https://astra.example.test/v1"',
+    '  - name: "kimi"',
+    '    base-url: "https://kimi.example.test/v1"',
     "    api-key-entries:",
     `      - api-key: "${apiKey}-a"`,
     `      - api-key: "${apiKey}-b"`,
     "    models:",
+    '      - name: "kimi-k2-upstream"',
+    '        alias: "kimi-k2"',
+    '  - name: "westlake"',
+    '    base-url: "https://westlake.example.test/v1"',
+    "    api-key-entries:",
+    `      - api-key: "${apiKey}-westlake"`,
+    "    models:",
+    '      - name: "westlake-null-upstream"',
+    '        alias: "westlake-null"',
+    '      - name: "westlake-prefixed-upstream"',
+    '        alias: "westlake-prefixed"',
+    '        prefix: "westlake"',
+    "codex-api-key:",
+    `  - api-key: "${apiKey}-codex"`,
+    '    base-url: "https://codex.example.test/v1"',
+    "    models:",
     '      - name: "gpt-6-astra-upstream"',
     '        alias: "gpt-6-astra"',
+    '      - name: "gpt-6-group-only-upstream"',
+    '        alias: "gpt-6-group-only"',
+    '      - name: "gpt-6-prefix-default-upstream"',
+    '        alias: "gpt-6-prefix"',
+    '        prefix: "codex"',
+    '      - name: "gpt-6-prefix-csil-upstream"',
+    '        alias: "gpt-6-prefix"',
+    '        prefix: "codex-csil"',
     ...(invalidModel ? ["        unsupported: true"] : []),
     ""].join("\n"), { mode: 0o600 });
   writeFileSync(join(auth, "copilot.json"), JSON.stringify({ type: "copilot", upstream: "copilot", handle: opaqueHandle, label: opaqueEmail }), { mode: 0o600 });
@@ -39,10 +62,16 @@ function writeSource(root: string, invalidModel = false): { config: string; auth
     version: 1,
     policies: [
       { key_hash: "a".repeat(64), enabled: true, grants: [
-        { provider: "astra-provider", model: "gpt-6-astra", group: "text", upstream_prefix: "astra" },
-        { provider: "astra-provider", model: "gpt-6-malformed", upstream_prefix: "astra" },
+        { provider: "codex", model: "gpt-6-astra" },
+        { provider: "kimi", model: "kimi-k2" },
+        { provider: "westlake", model: "westlake-null", group: "westlake" },
+        { provider: "westlake", model: "westlake-prefixed", group: "westlake", upstream_prefix: "westlake" },
+        { provider: "codex", model: "gpt-6-group-only", group: "csil" },
+        { provider: "codex", model: "gpt-6-prefix", group: "standard", upstream_prefix: "codex" },
+        { provider: "codex", model: "gpt-6-prefix", group: "csil", upstream_prefix: "codex-csil" },
+        { provider: "codex", group: "malformed" },
       ] },
-      { key_hash: "b".repeat(64), enabled: false, grants: [{ provider: "astra-provider", model: "disabled-only", group: "text", upstream_prefix: "astra" }] },
+      { key_hash: "b".repeat(64), enabled: false, grants: [{ provider: "codex", model: "disabled-only" }] },
     ],
     usage: {},
   }), { mode: 0o600 });
@@ -55,21 +84,32 @@ function exportArguments(source: { config: string; auth: string; policy: string;
 }
 
 describe("CPA source route inventory exporter", () => {
-  it("dynamically seals a newly introduced model and its complete exact two-account provider pool", () => {
+  it("dynamically seals nullable exact source coordinates and a complete provider pool", () => {
     const root = mkdtempSync(join(tmpdir(), "mtc-source-route-export-")), source = writeSource(root), output = join(root, "output"); mkdirSync(output, { mode: 0o700 });
     const result = spawnSync(process.execPath, exportArguments(source, output), { encoding: "utf8" }); assert.equal(result.status, 0, result.stderr);
     const receipt = JSON.parse(result.stdout) as Record<string, unknown>, sourcePath = join(output, "source-inventory.json"), materialPath = join(output, "provider-candidate-material.json");
-    assert.equal(receipt.source_mapping_count, 1); assert.equal(receipt.provider_candidate_set_count, 1); assert.equal(receipt.source_account_candidate_count, 2); assert.equal(receipt.reauthorization_required_count, 1); assert.equal(receipt.anomaly_count, 1);
+    assert.equal(receipt.source_mapping_count, 7); assert.equal(receipt.provider_candidate_set_count, 7); assert.equal(receipt.source_account_candidate_count, 8); assert.equal(receipt.reauthorization_required_count, 1); assert.equal(receipt.anomaly_count, 1);
     assert.equal(statSync(sourcePath).mode & 0o777, 0o600); assert.equal(statSync(materialPath).mode & 0o777, 0o600);
     const sourceInventory = JSON.parse(readFileSync(sourcePath, "utf8")) as Record<string, unknown>, material = JSON.parse(readFileSync(materialPath, "utf8")) as Record<string, unknown>;
-    assert.equal(sourceInventory.version, 2); assert.deepEqual(sourceInventory.mappings, [{ provider: "astra-provider", model: "gpt-6-astra", group: "text", upstream_prefix: "astra", protocol: "openai" }]);
-    assert.deepEqual(sourceInventory.anomalies, [{ provider: "astra-provider", model: "gpt-6-malformed", reason: "source grant lacks exact route coordinates" }]);
+    assert.equal(sourceInventory.version, 2);
+    const mappings = sourceInventory.mappings as Array<Record<string, unknown>>;
+    assert.equal(mappings.length, 7);
+    const mappingFor = (provider: string, model: string, upstreamPrefix: string | null): Record<string, unknown> | undefined => mappings.find((item) => item.provider === provider && item.model === model && item.upstream_prefix === upstreamPrefix);
+    assert.deepEqual(mappingFor("codex", "gpt-6-astra", null), { provider: "codex", model: "gpt-6-astra", group: null, upstream_prefix: null, protocol: "openai" });
+    assert.deepEqual(mappingFor("kimi", "kimi-k2", null), { provider: "kimi", model: "kimi-k2", group: null, upstream_prefix: null, protocol: "openai" });
+    assert.deepEqual(mappingFor("westlake", "westlake-null", null), { provider: "westlake", model: "westlake-null", group: "westlake", upstream_prefix: null, protocol: "openai" });
+    assert.deepEqual(mappingFor("westlake", "westlake-prefixed", "westlake"), { provider: "westlake", model: "westlake-prefixed", group: "westlake", upstream_prefix: "westlake", protocol: "openai" });
+    assert.deepEqual(mappingFor("codex", "gpt-6-group-only", null), { provider: "codex", model: "gpt-6-group-only", group: "csil", upstream_prefix: null, protocol: "openai" });
+    assert.deepEqual(mappingFor("codex", "gpt-6-prefix", "codex"), { provider: "codex", model: "gpt-6-prefix", group: "standard", upstream_prefix: "codex", protocol: "openai" });
+    assert.deepEqual(mappingFor("codex", "gpt-6-prefix", "codex-csil"), { provider: "codex", model: "gpt-6-prefix", group: "csil", upstream_prefix: "codex-csil", protocol: "openai" });
+    assert.deepEqual(sourceInventory.anomalies, [{ provider: "codex", model: "unknown", reason: "source grant lacks provider or model route coordinates" }]);
     assert.equal(parseSourceInventory(readFileSync(sourcePath)).reauthorizationRequired, 1);
     assert.deepEqual(sourceInventory.reauthorization_required && (sourceInventory.reauthorization_required as unknown[]).map((item) => Object.keys(item as Record<string, unknown>).sort()), [["provider", "source_stable_id"]]);
     const firstReauthorization = sourceInventory.reauthorization_required as Array<Record<string, unknown>>; assert.match(String(firstReauthorization[0]!.source_stable_id), /^[0-9a-f]{64}$/u);
-    const pools = material.provider_candidate_sets as Array<Record<string, unknown>>; assert.equal(material.version, 1); assert.equal(material.source_inventory_sha256, createHash("sha256").update(readFileSync(sourcePath)).digest("hex")); assert.equal(pools.length, 1);
-    assert.deepEqual(pools[0]!.source, (sourceInventory.mappings as unknown[])[0]); assert.equal(pools[0]!.upstream_model, "gpt-6-astra-upstream"); assert.equal(pools[0]!.protocol, "openai"); assert.equal(pools[0]!.selection, "equal_round_robin");
-    const candidates = pools[0]!.candidates as Array<Record<string, unknown>>; assert.equal(candidates.length, 2); assert.deepEqual(candidates.map((item) => item.driver), ["http-json", "http-json"]); assert.deepEqual(candidates.map((item) => item.source_provider), ["astra-provider", "astra-provider"]); assert.equal(new Set(candidates.map((item) => item.source_stable_id)).size, 2);
+    const pools = material.provider_candidate_sets as Array<Record<string, unknown>>; assert.equal(material.version, 1); assert.equal(material.source_inventory_sha256, createHash("sha256").update(readFileSync(sourcePath)).digest("hex")); assert.equal(pools.length, 7);
+    const kimiPool = pools.find((item) => (item.source as Record<string, unknown>).provider === "kimi"); assert(kimiPool); assert.equal(kimiPool.upstream_model, "kimi-k2-upstream"); assert.equal(kimiPool.protocol, "openai"); assert.equal(kimiPool.selection, "equal_round_robin");
+    const candidates = kimiPool.candidates as Array<Record<string, unknown>>; assert.equal(candidates.length, 2); assert.deepEqual(candidates.map((item) => item.driver), ["http-json", "http-json"]); assert.deepEqual(candidates.map((item) => item.source_provider), ["kimi", "kimi"]); assert.equal(new Set(candidates.map((item) => item.source_stable_id)).size, 2);
+    const westlakePools = pools.filter((item) => (item.source as Record<string, unknown>).provider === "westlake"); assert.equal(westlakePools.length, 2); assert.deepEqual(westlakePools.map((item) => (item.source as Record<string, unknown>).upstream_prefix).sort(), [null, "westlake"]); assert.deepEqual(westlakePools.map((item) => (item.candidates as unknown[]).length).sort(), [1, 1]);
     const outputText = `${result.stdout}${result.stderr}${readFileSync(sourcePath, "utf8")}${readFileSync(materialPath, "utf8")}`;
     for (const forbidden of [apiKey, opaqueHandle, opaqueEmail, "/sealed/auth", source.config, source.auth, source.key]) assert.doesNotMatch(outputText, new RegExp(forbidden.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")));
     assert.deepEqual(readdirSync(output).sort(), ["provider-candidate-material.json", "source-inventory.json"]);
@@ -85,7 +125,7 @@ describe("CPA source route inventory exporter", () => {
     const invalidRoot = mkdtempSync(join(tmpdir(), "mtc-source-route-invalid-")), invalid = writeSource(invalidRoot, true), invalidOutput = join(invalidRoot, "output"); mkdirSync(invalidOutput, { mode: 0o700 });
     const rejected = spawnSync(process.execPath, exportArguments(invalid, invalidOutput), { encoding: "utf8" }); assert.equal(rejected.status, 2); assert.equal(existsSync(join(invalidOutput, "source-inventory.json")), false); assert.equal(existsSync(join(invalidOutput, "provider-candidate-material.json")), false); assert.doesNotMatch(rejected.stderr, /fixture-only-route-export-api-key|FixtureCopilotHandle|fixture-route-export@example/u);
     const missingRoot = mkdtempSync(join(tmpdir(), "mtc-source-route-missing-")), missing = writeSource(missingRoot), missingOutput = join(missingRoot, "output"); mkdirSync(missingOutput, { mode: 0o700 });
-    writeFileSync(missing.policy, JSON.stringify({ version: 1, policies: [{ key_hash: "c".repeat(64), enabled: true, grants: [{ provider: "astra-provider", model: "unresolved", group: "text", upstream_prefix: "astra" }] }], usage: {} }), { mode: 0o600 });
+    writeFileSync(missing.policy, JSON.stringify({ version: 1, policies: [{ key_hash: "c".repeat(64), enabled: true, grants: [{ provider: "codex", model: "unresolved" }] }], usage: {} }), { mode: 0o600 });
     const unresolved = spawnSync(process.execPath, exportArguments(missing, missingOutput), { encoding: "utf8" }); assert.equal(unresolved.status, 2); assert.equal(existsSync(join(missingOutput, "source-inventory.json")), false); assert.equal(existsSync(join(missingOutput, "provider-candidate-material.json")), false);
   });
 });

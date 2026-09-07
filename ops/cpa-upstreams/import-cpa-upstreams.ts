@@ -362,10 +362,13 @@ function routeModelDefinitions(value: unknown, label: string, provider: string, 
   const excludedModels = list(excluded, `${label} excluded models`).map((item) => routeText(item, `${label} excluded model`));
   if (new Set(excludedModels).size !== excludedModels.length) throw new ImportFailure(`${label} contains a duplicate excluded model`);
   const result = entries.map((raw) => {
-    const model = mapping(raw, `${label} model`); exact(model, ["name", "alias"], `${label} model`);
-    return { provider, model: routeText(model.alias, `${label} model alias`), upstreamModel: routeText(model.name, `${label} model name`), upstreamPrefix, protocol, candidateSourceIds: excludedModels.includes(routeText(model.alias, `${label} model alias`)) ? [] : [...candidateSourceIds] };
+    const model = mapping(raw, `${label} model`); exact(model, ["name", "alias", "prefix"], `${label} model`);
+    const modelPrefix = routePrefix(model.prefix, `${label} model prefix`);
+    if (modelPrefix !== null && upstreamPrefix !== null && modelPrefix !== upstreamPrefix) throw new ImportFailure(`${label} model prefix conflicts with its provider prefix`);
+    const exactPrefix = modelPrefix ?? upstreamPrefix;
+    return { provider, model: routeText(model.alias, `${label} model alias`), upstreamModel: routeText(model.name, `${label} model name`), upstreamPrefix: exactPrefix, protocol, candidateSourceIds: excludedModels.includes(routeText(model.alias, `${label} model alias`)) ? [] : [...candidateSourceIds] };
   });
-  if (new Set(result.map((item) => item.model)).size !== result.length) throw new ImportFailure(`${label} contains a duplicate model alias`);
+  if (new Set(result.map((item) => JSON.stringify([item.model, item.upstreamPrefix]))).size !== result.length) throw new ImportFailure(`${label} contains a duplicate model alias/prefix pair`);
   if (excludedModels.some((model) => !result.some((item) => item.model === model))) throw new ImportFailure(`${label} excludes a model absent from its declared model list`);
   return result;
 }

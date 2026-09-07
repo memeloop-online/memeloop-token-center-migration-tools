@@ -32,9 +32,14 @@ function publicField(value: unknown): string | undefined {
   return typeof value === "string" && SOURCE_FIELD.test(value) && !value.includes("@") && !value.startsWith("/") && !value.includes("//") && !/^(?:sk-|pk-|rk-|gh[oprsu]_|mtc_)/iu.test(value) ? value : undefined;
 }
 function anomalyField(value: unknown): string { return publicField(value) ?? "unknown"; }
+function nullableField(value: string | undefined): string | null | undefined {
+  if (value === undefined) return null;
+  return publicField(value);
+}
 function exactGrant(grant: SourceGrant): Source | Anomaly {
-  const provider = publicField(grant.provider), model = publicField(grant.model), group = publicField(grant.group), upstreamPrefix = publicField(grant.upstream_prefix);
-  if (!provider || !model || !group || !upstreamPrefix) return { provider: anomalyField(grant.provider), model: anomalyField(grant.model), reason: "source grant lacks exact route coordinates" };
+  const provider = publicField(grant.provider), model = publicField(grant.model), group = nullableField(grant.group), upstreamPrefix = nullableField(grant.upstream_prefix);
+  if (!provider || !model) return { provider: anomalyField(grant.provider), model: anomalyField(grant.model), reason: "source grant lacks provider or model route coordinates" };
+  if (group === undefined || upstreamPrefix === undefined) return { provider, model, reason: "source grant contains an invalid optional route coordinate" };
   return { provider, model, group, upstream_prefix: upstreamPrefix, protocol: "openai" };
 }
 function isAnomaly(value: Source | Anomaly): value is Anomaly { return "reason" in value; }

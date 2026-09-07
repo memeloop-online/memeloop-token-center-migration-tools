@@ -17,16 +17,19 @@ written mode `0600` with temporary-file fsync, no-replace hard-link publish,
 and parent-directory fsync. Existing output is never overwritten.
 
 The exporter shares the upstream importer's strict YAML/auth parser and source
-identity logic. It resolves enabled exact native-policy grant coordinates
-(`provider`, `model`, `group`, `upstream_prefix`) only against the config's
-declared `models[].{name,alias}`, provider and prefix. Configuration determines
-the upstream model and protocol. Thus a source-declared model such as
-`gpt-6-astra` appears without changing this tool or relying on historical
-counts. Unknown config fields, unsupported model entries, missing aliases,
-ambiguous model/driver/configuration joins, an unresolved source grant, or an
-empty active source pool stop before either public output is created. A
-parseable but incomplete policy grant is a static anomaly and is never guessed
-or repaired.
+identity logic. It resolves enabled native-policy grant coordinates against the
+config's declared `models[].{name,alias,prefix}`, provider and prefix.
+`provider` and `model` are mandatory anchors for a route mapping; an absent one
+becomes an explicit anomaly and is never inferred. `group` and
+`upstream_prefix` are independently optional: an omitted field is preserved as
+JSON `null`, then matched as part of the exact source pattern and candidate
+pool. Configuration determines the upstream model and protocol. Thus a
+source-declared model such as `gpt-6-astra` appears without changing this tool
+or relying on historical counts. Unknown config fields, unsupported model
+entries, missing aliases, ambiguous model/driver/configuration joins, an
+unresolved source grant, or an empty active source pool stop before either
+public output is created. A parseable policy shape without provider/model is a
+static anomaly and is never guessed or repaired.
 
 `source-inventory.json` is version 2 and can be used directly as
 `import-cpa-model-routes --source-inventory-file`. It preserves every exact
