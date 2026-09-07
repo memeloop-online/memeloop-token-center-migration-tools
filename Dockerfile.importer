@@ -43,6 +43,12 @@ COPY ops/audit-cpa-migration.ts /usr/local/bin/audit-cpa-migration.ts
 COPY ops/lib/strict-json.ts /usr/local/lib/strict-json.ts
 COPY ops/lib/strict-json.ts /usr/local/bin/lib/strict-json.ts
 
+# The source-route exporter deliberately imports the reviewed upstream and
+# policy parsers from their repository-relative locations. Preserve that
+# dependency layout as well as the flattened command copies above.
+COPY ops/cpa-upstreams/import-cpa-upstreams.ts /usr/local/cpa-upstreams/import-cpa-upstreams.ts
+COPY ops/legacy-policy/import-cpa-key-policy.ts /usr/local/legacy-policy/import-cpa-key-policy.ts
+
 # These extensionless names are the stable paths used by Kubernetes Jobs. Each
 # is a TypeScript shebang entry that imports the corresponding .ts file; no
 # shell or generated JavaScript launcher is introduced.
@@ -80,7 +86,9 @@ RUN chmod 0555 \
     /usr/local/bin/import-cpa-session-archive \
     /usr/local/bin/audit-cpa-migration \
     /usr/local/lib/strict-json.ts \
-    /usr/local/bin/lib/strict-json.ts
+    /usr/local/bin/lib/strict-json.ts \
+    /usr/local/cpa-upstreams/import-cpa-upstreams.ts \
+    /usr/local/legacy-policy/import-cpa-key-policy.ts
 
 # Numeric identity works even when Kubernetes has no passwd entry for it.
 USER 10001:10001
