@@ -113,8 +113,8 @@ jobs:
           {
             echo "### Immutable migration-tools image"
             echo
-            echo "- image: `$IMAGE:sha-${GITHUB_SHA}`"
-            echo "- digest: `$DIGEST`"
+            printf -- '- image: `%s:sha-%s`\n' "$IMAGE" "$GITHUB_SHA"
+            printf -- '- digest: `%s`\n' "$DIGEST"
             echo
             echo '```text'
             cat "$RUNNER_TEMP/migration-tools-manifest.txt"
