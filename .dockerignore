@@ -1,0 +1,24 @@
+# The image is assembled from an explicit production allow-list in the
+# Dockerfile. Keep tests, fixtures, source manifests, and operator notes out
+# of the build context as an additional accidental-copy boundary.
+*
+!Dockerfile.importer
+!package.json
+!package-lock.json
+!ops/
+!ops/ci/
+!ops/ci/run-typescript-entrypoint.ts
+!ops/ci/stage-protected-inputs.ts
+!ops/legacy-routes/
+!ops/legacy-routes/import-cpa-model-routes.ts
+!ops/legacy-policy/
+!ops/legacy-policy/import-cpa-key-policy.ts
+!ops/cpa-upstreams/
+!ops/cpa-upstreams/import-cpa-upstreams.ts
+!ops/cpa-upstreams/generate-source-identity-key.ts
+!ops/export-cpa-session-archive-delta.ts
+!ops/finalize-session-archive-delta.ts
+!ops/import-cpa-session-archive.ts
+!ops/audit-cpa-migration.ts
+!ops/lib/
+!ops/lib/strict-json.ts

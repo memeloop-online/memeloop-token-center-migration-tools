@@ -1,0 +1,84 @@
+# syntax=docker/dockerfile:1.7
+
+# Official Node 24.18.0 image, pinned to its multi-platform manifest digest.
+ARG NODE_IMAGE=node:24.18.0-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d
+
+FROM ${NODE_IMAGE} AS production-dependencies
+ENV NPM_CONFIG_REGISTRY=https://registry.npmjs.org/
+WORKDIR /build
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
+    && npm cache clean --force
+
+FROM ${NODE_IMAGE}
+ENV NODE_ENV=production \
+    NODE_OPTIONS=--experimental-strip-types
+WORKDIR /tmp
+
+# Policy import and archive reconciliation use psql and flock. No compiler,
+# test fixture, source snapshot, credential, or shell/JavaScript wrapper enters
+# the final layer; Node executes the reviewed TypeScript files directly.
+RUN apt-get update \
+    && apt-get install --no-install-recommends --yes ca-certificates postgresql-client util-linux \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=production-dependencies /build/node_modules /usr/local/node_modules
+COPY package.json /usr/local/package.json
+
+# Keep only the route/policy/upstream tools, the archive coordinator/wrappers,
+# and the TypeScript staging helper. Relative imports are deliberately staged
+# beside the entrypoints rather than copying the repository tree wholesale.
+COPY ops/ci/run-typescript-entrypoint.ts /usr/local/bin/run-typescript-entrypoint.ts
+COPY ops/ci/stage-protected-inputs.ts /usr/local/bin/stage-protected-inputs.ts
+COPY ops/legacy-routes/import-cpa-model-routes.ts /usr/local/bin/import-cpa-model-routes.ts
+COPY ops/legacy-policy/import-cpa-key-policy.ts /usr/local/bin/import-cpa-key-policy.ts
+COPY ops/cpa-upstreams/import-cpa-upstreams.ts /usr/local/bin/import-cpa-upstreams.ts
+COPY ops/cpa-upstreams/generate-source-identity-key.ts /usr/local/bin/generate-source-identity-key.ts
+COPY ops/export-cpa-session-archive-delta.ts /usr/local/bin/export-cpa-session-archive-delta.ts
+COPY ops/finalize-session-archive-delta.ts /usr/local/bin/finalize-session-archive-delta.ts
+COPY ops/import-cpa-session-archive.ts /usr/local/bin/import-cpa-session-archive.ts
+COPY ops/audit-cpa-migration.ts /usr/local/bin/audit-cpa-migration.ts
+COPY ops/lib/strict-json.ts /usr/local/lib/strict-json.ts
+COPY ops/lib/strict-json.ts /usr/local/bin/lib/strict-json.ts
+
+# These extensionless names are the stable paths used by Kubernetes Jobs. Each
+# is a TypeScript shebang entry that imports the corresponding .ts file; no
+# shell or generated JavaScript launcher is introduced.
+COPY ops/ci/run-typescript-entrypoint.ts /usr/local/bin/stage-protected-inputs
+COPY ops/ci/run-typescript-entrypoint.ts /usr/local/bin/import-cpa-model-routes
+COPY ops/ci/run-typescript-entrypoint.ts /usr/local/bin/import-cpa-key-policy
+COPY ops/ci/run-typescript-entrypoint.ts /usr/local/bin/import-cpa-upstreams
+COPY ops/ci/run-typescript-entrypoint.ts /usr/local/bin/generate-source-identity-key
+COPY ops/ci/run-typescript-entrypoint.ts /usr/local/bin/export-cpa-session-archive-delta
+COPY ops/ci/run-typescript-entrypoint.ts /usr/local/bin/finalize-session-archive-delta
+COPY ops/ci/run-typescript-entrypoint.ts /usr/local/bin/import-cpa-session-archive
+COPY ops/ci/run-typescript-entrypoint.ts /usr/local/bin/audit-cpa-migration
+
+RUN chmod 0555 \
+    /usr/local/bin/run-typescript-entrypoint.ts \
+    /usr/local/bin/stage-protected-inputs.ts \
+    /usr/local/bin/import-cpa-model-routes.ts \
+    /usr/local/bin/import-cpa-key-policy.ts \
+    /usr/local/bin/import-cpa-upstreams.ts \
+    /usr/local/bin/generate-source-identity-key.ts \
+    /usr/local/bin/export-cpa-session-archive-delta.ts \
+    /usr/local/bin/finalize-session-archive-delta.ts \
+    /usr/local/bin/import-cpa-session-archive.ts \
+    /usr/local/bin/audit-cpa-migration.ts \
+    /usr/local/bin/stage-protected-inputs \
+    /usr/local/bin/import-cpa-model-routes \
+    /usr/local/bin/import-cpa-key-policy \
+    /usr/local/bin/import-cpa-upstreams \
+    /usr/local/bin/generate-source-identity-key \
+    /usr/local/bin/export-cpa-session-archive-delta \
+    /usr/local/bin/finalize-session-archive-delta \
+    /usr/local/bin/import-cpa-session-archive \
+    /usr/local/bin/audit-cpa-migration \
+    /usr/local/lib/strict-json.ts \
+    /usr/local/bin/lib/strict-json.ts
+
+# Numeric identity works even when Kubernetes has no passwd entry for it.
+USER 10001:10001
+ENTRYPOINT ["node"]
+CMD ["/usr/local/bin/import-cpa-model-routes", "--help"]

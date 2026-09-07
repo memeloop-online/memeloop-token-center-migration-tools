@@ -16,19 +16,118 @@ concurrency:
 jobs:
   verify:
     name: Verify migration tools
+    if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v6.0.0
+        with:
+          persist-credentials: false
 
       - name: Set up Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "24.18.0"
+          registry-url: https://registry.npmjs.org/
 
       - name: Install dependencies
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: npm ci --ignore-scripts --no-audit
 
       - name: Verify repository policy, types, and tests
         run: npm run verify
+
+  publish-ghcr:
+    name: Publish immutable migration-tools image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    needs: [verify]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/memeloop-token-center-migration-tools
+    steps:
+      - name: Check out the verified revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v6.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Log in to private GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish the git-SHA image
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Dockerfile.importer
+          platforms: linux/amd64
+          outputs: type=image,push=true,oci-mediatypes=true
+          tags: ${{ env.IMAGE }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Run digest-pinned extensionless entrypoint self-check
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          test -n "$DIGEST"
+          test "${DIGEST#sha256:}" != "$DIGEST"
+          for entrypoint in \
+            /usr/local/bin/import-cpa-model-routes \
+            /usr/local/bin/import-cpa-key-policy \
+            /usr/local/bin/import-cpa-upstreams \
+            /usr/local/bin/stage-protected-inputs \
+            /usr/local/bin/export-cpa-session-archive-delta; do
+            docker run --rm --read-only --tmpfs /tmp:rw,noexec,nosuid,size=8m \
+              --security-opt no-new-privileges --cap-drop ALL \
+              "$IMAGE@$DIGEST" "$entrypoint" --help
+          done
+
+      - name: Emit the immutable digest and manifest
+        id: evidence
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          test -n "$DIGEST"
+          test "${DIGEST#sha256:}" != "$DIGEST"
+          docker buildx imagetools inspect "$IMAGE@$DIGEST" | tee "$RUNNER_TEMP/migration-tools-manifest.txt"
+          {
+            echo "### Immutable migration-tools image"
+            echo
+            echo "- image: `$IMAGE:sha-${GITHUB_SHA}`"
+            echo "- digest: `$DIGEST`"
+            echo
+            echo '```text'
+            cat "$RUNNER_TEMP/migration-tools-manifest.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "image=$IMAGE"
+            echo "digest=$DIGEST"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload immutable manifest evidence
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.6.2
+        with:
+          name: migration-tools-image-${{ github.sha }}
+          path: ${{ runner.temp }}/migration-tools-manifest.txt
+          if-no-files-found: error
+          retention-days: 90
