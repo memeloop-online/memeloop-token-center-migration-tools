@@ -16,6 +16,7 @@ await build({
     'ops/legacy-policy/import-cpa-key-policy.ts',
     'ops/legacy-policy/generate-provider-exact-policy-inputs.ts',
     'ops/legacy-routes/export-cpa-source-route-inventory.ts',
+    'ops/legacy-routes/export-cpa-target-route-receipt.ts',
     'ops/legacy-routes/import-cpa-model-routes.ts',
     'ops/cpa-upstreams/import-cpa-upstreams.ts',
     'ops/cpa-upstreams/generate-source-identity-key.ts',

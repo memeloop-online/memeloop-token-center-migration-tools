@@ -91,6 +91,7 @@ jobs:
           test "${DIGEST#sha256:}" != "$DIGEST"
           for entrypoint in \
             /usr/local/bin/export-cpa-source-route-inventory \
+            /usr/local/bin/export-cpa-target-route-receipt \
             /usr/local/bin/import-cpa-model-routes \
             /usr/local/bin/import-cpa-key-policy \
             /usr/local/bin/generate-provider-exact-policy-inputs \

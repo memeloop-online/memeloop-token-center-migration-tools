@@ -1,9 +1,30 @@
 # Provider-exact policy input generation
 
-`generate-provider-exact-policy-inputs` closes the handoff between a
-successfully replayed native-route plan and the separate full direct-grant
-policy importer. It is an offline, dry-run-only derivation tool: it does not
-contact or mutate Token Center, CPA, Kubernetes, or a Secret store.
+`export-cpa-target-route-receipt` first closes the target-state observation
+step after a successfully replayed native-route plan. It only calls the
+existing read-only target route and upstream list APIs; it has no mutation
+flags or write requests. It reads all selected files as mode-`0600` protected
+inputs, requires the supplied target URL to exactly equal the reviewed
+manifest URL, and writes a new mode-`0600` receipt by atomic no-overwrite
+publication. HTTPS is required unless the exact reviewed HTTP URL is paired
+with `--allow-http-target`.
+
+```text
+export-cpa-target-route-receipt --source-inventory-file /state/source/source-inventory.json --upstream-inventory-file /review/upstream-inventory.json --reviewed-route-manifest-file /review/reviewed-route-manifest.json --target-api-base-url https://control.example.test/ --service-token-file /run/secrets/target-read-token --receipt-output /state/source/target-route-receipt.json
+```
+
+It binds the raw SHA-256 digests of the source inventory, reviewed upstream
+inventory, and reviewed route manifest. It rejects a tenant, response-schema,
+route topology, candidate-pool, target-account revision, or retired bridge
+mismatch before writing. The strict v1 output contains only the receipt
+digests, public route coordinates, target account UUIDs, and reviewed
+`source_stable_id` bindings; its stdout is only `route_count` and
+`target_route_receipt_sha256`, never the service token or credential data.
+
+`generate-provider-exact-policy-inputs` then closes the handoff between that
+receipt and the separate full direct-grant policy importer. It is an offline,
+dry-run-only derivation tool: it does not contact or mutate Token Center, CPA,
+Kubernetes, or a Secret store.
 
 It accepts six owner-controlled, mode-`0600` regular files with one link:
 

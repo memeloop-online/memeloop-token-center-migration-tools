@@ -33,6 +33,7 @@ COPY ops/ci/run-typescript-entrypoint.ts /usr/local/bin/run-typescript-entrypoin
 COPY ops/ci/stage-protected-inputs.ts /usr/local/bin/stage-protected-inputs.ts
 COPY ops/legacy-routes/import-cpa-model-routes.ts /usr/local/bin/import-cpa-model-routes.ts
 COPY ops/legacy-routes/export-cpa-source-route-inventory.ts /usr/local/bin/export-cpa-source-route-inventory.ts
+COPY ops/legacy-routes/export-cpa-target-route-receipt.ts /usr/local/bin/export-cpa-target-route-receipt.ts
 COPY ops/legacy-policy/import-cpa-key-policy.ts /usr/local/bin/import-cpa-key-policy.ts
 COPY ops/legacy-policy/generate-provider-exact-policy-inputs.ts /usr/local/bin/generate-provider-exact-policy-inputs.ts
 COPY ops/cpa-upstreams/import-cpa-upstreams.ts /usr/local/bin/import-cpa-upstreams.ts
@@ -58,6 +59,7 @@ COPY ops/legacy-routes/import-cpa-model-routes.ts /usr/local/legacy-routes/impor
 COPY ops/ci/run-typescript-entrypoint.ts /usr/local/bin/stage-protected-inputs
 COPY ops/ci/run-typescript-entrypoint.ts /usr/local/bin/import-cpa-model-routes
 COPY ops/ci/run-typescript-entrypoint.ts /usr/local/bin/export-cpa-source-route-inventory
+COPY ops/ci/run-typescript-entrypoint.ts /usr/local/bin/export-cpa-target-route-receipt
 COPY ops/ci/run-typescript-entrypoint.ts /usr/local/bin/import-cpa-key-policy
 COPY ops/ci/run-typescript-entrypoint.ts /usr/local/bin/generate-provider-exact-policy-inputs
 COPY ops/ci/run-typescript-entrypoint.ts /usr/local/bin/import-cpa-upstreams
@@ -73,6 +75,7 @@ RUN chmod 0555 \
     /usr/local/bin/stage-protected-inputs.ts \
     /usr/local/bin/import-cpa-model-routes.ts \
     /usr/local/bin/export-cpa-source-route-inventory.ts \
+    /usr/local/bin/export-cpa-target-route-receipt.ts \
     /usr/local/bin/import-cpa-key-policy.ts \
     /usr/local/bin/generate-provider-exact-policy-inputs.ts \
     /usr/local/bin/import-cpa-upstreams.ts \
@@ -85,6 +88,7 @@ RUN chmod 0555 \
     /usr/local/bin/stage-protected-inputs \
     /usr/local/bin/import-cpa-model-routes \
     /usr/local/bin/export-cpa-source-route-inventory \
+    /usr/local/bin/export-cpa-target-route-receipt \
     /usr/local/bin/import-cpa-key-policy \
     /usr/local/bin/generate-provider-exact-policy-inputs \
     /usr/local/bin/import-cpa-upstreams \
