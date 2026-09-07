@@ -11,6 +11,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const entrypoints = Object.freeze({
   "audit-cpa-migration": "audit-cpa-migration.ts",
   "export-cpa-session-archive-delta": "export-cpa-session-archive-delta.ts",
+  "export-cpa-source-route-inventory": "export-cpa-source-route-inventory.ts",
   "finalize-session-archive-delta": "finalize-session-archive-delta.ts",
   "generate-source-identity-key": "generate-source-identity-key.ts",
   "import-cpa-key-policy": "import-cpa-key-policy.ts",

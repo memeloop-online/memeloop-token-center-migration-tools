@@ -11,6 +11,7 @@
 !ops/ci/stage-protected-inputs.ts
 !ops/legacy-routes/
 !ops/legacy-routes/import-cpa-model-routes.ts
+!ops/legacy-routes/export-cpa-source-route-inventory.ts
 !ops/legacy-policy/
 !ops/legacy-policy/import-cpa-key-policy.ts
 !ops/cpa-upstreams/

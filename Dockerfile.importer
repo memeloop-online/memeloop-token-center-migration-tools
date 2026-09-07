@@ -32,6 +32,7 @@ COPY package.json /usr/local/package.json
 COPY ops/ci/run-typescript-entrypoint.ts /usr/local/bin/run-typescript-entrypoint.ts
 COPY ops/ci/stage-protected-inputs.ts /usr/local/bin/stage-protected-inputs.ts
 COPY ops/legacy-routes/import-cpa-model-routes.ts /usr/local/bin/import-cpa-model-routes.ts
+COPY ops/legacy-routes/export-cpa-source-route-inventory.ts /usr/local/bin/export-cpa-source-route-inventory.ts
 COPY ops/legacy-policy/import-cpa-key-policy.ts /usr/local/bin/import-cpa-key-policy.ts
 COPY ops/cpa-upstreams/import-cpa-upstreams.ts /usr/local/bin/import-cpa-upstreams.ts
 COPY ops/cpa-upstreams/generate-source-identity-key.ts /usr/local/bin/generate-source-identity-key.ts
@@ -47,6 +48,7 @@ COPY ops/lib/strict-json.ts /usr/local/bin/lib/strict-json.ts
 # shell or generated JavaScript launcher is introduced.
 COPY ops/ci/run-typescript-entrypoint.ts /usr/local/bin/stage-protected-inputs
 COPY ops/ci/run-typescript-entrypoint.ts /usr/local/bin/import-cpa-model-routes
+COPY ops/ci/run-typescript-entrypoint.ts /usr/local/bin/export-cpa-source-route-inventory
 COPY ops/ci/run-typescript-entrypoint.ts /usr/local/bin/import-cpa-key-policy
 COPY ops/ci/run-typescript-entrypoint.ts /usr/local/bin/import-cpa-upstreams
 COPY ops/ci/run-typescript-entrypoint.ts /usr/local/bin/generate-source-identity-key
@@ -59,6 +61,7 @@ RUN chmod 0555 \
     /usr/local/bin/run-typescript-entrypoint.ts \
     /usr/local/bin/stage-protected-inputs.ts \
     /usr/local/bin/import-cpa-model-routes.ts \
+    /usr/local/bin/export-cpa-source-route-inventory.ts \
     /usr/local/bin/import-cpa-key-policy.ts \
     /usr/local/bin/import-cpa-upstreams.ts \
     /usr/local/bin/generate-source-identity-key.ts \
@@ -68,6 +71,7 @@ RUN chmod 0555 \
     /usr/local/bin/audit-cpa-migration.ts \
     /usr/local/bin/stage-protected-inputs \
     /usr/local/bin/import-cpa-model-routes \
+    /usr/local/bin/export-cpa-source-route-inventory \
     /usr/local/bin/import-cpa-key-policy \
     /usr/local/bin/import-cpa-upstreams \
     /usr/local/bin/generate-source-identity-key \

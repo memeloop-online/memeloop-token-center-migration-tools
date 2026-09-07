@@ -254,6 +254,10 @@ test("dispatches extensionless launchers by basename to explicit TypeScript targ
     assert.deepEqual(JSON.parse(readFileSync(marker, "utf8")), [target, "--help"]);
     assert.equal(targetForEntrypoint("unknown"), undefined);
     assert.equal(targetForEntrypoint("stage-protected-inputs"), "stage-protected-inputs.ts");
+    assert.equal(
+      targetForEntrypoint("export-cpa-source-route-inventory"),
+      "export-cpa-source-route-inventory.ts",
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
