@@ -77,10 +77,10 @@ WITH selected_tenant AS MATERIALIZED (
   SELECT id FROM tenants WHERE external_id = :'tenant_external_id'
 ), provenance AS MATERIALIZED (
   /*
-   * `output_tokens` was not part of the original durable provenance schema.
+   * output_tokens was not part of the original durable provenance schema.
    * Do not reference it as a PostgreSQL column: a reference would make the
    * whole read-only receipt fail to plan on an otherwise supported target.
-   * `total_tokens` is the source receipt total and the importer requires the
+   * total_tokens is the source receipt total and the importer requires the
    * normalized input partition to account for every input token, so an older
    * row's output is exactly total - normalized input. Newer schemas may
    * persist output_tokens; inspect the row JSON rather than pinning a schema
