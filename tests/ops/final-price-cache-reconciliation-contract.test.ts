@@ -8,11 +8,11 @@ import { installExecutableHelper, repository } from "./contract-helpers.ts";
 
 const script = join(repository, "ops/reconcile-final-price-cache.ts");
 
-function runReconciliation(workspace: string, gaps: number, args: readonly string[] = []) {
+function runReconciliation(workspace: string, gaps: number, args: readonly string[] = [], invalidProvenanceOutputTokens = 0) {
   const passFile = join(workspace, "pgpass");
   writeFileSync(passFile, "fixture-host:5432:fixture:fixture:fixture-only-password\n", { mode: 0o600 });
   chmodSync(passFile, 0o600);
-  writeFileSync(join(workspace, "price-cache-reconciliation-fixture.json"), JSON.stringify({ current_price_gap_count: gaps }), { mode: 0o600 });
+  writeFileSync(join(workspace, "price-cache-reconciliation-fixture.json"), JSON.stringify({ current_price_gap_count: gaps, invalid_provenance_output_tokens: invalidProvenanceOutputTokens }), { mode: 0o600 });
   return spawnSync(process.execPath, [script, ...args], {
     encoding: "utf8",
     shell: false,
@@ -52,7 +52,26 @@ test("final price/cache reconciliation emits a read-only aggregate receipt", () 
     assert.equal(invocation.argv.some((value) => value.includes("fixture-only-password")), false);
     assert.match(invocation.sql, /BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY/);
     assert.doesNotMatch(invocation.sql, /\b(?:INSERT|UPDATE|DELETE|ALTER|CREATE|DROP|LOCK)\b/);
+    assert.match(invocation.sql, /to_jsonb\(p\) AS provenance_json/);
+    assert.match(invocation.sql, /p\.total_tokens - p\.normalized_total_input_tokens/);
+    assert.doesNotMatch(invocation.sql, /\bp\.output_tokens\b/);
     assert.equal(invocation.pgpassfile.endsWith("/pgpass"), true);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("missing durable output columns fall back to the source total only when its input partition is valid", () => {
+  const workspace = mkdtempSync(join(tmpdir(), "mtc-price-cache-output-provenance."));
+  try {
+    installExecutableHelper("tests/ops/helpers/fake-psql-price-cache-reconciliation.ts", workspace, "psql");
+    const result = runReconciliation(workspace, 0, [], 1);
+    assert.equal(result.status, 1, result.stderr);
+    const receipt = JSON.parse(result.stdout) as Record<string, unknown>;
+    assert.deepEqual(receipt.blockers, ["invalid_provenance_output_tokens"]);
+    const nested = receipt.receipt as Record<string, unknown>;
+    const provenance = nested.historical_provenance_coverage as Record<string, string>;
+    assert.equal(provenance.invalid_provenance_output_tokens, "1");
   } finally {
     rmSync(workspace, { recursive: true, force: true });
   }

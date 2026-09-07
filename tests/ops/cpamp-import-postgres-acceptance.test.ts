@@ -309,6 +309,13 @@ ${pricedEvent({hash:'pricing-auto-base',request:'pricing-request-auto',timestamp
       AND raw_cache_read_tokens=20 AND raw_cache_creation_tokens=10 AND residual_cached_tokens=0)
     FROM cpamp_import_event_provenance WHERE tenant_id=:'tenant_id' AND source=:'source';`,
     { tenant_id: pricingTenantId, source: pricingSource }), "3|3|1|1|1|5|45|220|60|10|1338|3|1");
+  assert.equal(psql(`SELECT count(*) || '|' ||
+    count(*) FILTER (WHERE p.total_tokens < p.normalized_total_input_tokens) || '|' ||
+    sum(p.total_tokens - p.normalized_total_input_tokens) || '|' || sum(r.output_tokens)
+    FROM cpamp_import_event_provenance p
+    JOIN request_records r ON r.id=p.target_request_id AND r.tenant_id=p.tenant_id
+    WHERE p.tenant_id=:'tenant_id' AND p.source=:'source';`,
+    { tenant_id: pricingTenantId, source: pricingSource }), "3|0|16|16");
   assert.equal(psql("SELECT count(*) FROM model_prices WHERE model='exact-model';"), "0", "CPAMP source pricing must not mutate global MTC prices");
   assert.equal(psql(`SELECT sum(requests) || '|' || sum(input_tokens) || '|' || sum(output_tokens) || '|' ||
     sum(cached_input_tokens) || '|' || sum(cache_write_tokens) || '|' || sum(cost_micros)

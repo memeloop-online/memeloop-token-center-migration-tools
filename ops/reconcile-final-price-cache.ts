@@ -76,17 +76,65 @@ SET LOCAL statement_timeout = :'statement_timeout';
 WITH selected_tenant AS MATERIALIZED (
   SELECT id FROM tenants WHERE external_id = :'tenant_external_id'
 ), provenance AS MATERIALIZED (
-  SELECT p.*
+  /*
+   * `output_tokens` was not part of the original durable provenance schema.
+   * Do not reference it as a PostgreSQL column: a reference would make the
+   * whole read-only receipt fail to plan on an otherwise supported target.
+   * `total_tokens` is the source receipt total and the importer requires the
+   * normalized input partition to account for every input token, so an older
+   * row's output is exactly total - normalized input. Newer schemas may
+   * persist output_tokens; inspect the row JSON rather than pinning a schema
+   * migration version. A malformed, negative, or out-of-range persisted value,
+   * or a negative derivation, is measured below and blocks the receipt.
+   */
+  SELECT p.*, to_jsonb(p) AS provenance_json
     FROM cpamp_import_event_provenance p
    WHERE p.tenant_id = (SELECT id FROM selected_tenant)
      AND p.source = :'import_source'
+), provenance_output_text AS MATERIALIZED (
+  SELECT p.*, p.provenance_json->>'output_tokens' AS persisted_output_token_text
+    FROM provenance p
+), provenance_with_output AS MATERIALIZED (
+  SELECT p.*,
+         CASE
+           WHEN p.provenance_json ? 'output_tokens'
+             AND COALESCE(
+               p.persisted_output_token_text ~ '^[0-9]+$'
+               AND (
+                 length(p.persisted_output_token_text) < 19
+                 OR (length(p.persisted_output_token_text) = 19
+                   AND p.persisted_output_token_text <= '9223372036854775807')
+               ),
+               false
+             )
+             THEN p.persisted_output_token_text::bigint
+           WHEN NOT (p.provenance_json ? 'output_tokens')
+             AND p.total_tokens >= p.normalized_total_input_tokens
+             THEN p.total_tokens - p.normalized_total_input_tokens
+           ELSE NULL
+         END AS provenance_output_tokens,
+         CASE
+           WHEN p.provenance_json ? 'output_tokens'
+             THEN NOT COALESCE(
+               p.persisted_output_token_text ~ '^[0-9]+$'
+               AND (
+                 length(p.persisted_output_token_text) < 19
+                 OR (length(p.persisted_output_token_text) = 19
+                   AND p.persisted_output_token_text <= '9223372036854775807')
+               ),
+               false
+             )
+           ELSE p.total_tokens < p.normalized_total_input_tokens
+         END AS invalid_provenance_output_tokens
+    FROM provenance_output_text p
 ), scoped AS MATERIALIZED (
   SELECT p.external_event_hash, p.target_request_id, p.source_digest,
          p.pricing_digest, p.pricing_config_json, p.pricing_model,
          p.applied_service_tier, p.correction_revision,
          p.normalized_uncached_input_tokens, p.normalized_total_input_tokens,
          p.normalized_cache_read_tokens, p.normalized_cache_creation_tokens,
-         p.output_tokens, p.cost_micros AS provenance_cost_micros,
+         p.provenance_output_tokens, p.invalid_provenance_output_tokens,
+         p.cost_micros AS provenance_cost_micros,
          l.target_request_id AS linked_target_request_id,
          r.id AS request_id, r.key_id, r.created_at, r.model AS request_model,
          r.currency AS request_currency, r.reservation_id,
@@ -101,7 +149,7 @@ WITH selected_tenant AS MATERIALIZED (
          f.cached_input_tokens AS fact_cached_input_tokens,
          f.cache_write_tokens AS fact_cache_write_tokens,
          f.cost_micros AS fact_cost_micros
-    FROM provenance p
+    FROM provenance_with_output p
     LEFT JOIN import_request_links l
       ON l.tenant_id = p.tenant_id
      AND l.source = p.source
@@ -140,11 +188,11 @@ WITH selected_tenant AS MATERIALIZED (
          COALESCE(sum(p.normalized_uncached_input_tokens), 0) AS input_tokens,
          COALESCE(sum(p.normalized_cache_read_tokens), 0) AS cached_input_tokens,
          COALESCE(sum(p.normalized_cache_creation_tokens), 0) AS cache_write_tokens,
-         COALESCE(sum(p.output_tokens), 0) AS output_tokens,
+         COALESCE(sum(p.provenance_output_tokens), 0) AS output_tokens,
          COALESCE(sum(p.cost_micros), 0) AS historical_cost_micros,
          max(t.id) AS current_price_id,
          COALESCE(max(t.cache_price_estimated), 0) AS cache_price_estimated
-    FROM provenance p
+    FROM provenance_with_output p
     LEFT JOIN model_price_tiers t
       ON t.model = p.pricing_model
      AND t.currency = :'currency'
@@ -152,7 +200,7 @@ WITH selected_tenant AS MATERIALIZED (
    WHERE p.normalized_uncached_input_tokens <> 0
       OR p.normalized_cache_read_tokens <> 0
       OR p.normalized_cache_creation_tokens <> 0
-      OR p.output_tokens <> 0
+      OR p.provenance_output_tokens <> 0
    GROUP BY p.pricing_model, p.applied_service_tier
 ), missing_current_price_combinations AS MATERIALIZED (
   SELECT * FROM current_price_combinations WHERE current_price_id IS NULL
@@ -164,7 +212,7 @@ WITH selected_tenant AS MATERIALIZED (
          COALESCE(sum(s.normalized_uncached_input_tokens), 0) AS provenance_input_tokens,
          COALESCE(sum(s.normalized_cache_read_tokens), 0) AS provenance_cached_input_tokens,
          COALESCE(sum(s.normalized_cache_creation_tokens), 0) AS provenance_cache_write_tokens,
-         COALESCE(sum(s.output_tokens), 0) AS provenance_output_tokens,
+         COALESCE(sum(s.provenance_output_tokens), 0) AS provenance_output_tokens,
          COALESCE(sum(s.provenance_cost_micros), 0) AS provenance_cost_micros,
          count(s.request_id) AS request_rows,
          COALESCE(sum(s.request_input_tokens), 0) AS request_input_tokens,
@@ -198,6 +246,7 @@ WITH selected_tenant AS MATERIALIZED (
     (SELECT count(*) FROM scoped WHERE fact_request_id IS NULL) AS provenance_without_fact,
     (SELECT count(*) FROM scoped WHERE source_digest = '' OR pricing_digest = '' OR pricing_config_json = '') AS provenance_without_price_snapshot,
     (SELECT count(*) FROM scoped WHERE normalized_total_input_tokens <> normalized_uncached_input_tokens + normalized_cache_read_tokens + normalized_cache_creation_tokens) AS invalid_cache_partitions,
+    (SELECT count(*) FROM scoped WHERE invalid_provenance_output_tokens) AS invalid_provenance_output_tokens,
     (SELECT count(*) FROM scoped WHERE request_id IS NOT NULL AND request_currency <> :'currency') AS request_currency_mismatches,
     (SELECT count(*) FROM scoped WHERE request_id IS NOT NULL AND reservation_id <> 'cpamp-import:' || external_event_hash) AS reservation_identity_mismatches,
     (SELECT count(*) FROM duplicate_targets) AS duplicate_target_request_count,
@@ -208,11 +257,13 @@ WITH selected_tenant AS MATERIALIZED (
     (SELECT count(*) FROM missing_current_price_combinations) AS missing_current_price_combination_count,
     (SELECT count(*) FROM current_price_combinations WHERE cache_price_estimated <> 0) AS estimated_cache_price_combination_count,
     (SELECT count(DISTINCT correction_revision) FROM provenance) AS correction_revision_count,
+    (SELECT count(*) FROM provenance_with_output WHERE provenance_json ? 'output_tokens') AS persisted_provenance_output_token_rows,
+    (SELECT count(*) FROM provenance_with_output WHERE NOT (provenance_json ? 'output_tokens')) AS derived_provenance_output_token_rows,
     (SELECT count(*) FROM key_model_day) AS key_model_day_count,
     (SELECT COALESCE(sum(request_input_tokens - normalized_total_input_tokens), 0) FROM scoped WHERE request_id IS NOT NULL) AS request_input_delta,
     (SELECT COALESCE(sum(request_cached_input_tokens - normalized_cache_read_tokens), 0) FROM scoped WHERE request_id IS NOT NULL) AS request_cache_read_delta,
     (SELECT COALESCE(sum(request_cache_write_tokens - normalized_cache_creation_tokens), 0) FROM scoped WHERE request_id IS NOT NULL) AS request_cache_write_delta,
-    (SELECT COALESCE(sum(request_output_tokens - output_tokens), 0) FROM scoped WHERE request_id IS NOT NULL) AS request_output_delta,
+    (SELECT COALESCE(sum(request_output_tokens - provenance_output_tokens), 0) FROM scoped WHERE request_id IS NOT NULL) AS request_output_delta,
     (SELECT COALESCE(sum(request_cost_micros - provenance_cost_micros), 0) FROM scoped WHERE request_id IS NOT NULL) AS request_cost_delta,
     (SELECT COALESCE(sum(fact_input_tokens - request_input_tokens), 0) FROM scoped WHERE fact_request_id IS NOT NULL) AS fact_input_delta,
     (SELECT COALESCE(sum(fact_cached_input_tokens - request_cached_input_tokens), 0) FROM scoped WHERE fact_request_id IS NOT NULL) AS fact_cache_read_delta,
@@ -223,7 +274,8 @@ WITH selected_tenant AS MATERIALIZED (
       request_input_tokens <> normalized_total_input_tokens
       OR request_cached_input_tokens <> normalized_cache_read_tokens
       OR request_cache_write_tokens <> normalized_cache_creation_tokens
-      OR request_output_tokens <> output_tokens
+      OR provenance_output_tokens IS NULL
+      OR request_output_tokens <> provenance_output_tokens
       OR request_cost_micros <> provenance_cost_micros
     )) AS request_amount_mismatch_count,
     (SELECT count(*) FROM scoped WHERE fact_request_id IS NOT NULL AND (
@@ -242,7 +294,9 @@ SELECT jsonb_build_object(
     'current_price_combinations', current_price_combination_count::text,
     'missing_current_price_combinations', missing_current_price_combination_count::text,
     'estimated_cache_price_combinations', estimated_cache_price_combination_count::text,
-    'correction_revisions', correction_revision_count::text
+    'correction_revisions', correction_revision_count::text,
+    'persisted_provenance_output_token_rows', persisted_provenance_output_token_rows::text,
+    'derived_provenance_output_token_rows', derived_provenance_output_token_rows::text
   ),
   'historical_provenance_coverage', jsonb_build_object(
     'provenance_without_link', provenance_without_link::text,
@@ -252,6 +306,7 @@ SELECT jsonb_build_object(
     'provenance_without_fact', provenance_without_fact::text,
     'provenance_without_price_snapshot', provenance_without_price_snapshot::text,
     'invalid_cache_partitions', invalid_cache_partitions::text,
+    'invalid_provenance_output_tokens', invalid_provenance_output_tokens::text,
     'request_currency_mismatches', request_currency_mismatches::text
   ),
   'amount_differences', jsonb_build_object(

@@ -39,6 +39,16 @@ entry make the command exit nonzero after writing the complete receipt. This is
 intentional: retain the receipt for investigation and do not acknowledge a
 known gap by changing tool code or substituting a global price book.
 
+Some durable provenance schemas predate a dedicated `output_tokens` column.
+The receipt inspects each provenance row without assuming a migration version:
+when that column is absent it derives source output tokens as
+`total_tokens - normalized_total_input_tokens`. The CPAMP source/importer
+contract defines `total_tokens` as normalized input plus output; a malformed,
+negative, or out-of-range persisted value, or a negative derivation, is emitted as
+`invalid_provenance_output_tokens` and blocks the receipt. The receipt reports
+how many rows used persisted versus derived output
+tokens, but never exposes request IDs, bodies, keys, or source payloads.
+
 Historical CPAMP source price snapshots remain the accounting provenance. The
 current price-tier check is only a cutover visibility gap check; this tool never
 creates, updates, or infers a current price.

@@ -17,10 +17,13 @@ try {
 } catch {
   process.exit(9);
 }
-const gapCount = typeof fixture === "object" && fixture !== null && !Array.isArray(fixture)
-  ? (fixture as Record<string, unknown>).current_price_gap_count
+const fields = typeof fixture === "object" && fixture !== null && !Array.isArray(fixture)
+  ? fixture as Record<string, unknown>
   : undefined;
-if (typeof gapCount !== "number" || !Number.isSafeInteger(gapCount) || gapCount < 0) process.exit(9);
+const gapCount = fields?.current_price_gap_count;
+const invalidProvenanceOutputTokens = fields?.invalid_provenance_output_tokens;
+if (typeof gapCount !== "number" || !Number.isSafeInteger(gapCount) || gapCount < 0
+  || typeof invalidProvenanceOutputTokens !== "number" || !Number.isSafeInteger(invalidProvenanceOutputTokens) || invalidProvenanceOutputTokens < 0) process.exit(9);
 const zero = "0";
 const missing = Array.from({ length: gapCount }, (_, index) => ({
   pricing_model: `fixture-price-gap-${String(index + 1).padStart(2, "0")}`,
@@ -39,12 +42,14 @@ process.stdout.write(`${JSON.stringify({
     current_price_combinations: String(gapCount + 2),
     missing_current_price_combinations: String(gapCount),
     estimated_cache_price_combinations: zero, correction_revisions: "1",
+    persisted_provenance_output_token_rows: zero, derived_provenance_output_token_rows: "3",
   },
   historical_provenance_coverage: {
     provenance_without_link: zero, import_links_without_provenance: zero,
     link_target_mismatches: zero,
     provenance_without_target_request: zero, provenance_without_fact: zero,
     provenance_without_price_snapshot: zero, invalid_cache_partitions: zero,
+    invalid_provenance_output_tokens: String(invalidProvenanceOutputTokens),
     request_currency_mismatches: zero,
   },
   amount_differences: {
