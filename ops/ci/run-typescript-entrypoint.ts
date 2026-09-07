@@ -14,6 +14,7 @@ const entrypoints = Object.freeze({
   "export-cpa-source-route-inventory": "export-cpa-source-route-inventory.ts",
   "finalize-session-archive-delta": "finalize-session-archive-delta.ts",
   "generate-source-identity-key": "generate-source-identity-key.ts",
+  "generate-provider-exact-policy-inputs": "generate-provider-exact-policy-inputs.ts",
   "import-cpa-key-policy": "import-cpa-key-policy.ts",
   "import-cpa-model-routes": "import-cpa-model-routes.ts",
   "import-cpa-session-archive": "import-cpa-session-archive.ts",
