@@ -419,12 +419,13 @@ function options(argv: readonly string[]): Options {
     process.exit(0);
   }
   const fields: Record<string, keyof MutableOptions> = { "--source-import-tenant-mapping-file": "sourceTenantMappingFile", "--source-config-file": "sourceConfigFile", "--managed-codex-model-snapshot-file": "managedCodexModelSnapshotFile", "--source-identity-key-file": "sourceIdentityKeyFile", "--key-pepper-file": "keyPepperFile", "--source-inventory-file": "sourceInventoryFile", "--provider-candidate-material-file": "candidateMaterialFile", "--pg-service-file": "pgServiceFile", "--pg-service": "pgService", "--binding-receipt-output": "output", "--psql-binary": "psqlBinary", "--statement-timeout-ms": "statementTimeoutMs" };
-  const parsed: MutableOptions = { psqlBinary: "psql", statementTimeoutMs: 15_000 };
+  const parsed: MutableOptions = {};
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index]!, field = fields[argument], value = argv[index + 1];
     if (!field || !value || value.startsWith("--") || parsed[field] !== undefined) throw new ManagedCodexProvenanceFailure("arguments are invalid");
     (parsed as unknown as Record<string, unknown>)[field] = field === "statementTimeoutMs" ? Number(value) : value; index += 1;
   }
+  parsed.psqlBinary ??= "psql"; parsed.statementTimeoutMs ??= 15_000;
   if (!parsed.sourceTenantMappingFile || !parsed.sourceConfigFile || !parsed.managedCodexModelSnapshotFile || !parsed.sourceIdentityKeyFile || !parsed.keyPepperFile || !parsed.sourceInventoryFile || !parsed.candidateMaterialFile || !parsed.pgServiceFile || !parsed.pgService || !parsed.output || !parsed.psqlBinary || parsed.statementTimeoutMs === undefined) throw new ManagedCodexProvenanceFailure("required arguments are missing");
   return parsed as Options;
 }
