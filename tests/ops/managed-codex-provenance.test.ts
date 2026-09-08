@@ -12,6 +12,7 @@ import {
   managedCodexImportSourceKey,
   ManagedCodexProvenanceFailure,
   prepareManagedCodexProvenance,
+  run as runManagedCodexProvenance,
 } from "../../ops/legacy-routes/resolve-cpa-managed-codex-provenance.ts";
 import { managedCodexRouteSourceStableId } from "../../ops/legacy-routes/cpa-managed-codex-route-parser.ts";
 
@@ -23,7 +24,7 @@ const sha = (value: Buffer | string): string => createHash("sha256").update(valu
 const accountId = "10000000-0000-4000-8000-000000000001";
 const relativePath = "fixture-managed-codex.json";
 const sourceTenant = "fixture-import-tenant", targetTenant = "fixture-route-tenant";
-const identityKey = Buffer.alloc(32, 7), pepper = Buffer.from("fixture-key-pepper");
+const identityKey = createHash("sha256").update("fixture-managed-codex-source-identity-v1").digest(), pepper = Buffer.from("fixture-key-pepper");
 
 function protectedFile(path: string, value: Buffer | string): Buffer {
   const raw = Buffer.isBuffer(value) ? value : Buffer.from(value);
@@ -59,6 +60,14 @@ function currentObservation(stableId: string, sourceKey: string, payloadDigest =
     credential_generation: 4, oauth_session_id: accountId, oauth_driver: "openai_codex_device",
     oauth_refresh_url: "https://auth.openai.com/oauth/token", updated_at: 72,
   };
+}
+/** Test-only diagnostic wrapper: all inputs are synthesized in this file. */
+function runSyntheticFixture(argv: readonly string[]): Readonly<Record<string, number | string>> {
+  try { return runManagedCodexProvenance(argv); }
+  catch (error) {
+    const detail = error instanceof Error && error.stack ? error.stack : String(error);
+    throw new Error(`synthetic managed Codex provenance fixture failed:\n${detail}`, { cause: error });
+  }
 }
 
 describe("managed Codex existing-provenance receipt", () => {
@@ -96,7 +105,16 @@ describe("managed Codex existing-provenance receipt", () => {
     protectedFile(mapping, item.mapping); protectedFile(config, item.config); protectedFile(snapshot, item.snapshot); protectedFile(source, item.source); protectedFile(material, item.material); protectedFile(identity, Buffer.concat([sourceKeyPrefix, identityKey])); protectedFile(keyPepper, pepper);
     protectedFile(service, "[fixture_provenance]\nhost=fixture.invalid\n");
     protectedFile(result, `${JSON.stringify([currentObservation(item.stableId, item.sourceKey)])}\n`);
-    const arguments_ = [resolver, "--source-import-tenant-mapping-file", mapping, "--source-config-file", config, "--managed-codex-model-snapshot-file", snapshot, "--source-identity-key-file", identity, "--key-pepper-file", keyPepper, "--source-inventory-file", source, "--provider-candidate-material-file", material, "--pg-service-file", service, "--pg-service", "fixture_provenance", "--binding-receipt-output", output, "--psql-binary", fakePsql];
+    const argumentsFor = (destination: string): string[] => ["--source-import-tenant-mapping-file", mapping, "--source-config-file", config, "--managed-codex-model-snapshot-file", snapshot, "--source-identity-key-file", identity, "--key-pepper-file", keyPepper, "--source-inventory-file", source, "--provider-candidate-material-file", material, "--pg-service-file", service, "--pg-service", "fixture_provenance", "--binding-receipt-output", destination, "--psql-binary", fakePsql];
+    const uniformIdentity = join(root, "uniform-source-identity-key.bin"), rejectedOutput = join(root, "uniform-source-identity-receipt.json");
+    protectedFile(uniformIdentity, Buffer.concat([sourceKeyPrefix, Buffer.alloc(32, 7)]));
+    const uniformArguments = argumentsFor(rejectedOutput).map((value, index, values) => value === identity && values[index - 1] === "--source-identity-key-file" ? uniformIdentity : value);
+    assert.throws(() => runSyntheticFixture(uniformArguments), /source identity key payload is invalid/u);
+    assert.throws(() => readFileSync(rejectedOutput));
+    const directOutput = join(root, "managed-codex-direct-run-receipt.json");
+    const directSummary = runSyntheticFixture(argumentsFor(directOutput));
+    assert.equal(directSummary.binding_count, 1); assert.equal(statSync(directOutput).mode & 0o777, 0o600);
+    const arguments_ = [resolver, ...argumentsFor(output)];
     const run = spawnSync(process.execPath, arguments_, { encoding: "utf8" });
     assert.equal(run.status, 0, run.stderr);
     const summary = JSON.parse(run.stdout) as Record<string, unknown>;

@@ -16,7 +16,9 @@ const serviceFile = process.env.PGSERVICEFILE;
 if (!serviceFile || process.env.PGSERVICE !== "fixture_provenance") process.exit(9);
 try {
   const result = readFileSync(join(dirname(serviceFile), "managed-codex-provenance-query-result.json"));
-  JSON.parse(result.toString("utf8"));
+  const rendered = result.toString("utf8");
+  if (!rendered.endsWith("\n") || rendered.endsWith("\n\n") || /[\r\n]/.test(rendered.slice(0, -1))) process.exit(9);
+  JSON.parse(rendered.slice(0, -1));
   process.stdout.write(result);
 } catch {
   process.exit(9);

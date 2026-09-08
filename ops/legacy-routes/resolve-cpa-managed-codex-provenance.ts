@@ -407,11 +407,16 @@ function queryExistingBindings(prepared: PreparedManagedCodexProvenance, service
   const sourceTenant = Buffer.from(prepared.evidence.sourceImportTenant, "utf8").toString("base64"), targetTenant = Buffer.from(prepared.evidence.targetTenant, "utf8").toString("base64");
   const psqlInput = `\\set requested_bindings_b64 ${requested}\n\\set source_import_tenant_external_id_b64 ${sourceTenant}\n\\set target_tenant_external_id_b64 ${targetTenant}\n${querySql}`;
   const environment: NodeJS.ProcessEnv = { PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C", PGSERVICEFILE: serviceFile, PGSERVICE: service, PGAPPNAME: "mtc-managed-codex-provenance", PGCONNECT_TIMEOUT: "10" };
-  const result = spawnSync(psqlBinary, ["-X", "--no-psqlrc", "--no-password", "-qAt", "--set=ON_ERROR_STOP=1", `--set=statement_timeout_ms=${statementTimeoutMs}`], { encoding: "utf8", env: environment, input: psqlInput, shell: false, stdio: ["pipe", "pipe", "pipe"], timeout: 30_000, maxBuffer: MAX_BYTES });
+  const result = spawnSync(psqlBinary, ["-X", "--no-psqlrc", "--no-password", "-qAt", "--set=ON_ERROR_STOP=1", `--set=statement_timeout_ms=${statementTimeoutMs}`], { env: environment, input: psqlInput, shell: false, stdio: ["pipe", "pipe", "pipe"], timeout: 30_000, maxBuffer: MAX_BYTES });
   if (result.error || result.status !== 0) throw new ManagedCodexProvenanceFailure("managed Codex provenance query failed");
-  const output = Buffer.from(String(result.stdout), "utf8");
-  if (output.length === 0 || output.length > MAX_BYTES || output.includes(0x0a, output.length - 2)) throw new ManagedCodexProvenanceFailure("managed Codex provenance query returned invalid output");
-  return strictJson(Buffer.from(output.toString("utf8").trim(), "utf8"), "managed Codex provenance query result");
+  const output = Buffer.from(result.stdout);
+  let rendered: string;
+  try { rendered = new TextDecoder("utf-8", { fatal: true }).decode(output); }
+  catch { throw new ManagedCodexProvenanceFailure("managed Codex provenance query returned invalid output"); }
+  if (output.length === 0 || output.length > MAX_BYTES || !rendered.endsWith("\n") || rendered.endsWith("\n\n")) throw new ManagedCodexProvenanceFailure("managed Codex provenance query returned invalid output");
+  const line = rendered.slice(0, -1);
+  if (line.length === 0 || /[\r\n]/.test(line)) throw new ManagedCodexProvenanceFailure("managed Codex provenance query returned invalid output");
+  return strictJson(Buffer.from(line, "utf8"), "managed Codex provenance query result");
 }
 function options(argv: readonly string[]): Options {
   if (argv.includes("--help") || argv.includes("-h")) {
