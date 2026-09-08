@@ -7,13 +7,13 @@ auth files, policy snapshots, source identity keys, inventories, credentials,
 logs, checkpoints, receipts and other dynamic evidence stay outside Git and
 are supplied through an owner-approved protected-input boundary.
 
-The exporter is executed from a CI-built image addressed by its verified
-immutable digest. Dependencies are resolved from the lockfile while building
-that image; the runtime must not use a generic `node` image to clone source,
-download TypeScript, or run `npm install`/`npm ci`. Startup fetches make code
-and dependency resolution mutable, require unnecessary network access, and
-cannot reproduce the image's SBOM/provenance. Keep the existing command and
-file names until a separately versioned compatibility adapter is reviewed.
+The exporter is executed locally from the CI-built, verified release JS
+package. Dependencies are resolved from the lockfile in CI; runtime must not
+clone source, download a migration image, or run `npm install`/`npm ci`.
+Startup fetches make code and dependency resolution mutable, require
+unnecessary network access, and cannot reproduce the release provenance.
+Keep the existing command and file names until a separately versioned
+compatibility adapter is reviewed.
 
 Run `export-cpa-source-route-inventory` before reviewed legacy-route planning.
 It turns one immutable live CPA config/auth snapshot plus the matching native
@@ -46,6 +46,46 @@ unresolved source grant, or an empty active source pool stop before either
 public output is created. A parseable policy shape without provider/model is a
 static anomaly and is never guessed or repaired.
 
+## Managed Codex OAuth source evidence
+
+A Codex OAuth auth file makes the management-plane model registry part of the
+source proof. Capture it first with the local release entrypoint; this
+is read-only and does not import an account, call Token Center, or print an
+auth-file ID, token, model list, or credential payload.
+
+```text
+node /verified-release/operator-scripts/export-cpa-managed-codex-model-snapshot.mjs --management-api-base-url https://cpa.example/v0/management --management-token-file /secrets/migration/cpa-management.token --source-config-file /source/config.yaml --output /sealed/managed-codex-model-snapshot.json
+```
+
+`/secrets/migration/cpa-management.token`, `/source/config.yaml`, and the
+snapshot output are current-UID-owned mode-`0600` regular files. The snapshot
+output is protected dynamic material: it includes relative auth-file IDs and
+model observations and must not be committed, copied to chat, or logged. Its
+stdout receipt contains counts and digests only. The capture reads
+`GET /v0/management/auth-files`, then each
+`GET /v0/management/auth-files/models?name=...`, and repeats both observations.
+It also rereads the source config. It rejects any config, list, or per-auth
+model change during that window instead of
+claiming an atomic CPA view that the API does not provide.
+
+Pass the resulting snapshot to the normal exporter:
+
+```text
+node /verified-release/operator-scripts/export-cpa-source-route-inventory.mjs --config /source/config.yaml --auth-dir /source/auth --policy-snapshot-file /source/native-key-policy.json --source-identity-key-file /secrets/migration/source-identity.key --managed-codex-model-snapshot-file /sealed/managed-codex-model-snapshot.json --source-inventory-output /sealed/source-inventory.json --provider-candidate-material-output /sealed/provider-candidate-material.json
+```
+
+For managed Codex routes, the exporter evaluates the deployed native-access
+`cpa-key-policy` `classify_rules` against the source auth-file identity and
+accepts only the exact requested `classify:<group>` members. It applies the
+per-auth alias before a global alias, honors exclusions and prefix policy, and
+requires the captured per-auth registry to prove the model is actually
+available. It therefore does not treat all enabled OAuth accounts as candidates
+for every group. Unsupported RE2 rule syntax, source/config drift, missing
+registry coverage, a missing candidate, incompatible aliases, or a collision
+between a direct and managed pool for the same exact source tuple stops the
+export. OAuth refresh fields are not route identity evidence and do not create
+new candidates or force a re-import.
+
 `source-inventory.json` is version 2 and can be used directly as
 `import-cpa-model-routes --source-inventory-file`. It preserves every exact
 source coordinate and reports opaque Copilot/Cursor records only as
@@ -54,10 +94,12 @@ domain-separated HMAC-SHA256 `source_stable_id`. It never emits auth handles,
 logins, labels, emails, paths, credentials, tokens, source key material, or
 raw/key hashes. Stdout is a count-and-digest receipt only.
 
-`provider-candidate-material.json` seals a target-independent version 1 candidate set
+`provider-candidate-material.json` seals one target-independent version 1 candidate set
 per source mapping: exact source, upstream model, protocol,
 `equal_round_robin`, provider, driver and all HMAC-stable active source-account
-candidates. It is intentionally not an `upstream-inventory.json` replacement:
+candidates. Direct candidates use `http-json`; managed Codex OAuth candidates
+use `openai-codex`. Both are serialized once with the same final
+`source-inventory.json` digest. It is intentionally not an `upstream-inventory.json` replacement:
 after the upstream import, bind each candidate exactly once to a current target
 upstream account from a read-only target snapshot, then create reviewed
 `upstream-inventory.json` version 2. Do not drop pool members, merge providers

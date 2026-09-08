@@ -217,7 +217,10 @@ describe("CPA upstream TypeScript operators", () => {
     const stableName = `cpa-fixture-openai-compatible-${createHash("sha256").update(sourceId).digest("hex").slice(0, 16)}`;
     const stableId = createHmac("sha256", readFileSync(key).subarray(19)).update(Buffer.concat([Buffer.from("memeloop-token-center\0cpa-route-source-account-id\0v1\0"), Buffer.from(sourceId)])).digest("hex");
     const material = join(root, "provider-candidate-material.json");
-    writeFileSync(material, `${JSON.stringify({ version: 1, source_inventory_sha256: "a".repeat(64), provider_candidate_sets: [{ source: { provider: "fixture-openai-compatible", model: "fixture-model", group: null, upstream_prefix: null, protocol: "openai" }, upstream_model: "fixture-model-upstream", protocol: "openai", selection: "equal_round_robin", candidates: [{ source_stable_id: stableId, source_provider: "fixture-openai-compatible", driver: "http-json" }] }] })}\n`, { mode: 0o600 });
+    writeFileSync(material, `${JSON.stringify({ version: 1, source_inventory_sha256: "a".repeat(64), provider_candidate_sets: [
+      { source: { provider: "fixture-openai-compatible", model: "fixture-model", group: null, upstream_prefix: null, protocol: "openai" }, upstream_model: "fixture-model-upstream", protocol: "openai", selection: "equal_round_robin", candidates: [{ source_stable_id: stableId, source_provider: "fixture-openai-compatible", driver: "http-json" }] },
+      { source: { provider: "codex", model: "fixture-codex-model", group: null, upstream_prefix: null, protocol: "openai" }, upstream_model: "fixture-codex-upstream", protocol: "openai", selection: "equal_round_robin", candidates: [{ source_stable_id: "b".repeat(64), source_provider: "codex", driver: "openai-codex" }] },
+    ] })}\n`, { mode: 0o600 });
     let drifted = false, requests = 0;
     const server = createServer((request, response) => {
       requests += 1; response.setHeader("content-type", "application/json");

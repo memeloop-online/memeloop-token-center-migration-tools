@@ -322,8 +322,15 @@ function mutedChild(command: string, args: readonly string[], env: NodeJS.Proces
   });
 }
 
+function siblingCommand(name: string): string {
+  // Source commands run directly as TypeScript, while the release artifact
+  // uses the same reviewed basename as a bundled .mjs command.
+  const extension = fileURLToPath(import.meta.url).endsWith(".mjs") ? ".mjs" : ".ts";
+  return fileURLToPath(new URL(`./${name}${extension}`, import.meta.url));
+}
+
 function aggregateAudit(env: NodeJS.ProcessEnv): Promise<AggregateAudit> {
-  const audit = fileURLToPath(new URL("./audit-cpa-migration.ts", import.meta.url));
+  const audit = siblingCommand("audit-cpa-migration");
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [audit], { env, shell: false, stdio: ["ignore", "pipe", "ignore"] });
     const chunks: Buffer[] = [];
@@ -356,7 +363,7 @@ function sameAudit(left: AggregateAudit, right: AggregateAudit): boolean {
 async function approvedApply(args: Arguments, set: FinalArtifactSet): Promise<JsonObject> {
   const values = requiredApplyArguments(args, set);
   const approvalSha256 = verifyApproval(values.approvalFile, set, values);
-  const importer = fileURLToPath(new URL("./import-cpa-session-archive.ts", import.meta.url));
+  const importer = siblingCommand("import-cpa-session-archive");
   const shared = {
     ...process.env,
     IMPORT_TENANT_EXTERNAL_ID: values.tenantExternalId,

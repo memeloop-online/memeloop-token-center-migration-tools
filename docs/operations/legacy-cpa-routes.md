@@ -23,6 +23,26 @@ All four input files, including the service token, must be regular files with on
 
 Every manifest item repeats the complete source pattern (`provider`, `model`, nullable `group`, nullable `upstream_prefix`, `protocol`) and the exact target candidate bindings, public model, upstream model, protocol, priority, and expected existing state. Target protocol must equal source protocol. For v2, the manifest candidate set must equal the corresponding upstream-inventory set in full; order does not affect the normalized intent digest. Unknown fields, duplicate mappings/candidates, duplicate route choices, stale or disabled upstream bindings, incomplete provider pools, model/protocol mismatch, priority outside `[-1000000,1000000]`, missing source mappings, and provider expansion all fail closed.
 
+## Compose typed binding evidence
+
+Do not hand-assemble `upstream-inventory.json`. After the unified source
+exporter has emitted one version 2 source inventory and its one combined
+provider-candidate material file, first obtain the separate read-only direct
+and managed binding receipts. Then use the offline composer:
+
+```text
+compose-cpa-upstream-inventory --source-inventory-file /state/source/source-inventory.json --provider-candidate-material-file /state/source/provider-candidate-material.json --direct-binding-receipt-file /state/receipts/direct-route-bindings.json --managed-binding-receipt-file /state/receipts/managed-codex-route-bindings.json --upstream-inventory-output /review/upstream-inventory.json
+```
+
+It writes exactly one new mode-`0600` version 2 inventory and emits only
+counts and digests. It is offline and has no API mutation path. It requires
+the raw source inventory, combined candidate material, and both typed receipts
+to share the same source and material digests and tenant; it rejects a missing
+or extra source mapping/candidate, non-homogeneous driver pool, receipt
+quarantine, duplicate stable source/target account ID, or any provider/driver
+mismatch. It does not choose a public model, priority, or any other reviewed
+manifest decision.
+
 The Job template also requires an explicit `REPLACE_TARGET_NAMESPACE`. It must
 be the namespace that owns the same database, key pepper and control Service
 named by the reviewed manifest. Never infer it from a historical production or

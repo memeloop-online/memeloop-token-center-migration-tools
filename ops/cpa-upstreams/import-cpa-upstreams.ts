@@ -506,17 +506,20 @@ function providerCandidates(raw: Buffer): { sourceInventoryDigest: string; candi
     if ((source.group !== null && typeof source.group !== "string") || (source.upstream_prefix !== null && typeof source.upstream_prefix !== "string") || (source.protocol !== "openai" && source.protocol !== "anthropic") || set.protocol !== source.protocol || set.selection !== "equal_round_robin" || !Array.isArray(set.candidates) || set.candidates.length === 0 || set.candidates.length > MAX_ACCOUNTS) throw new ImportFailure("provider candidate set is invalid");
     if (source.group !== null) text(source.group, "provider candidate source group");
     if (source.upstream_prefix !== null) text(source.upstream_prefix, "provider candidate source prefix");
+    const poolDrivers = new Set<"http-json" | "openai-codex">();
     for (const rawCandidate of set.candidates) {
       const candidate = mapping(rawCandidate, "provider source candidate");
       exact(candidate, ["source_stable_id", "source_provider", "driver"], "provider source candidate");
-      const sourceStableId = text(candidate.source_stable_id, "provider source candidate stable ID", SHA256), sourceProvider = text(candidate.source_provider, "provider source candidate provider");
-      if (sourceProvider !== provider || candidate.driver !== "http-json") throw new ImportFailure("provider source candidate is invalid");
+      const sourceStableId = text(candidate.source_stable_id, "provider source candidate stable ID", SHA256), sourceProvider = text(candidate.source_provider, "provider source candidate provider"), candidateDriver = candidate.driver;
+      if (sourceProvider !== provider || (candidateDriver !== "http-json" && candidateDriver !== "openai-codex")) throw new ImportFailure("provider source candidate is invalid");
+      poolDrivers.add(candidateDriver);
+      if (candidateDriver === "openai-codex") continue;
       const prior = candidates.get(sourceStableId), current: ProviderCandidate = { sourceStableId, sourceProvider, driver: "http-json" };
       if (prior && (prior.sourceProvider !== current.sourceProvider || prior.driver !== current.driver)) throw new ImportFailure("provider candidate material has a conflicting source binding");
       candidates.set(sourceStableId, current);
     }
+    if (poolDrivers.size !== 1) throw new ImportFailure("provider candidate set mixes unsupported resolver drivers");
   }
-  if (candidates.size === 0) throw new ImportFailure("provider candidate material has no source candidates");
   return { sourceInventoryDigest, candidates: [...candidates.values()].sort((left, right) => left.sourceStableId.localeCompare(right.sourceStableId, "en")) };
 }
 type TargetAccount = Readonly<{ id: string; name: string; driver: string; config: string; status: string; updatedAt: number }>;

@@ -55,8 +55,18 @@ npm test
 
 PostgreSQL acceptance 默认跳过，只有显式提供隔离 schema 的测试环境变量时才会执行。`ops/import-cpa-session-archive.ts` 目前仍依赖尚未提取的 Rust 可执行导入器，因此只能在边界关闭后作为完整链路使用。本地不安装依赖、不拉取源码、不接触真实源/目标数据；本地验证仅限 `git diff --check`。
 
-## 固定 digest 的执行模型
+## 固定 revision 的 Release 执行模型
 
-正式执行应使用 CI 为某个完整 Git revision 构建并验证的容器 digest，以及对应的 immutable manifest、SBOM 和 provenance。部署或迁移记录应保存 revision、image digest 和非敏感 evidence digest；禁止使用 mutable tag、未经验证的重建镜像或把公共仓库内容当作运行时输入。
+正式执行使用 CI 为完整 Git revision 构建并验证的 GitHub Release JS 包，而不是容器镜像、GHCR 标签或 npm 包。每个 Release 的 tag 为 `migration-tools-<40-char-git-sha>`，并附带 `release-manifest.json` 与 `SHA256SUMS`；CI 不覆写已有 tag 的资产，重跑只会核验完全相同的校验和。迁移记录必须保存 revision、Release tag、包 SHA-256 和非敏感 evidence digest。
 
-依赖在 CI/build 阶段由锁定的 `package-lock.json` 解析，最终镜像只复制经过 allowlist 的 TypeScript entrypoints 和必要运行库。不要在通用 `node` 镜像中启动时 `git clone`、下载源码、运行 `npm install`/`npm ci` 或解析未锁定依赖：这会使同一 revision 得到不同代码/依赖闭包，扩大运行时网络和凭据暴露面，并绕过镜像 digest、SBOM 与 provenance 的审计边界。CI 是唯一可复现的验证/执行入口；本地仅做 `git diff --check`。
+下载后，在隔离的受保护目录中先验证校验和，再直接以固定 Node.js 24.18.0 运行所需命令。包内 `commands/` 是用锁定的 `package-lock.json` 依赖闭包构建的 ESM bundle；它不包含 `node_modules`，运行时也不需要 npm、网络、`git clone`、`npm install` 或 `npm ci`。
+
+```text
+sha256sum -c SHA256SUMS
+tar -xzf memeloop-token-center-migration-tools-<git-sha>.tar.gz
+node ./commands/import-cpa-upstreams.mjs --help
+```
+
+Bundle 只封装 JavaScript 依赖，不会伪装为完整运行环境：涉及数据库的命令仍要求运行主机提供已审核的 `psql`；CPAMP 导入还要求 `sqlite3`；archive delta 导出使用 `flock`；archive wrapper 仍需边界外的 Rust 导入器；API2 rollback 的相应子命令还需要 `mc` 和 `pg_dump`。这些二进制、访问权限与受保护的输入须按每次迁移批准单单独核验。
+
+只在已获批的迁移主机上运行已验签的 Release，并继续把真实输入、PGPASS、token、输出和证据放在受保护的外部目录。CI 是唯一的 build/test 入口；获批本地运行只执行已验证的 Release 命令，不在本地重建或安装依赖。

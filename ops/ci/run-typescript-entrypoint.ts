@@ -7,29 +7,15 @@
 
 import { basename } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-
-const entrypoints = Object.freeze({
-  "audit-cpa-migration": "audit-cpa-migration.ts",
-  "export-cpa-session-archive-delta": "export-cpa-session-archive-delta.ts",
-  "export-cpa-source-route-inventory": "export-cpa-source-route-inventory.ts",
-  "export-cpa-target-route-receipt": "export-cpa-target-route-receipt.ts",
-  "finalize-session-archive-delta": "finalize-session-archive-delta.ts",
-  "generate-source-identity-key": "generate-source-identity-key.ts",
-  "generate-provider-exact-policy-inputs": "generate-provider-exact-policy-inputs.ts",
-  "import-cpa-key-policy": "import-cpa-key-policy.ts",
-  "import-cpa-model-routes": "import-cpa-model-routes.ts",
-  "import-cpa-session-archive": "import-cpa-session-archive.ts",
-  "import-cpa-upstreams": "import-cpa-upstreams.ts",
-  "reconcile-final-price-cache": "reconcile-final-price-cache.ts",
-  "stage-protected-inputs": "stage-protected-inputs.ts",
-});
+import { releaseEntrypoints } from "./release-entrypoints.ts";
 
 /**
  * @param {string} entrypoint
  * @returns {string | undefined}
  */
 export function targetForEntrypoint(entrypoint = "") {
-  return Object.entries(entrypoints).find(([name]) => name === entrypoint)?.[1];
+  const source = releaseEntrypoints[entrypoint as keyof typeof releaseEntrypoints];
+  return source === undefined ? undefined : basename(source);
 }
 
 /**

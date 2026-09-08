@@ -128,4 +128,67 @@ describe("CPA source route inventory exporter", () => {
     writeFileSync(missing.policy, JSON.stringify({ version: 1, policies: [{ key_hash: "c".repeat(64), enabled: true, grants: [{ provider: "codex", model: "unresolved" }] }], usage: {} }), { mode: 0o600 });
     const unresolved = spawnSync(process.execPath, exportArguments(missing, missingOutput), { encoding: "utf8" }); assert.equal(unresolved.status, 2); assert.equal(existsSync(join(missingOutput, "source-inventory.json")), false); assert.equal(existsSync(join(missingOutput, "provider-candidate-material.json")), false);
   });
+
+  it("unifies only registry-proven managed Codex OAuth candidates in their exact classify groups", () => {
+    const root = mkdtempSync(join(tmpdir(), "mtc-managed-codex-route-")), source = join(root, "source"), auth = join(source, "auth"), output = join(root, "output");
+    mkdirSync(auth, { recursive: true, mode: 0o700 }); mkdirSync(output, { mode: 0o700 }); chmodSync(source, 0o700); chmodSync(auth, 0o700);
+    const dongwu = "lindongwu11@gmail.com.json", csil = "csil.ai.automation@gmail.com.json";
+    const config = join(source, "config.yaml");
+    writeFileSync(config, [
+      'auth-dir: "/sealed/auth"',
+      "force-model-prefix: false",
+      "oauth-model-alias:",
+      "  codex:",
+      "    - name: gpt-5.6-terra-dongwu-upstream",
+      "      alias: gpt-5.6-terra",
+      "codex-api-key:",
+      "  - api-key: fixture-only-direct-codex-key",
+      '    base-url: "https://codex.example.test/v1"',
+      "    models:",
+      "      - name: gpt-5.6-direct-upstream",
+      "        alias: gpt-5.6-direct",
+      "plugins:",
+      "  configs:",
+      "    cpa-key-policy:",
+      "      mode: native-access",
+      "      classify_rules:",
+      "        - name: codex-dongwu-credential",
+      "          field: filename",
+      "          pattern: 'lindongwu11@gmail\\.com'",
+      "          group: dongwu",
+      "          enabled: true",
+      "        - name: codex-csil-credential",
+      "          field: filename",
+      "          pattern: 'csil\\.ai\\.automation@gmail\\.com'",
+      "          group: csil",
+      "          enabled: true",
+      "",
+    ].join("\n"), { mode: 0o600 });
+    writeFileSync(join(auth, dongwu), JSON.stringify({ type: "codex", prefix: "codex-dongwu", refresh_token: "fixture-only" }), { mode: 0o600 });
+    writeFileSync(join(auth, csil), JSON.stringify({ type: "codex", prefix: "codex-csil", refresh_token: "fixture-only", model_aliases: [{ name: "gpt-5.6-terra-csil-upstream", alias: "gpt-5.6-terra" }] }), { mode: 0o600 });
+    const policy = join(root, "native-policy.json");
+    writeFileSync(policy, JSON.stringify({ version: 1, policies: [{ key_hash: "c".repeat(64), enabled: true, grants: [
+      { provider: "codex", model: "gpt-5.6-direct" },
+      { provider: "codex", model: "gpt-5.6-terra", group: "classify:dongwu", upstream_prefix: "codex-dongwu" },
+      { provider: "codex", model: "gpt-5.6-terra", group: "classify:csil", upstream_prefix: "codex-csil" },
+    ] }], usage: {} }), { mode: 0o600 });
+    const snapshot = join(root, "managed-models.json"), authFiles = [
+      { id: csil, provider: "codex", disabled: false, status: "active" },
+      { id: dongwu, provider: "codex", disabled: false, status: "active" },
+    ];
+    writeFileSync(snapshot, JSON.stringify({ version: 1, source_config_sha256: createHash("sha256").update(readFileSync(config)).digest("hex"), auth_files_sha256: createHash("sha256").update(`${JSON.stringify(authFiles)}\n`).digest("hex"), auth_models: [
+      { auth_id: csil, provider: "codex", registered_models: ["codex-csil/gpt-5.6-terra", "gpt-5.6-terra-csil-upstream"] },
+      { auth_id: dongwu, provider: "codex", registered_models: ["codex-dongwu/gpt-5.6-terra", "gpt-5.6-terra-dongwu-upstream"] },
+    ] }), { mode: 0o600 });
+    const key = join(root, "source-identity.key"), generated = spawnSync(process.execPath, [keyGenerator, key], { encoding: "utf8" }); assert.equal(generated.status, 0, generated.stderr);
+    const sourceOutput = join(output, "source-inventory.json"), materialOutput = join(output, "provider-candidate-material.json");
+    const result = spawnSync(process.execPath, [exporter, "--config", config, "--auth-dir", auth, "--policy-snapshot-file", policy, "--source-identity-key-file", key, "--managed-codex-model-snapshot-file", snapshot, "--source-inventory-output", sourceOutput, "--provider-candidate-material-output", materialOutput], { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    const inventory = JSON.parse(readFileSync(sourceOutput, "utf8")) as { mappings: Array<Record<string, unknown>> }, material = JSON.parse(readFileSync(materialOutput, "utf8")) as { provider_candidate_sets: Array<Record<string, unknown>> };
+    assert.deepEqual(inventory.mappings.map((item) => item.group).sort(), ["classify:csil", "classify:dongwu", null]);
+    assert.equal(material.provider_candidate_sets.length, 3);
+    assert.deepEqual(material.provider_candidate_sets.map((item) => ((item.candidates as Array<Record<string, unknown>>)[0]!.driver)).sort(), ["http-json", "openai-codex", "openai-codex"]);
+    const outputText = `${result.stdout}${result.stderr}${readFileSync(sourceOutput, "utf8")}${readFileSync(materialOutput, "utf8")}`;
+    assert.doesNotMatch(outputText, /lindongwu11@gmail\.com|csil\.ai\.automation@gmail\.com|fixture-only/u);
+  });
 });

@@ -304,6 +304,10 @@ test("dispatches extensionless launchers by basename to explicit TypeScript targ
       "export-cpa-source-route-inventory.ts",
     );
     assert.equal(
+      targetForEntrypoint("compose-cpa-upstream-inventory"),
+      "compose-cpa-upstream-inventory.ts",
+    );
+    assert.equal(
       targetForEntrypoint("reconcile-final-price-cache"),
       "reconcile-final-price-cache.ts",
     );
