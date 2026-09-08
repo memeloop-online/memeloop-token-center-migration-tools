@@ -10,7 +10,7 @@
  * stderr.
  */
 
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, type ChildProcessByStdio } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
 import { dirname, isAbsolute, parse, relative, resolve, sep } from "node:path";
@@ -70,6 +70,7 @@ type Options = Readonly<{
 }>;
 
 type MutableOptions = { -readonly [Key in keyof Options]?: Options[Key] };
+type KubectlChild = ChildProcessByStdio<null, Readable, null>;
 
 export class CpaSourceCollectionFailure extends Error {}
 
@@ -171,7 +172,7 @@ function kubectlPrefix(selected: Options): string[] { return [...selected.kubect
 
 async function command(binary: string, args: readonly string[], maximum: number, timeoutMs: number): Promise<Buffer> {
   return await new Promise((resolveCommand, rejectCommand) => {
-    let child: ChildProcessWithoutNullStreams;
+    let child: KubectlChild;
     try { child = spawn(binary, [...args], { shell: false, windowsHide: true, stdio: ["ignore", "pipe", "ignore"], env: process.env }); }
     catch { rejectCommand(new CpaSourceCollectionFailure("kubectl command could not start")); return; }
     const chunks: Buffer[] = []; let total = 0, settled = false;
@@ -260,8 +261,9 @@ async function parseArchive(raw: Buffer, maximum: number): Promise<ReadonlyMap<s
         if (entries.has(name) || !Number.isSafeInteger(header.size) || Number(header.size) < 0 || Number(header.size) > MAX_ENTRY_BYTES) fail("source archive has an invalid entry");
       } catch (error) { stream.resume(); abort(error instanceof CpaSourceCollectionFailure ? error : new CpaSourceCollectionFailure("source archive is invalid")); return; }
       const chunks: Buffer[] = []; let size = 0;
-      stream.on("data", (chunk: Buffer | Uint8Array) => {
+      stream.on("data", (chunk: unknown) => {
         if (settled) return;
+        if (!(chunk instanceof Uint8Array)) { abort(new CpaSourceCollectionFailure("source archive has an invalid entry stream")); return; }
         const value = Buffer.from(chunk); size += value.length; total += value.length;
         if (size > MAX_ENTRY_BYTES || total > maximum) { abort(new CpaSourceCollectionFailure("source archive exceeds the safety limit")); return; }
         chunks.push(value);
@@ -421,6 +423,7 @@ function safeParent(path: string): string {
     if (error instanceof CpaSourceCollectionFailure) throw error;
     fail("output parent directory is unsafe");
   } finally { if (descriptor !== undefined) closeSync(descriptor); }
+  fail("output parent directory is unsafe");
 }
 function privateDirectory(path: string): void {
   try { mkdirSync(path, { mode: 0o700 }); }
@@ -468,7 +471,7 @@ function writeSourceCapture(directory: string, capture: SourceCapture): void {
 
 type PortForward = Readonly<{ port: number; close: () => Promise<void> }>;
 async function portForward(selected: Options): Promise<PortForward> {
-  let child: ChildProcessWithoutNullStreams;
+  let child: KubectlChild;
   try {
     child = spawn(selected.kubectl, [...kubectlPrefix(selected), "port-forward", `pod/${selected.pod}`, "--address", "127.0.0.1", `:${selected.managementPort}`], { shell: false, windowsHide: true, stdio: ["ignore", "pipe", "ignore"], env: process.env });
   } catch { fail("kubectl port-forward could not start"); }

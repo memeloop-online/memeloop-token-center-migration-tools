@@ -47,7 +47,19 @@ function nextRevision(): number {
 }
 async function archive(entries: readonly Readonly<{ name: string; content?: string; type?: "directory" | "symlink"; linkname?: string }>[]): Promise<void> {
   const output = pack(); output.pipe(process.stdout);
-  for (const entry of entries) await new Promise<void>((resolve, reject) => output.entry({ name: entry.name, ...(entry.type === undefined ? {} : { type: entry.type }), ...(entry.linkname === undefined ? {} : { linkname: entry.linkname }) }, entry.content, (error) => error ? reject(error) : resolve()));
+  for (const entry of entries) {
+    await new Promise<void>((resolve, reject) => {
+      const done = (error?: Error | null): void => { if (error) reject(error); else resolve(); };
+      if (entry.content === undefined) {
+        const header = entry.type === undefined
+          ? { name: entry.name, type: "directory" as const }
+          : { name: entry.name, type: entry.type, ...(entry.linkname === undefined ? {} : { linkname: entry.linkname }) };
+        output.entry(header, done);
+      } else {
+        output.entry({ name: entry.name, ...(entry.type === undefined ? {} : { type: entry.type }), ...(entry.linkname === undefined ? {} : { linkname: entry.linkname }) }, entry.content, done);
+      }
+    });
+  }
   output.finalize();
 }
 async function servePortForward(): Promise<void> {
@@ -63,7 +75,7 @@ async function servePortForward(): Promise<void> {
   const address = server.address();
   if (!address || typeof address === "string") process.exit(92);
   process.stdout.write(`Forwarding from 127.0.0.1:${address.port} -> 8317\n`);
-  const close = (): void => server.close(() => process.exit(0));
+  const close = (): void => { server.close(() => process.exit(0)); };
   process.once("SIGTERM", close); process.once("SIGINT", close);
 }
 
