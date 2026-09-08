@@ -61,6 +61,31 @@ try {
   execute(command("export-cpa-managed-codex-model-snapshot"), ["--help"]);
   execute(command("resolve-cpa-managed-codex-provenance"), ["--help"]);
 
+  const captureRoot = join(root, "source-capture");
+  mkdirSync(captureRoot, { mode: 0o700 }); chmodSync(captureRoot, 0o700);
+  const captureToken = join(captureRoot, "management.token");
+  writePrivate(captureToken, "fixture-management-token\n");
+  const capture = JSON.parse(execute(command("collect-cpa-source-snapshot"), [
+    "--kubectl-binary", process.execPath,
+    "--kubectl-argument", "--experimental-strip-types",
+    "--kubectl-argument", join(repository, "tests/ops/helpers/fake-kubectl-cpa-source-snapshot.ts"),
+    "--context", "fixture-context",
+    "--namespace", "fixture-cpa",
+    "--pod", "cliproxyapi-0",
+    "--pod-uid", "10000000-0000-4000-8000-000000000001",
+    "--container", "cliproxyapi",
+    "--expected-app-name", "cliproxyapi",
+    "--expected-pvc", "cliproxyapi-auth",
+    "--source-state-root", "/root/.cli-proxy-api",
+    "--config-mount-path", "/CLIProxyAPI/config.yaml",
+    "--management-port", "8317",
+    "--management-token-file", captureToken,
+    "--output-directory", join(captureRoot, "capture"),
+  ], { FAKE_CPA_COUNTER_PATH: join(captureRoot, "counter") })) as Record<string, unknown>;
+  assert.equal(capture.mode, "collect-cpa-source-snapshot");
+  assert.equal(capture.auth_file_count, 1);
+  assert.equal(existsSync(join(captureRoot, "capture", "source-capture-receipt.json")), true);
+
   const source = join(root, "source");
   cpSync(join(repository, "tests/fixtures/cpa-upstreams/supported"), source, { recursive: true });
   privateTree(source);

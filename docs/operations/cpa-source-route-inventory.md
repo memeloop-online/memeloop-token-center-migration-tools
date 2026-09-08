@@ -46,12 +46,82 @@ unresolved source grant, or an empty active source pool stop before either
 public output is created. A parseable policy shape without provider/model is a
 static anomaly and is never guessed or repaired.
 
+## Local read-only source capture
+
+`collect-cpa-source-snapshot` is the only supported way to obtain the source
+config, auth tree, native-access policy, and (when applicable) managed Codex
+model snapshot from the already-running CPA process. It does not create a Pod,
+Job, image pull, Secret read, Kubernetes object, route, grant, or target
+account. It deliberately requires an operator to name one existing Pod and
+its UID; it never lists Pods or selects a workload.
+
+Prepare an otherwise empty destination name below an existing current-UID
+owned `0700` directory, and an already-authorized current-UID `0600` management
+token file. The token is needed only if the captured source contains active
+Codex OAuth auth files. Do not put either the token or generated directory in
+Git, a ticket, chat, command substitution, or a shell trace. The command reads
+the fixed Pod and verifies its actual `app.kubernetes.io/name`, container,
+state-PVC claim, state/config volume relationship, config `subPath`, and
+management port before every sensitive stage. The names and mount paths below
+are the reviewed CPA deployment layout; `CONTEXT`, `POD`, and `POD_UID` must be
+copied from the operator's read-only approved observation, not guessed.
+
+```text
+node /verified-release/operator-scripts/collect-cpa-source-snapshot.mjs \
+  --kubectl-binary /usr/bin/kubectl \
+  --context CONTEXT \
+  --namespace cliproxyapi \
+  --pod POD \
+  --pod-uid POD_UID \
+  --container cliproxyapi \
+  --expected-app-name cliproxyapi \
+  --expected-pvc cliproxyapi-auth \
+  --source-state-root /root/.cli-proxy-api \
+  --config-mount-path /CLIProxyAPI/config.yaml \
+  --management-port 8317 \
+  --management-token-file /protected/cpa-management.token \
+  --output-directory /protected/cpa-source-captures/CAPTURE_ID
+```
+
+The collector invokes only fixed-argument `kubectl get pod`, `kubectl exec`
+with `tar` read mode, and a loopback-only `kubectl port-forward` to that exact
+Pod. It has no shell execution and does not change the caller's proxy or
+Kubernetes settings. The port-forward is terminated in `finally`, including
+on an API, timeout, or consistency error. Its production invocation requires
+no `--kubectl-argument`; that repeatable option exists only for an explicitly
+approved static local wrapper such as the synthetic CI fixture and never
+may be given a Secret value.
+
+The returned protected directory has mode `0700`; every contained dynamic file
+has mode `0600` (and nested auth directories mode `0700`):
+
+- `config.yaml`, `auth/`, and `native-key-policy.json` are the exact captured
+  source inputs. `auth/logs` is excluded if it exists; its absence is valid.
+- `managed-codex-model-snapshot.json` exists only when active Codex OAuth was
+  observed. It is collected with the existing read-only management snapshot
+  command over the temporary loopback forwarding path.
+- `source-capture-receipt.json` is the final completeness sentinel. It carries
+  only counts and SHA-256 seals, never config/auth/policy/token values or paths.
+
+The collector captures the source twice. Full config, native policy, and the
+route-affecting auth projection (`type`, enabled state, prefix, aliases, and
+exclusions) must be identical. A full OAuth document digest is recorded only
+as the observed payload revision: a normal token/expiry refresh may change it
+without creating a new route identity or a target import. The managed registry
+snapshot separately repeats its auth/model reads, so either source projection
+or model-list movement fails closed. It also enforces limits on archive size,
+entry count, per-entry size, command duration, management response size, and
+port-forward output. A failed capture publishes no final receipt; choose a new
+destination after investigating a partial directory rather than overwriting it.
+
 ## Managed Codex OAuth source evidence
 
 A Codex OAuth auth file makes the management-plane model registry part of the
-source proof. Capture it first with the local release entrypoint; this
-is read-only and does not import an account, call Token Center, or print an
-auth-file ID, token, model list, or credential payload.
+source proof. The local collector above invokes this read-only release
+entrypoint through its temporary loopback path when it observes Codex OAuth.
+Use the standalone form only when all its protected local source inputs were
+already captured by that collector; it does not import an account, call Token
+Center, or print an auth-file ID, token, model list, or credential payload.
 
 ```text
 node /verified-release/operator-scripts/export-cpa-managed-codex-model-snapshot.mjs --management-api-base-url https://cpa.example/v0/management --management-token-file /secrets/migration/cpa-management.token --source-config-file /source/config.yaml --output /sealed/managed-codex-model-snapshot.json

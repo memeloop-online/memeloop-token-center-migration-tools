@@ -15,9 +15,11 @@ await build({
   platform: 'node',
   target: 'node24.18',
   format: 'esm',
-  // yaml's Node export is CommonJS. Bundle its maintained ESM distribution so
-  // the importer remains a native ESM executable without a createRequire shim.
+  // yaml is bundled from its maintained ESM distribution. tar-stream is the
+  // reviewed tar parser and is CommonJS; its bundled builtin imports require a
+  // Node-only lexical require in the otherwise ESM release command.
   alias: { yaml: resolve(repository, 'node_modules/yaml/browser/index.js') },
+  banner: { js: 'import { createRequire as __createRequire } from "node:module"; const require = __createRequire(import.meta.url);' },
   outExtension: { '.js': '.mjs' },
   outdir: commands,
   logLevel: 'info',

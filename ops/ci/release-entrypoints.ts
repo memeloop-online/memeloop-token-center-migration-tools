@@ -10,6 +10,7 @@ export const releaseEntrypoints = Object.freeze({
   "api2-target-rollback": "ops/api2-target-rollback.ts",
   "attach-legacy-cpa-credentials": "ops/legacy-credentials/attach-legacy-cpa-credentials.ts",
   "audit-cpa-migration": "ops/audit-cpa-migration.ts",
+  "collect-cpa-source-snapshot": "ops/legacy-routes/collect-cpa-source-snapshot.ts",
   "compose-cpa-upstream-inventory": "ops/legacy-routes/compose-cpa-upstream-inventory.ts",
   "export-cpa-managed-codex-model-snapshot": "ops/legacy-routes/export-cpa-managed-codex-model-snapshot.ts",
   "export-cpa-session-archive-delta": "ops/export-cpa-session-archive-delta.ts",

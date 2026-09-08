@@ -435,7 +435,7 @@ function options(argv: readonly string[]): Options {
   return parsed as Options;
 }
 
-export function run(argv = process.argv.slice(2)): Readonly<Record<string, number | string>> {
+export function run(argv: readonly string[] = process.argv.slice(2)): Readonly<Record<string, number | string>> {
   const selected = options(argv);
   let tenantMappingRaw: Buffer | undefined, sourceConfigRaw: Buffer | undefined, modelSnapshotRaw: Buffer | undefined, sourceRaw: Buffer | undefined, materialRaw: Buffer | undefined, pepper: Buffer | undefined, identityKey: Buffer | undefined, output: OutputTarget | undefined;
   try {

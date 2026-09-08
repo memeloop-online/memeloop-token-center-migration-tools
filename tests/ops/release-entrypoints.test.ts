@@ -15,6 +15,10 @@ test("release registry is the explicit non-container command contract", () => {
     "ops/legacy-routes/export-cpa-managed-codex-model-snapshot.ts",
   );
   assert.equal(
+    releaseEntrypoints["collect-cpa-source-snapshot"],
+    "ops/legacy-routes/collect-cpa-source-snapshot.ts",
+  );
+  assert.equal(
     releaseEntrypoints["resolve-cpa-managed-codex-provenance"],
     "ops/legacy-routes/resolve-cpa-managed-codex-provenance.ts",
   );
