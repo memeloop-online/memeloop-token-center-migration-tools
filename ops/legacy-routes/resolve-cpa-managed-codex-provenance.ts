@@ -80,7 +80,7 @@ type Options = Readonly<{
   psqlBinary: string;
   statementTimeoutMs: number;
 }>;
-type MutableOptions = Partial<Options>;
+type MutableOptions = { -readonly [Key in keyof Options]?: Options[Key] };
 
 export class ManagedCodexProvenanceFailure extends Error {}
 
