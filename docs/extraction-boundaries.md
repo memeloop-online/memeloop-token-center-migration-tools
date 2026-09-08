@@ -6,6 +6,38 @@ Source tree: `8cdd681246924debc5c9752422aa422c0afce331`
 
 This repository contains exact copies of the reviewed TypeScript migration surface. The following source-owned areas remain intentionally outside this repository.
 
+## Public repository and reproducible runtime boundary
+
+This repository is publicly reusable as a one-shot migration-tool source
+distribution. It contains implementation, contracts, documentation and
+synthetic fixtures only. It must never contain business data or dynamic
+operational evidence: database/SQLite/archive exports, request or object
+payloads, production identities, keys, grants, balances, policy snapshots,
+source/target inventories, route or policy mappings, checkpoints, plans,
+receipts, logs, screenshots, Secret values, credentials, ciphertext or
+registry login material. Non-sensitive hashes and owner-approval references
+may be retained in an external evidence store and documented without copying
+the evidence itself into Git.
+
+The reproducible execution boundary is a CI-built container for an exact Git
+revision, consumed by immutable image digest with its manifest, SBOM and
+provenance. Dependencies are installed from the lockfile during image build;
+the final layer contains only the reviewed TypeScript entrypoints and runtime
+libraries. A generic `node` image must not clone this repository, fetch source,
+or run `npm install`/`npm ci` at startup. That pattern permits mutable code and
+dependency drift, requires runtime network/registry access, risks exposing
+injected credentials, and bypasses the digest/attestation boundary. The full
+verification suite is CI-only; local validation is limited to
+`git diff --check`. Real inputs are injected only by the approved execution
+environment.
+
+The copied CLI and path names intentionally retain current source-product
+terminology for migration compatibility. Removing CPA/Token Center-specific
+names, introducing generic provider/source/target adapters, or changing CLI
+aliases is a separately versioned compatibility follow-up, not an extraction
+cleanup. Until that work has its own fixtures and dual review, existing names
+must not be renamed.
+
 ## Compiled migration/runtime boundary
 
 The session-archive importer is implemented in Rust and is coupled to product database, archive, configuration and authorization modules. It was not copied or mechanically rewritten:

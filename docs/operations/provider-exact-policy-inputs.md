@@ -1,5 +1,33 @@
 # Provider-exact policy input generation
 
+This is a public, reusable one-shot migration contract, not a runtime policy
+service. The examples retain the current CPA/Token Center command and field
+names deliberately: active migration consumers depend on them. Generalizing
+those names requires a separately versioned compatibility adapter and review;
+do not rename the existing CLI or files as part of a documentation-only
+reuse effort.
+
+The repository contains only code, documentation, and synthetic fixtures. A
+real policy snapshot, source/target inventory, route or policy mapping,
+credential, Secret value, checkpoint, receipt, log, or other dynamic evidence
+must remain in the approved external input/evidence system. Counts and model
+names in this document are schema examples, never production evidence or
+activation conditions.
+
+## Immutable execution boundary
+
+Build and test a complete Git revision in CI, then execute the resulting image
+by its verified immutable digest with its manifest/SBOM/provenance receipt.
+The image's dependency closure is assembled from the lockfile during the
+build and its final layer contains only the reviewed TypeScript entrypoints
+and required runtime libraries. Do not use a generic `node` image to fetch a
+repository, run `npm install`/`npm ci`, or resolve mutable packages at
+startup: runtime source/dependency drift would defeat digest reproducibility,
+increase network and credential exposure, and bypass the attestation boundary.
+The full verification suite is CI-only; local work is limited to
+`git diff --check`. Real inputs are injected only by an approved execution
+environment.
+
 `export-cpa-target-route-receipt` first closes the target-state observation
 step after a successfully replayed native-route plan. It only calls the
 existing read-only target route and upstream list APIs; it has no mutation

@@ -1,5 +1,20 @@
 # CPA source route inventory export
 
+This document describes a public, reusable one-shot exporter while preserving
+the current CPA/Token Center names required by the active migration. It does
+not authorize access to a CPA volume or any target environment. Real config,
+auth files, policy snapshots, source identity keys, inventories, credentials,
+logs, checkpoints, receipts and other dynamic evidence stay outside Git and
+are supplied through an owner-approved protected-input boundary.
+
+The exporter is executed from a CI-built image addressed by its verified
+immutable digest. Dependencies are resolved from the lockfile while building
+that image; the runtime must not use a generic `node` image to clone source,
+download TypeScript, or run `npm install`/`npm ci`. Startup fetches make code
+and dependency resolution mutable, require unnecessary network access, and
+cannot reproduce the image's SBOM/provenance. Keep the existing command and
+file names until a separately versioned compatibility adapter is reviewed.
+
 Run `export-cpa-source-route-inventory` before reviewed legacy-route planning.
 It turns one immutable live CPA config/auth snapshot plus the matching native
 key-policy snapshot into dynamic, sealed routing inputs. It does not contact or
