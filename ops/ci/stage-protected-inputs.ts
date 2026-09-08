@@ -356,7 +356,6 @@ function copyProtectedFile(request: CopyRequest, uid: number, gid: number, maxBy
     // inode's final ownership without adding CAP_FOWNER or CAP_DAC_OVERRIDE.
     linkSync(temporary, request.target);
     fchownRequested(targetFd, uid, gid);
-    fchmodSync(targetFd, 0o600);
     fsyncSync(targetFd);
     unlinkSync(temporary);
     const published = descriptorStat(targetFd, "staged input");
