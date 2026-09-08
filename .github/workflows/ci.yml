@@ -111,36 +111,52 @@ jobs:
           set -euo pipefail
           test -n "$DIGEST"
           test "${DIGEST#sha256:}" != "$DIGEST"
-          docker run --rm --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=8m \
+          fixture_volume="migration-tools-stage-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cleanup_fixture_volume() {
+            docker volume rm -f "$fixture_volume" >/dev/null 2>&1 || true
+          }
+          trap cleanup_fixture_volume EXIT
+          docker volume create "$fixture_volume" >/dev/null
+          docker run --rm --network none --read-only --mount type=volume,src="$fixture_volume",dst=/work \
             --user 0:0 --security-opt no-new-privileges --cap-drop ALL --cap-add CHOWN \
             --entrypoint /bin/sh "$IMAGE@$DIGEST" -ec '
               test "$(cat /proc/sys/fs/protected_hardlinks)" = "1"
               test "$(grep ^CapEff: /proc/self/status | cut -f2)" = "0000000000000001"
               umask 077
-              mkdir -p /tmp/source/auth/nested /tmp/source/auth/logs /tmp/inputs /tmp/stage
-              printf "fixture\n" > /tmp/source/config.yaml
-              printf "{\"provider\":\"fixture\"}\n" > /tmp/source/auth/account.json
-              printf "{\"nested\":true}\n" > /tmp/source/auth/nested/account.json
-              printf "reviewed non-credential output\n" > /tmp/source/auth/logs/debug.log
-              printf "{\"version\":1,\"policies\":[],\"usage\":{}}\n" > /tmp/source/auth/cpa-key-access-policy-state.json
-              printf "fixture-identity\n" > /tmp/inputs/source-identity.key
-              chmod 0600 /tmp/source/config.yaml /tmp/source/auth/account.json /tmp/source/auth/nested/account.json /tmp/source/auth/logs/debug.log /tmp/source/auth/cpa-key-access-policy-state.json /tmp/inputs/source-identity.key
+              mkdir -p /work/source/auth/nested /work/source/auth/logs /work/inputs /work/stage
+              printf "fixture\n" > /work/source/config.yaml
+              printf "{\"provider\":\"fixture\"}\n" > /work/source/auth/account.json
+              printf "{\"nested\":true}\n" > /work/source/auth/nested/account.json
+              printf "reviewed non-credential output\n" > /work/source/auth/logs/debug.log
+              printf "{\"version\":1,\"policies\":[],\"usage\":{}}\n" > /work/source/auth/cpa-key-access-policy-state.json
+              printf "fixture-identity\n" > /work/inputs/source-identity.key
+              chmod 0600 /work/source/config.yaml /work/source/auth/account.json /work/source/auth/nested/account.json /work/source/auth/logs/debug.log /work/source/auth/cpa-key-access-policy-state.json /work/inputs/source-identity.key
               /usr/local/bin/stage-protected-inputs \
-                --copy /tmp/source/config.yaml /tmp/stage/config.yaml \
-                --copy-auth-dir /tmp/source/auth /tmp/stage/auth \
+                --copy /work/source/config.yaml /work/stage/config.yaml \
+                --copy-auth-dir /work/source/auth /work/stage/auth \
                 --exclude-auth-subdir logs \
-                --copy /tmp/source/auth/cpa-key-access-policy-state.json /tmp/stage/native-key-policy.json \
-                --copy /tmp/inputs/source-identity.key /tmp/stage/source-identity.key
-              for file in /tmp/stage/config.yaml /tmp/stage/auth/account.json /tmp/stage/auth/nested/account.json /tmp/stage/auth/cpa-key-access-policy-state.json /tmp/stage/native-key-policy.json /tmp/stage/source-identity.key; do
+                --copy /work/source/auth/cpa-key-access-policy-state.json /work/stage/native-key-policy.json \
+                --copy /work/inputs/source-identity.key /work/stage/source-identity.key
+              chown 10001:10001 /work/stage
+              test "$(stat -c %a /work/stage)" = "700"
+              test "$(stat -c %u:%g /work/stage)" = "10001:10001"
+            '
+          docker run --rm --network none --read-only --mount type=volume,src="$fixture_volume",dst=/work,readonly \
+            --user 10001:10001 --security-opt no-new-privileges --cap-drop ALL \
+            --entrypoint /bin/sh "$IMAGE@$DIGEST" -ec '
+              test "$(grep ^CapEff: /proc/self/status | cut -f2)" = "0000000000000000"
+              for file in /work/stage/config.yaml /work/stage/auth/account.json /work/stage/auth/nested/account.json /work/stage/auth/cpa-key-access-policy-state.json /work/stage/native-key-policy.json /work/stage/source-identity.key; do
+                test -r "$file"
+                test "$(wc -c < "$file")" -gt 0
                 test "$(stat -c %a "$file")" = "600"
                 test "$(stat -c %u:%g "$file")" = "10001:10001"
                 test "$(stat -c %h "$file")" = "1"
               done
-              for directory in /tmp/stage/auth /tmp/stage/auth/nested; do
+              for directory in /work/stage /work/stage/auth /work/stage/auth/nested; do
                 test "$(stat -c %a "$directory")" = "700"
                 test "$(stat -c %u:%g "$directory")" = "10001:10001"
               done
-              test ! -e /tmp/stage/auth/logs
+              test ! -e /work/stage/auth/logs
             '
 
       - name: Emit the immutable digest and manifest
