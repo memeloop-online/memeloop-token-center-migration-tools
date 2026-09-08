@@ -54,7 +54,7 @@ domain-separated HMAC-SHA256 `source_stable_id`. It never emits auth handles,
 logins, labels, emails, paths, credentials, tokens, source key material, or
 raw/key hashes. Stdout is a count-and-digest receipt only.
 
-`provider-candidate-material.json` seals a target-independent v2 candidate set
+`provider-candidate-material.json` seals a target-independent version 1 candidate set
 per source mapping: exact source, upstream model, protocol,
 `equal_round_robin`, provider, driver and all HMAC-stable active source-account
 candidates. It is intentionally not an `upstream-inventory.json` replacement:
@@ -63,3 +63,32 @@ upstream account from a read-only target snapshot, then create reviewed
 `upstream-inventory.json` version 2. Do not drop pool members, merge providers
 or drivers, select weights, or infer target IDs. The existing route importer
 will independently reject an incomplete or cross-provider/driver candidate set.
+
+## Read-only deterministic direct-account binding receipt
+
+If `import-cpa-upstreams --apply` has already replayed the direct API-key
+accounts, create the protected binding input for provider-exact review with:
+
+```text
+import-cpa-upstreams --resolve-existing-route-bindings --config /source/config.yaml --auth-dir /source/auth --source-identity-key-file /secrets/migration/source-identity.key --provider-candidate-material-file /sealed/provider-candidate-material.json --binding-receipt-output /sealed/direct-route-bindings.json --target-api-base-url https://target-control.example --service-token-file /secrets/migration/target-service-token [--transport-policy-file /sealed/transport-policy.json]
+```
+
+This mode makes exactly one target request: a read-only `GET` of the selected
+tenant's upstream inventory. It reconstructs the exporter’s domain-separated
+direct-account HMAC, deterministic target account name, strict `http-json`
+driver, canonical non-secret configuration, and active status. Exactly one
+match produces a binding; absent, mismatched, inactive, or duplicate accounts
+are recorded as quarantined. The receipt includes only opaque stable IDs,
+provider, target UUID, revision, driver, source-inventory digest, candidate
+material digest, and quarantine reasons. It never emits source IDs, account
+names, configurations, credentials, or service tokens. The output uses the
+same protected no-replace publication rules as the source outputs.
+
+When the direct import used a transport policy, supply that same protected
+policy file here; otherwise a policy-induced network scope or result-origin
+difference correctly quarantines the account.
+
+The mode does not create, update, or rotate target accounts; it does not cover
+managed OAuth imports or Copilot/Cursor native reauthorization. Those have
+separate provenance/reauthorization evidence and must be strictly composed
+with this direct receipt before reviewed `upstream-inventory.json` is made.

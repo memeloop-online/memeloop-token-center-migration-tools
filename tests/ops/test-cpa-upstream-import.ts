@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
-import { chmodSync, copyFileSync, cpSync, lstatSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { createHash, createHmac } from "node:crypto";
+import { chmodSync, copyFileSync, cpSync, lstatSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -205,6 +205,52 @@ describe("CPA upstream TypeScript operators", () => {
         "--target-api-base-url", `http://127.0.0.1:${address.port}`, "--service-token-file", token,
       ], { timeout: 20_000 }), /target account conflicts with a stable CPA source identity/);
       assert.equal(managedWrites, 0);
+    } finally { await new Promise<void>((resolveClose, rejectClose) => server.close((error) => error ? rejectClose(error) : resolveClose())); }
+  });
+
+  it("writes a redacted read-only direct binding receipt and quarantines target drift", async () => {
+    const root = mkdtempSync(join(tmpdir(), "mtc-cpa-route-binding-"));
+    const source = join(root, "source"); cpSync(join(fixtures, "supported"), source, { recursive: true }); privateTree(source);
+    const key = join(source, "source-identity.key"); assert.equal(spawnSync(process.execPath, [generator, key]).status, 0);
+    const token = join(root, "service-token"); writeFileSync(token, "fixture-only-target-service-token\n", { mode: 0o600 });
+    const sourceId = ["cpa-upstream-import-v1", "config", "openai-compatibility", "fixture-openai-compatible", "0"].join("\0");
+    const stableName = `cpa-fixture-openai-compatible-${createHash("sha256").update(sourceId).digest("hex").slice(0, 16)}`;
+    const stableId = createHmac("sha256", readFileSync(key).subarray(19)).update(Buffer.concat([Buffer.from("memeloop-token-center\0cpa-route-source-account-id\0v1\0"), Buffer.from(sourceId)])).digest("hex");
+    const material = join(root, "provider-candidate-material.json");
+    writeFileSync(material, `${JSON.stringify({ version: 1, source_inventory_sha256: "a".repeat(64), provider_candidate_sets: [{ source: { provider: "fixture-openai-compatible", model: "fixture-model", group: null, upstream_prefix: null, protocol: "openai" }, upstream_model: "fixture-model-upstream", protocol: "openai", selection: "equal_round_robin", candidates: [{ source_stable_id: stableId, source_provider: "fixture-openai-compatible", driver: "http-json" }] }] })}\n`, { mode: 0o600 });
+    let drifted = false, requests = 0;
+    const server = createServer((request, response) => {
+      requests += 1; response.setHeader("content-type", "application/json");
+      if (request.method !== "GET" || !request.url?.startsWith("/internal/v1/upstreams?") || request.headers.authorization !== "Bearer fixture-only-target-service-token") { response.statusCode = 403; response.end("{}"); return; }
+      response.end(JSON.stringify([{
+        id: "10000000-0000-4000-8000-000000000001", tenant_external_id: "default", name: stableName, driver: "http-json",
+        config: drifted ? { base_url: "https://drift.example.test", network_scope: "public" } : { network_scope: "public", base_url: "https://openai-compatible.example.test/v1" },
+        status: "active", updated_at: 7,
+      }]));
+    });
+    await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+    try {
+      const address = server.address(); assert(address && typeof address === "object");
+      const receipt = join(root, "binding-receipt.json");
+      const arguments_ = [importer, "--resolve-existing-route-bindings", "--config", join(source, "config.yaml"), "--auth-dir", join(source, "auth"), "--source-identity-key-file", key, "--provider-candidate-material-file", material, "--binding-receipt-output", receipt, "--target-api-base-url", `http://127.0.0.1:${address.port}`, "--service-token-file", token, "--allow-http-loopback"];
+      const result = await execFileAsync(process.execPath, arguments_, { timeout: 20_000 });
+      const summary = JSON.parse(result.stdout) as Record<string, unknown>, parsed = JSON.parse(readFileSync(receipt, "utf8")) as Record<string, unknown>;
+      assert.equal(summary.mode, "resolve-existing-route-bindings"); assert.equal(summary.bound_count, 1); assert.equal(summary.quarantined_count, 0); assert.equal(requests, 1);
+      assert.equal(statSync(receipt).mode & 0o777, 0o600);
+      assert.deepEqual(parsed.bindings, [{ source_stable_id: stableId, source_provider: "fixture-openai-compatible", upstream_account_id: "10000000-0000-4000-8000-000000000001", driver: "http-json", status: "active", updated_at: 7 }]);
+      const visible = `${result.stdout}${result.stderr}${readFileSync(receipt, "utf8")}`;
+      for (const forbidden of ["fixture-only-target-service-token", "fixture-only-cpa-openai-key-a", stableName, "openai-compatible.example.test"]) assert.doesNotMatch(visible, new RegExp(forbidden.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")));
+      const retained = readFileSync(receipt);
+      const overwrite = spawnSync(process.execPath, arguments_, { encoding: "utf8" });
+      assert.equal(overwrite.status, 2);
+      assert.deepEqual(readFileSync(receipt), retained);
+
+      drifted = true;
+      const quarantinedReceipt = join(root, "binding-receipt-drifted.json");
+      const quarantined = await execFileAsync(process.execPath, [...arguments_.map((value, index, values) => value === receipt && values[index - 1] === "--binding-receipt-output" ? quarantinedReceipt : value)], { timeout: 20_000 });
+      const quarantineSummary = JSON.parse(quarantined.stdout) as Record<string, unknown>, quarantine = JSON.parse(readFileSync(quarantinedReceipt, "utf8")) as Record<string, unknown>;
+      assert.equal(quarantineSummary.bound_count, 0); assert.equal(quarantineSummary.quarantined_count, 1);
+      assert.deepEqual(quarantine.quarantined, [{ source_stable_id: stableId, source_provider: "fixture-openai-compatible", reason: "target_config_mismatch" }]);
     } finally { await new Promise<void>((resolveClose, rejectClose) => server.close((error) => error ? rejectClose(error) : resolveClose())); }
   });
 

@@ -4,13 +4,12 @@
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import { closeSync, constants, fstatSync, fsyncSync, linkSync, lstatSync, openSync, unlinkSync, writeSync } from "node:fs";
 import { basename, dirname, isAbsolute, parse, relative, resolve, sep } from "node:path";
-import { inspectCpaSourceRoutes, readSourceIdentityKey, type CpaRouteModel } from "../cpa-upstreams/import-cpa-upstreams.ts";
+import { cpaRouteSourceStableId, inspectCpaSourceRoutes, readSourceIdentityKey, type CpaRouteModel } from "../cpa-upstreams/import-cpa-upstreams.ts";
 import { parseNativePolicy, readProtectedFile, type SourceGrant } from "../legacy-policy/import-cpa-key-policy.ts";
 
 const MAX_MAPPINGS = 1_000;
 const STABLE_ID = /^[0-9a-f]{64}$/;
 const SOURCE_FIELD = /^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,199}$/;
-const DIRECT_ACCOUNT_DOMAIN = "memeloop-token-center\0cpa-route-source-account-id\0v1\0";
 const OPAQUE_ACCOUNT_DOMAIN = "memeloop-token-center\0cpa-native-reauthorization-source-id\0v1\0";
 
 type Protocol = "openai" | "anthropic";
@@ -67,7 +66,7 @@ export function buildArtifacts(models: readonly CpaRouteModel[], opaque: readonl
     const model = matches[0]!;
     const source: Source = { ...parsed, protocol: model.protocol };
     if (model.candidateSourceIds.length === 0) throw new SourceRouteExportFailure("source grant has no active exact source account candidates");
-    const candidates = model.candidateSourceIds.map((sourceId) => ({ source_stable_id: stableId(identityKey, DIRECT_ACCOUNT_DOMAIN, sourceId), source_provider: source.provider, driver: "http-json" as const })).sort((left, right) => compare(left.source_stable_id, right.source_stable_id));
+    const candidates = model.candidateSourceIds.map((sourceId) => ({ source_stable_id: cpaRouteSourceStableId(identityKey, sourceId), source_provider: source.provider, driver: "http-json" as const })).sort((left, right) => compare(left.source_stable_id, right.source_stable_id));
     if (new Set(candidates.map((candidate) => candidate.source_stable_id)).size !== candidates.length || candidates.some((candidate) => !STABLE_ID.test(candidate.source_stable_id))) throw new SourceRouteExportFailure("source account candidate identity is invalid");
     const sourceKey = key(source), current = pools.get(sourceKey), candidateSet: CandidateSet = { source, upstream_model: model.upstreamModel, protocol: model.protocol, selection: "equal_round_robin", candidates };
     if (current && JSON.stringify(current) !== JSON.stringify(candidateSet)) throw new SourceRouteExportFailure("source mapping has conflicting provider candidate material");

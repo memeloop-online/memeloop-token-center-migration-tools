@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 /** Inventory and import CPA upstream accounts through the control API. */
 
-import { createHash, createHmac, timingSafeEqual } from "node:crypto";
-import { readdirSync, lstatSync, openSync, closeSync, fstatSync, readSync, constants } from "node:fs";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { readdirSync, lstatSync, openSync, closeSync, fstatSync, fsyncSync, linkSync, readSync, unlinkSync, writeSync, constants } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
-import { basename, isAbsolute, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, parse, relative, resolve, sep } from "node:path";
 import { parseDocument } from "yaml";
 import { parseStrictJson } from "../lib/strict-json.ts";
 
@@ -22,6 +22,9 @@ const TENANT_PATTERN = /^[A-Za-z0-9._:-]{1,200}$/;
 const HANDLE_PATTERN = /^[A-Za-z0-9]{1,80}$/;
 const HEADER_NAME_PATTERN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,200}$/;
 const MANAGED_OAUTH_SOURCE_TYPES: Readonly<Record<string, string>> = { codex: "codex", gemini: "gemini-legacy" };
+const DIRECT_ROUTE_SOURCE_DOMAIN = "memeloop-token-center\0cpa-route-source-account-id\0v1\0";
+const SHA256 = /^[0-9a-f]{64}$/;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 
 export class ImportFailure extends Error {}
 type JsonObject = Record<string, unknown>;
@@ -37,12 +40,26 @@ type TransportPolicy = {
   resultOriginsByBaseUrl: Map<string, string[]>;
   matchedResultOriginBaseUrls: Set<string>;
 };
+type ProviderCandidate = Readonly<{ sourceStableId: string; sourceProvider: string; driver: "http-json" }>;
+type BindingReceipt = Readonly<{
+  sourceInventoryDigest: string;
+  providerCandidateMaterialDigest: string;
+  tenant: string;
+  bindings: readonly Readonly<{ sourceStableId: string; sourceProvider: string; accountId: string; driver: "http-json"; updatedAt: number }>[];
+  quarantined: readonly Readonly<{ sourceStableId: string; sourceProvider: string; reason: "source_candidate_unavailable" | "source_candidate_metadata_mismatch" | "target_absent" | "target_driver_mismatch" | "target_config_mismatch" | "target_inactive" | "target_ambiguous" }>[];
+}>;
 
 /** Non-secret source coordinates reused by route-inventory export. */
 export type CpaRouteSourceAccount = Readonly<{ sourceId: string; sourceProvider: string; driver: "http-json"; disabled: boolean }>;
 export type CpaRouteModel = Readonly<{ provider: string; model: string; upstreamModel: string; upstreamPrefix: string | null; protocol: "openai" | "anthropic"; candidateSourceIds: readonly string[] }>;
 export type CpaOpaqueReauthorization = Readonly<{ sourceId: string; provider: string }>;
 export type CpaSourceRouteInspection = Readonly<{ accounts: readonly CpaRouteSourceAccount[]; models: readonly CpaRouteModel[]; opaqueReauthorizations: readonly CpaOpaqueReauthorization[] }>;
+
+/** Derive the same non-reversible direct-account identity used by the source route exporter. */
+export function cpaRouteSourceStableId(identityKey: Buffer, sourceId: string): string {
+  if (identityKey.length !== SOURCE_KEY_BYTES || !sourceId) throw new ImportFailure("source route identity inputs are invalid");
+  return createHmac("sha256", identityKey).update(Buffer.concat([Buffer.from(DIRECT_ROUTE_SOURCE_DOMAIN), Buffer.from(sourceId)])).digest("hex");
+}
 
 class SecretStore {
   readonly values = new Map<string, unknown>();
@@ -449,6 +466,162 @@ function validateAccount(value: unknown, tenant: string, label: string): JsonObj
   const account = mapping(value, `${label} account response`); for (const key of ["id", "tenant_external_id", "name", "driver", "config", "status", "updated_at"]) if (!(key in account)) throw new ImportFailure(`${label} returned an incomplete account`);
   if (account.tenant_external_id !== tenant) throw new ImportFailure(`${label} returned an account outside the selected tenant`); if (["credential", "access_token", "refresh_token", "api_key"].some((key) => key in account)) throw new ImportFailure(`${label} returned credential material`); return account;
 }
+
+function text(value: unknown, label: string, pattern?: RegExp): string {
+  if (typeof value !== "string" || value.trim() !== value || value.length === 0 || Buffer.byteLength(value) > 500 || /[\0\r\n]/.test(value) || (pattern && !pattern.test(value))) throw new ImportFailure(`${label} is invalid`);
+  return value;
+}
+function integer(value: unknown, label: string): number {
+  if (!Number.isSafeInteger(value) || value < 0 || value > 1_000_000_000_000_000) throw new ImportFailure(`${label} is invalid`);
+  return value;
+}
+function canonicalJson(value: unknown, label: string, depth = 0): string {
+  if (depth > 32) throw new ImportFailure(`${label} is invalid`);
+  if (value === null || typeof value === "boolean" || typeof value === "string") return JSON.stringify(value);
+  if (typeof value === "number") { if (!Number.isFinite(value)) throw new ImportFailure(`${label} is invalid`); return JSON.stringify(value); }
+  if (Array.isArray(value)) {
+    if (value.length > MAX_ACCOUNTS) throw new ImportFailure(`${label} is invalid`);
+    return `[${value.map((item) => canonicalJson(item, label, depth + 1)).join(",")}]`;
+  }
+  const object = mapping(value, label), keys = Object.keys(object).sort((left, right) => left.localeCompare(right, "en"));
+  if (keys.length > MAX_ACCOUNTS) throw new ImportFailure(`${label} is invalid`);
+  return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalJson(object[key], label, depth + 1)}`).join(",")}}`;
+}
+function providerCandidates(raw: Buffer): { sourceInventoryDigest: string; candidates: ProviderCandidate[] } {
+  let parsed: unknown;
+  try { parsed = parseStrictJson(decodeUtf8(raw, "provider candidate material")); }
+  catch { throw new ImportFailure("provider candidate material is invalid"); }
+  const root = mapping(parsed, "provider candidate material");
+  exact(root, ["version", "source_inventory_sha256", "provider_candidate_sets"], "provider candidate material");
+  if (root.version !== 1 || !Array.isArray(root.provider_candidate_sets) || root.provider_candidate_sets.length > MAX_ACCOUNTS) throw new ImportFailure("provider candidate material is invalid");
+  const sourceInventoryDigest = text(root.source_inventory_sha256, "provider candidate material source inventory digest", SHA256);
+  const candidates = new Map<string, ProviderCandidate>();
+  for (const rawSet of root.provider_candidate_sets) {
+    const set = mapping(rawSet, "provider candidate set");
+    exact(set, ["source", "upstream_model", "protocol", "selection", "candidates"], "provider candidate set");
+    const source = mapping(set.source, "provider candidate source");
+    exact(source, ["provider", "model", "group", "upstream_prefix", "protocol"], "provider candidate source");
+    const provider = text(source.provider, "provider candidate source provider");
+    text(source.model, "provider candidate source model");
+    if ((source.group !== null && typeof source.group !== "string") || (source.upstream_prefix !== null && typeof source.upstream_prefix !== "string") || (source.protocol !== "openai" && source.protocol !== "anthropic") || set.protocol !== source.protocol || set.selection !== "equal_round_robin" || !Array.isArray(set.candidates) || set.candidates.length === 0 || set.candidates.length > MAX_ACCOUNTS) throw new ImportFailure("provider candidate set is invalid");
+    if (source.group !== null) text(source.group, "provider candidate source group");
+    if (source.upstream_prefix !== null) text(source.upstream_prefix, "provider candidate source prefix");
+    for (const rawCandidate of set.candidates) {
+      const candidate = mapping(rawCandidate, "provider source candidate");
+      exact(candidate, ["source_stable_id", "source_provider", "driver"], "provider source candidate");
+      const sourceStableId = text(candidate.source_stable_id, "provider source candidate stable ID", SHA256), sourceProvider = text(candidate.source_provider, "provider source candidate provider");
+      if (sourceProvider !== provider || candidate.driver !== "http-json") throw new ImportFailure("provider source candidate is invalid");
+      const prior = candidates.get(sourceStableId), current: ProviderCandidate = { sourceStableId, sourceProvider, driver: "http-json" };
+      if (prior && (prior.sourceProvider !== current.sourceProvider || prior.driver !== current.driver)) throw new ImportFailure("provider candidate material has a conflicting source binding");
+      candidates.set(sourceStableId, current);
+    }
+  }
+  if (candidates.size === 0) throw new ImportFailure("provider candidate material has no source candidates");
+  return { sourceInventoryDigest, candidates: [...candidates.values()].sort((left, right) => left.sourceStableId.localeCompare(right.sourceStableId, "en")) };
+}
+type TargetAccount = Readonly<{ id: string; name: string; driver: string; config: string; status: string; updatedAt: number }>;
+function targetAccount(value: unknown, tenant: string): TargetAccount {
+  const account = validateAccount(value, tenant, "target upstream inventory");
+  return {
+    id: text(account.id, "target upstream identifier", UUID),
+    name: text(account.name, "target upstream name"),
+    driver: text(account.driver, "target upstream driver"),
+    config: canonicalJson(account.config, "target upstream configuration"),
+    status: text(account.status, "target upstream status"),
+    updatedAt: integer(account.updated_at, "target upstream revision"),
+  };
+}
+function buildBindingReceipt(candidateRaw: Buffer, inventory: Inventory, identityKey: Buffer, tenant: string, targetAccounts: readonly TargetAccount[]): BindingReceipt {
+  const material = providerCandidates(candidateRaw), sourceAccounts = new Map<string, DirectAccount>();
+  for (const account of inventory.direct) {
+    if (account.disabled) continue;
+    const stableId = cpaRouteSourceStableId(identityKey, account.sourceId);
+    if (sourceAccounts.has(stableId)) throw new ImportFailure("source route identity is duplicated");
+    sourceAccounts.set(stableId, account);
+  }
+  if (new Set(targetAccounts.map((account) => account.id)).size !== targetAccounts.length) throw new ImportFailure("target upstream inventory contains duplicate account IDs");
+  const targetsByName = new Map<string, TargetAccount[]>();
+  for (const account of targetAccounts) {
+    const current = targetsByName.get(account.name); if (current) current.push(account); else targetsByName.set(account.name, [account]);
+  }
+  const bindings: BindingReceipt["bindings"] = [], quarantined: BindingReceipt["quarantined"] = [];
+  for (const candidate of material.candidates) {
+    const source = sourceAccounts.get(candidate.sourceStableId);
+    if (!source) { quarantined.push({ sourceStableId: candidate.sourceStableId, sourceProvider: candidate.sourceProvider, reason: "source_candidate_unavailable" }); continue; }
+    if (source.sourceProvider !== candidate.sourceProvider || source.driver !== candidate.driver) { quarantined.push({ sourceStableId: candidate.sourceStableId, sourceProvider: candidate.sourceProvider, reason: "source_candidate_metadata_mismatch" }); continue; }
+    const named = targetsByName.get(source.name) ?? [];
+    if (named.length === 0) { quarantined.push({ sourceStableId: candidate.sourceStableId, sourceProvider: candidate.sourceProvider, reason: "target_absent" }); continue; }
+    const sameDriver = named.filter((account) => account.driver === source.driver);
+    if (sameDriver.length === 0) { quarantined.push({ sourceStableId: candidate.sourceStableId, sourceProvider: candidate.sourceProvider, reason: "target_driver_mismatch" }); continue; }
+    const sameConfig = sameDriver.filter((account) => account.config === canonicalJson(source.config, "source upstream configuration"));
+    if (sameConfig.length === 0) { quarantined.push({ sourceStableId: candidate.sourceStableId, sourceProvider: candidate.sourceProvider, reason: "target_config_mismatch" }); continue; }
+    const active = sameConfig.filter((account) => account.status === "active");
+    if (active.length === 0) { quarantined.push({ sourceStableId: candidate.sourceStableId, sourceProvider: candidate.sourceProvider, reason: "target_inactive" }); continue; }
+    if (active.length !== 1) { quarantined.push({ sourceStableId: candidate.sourceStableId, sourceProvider: candidate.sourceProvider, reason: "target_ambiguous" }); continue; }
+    const target = active[0]!;
+    bindings.push({ sourceStableId: candidate.sourceStableId, sourceProvider: candidate.sourceProvider, accountId: target.id, driver: "http-json", updatedAt: target.updatedAt });
+  }
+  return { sourceInventoryDigest: material.sourceInventoryDigest, providerCandidateMaterialDigest: digest(candidateRaw), tenant, bindings, quarantined };
+}
+function encodeBindingReceipt(receipt: BindingReceipt): Buffer {
+  return Buffer.from(`${JSON.stringify({
+    version: 1,
+    tenant_external_id: receipt.tenant,
+    source_inventory_sha256: receipt.sourceInventoryDigest,
+    provider_candidate_material_sha256: receipt.providerCandidateMaterialDigest,
+    bindings: receipt.bindings.map((binding) => ({ source_stable_id: binding.sourceStableId, source_provider: binding.sourceProvider, upstream_account_id: binding.accountId, driver: binding.driver, status: "active", updated_at: binding.updatedAt })),
+    quarantined: receipt.quarantined.map((item) => ({ source_stable_id: item.sourceStableId, source_provider: item.sourceProvider, reason: item.reason })),
+  })}\n`);
+}
+type OutputTarget = Readonly<{ target: string; parentDescriptor: number }>;
+function openSafeOutput(path: string): OutputTarget {
+  if (!isAbsolute(path) || path !== resolve(path) || path === parse(path).root || path.includes("\0")) throw new ImportFailure("binding receipt output path is invalid");
+  const directory = resolve(dirname(path)), root = parse(directory).root;
+  let current = root;
+  for (const part of relative(root, directory).split(sep).filter(Boolean)) {
+    current = resolve(current, part);
+    let metadata: ReturnType<typeof lstatSync>;
+    try { metadata = lstatSync(current); } catch { throw new ImportFailure("binding receipt output directory is unsafe"); }
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new ImportFailure("binding receipt output directory is unsafe");
+  }
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    const metadata = fstatSync(descriptor);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink() || (process.geteuid?.() !== undefined && metadata.uid !== process.geteuid()) || (metadata.mode & 0o022) !== 0) throw new ImportFailure("binding receipt output directory is unsafe");
+    const target = `/proc/self/fd/${descriptor}/${basename(path)}`;
+    try { lstatSync(target); throw new ImportFailure("binding receipt output already exists"); }
+    catch (error) { if (error instanceof ImportFailure) throw error; if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw new ImportFailure("binding receipt output directory is unsafe"); }
+    return { target, parentDescriptor: descriptor };
+  } catch (error) {
+    if (descriptor !== undefined) closeSync(descriptor);
+    if (error instanceof ImportFailure) throw error;
+    throw new ImportFailure("binding receipt output directory is unsafe");
+  }
+}
+function writeBindingReceipt(output: OutputTarget, receipt: Buffer): void {
+  const temporary = `${output.target}.tmp-${randomBytes(16).toString("hex")}`;
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    for (let offset = 0; offset < receipt.length;) { const written = writeSync(descriptor, receipt, offset, receipt.length - offset); if (written <= 0) throw new ImportFailure("binding receipt could not be written"); offset += written; }
+    fsyncSync(descriptor); closeSync(descriptor); descriptor = undefined;
+    linkSync(temporary, output.target); unlinkSync(temporary);
+    const metadata = lstatSync(output.target); if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1 || (metadata.mode & 0o777) !== 0o600) throw new ImportFailure("binding receipt could not be persisted");
+    fsyncSync(output.parentDescriptor);
+  } catch (error) {
+    if (descriptor !== undefined) closeSync(descriptor);
+    try { lstatSync(temporary); unlinkSync(temporary); } catch {}
+    if (error instanceof ImportFailure) throw error;
+    throw new ImportFailure("binding receipt could not be persisted");
+  }
+}
+async function resolveExistingRouteBindings(baseUrl: string, token: string, tenant: string, inventory: Inventory, identityKey: Buffer, candidateMaterial: Buffer, caFile?: string): Promise<Buffer> {
+  const response = (await requestJson("GET", `${baseUrl}/internal/v1/upstreams?tenant_external_id=${encodeURIComponent(tenant)}&limit=100`, token, "target upstream inventory", [200], undefined, undefined, caFile)).value;
+  if (!Array.isArray(response) || response.length >= 100) throw new ImportFailure("target upstream inventory is incomplete");
+  const receipt = buildBindingReceipt(candidateMaterial, inventory, identityKey, tenant, response.map((item) => targetAccount(item, tenant)));
+  return encodeBindingReceipt(receipt);
+}
 async function apply(baseUrl: string, token: string, tenant: string, inventory: Inventory, secrets: SecretStore, caFile?: string): Promise<[number, number, number, number]> {
   if (inventory.managed.length > 0) {
     const capabilities = mapping((await requestJson("GET", `${baseUrl}/internal/v1/imports/cpa/managed-oauth/capabilities`, token, "CPA managed OAuth capability discovery", [200], undefined, undefined, caFile)).value, "CPA managed OAuth capability response");
@@ -515,11 +688,18 @@ function summary(mode: string, inventory: Inventory, native: JsonObject[], count
   const sourceCounts: Record<string, number> = {}; for (const record of inventory.managed) sourceCounts[record.sourceType] = (sourceCounts[record.sourceType] ?? 0) + 1;
   return { api_account_count: inventory.direct.length, created_count: counts[0], created_managed_oauth_count: counts[2], disabled_source_count: inventory.disabledSourceCount, managed_oauth_account_count: inventory.managed.length, managed_oauth_source_type_counts: Object.fromEntries(Object.entries(sourceCounts).sort()), mode, native_reauthorization_required: native, native_reauthorization_required_count: native.length, private_target_api_account_count: inventory.direct.filter((record) => record.config.network_scope === "private").length, proxied_api_account_count: inventory.direct.filter((record) => record.proxySecretRef !== undefined).length, replayed_count: counts[1], replayed_managed_oauth_count: counts[3] };
 }
-type Options = { config?: string; authDir?: string; tenant: string; apply: boolean; target?: string; token?: string; sourceKey?: string; transportPolicy?: string; ca?: string; allowHttp: boolean };
+type Options = { config?: string; authDir?: string; tenant: string; apply: boolean; resolveBindings: boolean; target?: string; token?: string; sourceKey?: string; candidateMaterial?: string; bindingReceipt?: string; transportPolicy?: string; ca?: string; allowHttp: boolean };
 function args(argv: string[]): Options {
-  if (argv.includes("--help") || argv.includes("-h")) { process.stdout.write("usage: import-cpa-upstreams --config FILE --auth-dir DIR [--transport-policy-file FILE] [--tenant ID] [--apply] [--target-api-base-url URL] [--service-token-file FILE] [--source-identity-key-file FILE] [--ca-file FILE] [--allow-http-loopback]\n\nImport real CPA config.yaml/auth-dir upstreams (dry-run by default).\n"); process.exit(0); }
-  const result: Options = { tenant: "default", apply: false, allowHttp: false }; const valued: Record<string, keyof Options> = { "--config": "config", "--auth-dir": "authDir", "--transport-policy-file": "transportPolicy", "--tenant": "tenant", "--target-api-base-url": "target", "--service-token-file": "token", "--source-identity-key-file": "sourceKey", "--ca-file": "ca" };
-  for (let index = 0; index < argv.length; index += 1) { const arg = argv[index]!; if (arg === "--apply") result.apply = true; else if (arg === "--allow-http-loopback") result.allowHttp = true; else if (valued[arg]) { const value = argv[++index]; if (!value) throw new ImportFailure(`${arg} requires a value`); (result as unknown as Record<string, unknown>)[valued[arg]!] = value; } else throw new ImportFailure(`unrecognized argument: ${arg}`); }
+  if (argv.includes("--help") || argv.includes("-h")) { process.stdout.write("usage: import-cpa-upstreams --config FILE --auth-dir DIR [--transport-policy-file FILE] [--tenant ID] [--apply] [--target-api-base-url URL] [--service-token-file FILE] [--source-identity-key-file FILE] [--ca-file FILE] [--allow-http-loopback]\n       import-cpa-upstreams --resolve-existing-route-bindings --config FILE --auth-dir DIR --source-identity-key-file FILE --provider-candidate-material-file FILE --binding-receipt-output FILE --target-api-base-url URL --service-token-file FILE [--transport-policy-file FILE] [--tenant ID] [--ca-file FILE] [--allow-http-loopback]\n\nImport real CPA config.yaml/auth-dir upstreams (dry-run by default), or read only deterministic direct-account bindings for provider-exact route review.\n"); process.exit(0); }
+  const result: Options = { tenant: "default", apply: false, resolveBindings: false, allowHttp: false }; const valued: Record<string, keyof Options> = { "--config": "config", "--auth-dir": "authDir", "--transport-policy-file": "transportPolicy", "--tenant": "tenant", "--target-api-base-url": "target", "--service-token-file": "token", "--source-identity-key-file": "sourceKey", "--provider-candidate-material-file": "candidateMaterial", "--binding-receipt-output": "bindingReceipt", "--ca-file": "ca" };
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index]!;
+    if (arg === "--apply") { if (result.apply) throw new ImportFailure("arguments are invalid"); result.apply = true; }
+    else if (arg === "--resolve-existing-route-bindings") { if (result.resolveBindings) throw new ImportFailure("arguments are invalid"); result.resolveBindings = true; }
+    else if (arg === "--allow-http-loopback") { if (result.allowHttp) throw new ImportFailure("arguments are invalid"); result.allowHttp = true; }
+    else if (valued[arg]) { const value = argv[++index]; if (!value || result[valued[arg]!] !== undefined) throw new ImportFailure(`${arg} requires one value`); (result as unknown as Record<string, unknown>)[valued[arg]!] = value; }
+    else throw new ImportFailure(`unrecognized argument: ${arg}`);
+  }
   if (!result.config || !result.authDir) throw new ImportFailure("--config and --auth-dir are required"); return result;
 }
 async function main(): Promise<void> {
@@ -533,8 +713,25 @@ async function main(): Promise<void> {
       matchedPrivateTargetBaseUrls: new Set<string>(),
       resultOriginsByBaseUrl: new Map<string, string[]>(),
       matchedResultOriginBaseUrls: new Set<string>(),
-    };
+  };
   const [inventory, secrets] = buildInventory(options.config!, options.authDir!, policy, options.allowHttp);
+  if (options.resolveBindings) {
+    if (options.apply || !options.target || !options.token || !options.sourceKey || !options.candidateMaterial || !options.bindingReceipt) throw new ImportFailure("binding resolution requires its explicit read-only inputs");
+    const identityKey = readSourceIdentityKey(options.sourceKey), candidateMaterial = readOwnerOnly(options.candidateMaterial, "provider candidate material", MAX_CONFIG_BYTES);
+    let output: OutputTarget | undefined;
+    try {
+      const target = upstreamUrl(options.target, "target API base URL", options.allowHttp);
+      const token = secretString(decodeUtf8(readOwnerOnly(options.token, "target service token file", MAX_SECRET_BYTES), "target service token file").replace(/\n$/, ""), "target service token file");
+      const receipt = await resolveExistingRouteBindings(target, token, options.tenant, inventory, identityKey, candidateMaterial, options.ca);
+      output = openSafeOutput(options.bindingReceipt); writeBindingReceipt(output, receipt);
+      const parsed = JSON.parse(receipt.toString("utf8")) as { bindings: unknown[]; quarantined: unknown[] };
+      process.stdout.write(`${JSON.stringify({ mode: "resolve-existing-route-bindings", provider_candidate_material_sha256: digest(candidateMaterial), binding_receipt_sha256: digest(receipt), bound_count: parsed.bindings.length, quarantined_count: parsed.quarantined.length })}\n`);
+      return;
+    } finally {
+      candidateMaterial.fill(0); identityKey.fill(0);
+      if (output) closeSync(output.parentDescriptor);
+    }
+  }
   let native: JsonObject[] = []; if (inventory.native.length > 0) { if (!options.sourceKey) throw new ImportFailure("source identity key file is required for opaque reauthorization records"); const key = readSourceIdentityKey(options.sourceKey); native = inventory.native.map((record) => ({ provider: record.provider, source_disabled: record.sourceDisabled, source_stable_id: createHmac("sha256", key).update(Buffer.concat([Buffer.from("memeloop-token-center\0cpa-native-reauthorization-source-id\0v1\0"), Buffer.from(record.sourceId)])).digest("hex") })); key.fill(0); }
   if (!options.apply || (inventory.direct.length === 0 && inventory.managed.length === 0)) { process.stdout.write(`${JSON.stringify(summary(options.apply ? "apply" : "dry-run", inventory, native))}\n`); return; }
   if (!options.target || !options.token) throw new ImportFailure("apply requires target API base URL and service token file"); const base = upstreamUrl(options.target, "target API base URL", options.allowHttp); const token = secretString(decodeUtf8(readOwnerOnly(options.token, "target service token file", MAX_SECRET_BYTES), "target service token file").replace(/\n$/, ""), "target service token file"); const counts = await apply(base, token, options.tenant, inventory, secrets, options.ca); process.stdout.write(`${JSON.stringify(summary("apply", inventory, native, counts))}\n`);
