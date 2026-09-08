@@ -64,7 +64,7 @@ try {
   const captureRoot = join(root, "source-capture");
   mkdirSync(captureRoot, { mode: 0o700 }); chmodSync(captureRoot, 0o700);
   const captureToken = join(captureRoot, "management.token");
-  writePrivate(captureToken, "fixture-management-token\n");
+  writePrivate(captureToken, "fixture-management-token");
   const capture = JSON.parse(execute(command("collect-cpa-source-snapshot"), [
     "--kubectl-binary", process.execPath,
     "--kubectl-argument", "--experimental-strip-types",

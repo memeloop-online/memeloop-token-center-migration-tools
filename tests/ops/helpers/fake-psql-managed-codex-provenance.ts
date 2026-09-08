@@ -10,6 +10,9 @@ const sql = Buffer.concat(chunks).toString("utf8");
 if (!sql.includes("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
   || !sql.includes("upstream_account_imports")
   || !sql.includes("accounts.credential_generation")
+  || !sql.includes("imports.tenant_id = (SELECT id FROM target_tenant)")
+  || sql.includes("source_tenant")
+  || sql.includes("source_import_tenant_external_id_b64")
   || /\b(?:INSERT|UPDATE|DELETE|ALTER|CREATE|DROP|LOCK)\b/u.test(sql)) process.exit(9);
 
 const serviceFile = process.env.PGSERVICEFILE;

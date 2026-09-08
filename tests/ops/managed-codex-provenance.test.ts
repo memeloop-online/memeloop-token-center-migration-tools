@@ -23,7 +23,8 @@ const sourceKeyPrefix = Buffer.from("4d54432d534f555243452d49442d4b45590001", "h
 const sha = (value: Buffer | string): string => createHash("sha256").update(value).digest("hex");
 const accountId = "10000000-0000-4000-8000-000000000001";
 const relativePath = "fixture-managed-codex.json";
-const sourceTenant = "fixture-import-tenant", targetTenant = "fixture-route-tenant";
+// This historical HMAC input intentionally has no current target DB tenant row.
+const sourceTenant = "fixture-retired-import-tenant", targetTenant = "fixture-route-tenant";
 const identityKey = createHash("sha256").update("fixture-managed-codex-source-identity-v1").digest(), pepper = Buffer.from("fixture-key-pepper");
 
 function protectedFile(path: string, value: Buffer | string): Buffer {

@@ -28,10 +28,13 @@ The owner prepares these files outside the repository:
   {"version":1,"source_import_tenant_external_id":"original-import-tenant","target_tenant_external_id":"current-route-tenant","source_kind":"auth_file","source_type":"codex"}
   ```
 
-  `source_import_tenant_external_id` is exactly the `tenant_external_id` sent
-  to the original managed-OAuth import. `target_tenant_external_id` is the
-  explicitly approved current route tenant. This file is the controlled
-  cross-tenant mapping; no historical tenant name is inferred.
+`source_import_tenant_external_id` is exactly the historical
+`tenant_external_id` string that was included in the original source-key HMAC.
+It is not a current database lookup. `target_tenant_external_id` is the
+explicitly approved current route tenant and is the only tenant looked up in
+PostgreSQL. This permits the historical tenant row to have been merged away
+while the durable import provenance row has moved to the current tenant. The
+mapping is controlled; no historical tenant name is inferred.
 
 - `--source-config-file` is the same current protected CPA config used to
   generate the managed candidate material.
@@ -91,11 +94,13 @@ memory:
    source-import-tenant + "\\0auth_file\\0" + relative-path)`.
 
 One bounded `REPEATABLE READ READ ONLY` PostgreSQL transaction then requires a
-unique `upstream_account_imports` record for that HMAC and original import
-tenant, whose account is in the explicitly mapped target tenant. It rejects a
-missing/extra result, a duplicate source or target account, any driver other
-than `openai-codex`, inactive status, non-OAuth or non-native lifecycle,
-missing current credential generation, or an invalid target CAS revision.
+unique `upstream_account_imports` record for that HMAC in the explicitly
+mapped current target tenant, whose account is in that same tenant. The
+historical tenant string is never queried as a current `tenants` row. It
+rejects a missing/extra result, a duplicate source or target account, any
+driver other than `openai-codex`, inactive status, non-OAuth or non-native
+lifecycle, missing current credential generation, or an invalid target CAS
+revision.
 It snapshots the current credential generation and `updated_at` together so a
 later account change cannot be silently treated as the reviewed target.
 It selects no account name, email, model configuration, OAuth ciphertext,

@@ -243,13 +243,19 @@ function archiveName(value: unknown, kind: string): string {
 async function parseArchive(raw: Buffer, maximum: number): Promise<ReadonlyMap<string, ArchiveEntry>> {
   return await new Promise((resolveArchive, rejectArchive) => {
     const entries = new Map<string, ArchiveEntry>(); let total = 0, count = 0, settled = false;
-    const parser = extract();
+    const parser = extract(), input = Readable.from(raw);
     const finish = (error?: CpaSourceCollectionFailure): void => {
       if (settled) return;
       settled = true;
       if (error) rejectArchive(error); else resolveArchive(entries);
     };
-    const abort = (error: CpaSourceCollectionFailure): void => { try { parser.destroy(error); } catch {} finish(error); };
+    const abort = (error: CpaSourceCollectionFailure): void => {
+      if (settled) return;
+      try { input.unpipe(parser); } catch {}
+      try { input.destroy(); } catch {}
+      try { parser.destroy(); } catch {}
+      finish(error);
+    };
     parser.on("entry", (header, stream, next) => {
       if (settled) { stream.resume(); return; }
       count += 1;
@@ -268,7 +274,7 @@ async function parseArchive(raw: Buffer, maximum: number): Promise<ReadonlyMap<s
         if (size > MAX_ENTRY_BYTES || total > maximum) { abort(new CpaSourceCollectionFailure("source archive exceeds the safety limit")); return; }
         chunks.push(value);
       });
-      stream.once("error", () => abort(new CpaSourceCollectionFailure("source archive could not be read")));
+      stream.on("error", () => abort(new CpaSourceCollectionFailure("source archive could not be read")));
       stream.once("end", () => {
         if (settled) return;
         if (size !== Number(header.size) || (kind === "directory" && size !== 0)) { abort(new CpaSourceCollectionFailure("source archive entry changed while being read")); return; }
@@ -276,9 +282,8 @@ async function parseArchive(raw: Buffer, maximum: number): Promise<ReadonlyMap<s
       });
     });
     parser.once("finish", () => finish());
-    parser.once("error", () => finish(new CpaSourceCollectionFailure("source archive is invalid")));
-    const input = Readable.from(raw);
-    input.once("error", () => abort(new CpaSourceCollectionFailure("source archive could not be read")));
+    parser.on("error", () => finish(new CpaSourceCollectionFailure("source archive is invalid")));
+    input.on("error", () => abort(new CpaSourceCollectionFailure("source archive could not be read")));
     input.pipe(parser);
   });
 }

@@ -287,9 +287,6 @@ WITH requested AS MATERIALIZED (
   SELECT source_stable_id, source_key
     FROM jsonb_to_recordset(convert_from(decode(:'requested_bindings_b64', 'base64'), 'UTF8')::jsonb)
       AS requested(source_stable_id text, source_key text)
-), source_tenant AS MATERIALIZED (
-  SELECT id FROM tenants
-   WHERE external_id = convert_from(decode(:'source_import_tenant_external_id_b64', 'base64'), 'UTF8')
 ), target_tenant AS MATERIALIZED (
   SELECT id FROM tenants
    WHERE external_id = convert_from(decode(:'target_tenant_external_id_b64', 'base64'), 'UTF8')
@@ -311,7 +308,7 @@ SELECT COALESCE(json_agg(json_build_object(
 ) ORDER BY requested.source_stable_id), '[]'::json)::text
   FROM requested
   JOIN upstream_account_imports imports
-    ON imports.tenant_id = (SELECT id FROM source_tenant)
+    ON imports.tenant_id = (SELECT id FROM target_tenant)
    AND imports.import_kind = 'cpa_managed_oauth'
    AND imports.source_key = requested.source_key
   JOIN upstream_accounts accounts
@@ -404,8 +401,8 @@ function queryExistingBindings(prepared: PreparedManagedCodexProvenance, service
   if (!Number.isSafeInteger(statementTimeoutMs) || statementTimeoutMs < 1 || statementTimeoutMs > MAX_STATEMENT_TIMEOUT_MS) throw new ManagedCodexProvenanceFailure("PostgreSQL statement timeout is invalid");
   if (psqlBinary !== "psql" && (!isAbsolute(psqlBinary) || psqlBinary !== resolve(psqlBinary) || psqlBinary.includes("\0"))) throw new ManagedCodexProvenanceFailure("psql binary path is invalid");
   const requested = Buffer.from(JSON.stringify(prepared.requests.map((item) => ({ source_stable_id: item.sourceStableId, source_key: item.sourceKey })))).toString("base64");
-  const sourceTenant = Buffer.from(prepared.evidence.sourceImportTenant, "utf8").toString("base64"), targetTenant = Buffer.from(prepared.evidence.targetTenant, "utf8").toString("base64");
-  const psqlInput = `\\set requested_bindings_b64 ${requested}\n\\set source_import_tenant_external_id_b64 ${sourceTenant}\n\\set target_tenant_external_id_b64 ${targetTenant}\n${querySql}`;
+  const targetTenant = Buffer.from(prepared.evidence.targetTenant, "utf8").toString("base64");
+  const psqlInput = `\\set requested_bindings_b64 ${requested}\n\\set target_tenant_external_id_b64 ${targetTenant}\n${querySql}`;
   const environment: NodeJS.ProcessEnv = { PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C", PGSERVICEFILE: serviceFile, PGSERVICE: service, PGAPPNAME: "mtc-managed-codex-provenance", PGCONNECT_TIMEOUT: "10" };
   const result = spawnSync(psqlBinary, ["-X", "--no-psqlrc", "--no-password", "-qAt", "--set=ON_ERROR_STOP=1", `--set=statement_timeout_ms=${statementTimeoutMs}`], { env: environment, input: psqlInput, shell: false, stdio: ["pipe", "pipe", "pipe"], timeout: 30_000, maxBuffer: MAX_BYTES });
   if (result.error || result.status !== 0) throw new ManagedCodexProvenanceFailure("managed Codex provenance query failed");

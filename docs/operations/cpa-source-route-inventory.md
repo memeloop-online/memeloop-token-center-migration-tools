@@ -65,6 +65,9 @@ state-PVC claim, state/config volume relationship, config `subPath`, and
 management port before every sensitive stage. The names and mount paths below
 are the reviewed CPA deployment layout; `CONTEXT`, `POD`, and `POD_UID` must be
 copied from the operator's read-only approved observation, not guessed.
+The management token is a single nonempty UTF-8 value with no leading,
+trailing, or embedded line-break whitespace; do not add a final newline when
+creating its `0600` file.
 
 ```text
 node /verified-release/operator-scripts/collect-cpa-source-snapshot.mjs \
