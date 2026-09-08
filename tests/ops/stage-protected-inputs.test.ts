@@ -65,41 +65,66 @@ function assertPrivateFile(path: string): void {
   assert.equal(stat.gid, targetGid);
 }
 
-test("copies standalone inputs and a recursive JSON auth tree with fences", () => {
+function assertPrivateDirectory(path: string): void {
+  const stat = lstatSync(path);
+  assert.equal(stat.isDirectory(), true);
+  assert.equal(stat.isSymbolicLink(), false);
+  assert.equal(stat.mode & 0o777, 0o700);
+  assert.equal(stat.uid, targetUid);
+  assert.equal(stat.gid, targetGid);
+}
+
+test("copies the full source staging shape with nested auth and an exact exclusion", () => {
   const root = workspace();
   try {
     const source = join(root, "source");
     const runtime = join(root, "runtime");
+    const inputs = join(root, "inputs");
     const auth = join(source, "auth");
     const nested = join(auth, "nested");
+    const logs = join(auth, "logs");
     privateDirectory(source);
     privateDirectory(runtime);
+    privateDirectory(inputs);
     privateDirectory(auth);
     privateDirectory(nested);
+    privateDirectory(logs);
     const config = join(source, "config.yaml");
+    const nativePolicy = join(auth, "cpa-key-access-policy-state.json");
+    const sourceIdentity = join(inputs, "source-identity.key");
     privateFile(config, "mode: fixture\n");
     privateFile(join(auth, "account.json"), "{\"provider\":\"fixture\"}\n");
     privateFile(join(nested, "account.json"), "{\"nested\":true}\n");
+    privateFile(join(logs, "debug.log"), "reviewed non-credential output\n");
+    privateFile(nativePolicy, "{\"version\":1,\"policies\":[],\"usage\":{}}\n");
+    privateFile(sourceIdentity, "fixture-identity\n");
 
     const result = receipt(runStage([
       "--copy", config, join(runtime, "config.yaml"),
       "--copy-auth-dir", auth, join(runtime, "auth"),
+      "--exclude-auth-subdir", "logs",
+      "--copy", nativePolicy, join(runtime, "native-key-policy.json"),
+      "--copy", sourceIdentity, join(runtime, "source-identity.key"),
     ]));
     assert.deepEqual(result, {
-      auth_file_count: 2,
+      auth_file_count: 3,
       checkpoint_present: false,
-      copied_count: 1,
-      excluded_directory_count: 0,
+      copied_count: 3,
+      excluded_directory_count: 1,
       target_gid: targetGid,
       target_uid: targetUid,
     });
     assertPrivateFile(join(runtime, "config.yaml"));
     assertPrivateFile(join(runtime, "auth/account.json"));
     assertPrivateFile(join(runtime, "auth/nested/account.json"));
+    assertPrivateFile(join(runtime, "auth/cpa-key-access-policy-state.json"));
+    assertPrivateFile(join(runtime, "native-key-policy.json"));
+    assertPrivateFile(join(runtime, "source-identity.key"));
     assert.deepEqual(readFileSync(join(runtime, "config.yaml")), readFileSync(config));
     assert.deepEqual(readFileSync(join(runtime, "auth/nested/account.json")), readFileSync(join(nested, "account.json")));
-    assert.equal(lstatSync(join(runtime, "auth")).mode & 0o777, 0o700);
-    assert.equal(lstatSync(join(runtime, "auth/nested")).mode & 0o777, 0o700);
+    assert.equal(existsSync(join(runtime, "auth/logs")), false);
+    assertPrivateDirectory(join(runtime, "auth"));
+    assertPrivateDirectory(join(runtime, "auth/nested"));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

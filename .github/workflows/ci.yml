@@ -104,7 +104,7 @@ jobs:
               "$IMAGE@$DIGEST" "$entrypoint" --help
           done
 
-      - name: Regress protected input publication with root CHOWN only
+      - name: Regress full protected source staging with root CHOWN only
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
@@ -117,13 +117,30 @@ jobs:
               test "$(cat /proc/sys/fs/protected_hardlinks)" = "1"
               test "$(grep ^CapEff: /proc/self/status | cut -f2)" = "0000000000000001"
               umask 077
-              mkdir /tmp/source /tmp/stage
+              mkdir -p /tmp/source/auth/nested /tmp/source/auth/logs /tmp/inputs /tmp/stage
               printf "fixture\n" > /tmp/source/config.yaml
-              chmod 0600 /tmp/source/config.yaml
-              /usr/local/bin/stage-protected-inputs --copy /tmp/source/config.yaml /tmp/stage/config.yaml
-              test "$(stat -c %a /tmp/stage/config.yaml)" = "600"
-              test "$(stat -c %u:%g /tmp/stage/config.yaml)" = "10001:10001"
-              test "$(stat -c %h /tmp/stage/config.yaml)" = "1"
+              printf "{\"provider\":\"fixture\"}\n" > /tmp/source/auth/account.json
+              printf "{\"nested\":true}\n" > /tmp/source/auth/nested/account.json
+              printf "reviewed non-credential output\n" > /tmp/source/auth/logs/debug.log
+              printf "{\"version\":1,\"policies\":[],\"usage\":{}}\n" > /tmp/source/auth/cpa-key-access-policy-state.json
+              printf "fixture-identity\n" > /tmp/inputs/source-identity.key
+              chmod 0600 /tmp/source/config.yaml /tmp/source/auth/account.json /tmp/source/auth/nested/account.json /tmp/source/auth/logs/debug.log /tmp/source/auth/cpa-key-access-policy-state.json /tmp/inputs/source-identity.key
+              /usr/local/bin/stage-protected-inputs \
+                --copy /tmp/source/config.yaml /tmp/stage/config.yaml \
+                --copy-auth-dir /tmp/source/auth /tmp/stage/auth \
+                --exclude-auth-subdir logs \
+                --copy /tmp/source/auth/cpa-key-access-policy-state.json /tmp/stage/native-key-policy.json \
+                --copy /tmp/inputs/source-identity.key /tmp/stage/source-identity.key
+              for file in /tmp/stage/config.yaml /tmp/stage/auth/account.json /tmp/stage/auth/nested/account.json /tmp/stage/auth/cpa-key-access-policy-state.json /tmp/stage/native-key-policy.json /tmp/stage/source-identity.key; do
+                test "$(stat -c %a "$file")" = "600"
+                test "$(stat -c %u:%g "$file")" = "10001:10001"
+                test "$(stat -c %h "$file")" = "1"
+              done
+              for directory in /tmp/stage/auth /tmp/stage/auth/nested; do
+                test "$(stat -c %a "$directory")" = "700"
+                test "$(stat -c %u:%g "$directory")" = "10001:10001"
+              done
+              test ! -e /tmp/stage/auth/logs
             '
 
       - name: Emit the immutable digest and manifest

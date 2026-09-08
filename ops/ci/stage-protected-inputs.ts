@@ -385,7 +385,7 @@ function privateDirectory(path: string, label: string): BigFileStat {
   return stat;
 }
 
-function createPrivateDirectory(path: string, uid: number, gid: number, label: string): void {
+function createPrivateDirectory(path: string, label: string): void {
   assertParent(path, label);
   try {
     const existing = lstatSync(path, { bigint: true });
@@ -394,9 +394,18 @@ function createPrivateDirectory(path: string, uid: number, gid: number, label: s
     if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") throw error;
   }
   mkdirSync(path, { mode: 0o700 });
-  chownRequested(path, uid, gid);
-  const stat = privateDirectory(path, label);
-  if (stat.uid !== BigInt(uid) || stat.gid !== BigInt(gid)) fail(`${label} has an unexpected owner`);
+  privateDirectory(path, label);
+}
+
+function fencePrivateDirectory(path: string, uid: number, gid: number, label: string): void {
+  try {
+    chownRequested(path, uid, gid);
+    const stat = privateDirectory(path, label);
+    if (stat.uid !== BigInt(uid) || stat.gid !== BigInt(gid)) fail(`${label} has an unexpected owner`);
+  } catch (error) {
+    if (error instanceof StageError) throw error;
+    failSystemStage(error);
+  }
 }
 
 type AuthTreeResult = Readonly<{
@@ -416,7 +425,11 @@ function copyAuthTree(
   exclusions: ReadonlySet<string>,
 ): AuthTreeResult {
   privateDirectory(source, `${label} source`);
-  createPrivateDirectory(target, uid, gid, label);
+  // Keep a newly created 0700 directory owned by the root staging process
+  // until every child is published. With only CAP_CHOWN, root cannot search or
+  // create in a directory already handed to the non-root consumer. Recursion
+  // therefore fences each directory post-order, without adding DAC/FOWNER.
+  createPrivateDirectory(target, label);
   let copiedFiles = 0;
   let excludedDirectories = 0;
   const matchedExclusions = new Set<string>();
@@ -444,6 +457,7 @@ function copyAuthTree(
     copyProtectedFile({ source: sourcePath, target: targetPath }, uid, gid, maxBytes);
     copiedFiles += 1;
   }
+  fencePrivateDirectory(target, uid, gid, label);
   return { copiedFiles, excludedDirectories, matchedExclusions };
 }
 
