@@ -204,6 +204,26 @@ test("rejects symlinks, hardlinks, unsafe modes, overwrites, and oversized input
   }
 });
 
+test("reports only a safe staging phase and errno for an unpublished destination failure", () => {
+  const root = workspace();
+  const source = join(root, "source");
+  const runtime = join(root, "runtime");
+  try {
+    privateDirectory(source);
+    privateDirectory(runtime);
+    const config = join(source, "config.yaml");
+    privateFile(config, "private-fixture-content\n");
+    chmodSync(runtime, 0o500);
+    const result = runStage(["--copy", config, join(runtime, "config.yaml")]);
+    assert.notEqual(result.status, 0, `unexpected success: ${result.stdout}`);
+    assert.match(result.stderr, /^protected input staging failed \(EACCES\)\n$/);
+    assert.doesNotMatch(result.stderr, /private-fixture-content|config\.yaml|runtime/);
+  } finally {
+    try { chmodSync(runtime, 0o700); } catch {}
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("fences an existing checkpoint and rejects unsafe checkpoint links", () => {
   const root = workspace();
   try {

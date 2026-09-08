@@ -104,6 +104,28 @@ jobs:
               "$IMAGE@$DIGEST" "$entrypoint" --help
           done
 
+      - name: Regress protected input publication with root CHOWN only
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          test -n "$DIGEST"
+          test "${DIGEST#sha256:}" != "$DIGEST"
+          docker run --rm --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=8m \
+            --user 0:0 --security-opt no-new-privileges --cap-drop ALL --cap-add CHOWN \
+            --entrypoint /bin/sh "$IMAGE@$DIGEST" -ec '
+              test "$(cat /proc/sys/fs/protected_hardlinks)" = "1"
+              test "$(grep ^CapEff: /proc/self/status | cut -f2)" = "0000000000000001"
+              umask 077
+              mkdir /tmp/source /tmp/stage
+              printf "fixture\n" > /tmp/source/config.yaml
+              chmod 0600 /tmp/source/config.yaml
+              /usr/local/bin/stage-protected-inputs --copy /tmp/source/config.yaml /tmp/stage/config.yaml
+              test "$(stat -c %a /tmp/stage/config.yaml)" = "600"
+              test "$(stat -c %u:%g /tmp/stage/config.yaml)" = "10001:10001"
+              test "$(stat -c %h /tmp/stage/config.yaml)" = "1"
+            '
+
       - name: Emit the immutable digest and manifest
         id: evidence
         env:

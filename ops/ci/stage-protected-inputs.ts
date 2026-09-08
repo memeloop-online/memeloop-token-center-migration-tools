@@ -30,7 +30,7 @@ import {
   writeSync,
 } from "node:fs";
 import type { BigIntStats } from "node:fs";
-import { basename, dirname, extname, isAbsolute, join } from "node:path";
+import { dirname, extname, isAbsolute, join } from "node:path";
 
 const DEFAULT_UID = 10001;
 const DEFAULT_GID = 10001;
@@ -270,6 +270,17 @@ function descriptorStat(fd: number, label: string): BigFileStat {
   }
 }
 
+function safeSystemErrorCode(error: unknown): string | undefined {
+  if (!error || typeof error !== "object" || !("code" in error)) return undefined;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" && /^[A-Z][A-Z0-9_]{0,31}$/.test(code) ? code : undefined;
+}
+
+function failSystemStage(error: unknown): never {
+  const code = safeSystemErrorCode(error);
+  fail(code === undefined ? "protected input staging failed" : `protected input staging failed (${code})`);
+}
+
 function openSource(path: string): { fd: number; stat: BigFileStat } {
   const listed = asBigFileStat(path, "source input");
   privateRegular(listed, "source input");
@@ -317,7 +328,6 @@ function copyProtectedFile(request: CopyRequest, uid: number, gid: number, maxBy
   try {
     targetFd = openSync(temporary, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
     fchmodSync(targetFd, 0o600);
-    fchownRequested(targetFd, uid, gid);
     const buffer = Buffer.allocUnsafe(1024 * 1024);
     let total = 0;
     while (true) {
@@ -329,25 +339,37 @@ function copyProtectedFile(request: CopyRequest, uid: number, gid: number, maxBy
       while (offset < length) offset += writeSync(targetFd, buffer, offset, length - offset);
     }
     fchmodSync(targetFd, 0o600);
-    fchownRequested(targetFd, uid, gid);
     fsyncSync(targetFd);
     const copied = descriptorStat(targetFd, "staged input");
-    if (!copied.isFile() || copied.nlink !== 1n || (copied.mode & 0o777n) !== PRIVATE_MODE || copied.uid !== BigInt(uid) || copied.gid !== BigInt(gid)) {
+    if (!copied.isFile() || copied.nlink !== 1n || (copied.mode & 0o777n) !== PRIVATE_MODE) {
       fail("staged input could not be fenced");
     }
     const sourceAfter = descriptorStat(source.fd, "source input");
     if (!sameFile(source.stat, sourceAfter)) fail("source input changed while copying");
-    closeSync(targetFd);
-    targetFd = -1;
 
     // link+unlink gives a no-overwrite publish: rename would replace a path
     // created by a concurrent actor, while link fails atomically with EEXIST.
+    // Keep the temporary file owned by the root staging process until the
+    // link exists. On Linux with protected_hardlinks=1, a root process limited
+    // to CAP_CHOWN cannot link a 0600 file after it has been chowned to the
+    // non-root consumer. The retained descriptor then fences the published
+    // inode's final ownership without adding CAP_FOWNER or CAP_DAC_OVERRIDE.
     linkSync(temporary, request.target);
+    fchownRequested(targetFd, uid, gid);
+    fchmodSync(targetFd, 0o600);
+    fsyncSync(targetFd);
     unlinkSync(temporary);
-    assertDestination(request.target, uid, gid, "staged input");
+    const published = descriptorStat(targetFd, "staged input");
+    if (!published.isFile() || published.nlink !== 1n || (published.mode & 0o777n) !== PRIVATE_MODE || published.uid !== BigInt(uid) || published.gid !== BigInt(gid)) {
+      fail("staged input could not be fenced");
+    }
+    const publishedPath = assertDestination(request.target, uid, gid, "staged input");
+    if (!sameFile(published, publishedPath)) fail("staged input changed after publication");
+    closeSync(targetFd);
+    targetFd = -1;
   } catch (error) {
     if (error instanceof StageError) throw error;
-    fail(`could not stage ${basename(request.target)}`);
+    failSystemStage(error);
   } finally {
     if (targetFd >= 0) closeSync(targetFd);
     try { unlinkSync(temporary); } catch (error) {
