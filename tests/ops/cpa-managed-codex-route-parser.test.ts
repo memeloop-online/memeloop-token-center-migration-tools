@@ -95,8 +95,8 @@ describe("managed CPA Codex OAuth route parser", () => {
 
   it("pins a sealed registry observation to the same copied source config", () => {
     const authFiles: readonly CapturedAuth[] = [
-      { id: csil, provider: "codex", disabled: false, status: "active" },
-      { id: dongwu, provider: "codex", disabled: false, status: "active" },
+      { id: csil, provider: "codex" as const, disabled: false, status: "active" },
+      { id: dongwu, provider: "codex" as const, disabled: false, status: "active" },
     ].sort((left, right) => left.id.localeCompare(right.id, "en"));
     const modelEntries: readonly CapturedModels[] = authFiles.map((item) => ({ auth_id: item.id, provider: "codex", registered_models: item.id === csil ? ["codex-csil/gpt-5.6-terra"] : ["codex-dongwu/gpt-5.6-terra"] }));
     const built = buildManagedCodexModelSnapshot(config, authFiles, modelEntries, authFiles, modelEntries);

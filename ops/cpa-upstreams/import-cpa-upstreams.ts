@@ -472,7 +472,7 @@ function text(value: unknown, label: string, pattern?: RegExp): string {
   return value;
 }
 function integer(value: unknown, label: string): number {
-  if (!Number.isSafeInteger(value) || value < 0 || value > 1_000_000_000_000_000) throw new ImportFailure(`${label} is invalid`);
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || value > 1_000_000_000_000_000) throw new ImportFailure(`${label} is invalid`);
   return value;
 }
 function canonicalJson(value: unknown, label: string, depth = 0): string {
@@ -547,7 +547,7 @@ function buildBindingReceipt(candidateRaw: Buffer, inventory: Inventory, identit
   for (const account of targetAccounts) {
     const current = targetsByName.get(account.name); if (current) current.push(account); else targetsByName.set(account.name, [account]);
   }
-  const bindings: BindingReceipt["bindings"] = [], quarantined: BindingReceipt["quarantined"] = [];
+  const bindings: Array<BindingReceipt["bindings"][number]> = [], quarantined: Array<BindingReceipt["quarantined"][number]> = [];
   for (const candidate of material.candidates) {
     const source = sourceAccounts.get(candidate.sourceStableId);
     if (!source) { quarantined.push({ sourceStableId: candidate.sourceStableId, sourceProvider: candidate.sourceProvider, reason: "source_candidate_unavailable" }); continue; }
