@@ -203,6 +203,11 @@ export async function run(argv = process.argv.slice(2)): Promise<Readonly<Record
   }
 }
 
-if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {
+function invokedAsSnapshotEntrypoint(): boolean {
+  const invoked = process.argv[1];
+  return invoked !== undefined && ["export-cpa-managed-codex-model-snapshot.ts", "export-cpa-managed-codex-model-snapshot.mjs"].includes(basename(invoked));
+}
+
+if (invokedAsSnapshotEntrypoint()) {
   run().then((result) => process.stdout.write(`${JSON.stringify(result)}\n`)).catch(() => { process.stderr.write("CPA managed Codex model snapshot stopped\n"); process.exitCode = 2; });
 }
