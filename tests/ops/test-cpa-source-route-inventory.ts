@@ -129,6 +129,24 @@ describe("CPA source route inventory exporter", () => {
     const unresolved = spawnSync(process.execPath, exportArguments(missing, missingOutput), { encoding: "utf8" }); assert.equal(unresolved.status, 2); assert.equal(existsSync(join(missingOutput, "source-inventory.json")), false); assert.equal(existsSync(join(missingOutput, "provider-candidate-material.json")), false);
   });
 
+  it("records each Kimi OAuth source capability gap and every affected exact grant without manufacturing a direct pool", () => {
+    const root = mkdtempSync(join(tmpdir(), "mtc-kimi-source-capability-gap-")), source = writeSource(root), output = join(root, "output"); mkdirSync(output, { mode: 0o700 });
+    writeFileSync(join(source.auth, "kimi-first.json"), JSON.stringify({ type: "kimi", opaque: "fixture-only-kimi-first" }), { mode: 0o600 });
+    writeFileSync(join(source.auth, "kimi-second.json"), JSON.stringify({ type: "kimi", opaque: "fixture-only-kimi-second" }), { mode: 0o600 });
+    const result = spawnSync(process.execPath, exportArguments(source, output), { encoding: "utf8" }); assert.equal(result.status, 0, result.stderr);
+    const receipt = JSON.parse(result.stdout) as Record<string, unknown>, sourceInventory = JSON.parse(readFileSync(join(output, "source-inventory.json"), "utf8")) as Record<string, unknown>, material = JSON.parse(readFileSync(join(output, "provider-candidate-material.json"), "utf8")) as Record<string, unknown>;
+    assert.equal(receipt.source_mapping_count, 6); assert.equal(receipt.provider_candidate_set_count, 6); assert.equal(receipt.source_account_candidate_count, 6);
+    assert.equal(receipt.reauthorization_required_count, 3); assert.equal(receipt.source_capability_gap_auth_count, 2); assert.equal(receipt.source_capability_gap_grant_count, 1); assert.equal(receipt.anomaly_count, 2);
+    assert.equal((sourceInventory.mappings as Array<Record<string, unknown>>).some((item) => item.provider === "kimi"), false);
+    const remediation = sourceInventory.reauthorization_required as Array<Record<string, unknown>>;
+    assert.deepEqual(remediation.map((item) => item.provider), ["copilot", "kimi", "kimi"]);
+    assert.equal(new Set(remediation.map((item) => item.source_stable_id)).size, 3);
+    assert.deepEqual((sourceInventory.anomalies as Array<Record<string, unknown>>).filter((item) => item.provider === "kimi"), [{ provider: "kimi", model: "kimi-k2", reason: "source capability gap: target lacks a managed OAuth adapter" }]);
+    assert.equal((material.provider_candidate_sets as Array<Record<string, unknown>>).some((item) => (item.source as Record<string, unknown>).provider === "kimi"), false);
+    const outputText = `${result.stdout}${result.stderr}${readFileSync(join(output, "source-inventory.json"), "utf8")}${readFileSync(join(output, "provider-candidate-material.json"), "utf8")}`;
+    assert.doesNotMatch(outputText, /fixture-only-kimi|kimi-(?:first|second)\.json/u);
+  });
+
   it("unifies only registry-proven managed Codex OAuth candidates in their exact classify groups", () => {
     const root = mkdtempSync(join(tmpdir(), "mtc-managed-codex-route-")), source = join(root, "source"), auth = join(source, "auth"), output = join(root, "output");
     mkdirSync(auth, { recursive: true, mode: 0o700 }); mkdirSync(output, { mode: 0o700 }); chmodSync(source, 0o700); chmodSync(auth, 0o700);

@@ -165,11 +165,19 @@ new candidates or force a re-import.
 
 `source-inventory.json` is version 2 and can be used directly as
 `import-cpa-model-routes --source-inventory-file`. It preserves every exact
-source coordinate and reports opaque Copilot/Cursor records only as
+mappable source coordinate and records source-authorization remediation as
 `reauthorization_required` objects containing `provider` and a stable,
-domain-separated HMAC-SHA256 `source_stable_id`. It never emits auth handles,
-logins, labels, emails, paths, credentials, tokens, source key material, or
-raw/key hashes. Stdout is a count-and-digest receipt only.
+domain-separated HMAC-SHA256 `source_stable_id`. Copilot/Cursor entries are
+native reauthorization work; an observed `provider: "kimi"` entry means an
+already-authorized source account has a target managed-OAuth capability gap.
+The exporter emits one such opaque ID per source auth file, plus a fixed
+capability-gap anomaly for every exact enabled Kimi policy grant. It emits no
+Kimi mapping, candidate pool, driver, bridge route, auth handle, login, label,
+email, path, credential, token, source key material, or raw/key hash. The
+count-and-digest receipt includes both
+`source_capability_gap_auth_count` and
+`source_capability_gap_grant_count`; a capability-gap anomaly cannot be
+quarantined into a partial route migration.
 
 `provider-candidate-material.json` seals one target-independent version 1 candidate set
 per source mapping: exact source, upstream model, protocol,

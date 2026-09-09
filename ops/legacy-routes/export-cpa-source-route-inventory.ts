@@ -4,7 +4,7 @@
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import { closeSync, constants, fstatSync, fsyncSync, linkSync, lstatSync, openSync, unlinkSync, writeSync } from "node:fs";
 import { basename, dirname, isAbsolute, parse, relative, resolve, sep } from "node:path";
-import { cpaRouteSourceStableId, inspectCpaSourceRoutes, readSourceIdentityKey, type CpaRouteModel } from "../cpa-upstreams/import-cpa-upstreams.ts";
+import { cpaRouteSourceStableId, inspectCpaSourceRoutes, readSourceIdentityKey, type CpaManagedOAuthCapabilityGap, type CpaRouteModel } from "../cpa-upstreams/import-cpa-upstreams.ts";
 import { invokedAsEntrypoint } from "../lib/invoked-as-entrypoint.ts";
 import { parseNativePolicy, readProtectedFile, type SourceGrant } from "../legacy-policy/import-cpa-key-policy.ts";
 import {
@@ -20,6 +20,8 @@ const MAX_CONFIG_BYTES = 4 * 1024 * 1024;
 const STABLE_ID = /^[0-9a-f]{64}$/;
 const SOURCE_FIELD = /^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,199}$/;
 const OPAQUE_ACCOUNT_DOMAIN = "memeloop-token-center\0cpa-native-reauthorization-source-id\0v1\0";
+const MANAGED_OAUTH_CAPABILITY_GAP_DOMAIN = "memeloop-token-center\0cpa-managed-oauth-capability-gap-source-id\0v1\0";
+const MANAGED_OAUTH_CAPABILITY_GAP_REASON = "source capability gap: target lacks a managed OAuth adapter";
 
 type Protocol = "openai" | "anthropic";
 type Source = Readonly<{ provider: string; model: string; group: string | null; upstream_prefix: string | null; protocol: Protocol }>;
@@ -61,14 +63,21 @@ function modelIndex(models: readonly CpaRouteModel[]): ReadonlyMap<string, reado
 }
 
 /** Pure construction step: it receives only parsed non-secret coordinates and policy grants. */
-export function buildArtifacts(models: readonly CpaRouteModel[], opaque: readonly { sourceId: string; provider: string }[], grants: readonly SourceGrant[], identityKey: Buffer): Artifacts {
+export function buildArtifacts(models: readonly CpaRouteModel[], opaque: readonly { sourceId: string; provider: string }[], capabilityGaps: readonly CpaManagedOAuthCapabilityGap[], grants: readonly SourceGrant[], identityKey: Buffer): Artifacts {
   if (identityKey.length !== 32) throw new SourceRouteExportFailure("source identity key is invalid");
   if (models.some((model) => !publicField(model.provider) || !publicField(model.model) || !publicField(model.upstreamModel) || (model.upstreamPrefix !== null && !publicField(model.upstreamPrefix)))) throw new SourceRouteExportFailure("configured route model contains an unsafe public coordinate");
   const lookup = modelIndex(models), mappings = new Map<string, Source>(), pools = new Map<string, CandidateSet>(), anomalies = new Map<string, Anomaly>();
+  const missingManagedKimiAdapter = capabilityGaps.some((item) => item.sourceType === "kimi"); let capabilityGapGrantCount = 0;
   const addAnomaly = (item: Anomaly): void => { anomalies.set(JSON.stringify([item.provider, item.model, item.reason]), item); };
   for (const grant of grants) {
     const parsed = exactGrant(grant);
     if (isAnomaly(parsed)) { addAnomaly(parsed); continue; }
+    // This is a source capability gap, not a direct candidate.  Even a
+    // same-named config provider cannot substitute for an observed Kimi OAuth
+    // account, because doing so would silently change the source pool.
+    if (missingManagedKimiAdapter && parsed.provider === "kimi") {
+      capabilityGapGrantCount += 1; addAnomaly({ provider: parsed.provider, model: parsed.model, reason: MANAGED_OAUTH_CAPABILITY_GAP_REASON }); continue;
+    }
     const matches = lookup.get(JSON.stringify([parsed.provider, parsed.model, parsed.upstream_prefix])) ?? [];
     if (matches.length === 0) throw new SourceRouteExportFailure("source grant lacks an exact configured route model");
     if (matches.length !== 1) throw new SourceRouteExportFailure("source grant has an ambiguous configured route model");
@@ -81,12 +90,15 @@ export function buildArtifacts(models: readonly CpaRouteModel[], opaque: readonl
     if (current && JSON.stringify(current) !== JSON.stringify(candidateSet)) throw new SourceRouteExportFailure("source mapping has conflicting provider candidate material");
     mappings.set(sourceKey, source); pools.set(sourceKey, candidateSet);
   }
-  if (mappings.size > MAX_MAPPINGS || anomalies.size > MAX_MAPPINGS || opaque.length > MAX_MAPPINGS) throw new SourceRouteExportFailure("source route inventory exceeds the supported safety boundary");
+  if (mappings.size > MAX_MAPPINGS || anomalies.size > MAX_MAPPINGS || opaque.length + capabilityGaps.length > MAX_MAPPINGS) throw new SourceRouteExportFailure("source route inventory exceeds the supported safety boundary");
   const reauthorization = opaque.map((item) => {
     const provider = publicField(item.provider); if (!provider || (provider !== "copilot" && provider !== "cursor")) throw new SourceRouteExportFailure("opaque source reauthorization record is invalid");
     return { provider, source_stable_id: stableId(identityKey, OPAQUE_ACCOUNT_DOMAIN, item.sourceId) };
-  }).sort((left, right) => compare(`${left.provider}\0${left.source_stable_id}`, `${right.provider}\0${right.source_stable_id}`));
-  if (new Set(reauthorization.map((item) => item.source_stable_id)).size !== reauthorization.length) throw new SourceRouteExportFailure("opaque source reauthorization identity is duplicated");
+  }).concat(capabilityGaps.map((item) => {
+    if (item.sourceType !== "kimi" || !item.sourceId) throw new SourceRouteExportFailure("managed OAuth capability gap record is invalid");
+    return { provider: item.sourceType, source_stable_id: stableId(identityKey, MANAGED_OAUTH_CAPABILITY_GAP_DOMAIN, item.sourceId) };
+  })).sort((left, right) => compare(`${left.provider}\0${left.source_stable_id}`, `${right.provider}\0${right.source_stable_id}`));
+  if (new Set(reauthorization.map((item) => item.source_stable_id)).size !== reauthorization.length) throw new SourceRouteExportFailure("source authorization remediation identity is duplicated");
   const sourceMappings = [...mappings.values()].sort((left, right) => compare(key(left), key(right)));
   const anomalyList = [...anomalies.values()].sort((left, right) => compare(JSON.stringify([left.provider, left.model, left.reason]), JSON.stringify([right.provider, right.model, right.reason])));
   const sourceInventory = Buffer.from(`${JSON.stringify({ version: 2, mappings: sourceMappings, reauthorization_required: reauthorization, anomalies: anomalyList })}\n`);
@@ -100,6 +112,8 @@ export function buildArtifacts(models: readonly CpaRouteModel[], opaque: readonl
       provider_candidate_set_count: candidateSets.length,
       source_account_candidate_count: candidateSets.reduce((sum, item) => sum + item.candidates.length, 0),
       reauthorization_required_count: reauthorization.length,
+      source_capability_gap_auth_count: capabilityGaps.length,
+      source_capability_gap_grant_count: capabilityGapGrantCount,
       anomaly_count: anomalyList.length,
     },
   };
@@ -166,6 +180,8 @@ function combineArtifacts(direct: Artifacts, managed: readonly ManagedCodexRoute
       provider_candidate_set_count: candidateSets.length,
       source_account_candidate_count: candidateSets.reduce((sum, item) => sum + item.candidates.length, 0),
       reauthorization_required_count: (sourceDocument.reauthorization_required as unknown[]).length,
+      source_capability_gap_auth_count: direct.counts.source_capability_gap_auth_count ?? 0,
+      source_capability_gap_grant_count: direct.counts.source_capability_gap_grant_count ?? 0,
       anomaly_count: anomalyList.length,
     },
   };
@@ -176,7 +192,7 @@ function sourceFromManaged(value: Source): { provider: "codex"; model: string; g
   return { provider: "codex", model: value.model, group: value.group, upstream_prefix: value.upstream_prefix, protocol: "openai" };
 }
 function buildManagedAwareArtifacts(
-  inspection: Readonly<{ models: readonly CpaRouteModel[]; opaqueReauthorizations: readonly { sourceId: string; provider: string }[] }>,
+  inspection: Readonly<{ models: readonly CpaRouteModel[]; opaqueReauthorizations: readonly { sourceId: string; provider: string }[]; managedOAuthCapabilityGaps: readonly CpaManagedOAuthCapabilityGap[] }>,
   grants: readonly SourceGrant[],
   identityKey: Buffer,
   configRaw: Buffer,
@@ -194,7 +210,7 @@ function buildManagedAwareArtifacts(
     if (isCustomClassifyGroup(parsed.group)) managedSources.set(key(parsed), parsed);
     else directGrants.push(grant);
   }
-  const direct = buildArtifacts(inspection.models, inspection.opaqueReauthorizations, directGrants, identityKey);
+  const direct = buildArtifacts(inspection.models, inspection.opaqueReauthorizations, inspection.managedOAuthCapabilityGaps, directGrants, identityKey);
   const snapshot = parseManagedCodexModelSnapshot(snapshotRaw); assertManagedCodexModelSnapshotConfig(snapshot, configRaw);
   const managed = managedSources.size === 0 ? [] : inspectManagedCodexRouteModels(configRaw, readManagedCodexAuthInputs(authDirectory), snapshot.auth_models, [...managedSources.values()].sort((left, right) => compare(key(left), key(right))).map(sourceFromManaged), identityKey, { allow_missing_candidates: true });
   const managedCovered = new Set(managed.map((item) => key(item.source)));
@@ -283,7 +299,7 @@ export function run(argv = process.argv.slice(2)): Readonly<Record<string, strin
     if (managedAuths.length === 0 && selected.managedCodexModelSnapshot) throw new SourceRouteExportFailure("managed Codex model snapshot was supplied without a managed Codex OAuth source");
     const grants = policy.filter((item) => item.enabled).flatMap((item) => item.grants);
     let artifacts: Artifacts;
-    if (managedAuths.length === 0) artifacts = buildArtifacts(inspection.models, inspection.opaqueReauthorizations, grants, identityKey);
+    if (managedAuths.length === 0) artifacts = buildArtifacts(inspection.models, inspection.opaqueReauthorizations, inspection.managedOAuthCapabilityGaps, grants, identityKey);
     else {
       configRaw = readProtectedFile(selected.config!, "CPA source config", MAX_CONFIG_BYTES);
       snapshotRaw = readProtectedFile(selected.managedCodexModelSnapshot!, "managed Codex model snapshot");

@@ -28,6 +28,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12
 const SHA = /^[0-9a-f]{64}$/;
 const TOKEN = /^[^\0\r\n]{1,16384}$/;
 const MAX_BYTES = 8 * 1024 * 1024;
+const MANAGED_OAUTH_CAPABILITY_GAP_REASON = "source capability gap: target lacks a managed OAuth adapter";
 
 export class RouteImportFailure extends Error {
   readonly counts?: Readonly<Record<string, number>>;
@@ -137,6 +138,7 @@ export function parseManifest(raw: Buffer, sourceDigest: string, upstreamDigest:
   if ((version !== 1 && version !== 2) || text(root.source_inventory_sha256, "reviewed manifest", SHA) !== sourceDigest || text(root.upstream_inventory_sha256, "reviewed manifest", SHA) !== upstreamDigest || !Array.isArray(root.routes) || root.routes.length > 1000) throw new RouteImportFailure("reviewed manifest does not match the selected inventories");
   const tenant = text(root.tenant_external_id, "reviewed manifest tenant");
   const targetBaseUrl = text(root.target_api_base_url, "reviewed target API base URL");
+  if (sourceInventory?.anomalies.some((item) => item.reason === MANAGED_OAUTH_CAPABILITY_GAP_REASON)) throw new RouteImportFailure("source capability gap has no target adapter and cannot be quarantined");
   let quarantinedAnomalies = 0;
   if (version === 2) {
     if (!sourceInventory) throw new RouteImportFailure("reviewed manifest anomaly binding cannot be verified");

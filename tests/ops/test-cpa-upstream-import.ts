@@ -73,6 +73,46 @@ describe("CPA upstream TypeScript operators", () => {
     assert.doesNotMatch(result.stdout + result.stderr, /fixture-only-|Fixture(Copilot|Cursor)Handle/);
   });
 
+  it("records the observed Kimi OAuth type as a target capability gap and blocks apply before network access", async () => {
+    const root = mkdtempSync(join(tmpdir(), "mtc-cpa-kimi-capability-gap-"));
+    const source = join(root, "source"); cpSync(join(fixtures, "supported"), source, { recursive: true });
+    const auth = join(source, "auth");
+    writeFileSync(join(auth, "kimi-first.json"), JSON.stringify({ type: "kimi", opaque: "fixture-only-kimi-first" }), { mode: 0o600 });
+    writeFileSync(join(auth, "kimi-second.json"), JSON.stringify({ type: "kimi", opaque: "fixture-only-kimi-second", disabled: true }), { mode: 0o600 });
+    privateTree(source);
+    const key = join(source, "source-identity.key"); assert.equal(spawnSync(process.execPath, [generator, key]).status, 0);
+    try {
+      const dry = spawnSync(process.execPath, [importer, "--config", join(source, "config.yaml"), "--auth-dir", auth, "--source-identity-key-file", key], { encoding: "utf8" });
+      assert.equal(dry.status, 0, dry.stderr);
+      const summary = JSON.parse(dry.stdout) as Record<string, unknown>;
+      assert.equal(summary.api_account_count, 6);
+      assert.equal(summary.managed_oauth_account_count, 0);
+      assert.equal(summary.source_capability_gap_count, 2);
+      assert.deepEqual(summary.source_capability_gap_source_type_counts, { kimi: 2 });
+      const gaps = summary.source_capability_gaps as Array<Record<string, unknown>>;
+      assert.equal(gaps.length, 2);
+      assert.deepEqual(gaps.map((item) => Object.keys(item).sort()), [["source_disabled", "source_stable_id", "source_type"], ["source_disabled", "source_stable_id", "source_type"]]);
+      assert.deepEqual(gaps.map((item) => item.source_type), ["kimi", "kimi"]);
+      assert.equal(new Set(gaps.map((item) => item.source_stable_id)).size, 2);
+      assert.doesNotMatch(`${dry.stdout}${dry.stderr}`, /fixture-only-kimi|kimi-(?:first|second)\.json/u);
+
+      let requests = 0;
+      const server = createServer((_request, response) => { requests += 1; response.statusCode = 500; response.end("{}"); });
+      await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+      try {
+        const address = server.address(); assert(address && typeof address === "object");
+        const token = join(root, "service-token"); writeFileSync(token, "fixture-only-target-service-token\n", { mode: 0o600 });
+        await assert.rejects(execFileAsync(process.execPath, [importer, "--config", join(source, "config.yaml"), "--auth-dir", auth, "--source-identity-key-file", key, "--apply", "--allow-http-loopback", "--target-api-base-url", `http://127.0.0.1:${address.port}`, "--service-token-file", token], { timeout: 20_000 }), /capability gap/u);
+        assert.equal(requests, 0);
+      } finally { await new Promise<void>((resolveClose, rejectClose) => server.close((error) => error ? rejectClose(error) : resolveClose())); }
+
+      writeFileSync(join(auth, "unknown.json"), JSON.stringify({ type: "unknown-kimi-like", refresh_token: "fixture-only-unknown" }), { mode: 0o600 }); privateTree(source);
+      const unknown = spawnSync(process.execPath, [importer, "--config", join(source, "config.yaml"), "--auth-dir", auth, "--source-identity-key-file", key], { encoding: "utf8" });
+      assert.equal(unknown.status, 2);
+      assert.doesNotMatch(`${unknown.stdout}${unknown.stderr}`, /fixture-only-unknown|unknown-kimi-like/u);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it("validates only the documented opaque created_at metadata field", () => {
     for (const [name, createdAt, extra] of [
       ["invalid-timestamp", "2026-99-09T12:00:00Z", {}],

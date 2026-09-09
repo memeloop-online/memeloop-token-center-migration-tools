@@ -23,6 +23,13 @@ these CPA configuration sections:
 - Codex and legacy Gemini OAuth documents, imported into the matching managed
   OAuth provider supplied by Token Center.
 
+The observed `type: kimi` OAuth records are retained as explicit source
+capability gaps, not treated as supported imports. The tool records only a
+domain-separated stable ID, `source_type: "kimi"`, and disabled state; it does
+not parse or forward a Kimi payload, infer a driver, or create a bridge account.
+This is a target-adapter gap, not a request for the source owner to reauthorize
+an already-authorized account. All other unknown auth types still fail closed.
+
 Per-account private `socks5` and `socks5h` proxy URLs are preserved in
 the same encrypted credential envelope as the API key. The URL is write-only and
 may contain proxy authentication; inventory, account views and errors expose only
@@ -34,9 +41,10 @@ still locally policy-checked, while the trusted proxy resolves the hostname for
 the connection. HTTP(S), public SOCKS and hostname-addressed `socks5h` proxies
 fail closed. Custom
 upstream headers and Claude request cloaking still stop the entire import.
-Unknown `*-api-key`/`*-compatibility` sections and unknown auth JSON types also
-stop the import. No supported accounts are written before source inventory and
-target metadata conflict checks finish.
+Unknown `*-api-key`/`*-compatibility` sections and auth JSON types other than
+the explicit Kimi capability-gap marker also stop the import. No supported
+accounts are written before source inventory and target metadata conflict checks
+finish.
 
 Target reachability is approved separately from proxy reachability. Targets are
 public by default. A reviewed owner-only transport-policy file may classify an
@@ -69,7 +77,8 @@ Before starting, make an immutable CPA volume snapshot and stage only its
 requires:
 
 - `config.yaml`, every auth JSON, the target service token, the optional
-  transport policy and, when opaque records exist, the source identity key to
+  transport policy and, when opaque records or source capability gaps exist,
+  the source identity key to
   be owner-owned, single-link, regular mode-`0600` files;
 - the auth root and every nested directory to be owner-owned mode `0700`;
 - no symlink or non-JSON file anywhere below the auth root; and
@@ -135,7 +144,7 @@ changing transport configuration on replay keeps the same stable source
 identity and fails as an account configuration conflict.
 
 `--source-identity-key-file` is required only when the snapshot contains opaque
-Copilot/Cursor records. It must be an absolute path to a mode-`0600` regular,
+Copilot/Cursor records or a managed-OAuth source capability gap. It must be an absolute path to a mode-`0600` regular,
 non-symlink, single-link file owned by the importer UID. Generate it only with
 the release image's `/usr/local/bin/generate-source-identity-key` command. The
 command takes one new absolute target path, requires its parent directory to be
@@ -172,7 +181,7 @@ A successful dry-run returns counts and the non-secret native-authorization
 worklist:
 
 ```json
-{"api_account_count":6,"created_count":0,"created_managed_oauth_count":0,"disabled_source_count":0,"managed_oauth_account_count":0,"managed_oauth_source_type_counts":{},"mode":"dry-run","native_reauthorization_required":[{"provider":"copilot","source_disabled":false,"source_stable_id":"3e37cd527b6365313440b4be4df9184b4dbe06c2aeb4c80628134bd38cb0ea38"},{"provider":"cursor","source_disabled":false,"source_stable_id":"2a8d8d1ee60dad9b93c5f8a479fb24fd38f48095da0c1e9cde5a00fc7ad650b3"}],"native_reauthorization_required_count":2,"private_target_api_account_count":2,"proxied_api_account_count":2,"replayed_count":0,"replayed_managed_oauth_count":0}
+{"api_account_count":6,"created_count":0,"created_managed_oauth_count":0,"disabled_source_count":0,"managed_oauth_account_count":0,"managed_oauth_source_type_counts":{},"mode":"dry-run","native_reauthorization_required":[{"provider":"copilot","source_disabled":false,"source_stable_id":"3e37cd527b6365313440b4be4df9184b4dbe06c2aeb4c80628134bd38cb0ea38"},{"provider":"cursor","source_disabled":false,"source_stable_id":"2a8d8d1ee60dad9b93c5f8a479fb24fd38f48095da0c1e9cde5a00fc7ad650b3"}],"native_reauthorization_required_count":2,"private_target_api_account_count":2,"proxied_api_account_count":2,"replayed_count":0,"replayed_managed_oauth_count":0,"source_capability_gap_count":0,"source_capability_gap_source_type_counts":{},"source_capability_gaps":[]}
 ```
 
 Preserve the source snapshot and inventory output for review. Do not reorder API
@@ -191,6 +200,15 @@ key for every dry-run, apply and recovery. Renaming an auth file changes its
 source identity, so never rename or reorganize the reviewed snapshot between
 runs.
 
+Preserve `source_capability_gaps` alongside that worklist. Its entries contain
+only `source_type`, `source_disabled`, and a different domain-separated stable
+ID; they never contain an auth path, OAuth payload, token, model, driver, or
+account name. `source_capability_gap_count` and
+`source_capability_gap_source_type_counts` make every unavailable target
+adapter visible in the dry-run receipt. A nonzero capability-gap count makes
+`--apply` fail before target discovery or any write, even when direct source
+accounts are also present.
+
 After approval, mount a least-privilege Token Center token as a mode-`0600` file
 and add:
 
@@ -204,6 +222,11 @@ If the snapshot contains only Copilot/Cursor opaque handles, `--apply` remains a
 report-only operation: it still requires the source identity key, but needs no
 target URL or service token and performs no HTTP request. This is intentional
 because those records require a fresh native authorization.
+
+This exception does not apply to a source capability gap. Kimi is not silently
+skipped, reauthorized, converted to an API-key account, or routed through the
+legacy CPA bridge. It remains a recorded source account until a separately
+reviewed Token Center Kimi managed-OAuth adapter exists.
 
 For API accounts, the target name includes a deterministic hash of the non-secret
 source identity. Apply first lists the tenant and rejects any same-name account
@@ -239,6 +262,9 @@ preflight. The response is intentionally limited to the contract version and a
 sorted, unique list of source types; it contains no driver, URL, token, or
 internal topology. If any inventoried managed OAuth record is unsupported, apply
 must stop before its first target write.
+
+Kimi capability gaps stop earlier still: the importer makes no target discovery
+request because there is no approved source schema or target adapter to test.
 
 Both operations require a global service credential with the dedicated
 `imports:cpa:write` scope. A tenant-bound credential is rejected even if it has

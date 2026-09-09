@@ -133,6 +133,14 @@ test("v2 anomaly quarantine is exact, digest-bound, count-visible, and does not 
   assert.throws(() => createPlan(changedSource, upstreamRaw, manifestV2Document(changedSource, upstreamRaw, [poolRouteSpec()], quarantine), [], liveAccounts), /quarantine/u);
 });
 
+test("a managed OAuth source capability gap cannot be quarantined into a partial route migration", () => {
+  const sourceRaw = json({ version: 2, mappings: [source], reauthorization_required: [{ provider: "kimi", source_stable_id: "e".repeat(64) }], anomalies: [{ provider: "kimi", model: "kimi-k2", reason: "source capability gap: target lacks a managed OAuth adapter" }] });
+  const upstreamRaw = upstreamV2Document(), parsed = parseSourceInventory(sourceRaw);
+  const quarantine = { source_anomalies_sha256: parsed.anomalyDigest, anomaly_count: 1, disposition: "quarantine_unmapped", owner_review_evidence_sha256: "f".repeat(64) };
+  const liveAccounts = poolAccounts.map((id, index) => ({ id, driver: "http-json", status: "active", updatedAt: 11 + index }));
+  assert.throws(() => createPlan(sourceRaw, upstreamRaw, manifestV2Document(sourceRaw, upstreamRaw, [poolRouteSpec()], quarantine), [], liveAccounts), /capability gap/u);
+});
+
 test("update never clears existing grants or provider groups", () => {
   const expected = { action: "update", route_id: routeId, updated_at: 22, grant_revision: 0, history_and_references_reviewed: true, history_and_references_evidence_sha256: "b".repeat(64) };
   for (const unsafe of [

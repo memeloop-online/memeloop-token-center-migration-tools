@@ -25,6 +25,8 @@ const HEADER_NAME_PATTERN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,200}$/;
 const RFC3339_TIMESTAMP = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(?:Z|[+-](\d{2}):(\d{2}))$/u;
 const MANAGED_OAUTH_SOURCE_TYPES: Readonly<Record<string, string>> = { codex: "codex", gemini: "gemini-legacy" };
 const DIRECT_ROUTE_SOURCE_DOMAIN = "memeloop-token-center\0cpa-route-source-account-id\0v1\0";
+const NATIVE_REAUTHORIZATION_SOURCE_DOMAIN = "memeloop-token-center\0cpa-native-reauthorization-source-id\0v1\0";
+const MANAGED_OAUTH_CAPABILITY_GAP_SOURCE_DOMAIN = "memeloop-token-center\0cpa-managed-oauth-capability-gap-source-id\0v1\0";
 const SHA256 = /^[0-9a-f]{64}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 
@@ -35,7 +37,8 @@ type TargetNetworkScope = "public" | "private";
 type DirectAccount = { sourceId: string; sourceProvider: string; name: string; driver: "http-json"; config: JsonObject; header: string; prefix: string; secretRef: string; proxySecretRef?: string; proxyNetworkScope?: ProxyNetworkScope; disabled: boolean };
 type NativeReauthorization = { sourceId: string; provider: string; sourceDisabled: boolean };
 type ManagedOAuth = { sourceId: string; stableId: string; sourceType: string; payloadRef: string };
-type Inventory = { direct: DirectAccount[]; native: NativeReauthorization[]; managed: ManagedOAuth[]; disabledSourceCount: number };
+type UnsupportedManagedOAuth = { sourceId: string; sourceType: "kimi"; sourceDisabled: boolean };
+type Inventory = { direct: DirectAccount[]; native: NativeReauthorization[]; managed: ManagedOAuth[]; unsupportedManagedOAuth: UnsupportedManagedOAuth[]; disabledSourceCount: number };
 type TransportPolicy = {
   privateTargetBaseUrls: Set<string>;
   matchedPrivateTargetBaseUrls: Set<string>;
@@ -55,7 +58,9 @@ type BindingReceipt = Readonly<{
 export type CpaRouteSourceAccount = Readonly<{ sourceId: string; sourceProvider: string; driver: "http-json"; disabled: boolean }>;
 export type CpaRouteModel = Readonly<{ provider: string; model: string; upstreamModel: string; upstreamPrefix: string | null; protocol: "openai" | "anthropic"; candidateSourceIds: readonly string[] }>;
 export type CpaOpaqueReauthorization = Readonly<{ sourceId: string; provider: string }>;
-export type CpaSourceRouteInspection = Readonly<{ accounts: readonly CpaRouteSourceAccount[]; models: readonly CpaRouteModel[]; opaqueReauthorizations: readonly CpaOpaqueReauthorization[] }>;
+/** Known CPA auth types with no target managed-OAuth adapter. Never a route candidate. */
+export type CpaManagedOAuthCapabilityGap = Readonly<{ sourceId: string; sourceType: "kimi" }>;
+export type CpaSourceRouteInspection = Readonly<{ accounts: readonly CpaRouteSourceAccount[]; models: readonly CpaRouteModel[]; opaqueReauthorizations: readonly CpaOpaqueReauthorization[]; managedOAuthCapabilityGaps: readonly CpaManagedOAuthCapabilityGap[] }>;
 
 /** Derive the same non-reversible direct-account identity used by the source route exporter. */
 export function cpaRouteSourceStableId(identityKey: Buffer, sourceId: string): string {
@@ -330,8 +335,8 @@ function validateOpaqueCreatedAt(value: unknown): void {
   const days = month >= 1 && month <= 12 ? new Date(Date.UTC(year, month, 0)).getUTCDate() : 0;
   if (year < 1 || month < 1 || month > 12 || day < 1 || day > days || hour > 23 || minute > 59 || second > 59 || offsetHour > 23 || offsetMinute > 59) throw new ImportFailure("CPA opaque Copilot/Cursor created_at metadata is invalid");
 }
-function inventoryAuth(root: string, secrets: SecretStore, policy: TransportPolicy, allowHttp: boolean): [DirectAccount[], NativeReauthorization[], ManagedOAuth[], number] {
-  const direct: DirectAccount[] = [], native: NativeReauthorization[] = [], managed: ManagedOAuth[] = []; let disabledCount = 0; const handles = new Set<string>();
+function inventoryAuth(root: string, secrets: SecretStore, policy: TransportPolicy, allowHttp: boolean): [DirectAccount[], NativeReauthorization[], ManagedOAuth[], UnsupportedManagedOAuth[], number] {
+  const direct: DirectAccount[] = [], native: NativeReauthorization[] = [], managed: ManagedOAuth[] = [], unsupportedManagedOAuth: UnsupportedManagedOAuth[] = []; let disabledCount = 0; const handles = new Set<string>();
   for (const [relativePath, path] of authFiles(root)) {
     const document = parseAuth(readOwnerOnly(path, "CPA auth document", MAX_AUTH_BYTES)); const disabled = document.disabled ?? false;
     if (typeof disabled !== "boolean") throw new ImportFailure("CPA auth disabled flag is invalid");
@@ -363,22 +368,29 @@ function inventoryAuth(root: string, secrets: SecretStore, policy: TransportPoli
       const sourceId = sourceIdentity("auth", relativePath, recordType), stableId = digest(sourceId), payloadRef = `managed-oauth:${stableId}`;
       secrets.put(payloadRef, { source: { kind: "auth_file", relative_path: relativePath }, document }); managed.push({ sourceId, stableId, sourceType, payloadRef }); disabledCount += Number(disabled); continue;
     }
+    // CPA's observed Kimi OAuth record type is deliberately retained as a
+    // source capability gap. We do not infer its payload schema, driver,
+    // model registry, or target adapter from this marker, and never send its
+    // document to Token Center. Other unknown auth types still fail closed.
+    if (recordType === "kimi") {
+      unsupportedManagedOAuth.push({ sourceId: sourceIdentity("auth", relativePath, recordType), sourceType: "kimi", sourceDisabled: disabled }); disabledCount += Number(disabled); continue;
+    }
     if (["access_token", "refresh_token", "id_token", "token"].some((field) => field in document)) throw new ImportFailure("CPA auth document has an unsupported managed OAuth type");
     throw new ImportFailure("CPA auth document has an unsupported account type");
   }
-  return [direct, native, managed, disabledCount];
+  return [direct, native, managed, unsupportedManagedOAuth, disabledCount];
 }
 function buildInventoryFromConfig(config: JsonObject, authDirectory: string, policy: TransportPolicy, allowHttp: boolean): [Inventory, SecretStore] {
   const secrets = new SecretStore(); const [direct, disabledConfig] = inventoryConfig(config, secrets, policy, allowHttp);
-  const [authDirect, native, managed, disabledAuth] = inventoryAuth(validateAuthDirectory(authDirectory), secrets, policy, allowHttp); direct.push(...authDirect);
-  if (direct.length + native.length + managed.length > MAX_ACCOUNTS) throw new ImportFailure("CPA source contains too many upstream accounts");
-  const identities = [...direct.map((item) => item.sourceId), ...native.map((item) => item.sourceId), ...managed.map((item) => item.sourceId)], names = direct.map((item) => item.name);
+  const [authDirect, native, managed, unsupportedManagedOAuth, disabledAuth] = inventoryAuth(validateAuthDirectory(authDirectory), secrets, policy, allowHttp); direct.push(...authDirect);
+  if (direct.length + native.length + managed.length + unsupportedManagedOAuth.length > MAX_ACCOUNTS) throw new ImportFailure("CPA source contains too many upstream accounts");
+  const identities = [...direct.map((item) => item.sourceId), ...native.map((item) => item.sourceId), ...managed.map((item) => item.sourceId), ...unsupportedManagedOAuth.map((item) => item.sourceId)], names = direct.map((item) => item.name);
   if (new Set(identities).size !== identities.length || new Set(names).size !== names.length) throw new ImportFailure("CPA source contains a stable identity conflict");
   if (policy.matchedPrivateTargetBaseUrls.size !== policy.privateTargetBaseUrls.size) throw new ImportFailure("CPA transport policy contains a private target absent from the source");
   if (policy.matchedResultOriginBaseUrls.size !== policy.resultOriginsByBaseUrl.size) throw new ImportFailure("CPA transport policy contains a result-origin target absent from the source");
   if (direct.some((record) => record.config.network_scope === "private" && record.proxySecretRef === undefined)) throw new ImportFailure("CPA private target requires an approved private SOCKS5 proxy");
-  if (identities.length === 0) throw new ImportFailure("CPA source contains no active supported upstream accounts");
-  return [{ direct, native, managed, disabledSourceCount: disabledConfig + disabledAuth }, secrets];
+  if (identities.length === 0) throw new ImportFailure("CPA source contains no source authentication records");
+  return [{ direct, native, managed, unsupportedManagedOAuth, disabledSourceCount: disabledConfig + disabledAuth }, secrets];
 }
 function buildInventory(configPath: string, authDirectory: string, policy: TransportPolicy, allowHttp: boolean): [Inventory, SecretStore] {
   return buildInventoryFromConfig(parseConfig(readOwnerOnly(configPath, "CPA config", MAX_CONFIG_BYTES)), authDirectory, policy, allowHttp);
@@ -451,6 +463,7 @@ export function inspectCpaSourceRoutes(configPath: string, authDirectory: string
     accounts: inventory.direct.map((item) => ({ sourceId: item.sourceId, sourceProvider: item.sourceProvider, driver: item.driver, disabled: item.disabled })).sort((left, right) => left.sourceId.localeCompare(right.sourceId, "en")),
     models: configuredRouteModels(config, inventory.direct),
     opaqueReauthorizations: inventory.native.map((item) => ({ sourceId: item.sourceId, provider: item.provider })).sort((left, right) => `${left.provider}\0${left.sourceId}`.localeCompare(`${right.provider}\0${right.sourceId}`, "en")),
+    managedOAuthCapabilityGaps: inventory.unsupportedManagedOAuth.map((item) => ({ sourceId: item.sourceId, sourceType: item.sourceType })).sort((left, right) => left.sourceId.localeCompare(right.sourceId, "en")),
   };
 }
 
@@ -703,9 +716,10 @@ export function readSourceIdentityKey(path: string): Buffer {
   if (!isAbsolute(path)) throw new ImportFailure("source identity key file path must be absolute"); const value = readOwnerOnly(path, "source identity key file", MAX_SECRET_BYTES);
   if (value.length !== SOURCE_KEY_PREFIX.length + SOURCE_KEY_BYTES || !timingSafeEqual(value.subarray(0, SOURCE_KEY_PREFIX.length), SOURCE_KEY_PREFIX)) throw new ImportFailure("source identity key has an invalid binary format"); const payload = Buffer.from(value.subarray(SOURCE_KEY_PREFIX.length)); value.fill(0); if (payload.every((byte) => byte === payload[0])) throw new ImportFailure("source identity key payload is invalid"); return payload;
 }
-function summary(mode: string, inventory: Inventory, native: JsonObject[], counts = [0, 0, 0, 0]): JsonObject {
+function summary(mode: string, inventory: Inventory, native: JsonObject[], capabilityGaps: JsonObject[], counts = [0, 0, 0, 0]): JsonObject {
   const sourceCounts: Record<string, number> = {}; for (const record of inventory.managed) sourceCounts[record.sourceType] = (sourceCounts[record.sourceType] ?? 0) + 1;
-  return { api_account_count: inventory.direct.length, created_count: counts[0], created_managed_oauth_count: counts[2], disabled_source_count: inventory.disabledSourceCount, managed_oauth_account_count: inventory.managed.length, managed_oauth_source_type_counts: Object.fromEntries(Object.entries(sourceCounts).sort()), mode, native_reauthorization_required: native, native_reauthorization_required_count: native.length, private_target_api_account_count: inventory.direct.filter((record) => record.config.network_scope === "private").length, proxied_api_account_count: inventory.direct.filter((record) => record.proxySecretRef !== undefined).length, replayed_count: counts[1], replayed_managed_oauth_count: counts[3] };
+  const capabilityCounts: Record<string, number> = {}; for (const record of inventory.unsupportedManagedOAuth) capabilityCounts[record.sourceType] = (capabilityCounts[record.sourceType] ?? 0) + 1;
+  return { api_account_count: inventory.direct.length, created_count: counts[0], created_managed_oauth_count: counts[2], disabled_source_count: inventory.disabledSourceCount, managed_oauth_account_count: inventory.managed.length, managed_oauth_source_type_counts: Object.fromEntries(Object.entries(sourceCounts).sort()), mode, native_reauthorization_required: native, native_reauthorization_required_count: native.length, private_target_api_account_count: inventory.direct.filter((record) => record.config.network_scope === "private").length, proxied_api_account_count: inventory.direct.filter((record) => record.proxySecretRef !== undefined).length, replayed_count: counts[1], replayed_managed_oauth_count: counts[3], source_capability_gap_count: capabilityGaps.length, source_capability_gap_source_type_counts: Object.fromEntries(Object.entries(capabilityCounts).sort()), source_capability_gaps: capabilityGaps };
 }
 type Options = { config?: string; authDir?: string; tenant: string; apply: boolean; resolveBindings: boolean; target?: string; token?: string; sourceKey?: string; candidateMaterial?: string; bindingReceipt?: string; transportPolicy?: string; ca?: string; allowHttp: boolean };
 function args(argv: string[]): Options {
@@ -751,9 +765,18 @@ async function main(): Promise<void> {
       if (output) closeSync(output.parentDescriptor);
     }
   }
-  let native: JsonObject[] = []; if (inventory.native.length > 0) { if (!options.sourceKey) throw new ImportFailure("source identity key file is required for opaque reauthorization records"); const key = readSourceIdentityKey(options.sourceKey); native = inventory.native.map((record) => ({ provider: record.provider, source_disabled: record.sourceDisabled, source_stable_id: createHmac("sha256", key).update(Buffer.concat([Buffer.from("memeloop-token-center\0cpa-native-reauthorization-source-id\0v1\0"), Buffer.from(record.sourceId)])).digest("hex") })); key.fill(0); }
-  if (!options.apply || (inventory.direct.length === 0 && inventory.managed.length === 0)) { process.stdout.write(`${JSON.stringify(summary(options.apply ? "apply" : "dry-run", inventory, native))}\n`); return; }
-  if (!options.target || !options.token) throw new ImportFailure("apply requires target API base URL and service token file"); const base = upstreamUrl(options.target, "target API base URL", options.allowHttp); const token = secretString(decodeUtf8(readOwnerOnly(options.token, "target service token file", MAX_SECRET_BYTES), "target service token file").replace(/\n$/, ""), "target service token file"); const counts = await apply(base, token, options.tenant, inventory, secrets, options.ca); process.stdout.write(`${JSON.stringify(summary("apply", inventory, native, counts))}\n`);
+  let native: JsonObject[] = [], capabilityGaps: JsonObject[] = [];
+  if (inventory.native.length > 0 || inventory.unsupportedManagedOAuth.length > 0) {
+    if (!options.sourceKey) throw new ImportFailure("source identity key file is required for source authorization remediation records");
+    const key = readSourceIdentityKey(options.sourceKey);
+    try {
+      native = inventory.native.map((record) => ({ provider: record.provider, source_disabled: record.sourceDisabled, source_stable_id: createHmac("sha256", key).update(Buffer.concat([Buffer.from(NATIVE_REAUTHORIZATION_SOURCE_DOMAIN), Buffer.from(record.sourceId)])).digest("hex") })).sort((left, right) => String(left.source_stable_id).localeCompare(String(right.source_stable_id), "en"));
+      capabilityGaps = inventory.unsupportedManagedOAuth.map((record) => ({ source_type: record.sourceType, source_disabled: record.sourceDisabled, source_stable_id: createHmac("sha256", key).update(Buffer.concat([Buffer.from(MANAGED_OAUTH_CAPABILITY_GAP_SOURCE_DOMAIN), Buffer.from(record.sourceId)])).digest("hex") })).sort((left, right) => String(left.source_stable_id).localeCompare(String(right.source_stable_id), "en"));
+    } finally { key.fill(0); }
+  }
+  if (options.apply && inventory.unsupportedManagedOAuth.length > 0) throw new ImportFailure("CPA source has a managed OAuth capability gap with no target adapter");
+  if (!options.apply || (inventory.direct.length === 0 && inventory.managed.length === 0)) { process.stdout.write(`${JSON.stringify(summary(options.apply ? "apply" : "dry-run", inventory, native, capabilityGaps))}\n`); return; }
+  if (!options.target || !options.token) throw new ImportFailure("apply requires target API base URL and service token file"); const base = upstreamUrl(options.target, "target API base URL", options.allowHttp); const token = secretString(decodeUtf8(readOwnerOnly(options.token, "target service token file", MAX_SECRET_BYTES), "target service token file").replace(/\n$/, ""), "target service token file"); const counts = await apply(base, token, options.tenant, inventory, secrets, options.ca); process.stdout.write(`${JSON.stringify(summary("apply", inventory, native, capabilityGaps, counts))}\n`);
 }
 if (invokedAsEntrypoint("import-cpa-upstreams", import.meta.url)) {
   main().catch((error) => { process.stderr.write(`CPA upstream import stopped: ${error instanceof ImportFailure ? error.message : "unexpected operator failure"}\n`); process.exitCode = 2; });
