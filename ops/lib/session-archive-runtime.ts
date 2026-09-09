@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { lstatSync, readFileSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { lstatSync, readFileSync, realpathSync } from "node:fs";
+import { basename, dirname, isAbsolute, join } from "node:path";
 
 export const archiveRuntimePin = {
   repository: "memeloop-online/memeloop-token-center",
@@ -19,6 +19,10 @@ export function fileDigest(path: string): string {
 /** No PATH fallback, network fetch, build, or execution before manifest validation. */
 export function verifiedArchiveRuntime(binary: string): string {
   try {
+    if (!isAbsolute(binary) || lstatSync(binary).isSymbolicLink()) throw new Error("runtime path must be absolute and regular");
+    // Resolve directory aliases before both validation and execution. Callers
+    // must spawn this return value, never the original user-supplied spelling.
+    binary = realpathSync(binary);
     const manifestPath = join(dirname(binary), "compatibility.json");
     const stat = lstatSync(manifestPath);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 16384) throw new Error("manifest invalid");

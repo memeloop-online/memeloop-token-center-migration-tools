@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -24,6 +25,22 @@ test("archive runtime rejects missing, drifted, substituted and symlinked artifa
     const reset = (): void => writeFileSync(manifest, JSON.stringify(value));
     reset();
     assert.equal(verifiedArchiveRuntime(binary), binary);
+    assert.throws(() => verifiedArchiveRuntime("import-cpa-session-archive"), /verification failed/);
+    assert.throws(() => verifiedArchiveRuntime("./import-cpa-session-archive"), /verification failed/);
+    // A same-named PATH executable must never replace the validated runtime.
+    const hostilePath = join(directory, "hostile-path");
+    mkdirSync(hostilePath);
+    writeFileSync(join(hostilePath, "import-cpa-session-archive"),
+      "#!/bin/sh\nprintf 'unverified-path-executable'\n", { mode: 0o700 });
+    writeFileSync(binary, "#!/bin/sh\nprintf 'verified-absolute-executable'\n");
+    writeFileSync(manifest, JSON.stringify({ ...value, binary_sha256: fileDigest(binary) }));
+    const executed = spawnSync(verifiedArchiveRuntime(binary), [], {
+      cwd: directory, env: { PATH: hostilePath }, encoding: "utf8",
+    });
+    assert.equal(executed.status, 0);
+    assert.equal(executed.stdout, "verified-absolute-executable");
+    writeFileSync(binary, "synthetic binary bytes; never executed");
+    reset();
     for (const field of ["revision", "cargo_lock_sha256", "rust_version", "binary_sha256", "source_archive_sha256", "cli_contract", "minimum_glibc"]) {
       writeFileSync(manifest, JSON.stringify({ ...value, [field]: "tampered" }));
       assert.throws(() => verifiedArchiveRuntime(binary), /verification failed/);
@@ -53,6 +70,7 @@ test("release CI pins engine provenance and packages source without runtime buil
   assert.match(workflow, /cargo build --locked --release --bin import-cpa-session-archive/);
   assert.match(workflow, /cargo test --locked --test session_archive_import --test session_archive_quarantine --test session_archive_unlinked/);
   const wrapper = readFileSync(new URL("../../ops/import-cpa-session-archive.ts", import.meta.url), "utf8");
-  assert.match(wrapper, /verifiedArchiveRuntime\(binary\)/);
+  assert.match(wrapper, /const binary = verifiedArchiveRuntime\(requestedBinary\)/);
+  assert.match(wrapper, /spawn\(binary, args/);
   assert.doesNotMatch(wrapper, /spawn\(["'](?:cargo|git|curl)/);
 });

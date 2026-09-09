@@ -62,8 +62,7 @@ try {
   // back to this checkout's node_modules for the bundled YAML dependency.
   bundle = isolated;
   // Execute only the validated native binary from the isolated release tree.
-  const archiveBinary = join(bundle, "commands/runtime/import-cpa-session-archive");
-  verifiedArchiveRuntime(archiveBinary);
+  const archiveBinary = verifiedArchiveRuntime(join(bundle, "commands/runtime/import-cpa-session-archive"));
   const archiveHelp = spawnSync(archiveBinary, ["--help"], { encoding: "utf8", timeout: 10_000 });
   assert.equal(archiveHelp.status, 0, "isolated archive runtime must execute without product checkout");
   assert.match(archiveHelp.stdout, /--max-plan-bytes/u);

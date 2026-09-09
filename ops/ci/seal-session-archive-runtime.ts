@@ -32,8 +32,8 @@ writeFileSync(resolve(output, "compatibility.json"), `${JSON.stringify({
   archive_schema_versions: [1, 2],
   source_closure_extracted: false,
 }, null, 2)}\n`, { mode: 0o644, flag: "wx" });
-verifiedArchiveRuntime(binary);
-const help = execFileSync(binary, ["--help"], { encoding: "utf8", timeout: 10000 });
+const verifiedBinary = verifiedArchiveRuntime(binary);
+const help = execFileSync(verifiedBinary, ["--help"], { encoding: "utf8", timeout: 10000 });
 for (const flag of ["--input", "--plan-directory", "--apply", "--max-plan-bytes", "--archive-source", "--cpamp-source"]) {
   if (!help.includes(flag)) throw new Error("archive runtime CLI contract mismatch");
 }

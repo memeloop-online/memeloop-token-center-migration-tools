@@ -34,7 +34,9 @@ The wrapper defaults to its adjacent `runtime/import-cpa-session-archive`; it
 does not fall back to PATH. `MTC_SESSION_ARCHIVE_IMPORT_BIN` can relocate the
 same verified runtime, but its sibling compatibility manifest and retained
 source archive are mandatory and must match the compiled pin. It cannot select
-an arbitrary replacement executable.
+an arbitrary replacement executable. Overrides must be absolute paths; the
+verifier returns the canonical absolute path and the wrapper executes exactly
+that path, never a same-named executable found through PATH.
 
 The runtime requires Linux x86_64 and glibc 2.39 or newer. The target database,
 archive store and approved credentials/configuration remain external inputs.

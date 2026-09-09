@@ -60,10 +60,10 @@ async function main(): Promise<void> {
   }
   const allowUnmapped = booleanSetting("SESSION_ARCHIVE_ALLOW_UNMAPPED", false);
   const apply = booleanSetting("SESSION_ARCHIVE_APPLY", false);
-  const binary = process.env.MTC_SESSION_ARCHIVE_IMPORT_BIN
+  const requestedBinary = process.env.MTC_SESSION_ARCHIVE_IMPORT_BIN
     ?? fileURLToPath(new URL("./runtime/import-cpa-session-archive", import.meta.url));
-  if (!binary || binary.includes("\0")) fail("session archive importer binary is unavailable");
-  verifiedArchiveRuntime(binary);
+  if (!requestedBinary || requestedBinary.includes("\0")) fail("session archive importer binary is unavailable");
+  const binary = verifiedArchiveRuntime(requestedBinary);
   if (process.platform !== "linux" || process.arch !== "x64") fail("session archive runtime requires Linux x86_64");
   const report = process.report.getReport() as { header?: { glibcVersionRuntime?: string } };
   const glibc = report.header?.glibcVersionRuntime?.split(".").map(Number);
