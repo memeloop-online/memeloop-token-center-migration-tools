@@ -8,11 +8,13 @@ import { closeSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import {
   ImportFailure, buildInventory, canonicalJson, cpaRouteSourceStableId,
-  decodeUtf8, openSafeOutput, parseTransportPolicy, providerCandidates,
+  decodeUtf8, openSafeOutput, parseTransportPolicy,
   readOwnerOnly, readSourceIdentityKey, requestJson, targetAccount,
   upstreamUrl, writeBindingReceipt,
 } from "./import-cpa-upstreams.ts";
 import { invokedAsEntrypoint } from "../lib/invoked-as-entrypoint.ts";
+import { parseSourceInventory } from "../legacy-routes/import-cpa-model-routes.ts";
+import { exactSet, parseCandidateMaterial, sourceKey } from "../legacy-routes/compose-cpa-upstream-inventory.ts";
 
 const MAX_BYTES = 4 * 1024 * 1024;
 const sha256 = (value: Buffer | string): string => createHash("sha256").update(value).digest("hex");
@@ -31,6 +33,18 @@ type GapReason = "source_candidate_unavailable" | "source_candidate_metadata_mis
 type Candidate = Readonly<{ sourceStableId: string; sourceProvider: string }>;
 type Match = { source_stable_id: string; source_provider: string; upstream_account_id: string; updated_at: number };
 type Gap = { source_stable_id: string; source_provider: string; reason: GapReason };
+
+/** Reject schema-valid but incomplete/empty candidate material before any GET. */
+export function validateTransportInputs(sourceRaw: Buffer, candidateRaw: Buffer) {
+  const source = parseSourceInventory(sourceRaw), material = parseCandidateMaterial(candidateRaw);
+  if (source.version !== 2 || source.mappings.length === 0 || material.sets.length === 0
+    || material.sourceDigest !== sha256(sourceRaw)) throw new ImportFailure("transport source inventory is empty or mismatched");
+  exactSet(source.mappings.map(sourceKey), material.sets.map(x => sourceKey(x.source)),
+    "transport candidate pools do not exactly cover source mappings");
+  const candidates = [...material.candidates.values()].filter(x => x.driver === "http-json");
+  if (candidates.length === 0) throw new ImportFailure("transport source has no direct candidates");
+  return { source, material, candidates };
+}
 
 /** Pure comparison. No target credentials are accepted or inspected. */
 export function reconcileTransport(
@@ -137,8 +151,8 @@ export async function runTransportReconciliation(argv: readonly string[]): Promi
   const identity = readSourceIdentityKey(get("--source-identity-key-file"));
   const tokenRaw = readOwnerOnly(get("--service-token-file"), "target service token", 64 * 1024);
   try {
-    const material = providerCandidates(candidateRaw);
-    if (material.sourceInventoryDigest !== sha256(sourceRaw)) throw new ImportFailure("candidate material does not match sealed source inventory");
+    const validated = validateTransportInputs(sourceRaw, candidateRaw);
+    const { candidates } = validated;
     const empty = parseTransportPolicy(Buffer.from('{"contract_version":1,"private_target_base_urls":[]}'), false);
     const [inventory] = buildInventory(get("--config"), get("--auth-dir"), empty, false);
     const sources: SourceTransport[] = inventory.direct.map(x => ({
@@ -155,7 +169,7 @@ export async function runTransportReconciliation(argv: readonly string[]): Promi
       const item = targetAccount(value, tenant);
       return { ...item, config: JSON.parse(item.config) as Config };
     });
-    const result = reconcileTransport(sources, targets, material.candidates);
+    const result = reconcileTransport(sources, targets, candidates);
     const policyBytes = Buffer.from(`${JSON.stringify(result.policy)}\n`);
     const configAfter = readOwnerOnly(get("--config"), "sealed source config", MAX_BYTES);
     try {
@@ -166,7 +180,12 @@ export async function runTransportReconciliation(argv: readonly string[]): Promi
       source_config_sha256: sha256(configRaw), source_inventory_sha256: sha256(sourceRaw),
       provider_candidate_material_sha256: sha256(candidateRaw),
       target_inventory_sha256: sha256(canonicalJson(response.value, "target inventory")),
-      transport_policy_sha256: sha256(policyBytes), candidate_count: material.candidates.length,
+      transport_policy_sha256: sha256(policyBytes), candidate_count: candidates.length,
+      source_mapping_count: validated.source.mappings.length,
+      source_anomaly_count: validated.source.anomalies.length,
+      reauthorization_required_count: validated.source.reauthorizationRequired,
+      managed_candidate_count: validated.material.candidates.size - candidates.length,
+      coverage: "supplied-source-mappings-and-direct-candidates-only",
       matched_count: result.matches.length, quarantined_count: result.quarantined.length,
       matches: result.matches, quarantined: result.quarantined,
     })}\n`);
@@ -176,7 +195,7 @@ export async function runTransportReconciliation(argv: readonly string[]): Promi
       try { writeBindingReceipt(policyOutput, policyBytes); writeBindingReceipt(receiptOutput, receipt); }
       finally { closeSync(receiptOutput.parentDescriptor); }
     } finally { closeSync(policyOutput.parentDescriptor); }
-    process.stdout.write(`${JSON.stringify({ mode: "read-only-transport-reconciliation", candidate_count: material.candidates.length,
+    process.stdout.write(`${JSON.stringify({ mode: "read-only-transport-reconciliation", candidate_count: candidates.length,
       matched_count: result.matches.length, quarantined_count: result.quarantined.length })}\n`);
   } finally { configRaw.fill(0); sourceRaw.fill(0); candidateRaw.fill(0); identity.fill(0); tokenRaw.fill(0); }
 }

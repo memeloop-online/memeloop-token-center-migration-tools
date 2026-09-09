@@ -16,7 +16,12 @@ temporary loopback port-forward to that same private Service, preserving auth.
 It is not evidence of canonical HTTPS or browser acceptance.
 
 Source parsing and domain-separated HMAC identities are shared with the existing
-importer. Candidate material must bind the exact supplied source-inventory SHA.
+importer. Source inventory must pass the existing version-2 schema parser and
+contain at least one mapping. Candidate material must bind the exact supplied
+source-inventory SHA, pass the composer schema parser, and cover every mapping
+exactly once without missing, extra or duplicate pools. At least one direct
+candidate is required; an empty `{}` input or an empty candidate set is not a
+successful zero-work reconciliation.
 An active source candidate must have exactly one active target with the exact
 deterministic name, driver and configuration. Only the existing target's
 `network_scope` and `result_origins` may supply policy annotations; these are not
@@ -38,6 +43,10 @@ source inventory, candidate material, target snapshot and policy SHA-256 and
 includes every direct candidate as either a match or an explicit gap. It contains
 no account name, URL, configuration or credential. Stdout is counts only.
 Managed OAuth candidates remain owned by their separate provenance workflow.
+The receipt additionally preserves source mapping, anomaly, reauthorization and
+managed-candidate counts and explicitly scopes coverage to the supplied inventory
+and direct candidates. It does not prove complete historical migration or that
+the supplied sealed inventory includes every historical source record.
 
 Both policy and receipt must exist and their digest binding must verify before
 any later use. Failure during the second publication can leave the first file;

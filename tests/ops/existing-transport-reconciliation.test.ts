@@ -6,7 +6,8 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writ
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { reconcileTransport, runTransportReconciliation, type SourceTransport, type ExistingTransport } from "../../ops/cpa-upstreams/reconcile-existing-transport.ts";
+import { reconcileTransport, runTransportReconciliation, validateTransportInputs, type SourceTransport, type ExistingTransport } from "../../ops/cpa-upstreams/reconcile-existing-transport.ts";
+import { buildInventory, cpaRouteSourceStableId, parseTransportPolicy } from "../../ops/cpa-upstreams/import-cpa-upstreams.ts";
 import { releaseEntrypoints } from "../../ops/ci/release-entrypoints.ts";
 
 const source: SourceTransport = {
@@ -81,17 +82,43 @@ test("CLI performs only authenticated GET and publishes bound owner-private outp
     return path;
   };
   const digest = (bytes: string | Buffer): string => createHash("sha256").update(bytes).digest("hex");
-  const configDocument = JSON.stringify({ "gemini-api-key": [{ "api-key": "fixture-only-source-key" }] });
-  const config = privateFile("config.yaml", configDocument), sourceInventory = privateFile("source.json", "{}\n");
-  const material = privateFile("candidate.json", JSON.stringify({
-    version: 1, source_inventory_sha256: digest("{}\n"), provider_candidate_sets: [],
-  }));
-  const identity = privateFile("identity.key", Buffer.concat([
-    Buffer.from("4d54432d534f555243452d49442d4b45590001", "hex"), Buffer.from(Array.from({ length: 32 }, (_, index) => index)),
-  ]));
-  const token = privateFile("token", "fixture-only-service-token\n");
   const auth = join(directory, "auth");
   mkdirSync(auth, { mode: 0o700 });
+  const configDocument = JSON.stringify({
+    "auth-dir": auth,
+    "openai-compatibility": [{
+      name: "fixture-provider", "base-url": "https://fixture.example.test/v1",
+      "api-key-entries": [{ "api-key": "fixture-only-source-key" }],
+      models: [{ name: "fixture-upstream-model", alias: "fixture-model" }],
+    }],
+  });
+  const config = privateFile("config.yaml", configDocument);
+  const pattern = { provider: "fixture-provider", model: "fixture-model", group: null, upstream_prefix: null, protocol: "openai" };
+  const sourceDocument = JSON.stringify({ version: 2, mappings: [pattern], reauthorization_required: [], anomalies: [] });
+  const sourceInventory = privateFile("source.json", sourceDocument);
+  const identityPayload = Buffer.from(Array.from({ length: 32 }, (_, index) => index));
+  const [fixtureInventory] = buildInventory(config, auth,
+    parseTransportPolicy(Buffer.from('{"contract_version":1,"private_target_base_urls":[]}'), false), false);
+  const fixtureAccount = fixtureInventory.direct[0]!;
+  const fixtureTarget = {
+    id: "10000000-0000-4000-8000-000000000001", tenant_external_id: "default",
+    name: fixtureAccount.name, driver: "http-json", config: fixtureAccount.config, status: "active", updated_at: 7,
+  };
+  const candidateDocument = JSON.stringify({
+    version: 1, source_inventory_sha256: digest(sourceDocument),
+    provider_candidate_sets: [{
+      source: pattern, upstream_model: "fixture-upstream-model", protocol: "openai", selection: "equal_round_robin",
+      candidates: [{
+        source_stable_id: cpaRouteSourceStableId(identityPayload, fixtureAccount.sourceId),
+        source_provider: "fixture-provider", driver: "http-json",
+      }],
+    }],
+  });
+  const material = privateFile("candidate.json", candidateDocument);
+  const identity = privateFile("identity.key", Buffer.concat([
+    Buffer.from("4d54432d534f555243452d49442d4b45590001", "hex"), identityPayload,
+  ]));
+  const token = privateFile("token", "fixture-only-service-token\n");
   const policy = join(directory, "policy.json"), receipt = join(directory, "receipt.json");
   let requests = 0;
   const server = createServer((request, response) => {
@@ -100,7 +127,7 @@ test("CLI performs only authenticated GET and publishes bound owner-private outp
     assert.equal(request.url, "/internal/v1/upstreams?tenant_external_id=default&limit=100");
     assert.equal(request.headers.authorization, "Bearer fixture-only-service-token");
     response.setHeader("Content-Type", "application/json");
-    response.end("[]");
+    response.end(JSON.stringify([fixtureTarget]));
   });
   await new Promise<void>(done => server.listen(0, "127.0.0.1", done));
   try {
@@ -125,17 +152,42 @@ test("CLI performs only authenticated GET and publishes bound owner-private outp
     assert.equal(result.code, 0, result.stderr);
     assert.equal(requests, 1);
     assert.deepEqual(JSON.parse(result.stdout), {
-      mode: "read-only-transport-reconciliation", candidate_count: 0, matched_count: 0, quarantined_count: 0,
+      mode: "read-only-transport-reconciliation", candidate_count: 1, matched_count: 1, quarantined_count: 0,
     });
     for (const path of [policy, receipt]) assert.equal(statSync(path).mode & 0o777, 0o600);
     const saved = JSON.parse(readFileSync(receipt, "utf8"));
     assert.equal(saved.source_config_sha256, digest(configDocument));
     assert.equal(saved.transport_policy_sha256, digest(readFileSync(policy)));
-    assert.equal(saved.target_inventory_sha256, digest("[]"));
+    assert.match(saved.target_inventory_sha256, /^[0-9a-f]{64}$/);
+    assert.equal(saved.source_inventory_sha256, digest(sourceDocument));
+    assert.equal(saved.source_mapping_count, 1);
+    assert.equal(saved.coverage, "supplied-source-mappings-and-direct-candidates-only");
     assert.doesNotMatch(result.stdout + result.stderr + readFileSync(receipt, "utf8"), /fixture-only-service-token/);
   } finally {
     server.closeAllConnections();
     await new Promise<void>(done => server.close(() => done()));
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("transport inputs reject forged empty, missing, extra and duplicate source coverage", () => {
+  const digest = (raw: Buffer): string => createHash("sha256").update(raw).digest("hex");
+  const pattern = { provider: "fixture", model: "fixture-model", group: null, upstream_prefix: null, protocol: "openai" };
+  const source = Buffer.from(JSON.stringify({ version: 2, mappings: [pattern], reauthorization_required: [], anomalies: [] }));
+  const set = {
+    source: pattern, upstream_model: "fixture-upstream", protocol: "openai", selection: "equal_round_robin",
+    candidates: [{ source_stable_id: "a".repeat(64), source_provider: "fixture", driver: "http-json" }],
+  };
+  const material = (sets: unknown[], sourceHash = digest(source)): Buffer => Buffer.from(JSON.stringify({
+    version: 1, source_inventory_sha256: sourceHash, provider_candidate_sets: sets,
+  }));
+  assert.equal(validateTransportInputs(source, material([set])).candidates.length, 1);
+  assert.throws(() => validateTransportInputs(Buffer.from("{}"), material([])));
+  const empty = Buffer.from(JSON.stringify({ version: 2, mappings: [], reauthorization_required: [], anomalies: [] }));
+  assert.throws(() => validateTransportInputs(empty, material([], digest(empty))));
+  assert.throws(() => validateTransportInputs(source, material([])));
+  assert.throws(() => validateTransportInputs(source, material([set, set])));
+  assert.throws(() => validateTransportInputs(source, material([set, { ...set, source: { ...pattern, model: "extra" } }])));
+  assert.throws(() => validateTransportInputs(source, material([{ ...set, source: { ...pattern, model: "other" } }])));
+  assert.throws(() => validateTransportInputs(source, material([set], "b".repeat(64))));
 });

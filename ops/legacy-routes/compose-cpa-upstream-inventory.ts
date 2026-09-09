@@ -70,6 +70,9 @@ function exactSet(left: readonly string[], right: readonly string[], label: stri
   if (new Set(sortedLeft).size !== sortedLeft.length || new Set(sortedRight).size !== sortedRight.length || sortedLeft.length !== sortedRight.length || sortedLeft.some((value, index) => value !== sortedRight[index])) throw new UpstreamInventoryComposeFailure(label);
 }
 
+// Shared schema and set-coverage validation for read-only transport receipts.
+export { parseCandidateMaterial, sourceKey, exactSet };
+
 function parseCandidateMaterial(raw: Buffer): CandidateMaterial {
   const root = object(strictJson(raw, "provider candidate material"), ["version", "source_inventory_sha256", "provider_candidate_sets"], "provider candidate material");
   if (root.version !== 1 || !Array.isArray(root.provider_candidate_sets) || root.provider_candidate_sets.length === 0 || root.provider_candidate_sets.length > MAX_ITEMS) throw new UpstreamInventoryComposeFailure("provider candidate material has an invalid schema");
