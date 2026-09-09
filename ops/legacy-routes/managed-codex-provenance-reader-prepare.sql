@@ -8,7 +8,7 @@ SELECT set_config('mtc.managed_codex_reader_valid_until', :'reader_valid_until',
 
 DO $prepare$
 DECLARE
-  reader_role constant name := 'mtc_managed_codex_provenance_reader_v1';
+  reader_role constant name := 'provenance_codex_reader_v1';
   reader_comment constant text := 'one-shot managed Codex provenance reader v1';
   target_relations constant regclass[] := ARRAY[
     'public.tenants'::regclass,
@@ -113,24 +113,24 @@ BEGIN
 END;
 $prepare$;
 
-GRANT CONNECT ON DATABASE memeloop_token_center TO mtc_managed_codex_provenance_reader_v1;
-GRANT USAGE ON SCHEMA public TO mtc_managed_codex_provenance_reader_v1;
+GRANT CONNECT ON DATABASE memeloop_token_center TO provenance_codex_reader_v1;
+GRANT USAGE ON SCHEMA public TO provenance_codex_reader_v1;
 GRANT SELECT (id, external_id)
   ON TABLE public.tenants
-  TO mtc_managed_codex_provenance_reader_v1;
+  TO provenance_codex_reader_v1;
 GRANT SELECT (tenant_id, import_kind, source_key, payload_digest, contract_version, upstream_account_id)
   ON TABLE public.upstream_account_imports
-  TO mtc_managed_codex_provenance_reader_v1;
+  TO provenance_codex_reader_v1;
 GRANT SELECT (id, tenant_id, driver, auth_kind, status, credential_generation, oauth_session_id, oauth_driver, oauth_refresh_url, updated_at)
   ON TABLE public.upstream_accounts
-  TO mtc_managed_codex_provenance_reader_v1;
+  TO provenance_codex_reader_v1;
 GRANT SELECT (upstream_account_id, generation, revoked_at)
   ON TABLE public.upstream_credentials
-  TO mtc_managed_codex_provenance_reader_v1;
+  TO provenance_codex_reader_v1;
 
 DO $verify$
 DECLARE
-  reader_role constant name := 'mtc_managed_codex_provenance_reader_v1';
+  reader_role constant name := 'provenance_codex_reader_v1';
   reader_role_id oid;
   target_relations constant regclass[] := ARRAY[
     'public.tenants'::regclass,

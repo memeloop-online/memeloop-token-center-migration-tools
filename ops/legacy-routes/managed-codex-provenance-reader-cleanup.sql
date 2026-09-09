@@ -6,7 +6,7 @@ SET LOCAL statement_timeout = '15000';
 
 DO $cleanup_preflight$
 DECLARE
-  reader_role constant name := 'mtc_managed_codex_provenance_reader_v1';
+  reader_role constant name := 'provenance_codex_reader_v1';
   reader_comment constant text := 'one-shot managed Codex provenance reader v1';
   reader_role_id oid;
   role_record record;
@@ -65,18 +65,18 @@ $cleanup_preflight$;
 
 REVOKE SELECT (id, external_id)
   ON TABLE public.tenants
-  FROM mtc_managed_codex_provenance_reader_v1;
+  FROM provenance_codex_reader_v1;
 REVOKE SELECT (tenant_id, import_kind, source_key, payload_digest, contract_version, upstream_account_id)
   ON TABLE public.upstream_account_imports
-  FROM mtc_managed_codex_provenance_reader_v1;
+  FROM provenance_codex_reader_v1;
 REVOKE SELECT (id, tenant_id, driver, auth_kind, status, credential_generation, oauth_session_id, oauth_driver, oauth_refresh_url, updated_at)
   ON TABLE public.upstream_accounts
-  FROM mtc_managed_codex_provenance_reader_v1;
+  FROM provenance_codex_reader_v1;
 REVOKE SELECT (upstream_account_id, generation, revoked_at)
   ON TABLE public.upstream_credentials
-  FROM mtc_managed_codex_provenance_reader_v1;
-REVOKE USAGE ON SCHEMA public FROM mtc_managed_codex_provenance_reader_v1;
-REVOKE CONNECT ON DATABASE memeloop_token_center FROM mtc_managed_codex_provenance_reader_v1;
-DROP ROLE mtc_managed_codex_provenance_reader_v1;
+  FROM provenance_codex_reader_v1;
+REVOKE USAGE ON SCHEMA public FROM provenance_codex_reader_v1;
+REVOKE CONNECT ON DATABASE memeloop_token_center FROM provenance_codex_reader_v1;
+DROP ROLE provenance_codex_reader_v1;
 
 COMMIT;

@@ -67,7 +67,7 @@ mapping is controlled; no historical tenant name is inferred.
 
 The resolver is not authorized to use the runtime application database
 credential. It requires the short-lived, fixed role
-`mtc_managed_codex_provenance_reader_v1`, whose grants are constrained to the
+`provenance_codex_reader_v1`, whose grants are constrained to the
 query below. The role does not receive `SELECT` on a whole table, any write or
 sequence privilege, a role membership, a future-default privilege, or a
 credential ciphertext column.
@@ -110,7 +110,7 @@ with this shape (the timestamp is an approved operation input, not a checked-in
 placeholder):
 
 ```text
-name: mtc_managed_codex_provenance_reader_v1
+name: provenance_codex_reader_v1
 ensure: present
 comment: one-shot managed Codex provenance reader v1
 login: true

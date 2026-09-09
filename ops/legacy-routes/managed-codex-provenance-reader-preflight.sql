@@ -5,7 +5,7 @@ SET LOCAL statement_timeout = '15000';
 
 DO $preflight$
 DECLARE
-  reader_role constant name := 'mtc_managed_codex_provenance_reader_v1';
+  reader_role constant name := 'provenance_codex_reader_v1';
   target_relations constant regclass[] := ARRAY[
     'public.tenants'::regclass,
     'public.upstream_account_imports'::regclass,
