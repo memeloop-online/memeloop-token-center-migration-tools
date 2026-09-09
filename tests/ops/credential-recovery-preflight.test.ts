@@ -46,7 +46,9 @@ test("preflight rejects apply, missing inputs and HTTP outside explicit loopback
   await assert.rejects(runRecoveryPreflight([]));
 });
 
-for (const scenario of ["success", "revoked", "generation_changed", "duplicate_identity"] as const) {
+for (const scenario of ["success", "revoked", "generation_changed", "duplicate_identity", "control_missing",
+  "control_wrapper", "tenant_wrong", "generation_string", "status_wrong", "recovery_missing",
+  "self_wrapper", "self_generation_string"] as const) {
   test(`GET-only CLI ${scenario} never stores original keys or prints them`, { timeout: 20_000 }, async () => {
     const directory = mkdtempSync(join(tmpdir(), "credential-identity-preflight-"));
     chmodSync(directory, 0o700);
@@ -69,14 +71,25 @@ for (const scenario of ["success", "revoked", "generation_changed", "duplicate_i
         selfRequests++;
         assert.ok([`Bearer ${key}`, `Bearer ${key}-second`].includes(request.headers.authorization ?? ""));
         if (scenario === "revoked") { response.statusCode = 401; response.end(key); return; }
+        if (scenario === "self_wrapper") { response.end(JSON.stringify({ data: self })); return; }
         response.end(JSON.stringify({
-          ...self, credential_generation: scenario === "generation_changed" && selfRequests > 1 ? 4 : 3,
+          ...self, credential_generation: scenario === "self_generation_string" ? "3"
+            : scenario === "generation_changed" && selfRequests > 1 ? 4 : 3,
         }));
       } else {
         controlRequests++;
         assert.equal(request.url, `/internal/v1/keys?tenant_external_id=default&key_id=${keyId}&limit=2`);
         assert.equal(request.headers.authorization, "Bearer fixture-only-control-read-token");
-        response.end(JSON.stringify([control]));
+        const item = { ...control };
+        if (scenario === "control_missing") { response.end("[]"); return; }
+        if (scenario === "control_wrapper") { response.end(JSON.stringify({ items: [control] })); return; }
+        response.end(JSON.stringify([{
+          ...item,
+          ...(scenario === "tenant_wrong" ? { tenant_external_id: "different" } : {}),
+          ...(scenario === "generation_string" ? { credential_generation: "3" } : {}),
+          ...(scenario === "status_wrong" ? { status: "revoked" } : {}),
+          ...(scenario === "recovery_missing" ? { credential_recovery_available: undefined } : {}),
+        }]));
       }
     });
     await new Promise<void>(done => server.listen(0, "127.0.0.1", done));
@@ -113,7 +126,25 @@ for (const scenario of ["success", "revoked", "generation_changed", "duplicate_i
         assert.equal(receipt.identities[0].credential_generation, 3);
       } else {
         assert.equal(result.stdout, "");
-        assert.equal(existsSync(receiptPath), false);
+        assert.equal(existsSync(receiptPath), true);
+        receiptText = readFileSync(receiptPath, "utf8");
+        const receipt = JSON.parse(receiptText);
+        assert.equal(receipt.mode, "credential-recovery-preflight-failed");
+        assert.equal(receipt.eligible_for_apply, false);
+        assert.equal(receipt.stored_count, 0);
+        assert.equal(Object.hasOwn(receipt, "identities"), false);
+        const reasons = {
+          revoked: "http_status", generation_changed: "secondpass_generation_changed",
+          duplicate_identity: "duplicate_identity", control_missing: "control_match_count",
+          control_wrapper: "control_shape", tenant_wrong: "tenant_mismatch",
+          generation_string: "generation_type", status_wrong: "status_not_active",
+          recovery_missing: "recovery_flag_type", self_wrapper: "self_identity_shape",
+          self_generation_string: "self_generation_type",
+        };
+        assert.equal(receipt.reason, reasons[scenario]);
+        if (scenario === "revoked") assert.equal(receipt.http_status, 401);
+        if (scenario === "control_missing") assert.equal(receipt.control_match_count, 0);
+        assert.equal(statSync(receiptPath).mode & 0o777, 0o600);
       }
       for (const forbidden of [key, "fixture-only-control-read-token", endpoint]) {
         assert.equal((result.stdout + result.stderr + receiptText).includes(forbidden), false);

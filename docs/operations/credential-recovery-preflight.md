@@ -21,8 +21,15 @@ Use only the exact CI-verified immutable Release command. Required arguments:
 An explicitly approved temporary loopback port-forward may use
 `--allow-http-loopback`; close it afterwards. This is not canonical HTTPS
 acceptance. Every request is bounded by 30 seconds and 256 KiB, never redirects
-or retries, and a failure stops the entire batch without a partial receipt.
-Only count-only success status or a fixed value-free error reaches stdout/stderr.
+or retries, and a failure stops the entire batch without a partial identity
+receipt. A failure instead emits an owner-only diagnostic receipt containing only
+fixed stage/reason names, HTTP status, count fields, `stored_count: 0` and
+`eligible_for_apply: false`. It has no identities and cannot be used for apply.
+Diagnostics distinguish source shape/count/digest, self identity/generation
+shape, control result shape/match count, tenant/generation/status/recovery flag
+type or mismatch, and second-pass identity/generation changes. No observed field
+value, dynamic field name, response body, URL or secret is serialized.
+Only count-only success status or these value-free diagnostics reach stdout/stderr.
 
 The tool reads original keys from the existing protected source into memory only.
 It does not create a plaintext identity-to-key mapping. The `0600`, no-overwrite
