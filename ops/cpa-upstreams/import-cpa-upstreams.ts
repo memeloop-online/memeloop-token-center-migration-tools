@@ -811,3 +811,10 @@ async function main(): Promise<void> {
 if (invokedAsEntrypoint("import-cpa-upstreams", import.meta.url)) {
   main().catch((error) => { process.stderr.write(`CPA upstream import stopped: ${error instanceof ImportFailure ? error.message : "unexpected operator failure"}\n`); process.exitCode = 2; });
 }
+
+/** Shared protected IO and source parsing for the separate read-only reconciler. */
+export {
+  buildInventory, canonicalJson, decodeUtf8, openSafeOutput, parseTransportPolicy,
+  providerCandidates, readOwnerOnly, requestJson, targetAccount, upstreamUrl,
+  writeBindingReceipt,
+};

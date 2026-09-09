@@ -63,6 +63,7 @@ try {
 
   execute(command("export-cpa-managed-codex-model-snapshot"), ["--help"]);
   execute(command("resolve-cpa-managed-codex-provenance"), ["--help"]);
+  execute(command("reconcile-existing-transport"), ["--help"]);
 
   const captureRoot = join(root, "source-capture");
   mkdirSync(captureRoot, { mode: 0o700 }); chmodSync(captureRoot, 0o700);

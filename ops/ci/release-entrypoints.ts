@@ -26,6 +26,7 @@ export const releaseEntrypoints = Object.freeze({
   "import-cpa-upstreams": "ops/cpa-upstreams/import-cpa-upstreams.ts",
   "migrate-cpamp": "ops/migrate-cpamp.ts",
   "reconcile-final-price-cache": "ops/reconcile-final-price-cache.ts",
+  "reconcile-existing-transport": "ops/cpa-upstreams/reconcile-existing-transport.ts",
   "resolve-cpa-managed-codex-provenance": "ops/legacy-routes/resolve-cpa-managed-codex-provenance.ts",
   "stage-protected-inputs": "ops/ci/stage-protected-inputs.ts",
 } as const);

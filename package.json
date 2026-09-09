@@ -13,6 +13,7 @@
     "node": "24.18.0"
   },
   "scripts": {
+    "pretest": "node --test tests/ops/existing-transport-reconciliation.test.ts",
     "build": "node ops/ci/build-importer-scripts.ts",
     "package:release": "node ops/ci/package-release-bundle.ts",
     "policy": "node ops/ci/verify-repository-policy.ts",
