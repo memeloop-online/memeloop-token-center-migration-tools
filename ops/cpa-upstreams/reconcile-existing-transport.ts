@@ -32,7 +32,32 @@ type GapReason = "source_candidate_unavailable" | "source_candidate_metadata_mis
   | "target_transport_invalid" | "shared_base_transport_conflict";
 type Candidate = Readonly<{ sourceStableId: string; sourceProvider: string }>;
 type Match = { source_stable_id: string; source_provider: string; upstream_account_id: string; updated_at: number };
-type Gap = { source_stable_id: string; source_provider: string; reason: GapReason };
+const CONFIG_DIAGNOSTIC_FIELDS = [
+  "base_url", "network_scope", "result_origins", "timeout_seconds",
+  "image_api_mode", "input_token_overhead_ceiling", "video_api", "video_models",
+  "reservation_token_bounds",
+] as const;
+type ConfigDiagnosticField = typeof CONFIG_DIAGNOSTIC_FIELDS[number];
+type GapDiagnostic = {
+  config_difference_keys?: ConfigDiagnosticField[];
+  unrecognized_config_field_count?: number;
+  shared_base_cause?: "uncovered_members" | "conflicting_transport" | "both";
+  uncovered_member_count?: number;
+  distinct_transport_count?: number;
+};
+type Gap = { source_stable_id: string; source_provider: string; reason: GapReason } & GapDiagnostic;
+
+/** Never serialize a caller-controlled property name or either field value. */
+function configDifference(left: Config, right: Config): GapDiagnostic {
+  const names = new Set([...Object.keys(left), ...Object.keys(right)]);
+  const differing = [...names].filter(name => Object.hasOwn(left, name) !== Object.hasOwn(right, name)
+    || canonicalJson(left[name], "configuration field") !== canonicalJson(right[name], "configuration field"));
+  const recognized = new Set<string>(CONFIG_DIAGNOSTIC_FIELDS);
+  return {
+    config_difference_keys: CONFIG_DIAGNOSTIC_FIELDS.filter(name => differing.includes(name)),
+    unrecognized_config_field_count: differing.filter(name => !recognized.has(name)).length,
+  };
+}
 
 /** Reject schema-valid but incomplete/empty candidate material before any GET. */
 export function validateTransportInputs(sourceRaw: Buffer, candidateRaw: Buffer) {
@@ -55,8 +80,8 @@ export function reconcileTransport(
   const bySource = new Map(sources.map(x => [x.stableId, x]));
   const groups = new Map<string, { source: SourceTransport; target: ExistingTransport; scope: string; origins?: string[] }[]>();
   const quarantined: Gap[] = [];
-  const gap = (candidate: Candidate, reason: GapReason): void => {
-    quarantined.push({ source_stable_id: candidate.sourceStableId, source_provider: candidate.sourceProvider, reason });
+  const gap = (candidate: Candidate, reason: GapReason, diagnostic: GapDiagnostic = {}): void => {
+    quarantined.push({ source_stable_id: candidate.sourceStableId, source_provider: candidate.sourceProvider, reason, ...diagnostic });
   };
   for (const candidate of candidates) {
     const source = bySource.get(candidate.sourceStableId);
@@ -80,7 +105,7 @@ export function reconcileTransport(
     delete config.result_origins;
     config.network_scope = source.config.network_scope;
     if (canonicalJson(config, "target transport configuration") !== canonicalJson(source.config, "source transport configuration")) {
-      gap(candidate, "target_config_mismatch"); continue;
+      gap(candidate, "target_config_mismatch", configDifference(config, source.config)); continue;
     }
     const base = source.config.base_url;
     if (typeof base !== "string" || (origins !== undefined
@@ -104,7 +129,14 @@ export function reconcileTransport(
     // A base-level policy cannot represent contradictory per-account states.
     const otherSources = sources.filter(x => x.config.base_url === base && !group.some(g => g.source.stableId === x.stableId));
     if (signatures.size !== 1 || otherSources.length !== 0) {
-      for (const item of group) gap({ sourceStableId: item.source.stableId, sourceProvider: item.source.provider }, "shared_base_transport_conflict");
+      const diagnostic: GapDiagnostic = {
+        shared_base_cause: signatures.size !== 1
+          ? (otherSources.length !== 0 ? "both" : "conflicting_transport") : "uncovered_members",
+        uncovered_member_count: otherSources.length,
+        distinct_transport_count: signatures.size,
+      };
+      for (const item of group) gap({ sourceStableId: item.source.stableId, sourceProvider: item.source.provider },
+        "shared_base_transport_conflict", diagnostic);
       continue;
     }
     if (group[0]!.scope === "private") policy.private_target_base_urls.push(base);

@@ -57,6 +57,10 @@ test("base-level policy cannot broaden another unmatched source account sharing 
   const result = reconcileTransport([source, other], [target], [...candidates, { sourceStableId: other.stableId, sourceProvider: other.provider }]);
   assert.equal(result.matches.length, 0);
   assert.deepEqual(new Set(result.quarantined.map(x => x.reason)), new Set(["source_proxy_unverifiable", "shared_base_transport_conflict"]));
+  const shared = result.quarantined.find(x => x.reason === "shared_base_transport_conflict");
+  assert.equal(shared?.shared_base_cause, "uncovered_members");
+  assert.equal(shared?.uncovered_member_count, 1);
+  assert.equal(shared?.distinct_transport_count, 1);
 });
 test("conflicting target transport on the same base is not collapsed", () => {
   const other = { ...source, stableId: "fixture-other", name: "fixture-other" };
@@ -65,6 +69,47 @@ test("conflicting target transport on the same base is not collapsed", () => {
   assert.equal(result.matches.length, 0);
   assert.equal(result.quarantined.length, 2);
   assert.deepEqual(result.policy.private_target_base_urls, []);
+  for (const gap of result.quarantined) {
+    assert.equal(gap.shared_base_cause, "conflicting_transport");
+    assert.equal(gap.uncovered_member_count, 0);
+    assert.equal(gap.distinct_transport_count, 2);
+  }
+});
+
+test("configuration diagnostics expose only allowlisted names, never values or untrusted keys", () => {
+  const sensitive = "fixture-secret-value-must-not-appear";
+  const sensitiveKey = "https://fixture-secret-host.invalid/private-name";
+  const result = reconcileTransport([source], [{
+    ...target,
+    config: {
+      ...target.config, base_url: `https://${sensitive}.invalid`, timeout_seconds: sensitive,
+      video_api: { nested: sensitive }, [sensitiveKey]: sensitive,
+    },
+  }], candidates);
+  assert.equal(result.matches.length, 0);
+  const gap = result.quarantined[0]!;
+  assert.equal(gap.reason, "target_config_mismatch");
+  assert.deepEqual(gap.config_difference_keys, ["base_url", "timeout_seconds", "video_api"]);
+  assert.equal(gap.unrecognized_config_field_count, 1);
+  const serialized = JSON.stringify(result);
+  for (const forbidden of [sensitive, sensitiveKey, source.name, String(source.config.base_url)]) {
+    assert.equal(serialized.includes(forbidden), false);
+  }
+});
+
+test("shared-base diagnostic distinguishes simultaneous uncovered and conflicting members", () => {
+  const second = { ...source, stableId: "fixture-second", name: "fixture-second" };
+  const absent = { ...source, stableId: "fixture-absent", name: "fixture-absent", disabled: true };
+  const result = reconcileTransport([source, second, absent], [
+    target, { ...target, id: "fixture-second", name: second.name, config: source.config },
+  ], [...candidates, { sourceStableId: second.stableId, sourceProvider: second.provider }]);
+  assert.equal(result.matches.length, 0);
+  assert.equal(result.quarantined.length, 2);
+  for (const gap of result.quarantined) {
+    assert.equal(gap.shared_base_cause, "both");
+    assert.equal(gap.uncovered_member_count, 1);
+    assert.equal(gap.distinct_transport_count, 2);
+  }
 });
 test("CLI refuses apply, omitted tenant and incomplete inputs before network or output", async () => {
   await assert.rejects(runTransportReconciliation(["--apply"]));
