@@ -63,6 +63,107 @@ mapping is controlled; no historical tenant name is inferred.
   Source-key HMAC query values are supplied only through the local `psql`
   standard-input stream, not process arguments or output.
 
+## One-shot PostgreSQL reader authorization
+
+The resolver is not authorized to use the runtime application database
+credential. It requires the short-lived, fixed role
+`mtc_managed_codex_provenance_reader_v1`, whose grants are constrained to the
+query below. The role does not receive `SELECT` on a whole table, any write or
+sequence privilege, a role membership, a future-default privilege, or a
+credential ciphertext column.
+
+| Relation | Permitted columns |
+| --- | --- |
+| `public.tenants` | `id`, `external_id` |
+| `public.upstream_account_imports` | `tenant_id`, `import_kind`, `source_key`, `payload_digest`, `contract_version`, `upstream_account_id` |
+| `public.upstream_accounts` | `id`, `tenant_id`, `driver`, `auth_kind`, `status`, `credential_generation`, `oauth_session_id`, `oauth_driver`, `oauth_refresh_url`, `updated_at` |
+| `public.upstream_credentials` | `upstream_account_id`, `generation`, `revoked_at` |
+
+The fixed psql templates are:
+
+- [`managed-codex-provenance-reader-preflight.sql`](../../ops/legacy-routes/managed-codex-provenance-reader-preflight.sql)
+  checks the exact database, relation inventory, absent role name, and absence
+  of any `PUBLIC` relation privilege which would bypass the column boundary.
+- [`managed-codex-provenance-reader-prepare.sql`](../../ops/legacy-routes/managed-codex-provenance-reader-prepare.sql)
+  has the only grant list. It accepts only `reader_mode=direct|cnpg` and an
+  RFC3339 `reader_valid_until` that is later than the transaction clock and at
+  most four hours ahead. It is transactional and rejects a same-name role,
+  non-default membership, owner objects, administrative attributes, prior
+  relation privileges, a different role comment, or a different expiry.
+- [`managed-codex-provenance-reader-cleanup.sql`](../../ops/legacy-routes/managed-codex-provenance-reader-cleanup.sql)
+  revokes only those grants and drops only that exact role. It never uses
+  `CASCADE`, never reassigns/drops objects, and stops rather than touching a
+  mismatched, member, or object-owning role.
+
+These are database administration artifacts, not resolver inputs. Do not put
+a password, connection string, key pepper, source key, auth path, or receipt
+digest in a template, its command line, or its output. Their required operation
+inputs are non-secret: `reader_mode` and the short `reader_valid_until`.
+
+### CNPG-managed role path
+
+The current target's CNPG role lifecycle is the preferred path. Before adding
+anything to CNPG, run the read-only preflight and retain its success evidence.
+That prevents a pre-existing same-name role from being silently adopted. The
+owner then adds an inline `spec.managed.roles` entry for the exact role name
+with this shape (the timestamp is an approved operation input, not a checked-in
+placeholder):
+
+```text
+name: mtc_managed_codex_provenance_reader_v1
+ensure: present
+comment: one-shot managed Codex provenance reader v1
+login: true
+inherit: false
+connectionLimit: 1
+superuser: false
+createdb: false
+createrole: false
+replication: false
+bypassrls: false
+inRoles: []
+validUntil: APPROVED_RFC3339_WITHIN_FOUR_HOURS
+passwordSecret: { name: OWNER_CREATED_BASIC_AUTH_SECRET }
+```
+
+The Secret is an owner-created, same-namespace `kubernetes.io/basic-auth`
+Secret with a `username` equal to the fixed role name and a separately held
+password; it is not a GitOps object and is never copied into this repository.
+No login Secret need be created during the initial review: CNPG can first hold
+the role with `login: false` and `disablePassword: true`. Only inside the
+approved execution window does the owner change it to the above login shape,
+provide a short-expiry password Secret, and invoke the prepare template with
+`reader_mode=cnpg`. A libpq service/passfile assembled from that owner-only
+credential remains local `0600` input to the resolver.
+
+CNPG's inline role declaration manages role attributes and passwords, not the
+four column grants. After its role status proves the exact role exists, the
+approved DBA principal runs the prepare template through the existing approved
+connection. That principal must have both the listed table-grant authority and
+the role-administration authority required by the selected lifecycle; the
+resolver role itself never has either. If those authorities are split, stop
+rather than substituting the application credential, broadening the reader, or
+adding a migration Job/image. `pg_read_all_data`, the runtime `database-url`, and
+`memeloop-token-center-pg-app` are not substitutes.
+
+For cleanup, first use CNPG to make the role `NOLOGIN` and clear its password,
+wait for that status, then remove the role entry so CNPG no longer reconciles
+it. Immediately run the cleanup template via an approved principal which can
+both revoke the listed grants and `DROP ROLE`. If cleanup fails, the remaining
+role is still `NOLOGIN`; investigate rather than
+recreating or force-dropping it. Only after the template commits may the owner
+delete the password Secret and local passfile. An alternative CNPG
+`ensure: absent` is allowed only when the operator itself is intended to drop
+the role; do not run the cleanup template against a role that has already been
+dropped.
+
+`reader_mode=direct` exists only for a separately approved DBA-owned role
+lifecycle. It creates a fresh `NOLOGIN` role with the same fixed expiry and
+grants, but never sets a password. A later owner-authorized login credential is
+still required before resolver execution. That lifecycle must likewise restore
+`NOLOGIN` before it uses the cleanup template. It must not be used where the
+target requires CNPG role management.
+
 For example, in an approved local migration shell:
 
 ```text

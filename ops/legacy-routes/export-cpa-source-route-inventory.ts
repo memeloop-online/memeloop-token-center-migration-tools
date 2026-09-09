@@ -26,6 +26,7 @@ const SOURCE_FIELD = /^[\p{L}\p{N}][\p{L}\p{N}._:/+-]*$/u;
 const OPAQUE_ACCOUNT_DOMAIN = "memeloop-token-center\0cpa-native-reauthorization-source-id\0v1\0";
 const MANAGED_OAUTH_CAPABILITY_GAP_DOMAIN = "memeloop-token-center\0cpa-managed-oauth-capability-gap-source-id\0v1\0";
 const MANAGED_OAUTH_CAPABILITY_GAP_REASON = "source capability gap: target lacks a managed OAuth adapter";
+const UNCONFIGURED_DIRECT_ROUTE_REASON = "source capability gap: no exact configured direct route";
 
 type Protocol = "openai" | "anthropic";
 type Source = Readonly<{ provider: string; model: string; group: string | null; upstream_prefix: string | null; protocol: Protocol }>;
@@ -57,13 +58,25 @@ function exactGrant(grant: SourceGrant): Source | Anomaly {
   return { provider, model, group, upstream_prefix: upstreamPrefix, protocol: "openai" };
 }
 function isAnomaly(value: Source | Anomaly): value is Anomaly { return "reason" in value; }
-function modelIndex(models: readonly CpaRouteModel[]): ReadonlyMap<string, readonly CpaRouteModel[]> {
-  const values = new Map<string, CpaRouteModel[]>();
+type ModelIndex = Readonly<{ exact: ReadonlyMap<string, readonly CpaRouteModel[]>; providerModel: ReadonlyMap<string, readonly CpaRouteModel[]> }>;
+function modelIndex(models: readonly CpaRouteModel[]): ModelIndex {
+  const exact = new Map<string, CpaRouteModel[]>(), providerModel = new Map<string, CpaRouteModel[]>();
   for (const model of models) {
     const id = JSON.stringify([model.provider, model.model, model.upstreamPrefix]);
-    const current = values.get(id); if (current) current.push(model); else values.set(id, [model]);
+    const current = exact.get(id); if (current) current.push(model); else exact.set(id, [model]);
+    const providerModelId = JSON.stringify([model.provider, model.model]);
+    const sameProviderModel = providerModel.get(providerModelId); if (sameProviderModel) sameProviderModel.push(model); else providerModel.set(providerModelId, [model]);
   }
-  return values;
+  return { exact, providerModel };
+}
+function configuredMatches(lookup: ModelIndex, source: Source): readonly CpaRouteModel[] {
+  const exact = lookup.exact.get(JSON.stringify([source.provider, source.model, source.upstream_prefix])) ?? [];
+  if (exact.length > 0 || source.upstream_prefix !== null) return exact;
+  // CPA native-access policy omits upstream_prefix for a canonical request.
+  // A unique configured effective prefix (provider-level or model-level) is
+  // therefore route configuration, not a policy grant expansion. Keep the
+  // source tuple null so later policy matching preserves that authorization.
+  return (lookup.providerModel.get(JSON.stringify([source.provider, source.model])) ?? []).filter((model) => model.upstreamPrefix !== null);
 }
 
 /** Pure construction step: it receives only parsed non-secret coordinates and policy grants. */
@@ -71,7 +84,7 @@ export function buildArtifacts(models: readonly CpaRouteModel[], opaque: readonl
   if (identityKey.length !== 32) throw new SourceRouteExportFailure("source identity key is invalid");
   if (models.some((model) => !publicField(model.provider) || !publicField(model.model) || !publicField(model.upstreamModel) || (model.upstreamPrefix !== null && !publicField(model.upstreamPrefix)))) throw new SourceRouteExportFailure("configured route model contains an unsafe public coordinate");
   const lookup = modelIndex(models), mappings = new Map<string, Source>(), pools = new Map<string, CandidateSet>(), anomalies = new Map<string, Anomaly>();
-  const missingManagedKimiAdapter = capabilityGaps.some((item) => item.sourceType === "kimi"); let capabilityGapGrantCount = 0;
+  const missingManagedKimiAdapter = capabilityGaps.some((item) => item.sourceType === "kimi"); let capabilityGapGrantCount = 0, unconfiguredDirectRouteGrantCount = 0;
   const addAnomaly = (item: Anomaly): void => { anomalies.set(JSON.stringify([item.provider, item.model, item.reason]), item); };
   for (const grant of grants) {
     const parsed = exactGrant(grant);
@@ -82,8 +95,10 @@ export function buildArtifacts(models: readonly CpaRouteModel[], opaque: readonl
     if (missingManagedKimiAdapter && parsed.provider === "kimi") {
       capabilityGapGrantCount += 1; addAnomaly({ provider: parsed.provider, model: parsed.model, reason: MANAGED_OAUTH_CAPABILITY_GAP_REASON }); continue;
     }
-    const matches = lookup.get(JSON.stringify([parsed.provider, parsed.model, parsed.upstream_prefix])) ?? [];
-    if (matches.length === 0) throw new SourceRouteExportFailure("source grant lacks an exact configured route model");
+    const matches = configuredMatches(lookup, parsed);
+    if (matches.length === 0) {
+      unconfiguredDirectRouteGrantCount += 1; addAnomaly({ provider: parsed.provider, model: parsed.model, reason: UNCONFIGURED_DIRECT_ROUTE_REASON }); continue;
+    }
     if (matches.length !== 1) throw new SourceRouteExportFailure("source grant has an ambiguous configured route model");
     const model = matches[0]!;
     const source: Source = { ...parsed, protocol: model.protocol };
@@ -118,6 +133,7 @@ export function buildArtifacts(models: readonly CpaRouteModel[], opaque: readonl
       reauthorization_required_count: reauthorization.length,
       source_capability_gap_auth_count: capabilityGaps.length,
       source_capability_gap_grant_count: capabilityGapGrantCount,
+      source_unconfigured_direct_route_grant_count: unconfiguredDirectRouteGrantCount,
       anomaly_count: anomalyList.length,
     },
   };
@@ -186,6 +202,7 @@ function combineArtifacts(direct: Artifacts, managed: readonly ManagedCodexRoute
       reauthorization_required_count: (sourceDocument.reauthorization_required as unknown[]).length,
       source_capability_gap_auth_count: direct.counts.source_capability_gap_auth_count ?? 0,
       source_capability_gap_grant_count: direct.counts.source_capability_gap_grant_count ?? 0,
+      source_unconfigured_direct_route_grant_count: direct.counts.source_unconfigured_direct_route_grant_count ?? 0,
       anomaly_count: anomalyList.length,
     },
   };

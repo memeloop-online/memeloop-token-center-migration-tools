@@ -221,9 +221,58 @@ describe("CPA source route inventory exporter", () => {
     const repeated = spawnSync(process.execPath, exportArguments(source, output), { encoding: "utf8" }); assert.equal(repeated.status, 2); assert.deepEqual(readFileSync(sourcePath), initialSource); assert.deepEqual(readFileSync(materialPath), initialMaterial);
     const invalidRoot = mkdtempSync(join(tmpdir(), "mtc-source-route-invalid-")), invalid = writeSource(invalidRoot, true), invalidOutput = join(invalidRoot, "output"); mkdirSync(invalidOutput, { mode: 0o700 });
     const rejected = spawnSync(process.execPath, exportArguments(invalid, invalidOutput), { encoding: "utf8" }); assert.equal(rejected.status, 2); assert.equal(existsSync(join(invalidOutput, "source-inventory.json")), false); assert.equal(existsSync(join(invalidOutput, "provider-candidate-material.json")), false); assert.doesNotMatch(rejected.stderr, /fixture-only-route-export-api-key|FixtureCopilotHandle|fixture-route-export@example/u);
-    const missingRoot = mkdtempSync(join(tmpdir(), "mtc-source-route-missing-")), missing = writeSource(missingRoot), missingOutput = join(missingRoot, "output"); mkdirSync(missingOutput, { mode: 0o700 });
-    writeFileSync(missing.policy, JSON.stringify({ version: 1, policies: [{ key_hash: "c".repeat(64), enabled: true, grants: [{ provider: "codex", model: "unresolved" }] }], usage: {} }), { mode: 0o600 });
-    const unresolved = spawnSync(process.execPath, exportArguments(missing, missingOutput), { encoding: "utf8" }); assert.equal(unresolved.status, 2); assert.equal(existsSync(join(missingOutput, "source-inventory.json")), false); assert.equal(existsSync(join(missingOutput, "provider-candidate-material.json")), false);
+  });
+
+  it("inherits only a unique configured effective prefix for a policy grant that omits it, and records unconfigured direct grants without blocking exact pools", () => {
+    const root = mkdtempSync(join(tmpdir(), "mtc-source-route-configured-prefix-")), source = writeSource(root), output = join(root, "output"); mkdirSync(output, { mode: 0o700 });
+    writeFileSync(source.config, [
+      'auth-dir: "/sealed/auth"',
+      "openai-compatibility:",
+      '  - name: "fixture-provider-prefix"',
+      '    prefix: "fixture-native-prefix"',
+      '    base-url: "https://fixture-provider-prefix.example.test/v1"',
+      "    api-key-entries:",
+      `      - api-key: "${apiKey}-configured-prefix"`,
+      "    models:",
+      '      - name: "fixture-configured-upstream"',
+      '        alias: "fixture-configured-model"',
+      "",
+    ].join("\n"), { mode: 0o600 });
+    writeFileSync(source.policy, JSON.stringify({ version: 1, policies: [{ key_hash: "e".repeat(64), enabled: true, grants: [
+      { provider: "fixture-provider-prefix", model: "fixture-configured-model" },
+      { provider: "fixture-provider-prefix", model: "fixture-configured-model", upstream_prefix: "unconfigured-prefix" },
+      { provider: "fixture-provider-gap", model: "fixture-gap-model" },
+    ] }], usage: {} }), { mode: 0o600 });
+    const result = spawnSync(process.execPath, exportArguments(source, output), { encoding: "utf8" }); assert.equal(result.status, 0, result.stderr);
+    const receipt = JSON.parse(result.stdout) as Record<string, unknown>, inventory = JSON.parse(readFileSync(join(output, "source-inventory.json"), "utf8")) as Record<string, unknown>, material = JSON.parse(readFileSync(join(output, "provider-candidate-material.json"), "utf8")) as Record<string, unknown>;
+    assert.equal(receipt.source_mapping_count, 1); assert.equal(receipt.provider_candidate_set_count, 1); assert.equal(receipt.source_unconfigured_direct_route_grant_count, 2); assert.equal(receipt.anomaly_count, 2);
+    assert.deepEqual(inventory.mappings, [{ provider: "fixture-provider-prefix", model: "fixture-configured-model", group: null, upstream_prefix: null, protocol: "openai" }]);
+    assert.deepEqual(inventory.anomalies, [
+      { provider: "fixture-provider-gap", model: "fixture-gap-model", reason: "source capability gap: no exact configured direct route" },
+      { provider: "fixture-provider-prefix", model: "fixture-configured-model", reason: "source capability gap: no exact configured direct route" },
+    ]);
+    const set = (material.provider_candidate_sets as Array<Record<string, unknown>>)[0]; assert(set);
+    assert.equal(set.upstream_model, "fixture-configured-upstream"); assert.deepEqual(set.source, { provider: "fixture-provider-prefix", model: "fixture-configured-model", group: null, upstream_prefix: null, protocol: "openai" });
+
+    const ambiguousRoot = mkdtempSync(join(tmpdir(), "mtc-source-route-configured-prefix-ambiguous-")), ambiguous = writeSource(ambiguousRoot), ambiguousOutput = join(ambiguousRoot, "output"); mkdirSync(ambiguousOutput, { mode: 0o700 });
+    writeFileSync(ambiguous.config, [
+      'auth-dir: "/sealed/auth"',
+      "openai-compatibility:",
+      '  - name: "fixture-provider-ambiguous"',
+      '    base-url: "https://fixture-provider-ambiguous.example.test/v1"',
+      "    api-key-entries:",
+      `      - api-key: "${apiKey}-ambiguous-prefix"`,
+      "    models:",
+      '      - name: "fixture-first-upstream"',
+      '        alias: "fixture-ambiguous-model"',
+      '        prefix: "first-prefix"',
+      '      - name: "fixture-second-upstream"',
+      '        alias: "fixture-ambiguous-model"',
+      '        prefix: "second-prefix"',
+      "",
+    ].join("\n"), { mode: 0o600 });
+    writeFileSync(ambiguous.policy, JSON.stringify({ version: 1, policies: [{ key_hash: "f".repeat(64), enabled: true, grants: [{ provider: "fixture-provider-ambiguous", model: "fixture-ambiguous-model" }] }], usage: {} }), { mode: 0o600 });
+    const rejected = spawnSync(process.execPath, exportArguments(ambiguous, ambiguousOutput), { encoding: "utf8" }); assert.equal(rejected.status, 2); assert.equal(existsSync(join(ambiguousOutput, "source-inventory.json")), false); assert.equal(existsSync(join(ambiguousOutput, "provider-candidate-material.json")), false);
   });
 
   it("records each Kimi OAuth source capability gap and every affected exact grant without manufacturing a direct pool", () => {

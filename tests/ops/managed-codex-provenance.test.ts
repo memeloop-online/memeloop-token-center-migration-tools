@@ -18,6 +18,21 @@ import { managedCodexRouteSourceStableId } from "../../ops/legacy-routes/cpa-man
 
 const repository = resolve(import.meta.dirname, "../..");
 const resolver = join(repository, "ops/legacy-routes/resolve-cpa-managed-codex-provenance.ts");
+describe("managed Codex provenance reader administration contract", () => {
+  it("fences preparation to a short-lived role and repeats PUBLIC privilege checks before granting", () => {
+    const sql = readFileSync(join(repository, "ops/legacy-routes/managed-codex-provenance-reader-prepare.sql"), "utf8");
+    const beforeGrants = sql.slice(0, sql.indexOf("GRANT CONNECT"));
+    assert.match(beforeGrants, /requested_mode IS NULL OR requested_mode NOT IN/u);
+    assert.match(beforeGrants, /requested_valid_until IS NULL/u);
+    assert.match(beforeGrants, /interval '4 hours'/u);
+    assert.equal([...beforeGrants.matchAll(/privilege\.grantee IN \(0, reader_role_id\)/gu)].length, 2);
+    assert.match(beforeGrants, /current_database\(\) <> 'memeloop_token_center'/u);
+    assert.doesNotMatch(sql, /GRANT SELECT ON|GRANT ALL|WITH GRANT OPTION|PASSWORD\s+'/iu);
+    const cleanup = readFileSync(join(repository, "ops/legacy-routes/managed-codex-provenance-reader-cleanup.sql"), "utf8");
+    assert.match(cleanup, /IF role_record\.rolcanlogin/u);
+    assert.doesNotMatch(cleanup, /CASCADE|DROP OWNED|REASSIGN OWNED/iu);
+  });
+});
 const fakePsql = join(repository, "tests/ops/helpers/fake-psql-managed-codex-provenance.ts");
 const sourceKeyPrefix = Buffer.from("4d54432d534f555243452d49442d4b45590001", "hex");
 const sha = (value: Buffer | string): string => createHash("sha256").update(value).digest("hex");
