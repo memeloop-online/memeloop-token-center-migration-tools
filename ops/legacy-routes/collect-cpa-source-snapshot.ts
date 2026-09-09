@@ -312,6 +312,23 @@ function sourceLayout(configRaw: Buffer, stateRoot: string): SourceLayout {
 
 function inside(path: string, directory: string): boolean { return path === directory || path.startsWith(`${directory}/`); }
 
+/**
+ * CPA keeps inactive pre-refresh revisions alongside the active auth JSON.
+ * This is deliberately an exact, suffix-only allowlist: every other
+ * non-JSON auth entry remains a capture failure.
+ */
+function inactiveAuthBackup(relativePath: string): boolean {
+  return /\.json\.bak(?:[-.].*)?$/u.test(relativePath);
+}
+
+function inactiveAuthBackupExclusions(authRelativePath: string): readonly string[] {
+  return [
+    `${authRelativePath}/*.json.bak`,
+    `${authRelativePath}/*.json.bak-*`,
+    `${authRelativePath}/*.json.bak.*`,
+  ];
+}
+
 function selectedAlias(value: unknown): readonly Readonly<{ name: string; alias: string }>[] {
   if (value === undefined || value === null) return [];
   if (!Array.isArray(value) || value.length > 2_000) fail("CPA auth route projection is invalid");
@@ -358,6 +375,7 @@ function captureFromArchive(entries: ReadonlyMap<string, ArchiveEntry>, layout: 
     if (inside(entry.name, `${layout.authRelativePath}/logs`)) fail("source archive did not exclude the reviewed logs subtree");
     if (entry.kind === "directory") continue;
     const relativePath = entry.name.slice(`${layout.authRelativePath}/`.length);
+    if (inactiveAuthBackup(relativePath)) continue;
     if (!relativePath || !relativePath.toLowerCase().endsWith(".json")) fail("source archive contains a non-JSON auth entry");
     authFiles.set(relativePath, entry.content);
     projections.push(authProjection(relativePath, entry.content));
@@ -399,7 +417,7 @@ async function captureSource(selected: Options): Promise<SourceCapture> {
   finally { for (const entry of configArchive.values()) entry.content.fill(0); }
   const paths = ["config.yaml", layout.authRelativePath];
   if (!inside(layout.policyRelativePath, layout.authRelativePath)) paths.push(layout.policyRelativePath);
-  const entries = await archive(selected, paths, [`${layout.authRelativePath}/logs`]);
+  const entries = await archive(selected, paths, [`${layout.authRelativePath}/logs`, ...inactiveAuthBackupExclusions(layout.authRelativePath)]);
   const capturedConfig = entries.get("config.yaml");
   if (!capturedConfig || capturedConfig.kind !== "file" || sha256(capturedConfig.content) !== layoutConfigSha256) fail("CPA source config changed while deriving the capture layout");
   return captureFromArchive(entries, layout);

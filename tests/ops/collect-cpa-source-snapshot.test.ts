@@ -35,7 +35,7 @@ function argumentsFor(root: string, output: string): string[] {
     "--timeout-ms", "10000",
   ];
 }
-async function run(root: string, output: string, mode: "stable" | "route-change" | "config-drift" | "traversal" | "symlink" | "uid-drift" | "pvc-drift" = "stable") {
+async function run(root: string, output: string, mode: "stable" | "backup" | "non-json" | "route-change" | "config-drift" | "traversal" | "symlink" | "uid-drift" | "pvc-drift" = "stable") {
   const environment: Record<string, string> = {
     FAKE_CPA_COUNTER_PATH: join(root, "capture-counter"),
     FAKE_CPA_CONFIG_COUNTER_PATH: join(root, "config-counter"),
@@ -43,6 +43,7 @@ async function run(root: string, output: string, mode: "stable" | "route-change"
     FAKE_CPA_UNSTABLE_ROUTE: mode === "route-change" ? "1" : "0",
     FAKE_CPA_UNSAFE_ARCHIVE: mode === "traversal" || mode === "symlink" ? mode : "",
     FAKE_CPA_POD_DRIFT: mode === "uid-drift" ? "uid" : mode === "pvc-drift" ? "pvc" : "",
+    FAKE_CPA_AUTH_ENTRY: mode === "backup" || mode === "non-json" ? mode : "",
   };
   const original = new Map(Object.keys(environment).map((key) => [key, process.env[key]]));
   try {
@@ -86,6 +87,18 @@ describe("local CPA source snapshot collector", () => {
       for (const key of ["source_config_sha256", "source_policy_sha256", "auth_route_projection_sha256", "auth_payload_revision_sha256", "source_route_evidence_sha256", "source_capture_sha256", "managed_codex_model_snapshot_sha256"]) assert.match(String(receipt[key]), /^[0-9a-f]{64}$/u);
       assert.equal(receipt.auth_file_count, 1); assert.equal(receipt.managed_codex_auth_file_count, 1);
       await expectFailure(root, output, "stable", "output directory already exists");
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("excludes only the documented inactive CPA auth backup suffixes", async () => {
+    const root = mkdtempSync(join(repository, ".test-cpa-source-capture-"));
+    try {
+      chmodSync(root, 0o700);
+      writeFileSync(join(root, "management.token"), "fixture-management-token", { mode: 0o600 }); chmodSync(join(root, "management.token"), 0o600);
+      const backupOutput = join(root, "backup-capture"), result = await run(root, backupOutput, "backup");
+      assert.equal(result.auth_file_count, 1);
+      assert.deepEqual(readdirSync(join(backupOutput, "auth")), ["csil.json"]);
+      await expectFailure(root, join(root, "non-json-capture"), "non-json", "source archive contains a non-JSON auth entry");
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 

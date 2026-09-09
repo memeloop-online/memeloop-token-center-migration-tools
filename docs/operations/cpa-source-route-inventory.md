@@ -100,6 +100,10 @@ has mode `0600` (and nested auth directories mode `0700`):
 
 - `config.yaml`, `auth/`, and `native-key-policy.json` are the exact captured
   source inputs. `auth/logs` is excluded if it exists; its absence is valid.
+- Within `auth/`, only active `*.json` files are captured. CPA's documented
+  inactive pre-refresh siblings ending in `.json.bak`, `.json.bak-*`, or
+  `.json.bak.*` are excluded before archive transfer and are not copied or
+  sealed. Any other regular non-JSON auth entry fails the capture.
 - `managed-codex-model-snapshot.json` exists only when active Codex OAuth was
   observed. It is collected with the existing read-only management snapshot
   command over the temporary loopback forwarding path.

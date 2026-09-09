@@ -86,13 +86,20 @@ if (arguments_.includes("get") && arguments_.includes("pod")) {
   const fullCapture = tarArguments.includes("auth");
   if (!fullCapture) await archive([{ name: "config.yaml", content: sourceConfig() }]);
   else {
-    if (!tarArguments.includes("--exclude=auth/logs")) process.exit(93);
+    const requiredExclusions = ["--exclude=auth/logs", "--exclude=auth/*.json.bak", "--exclude=auth/*.json.bak-*", "--exclude=auth/*.json.bak.*"];
+    if (!requiredExclusions.every((entry) => tarArguments.includes(entry))) process.exit(93);
     const revision = nextRevision(), prefix = process.env.FAKE_CPA_UNSTABLE_ROUTE === "1" && revision > 1 ? "codex-other" : "codex-csil";
     await archive([
       { name: "config.yaml", content: sourceConfig() },
       { name: "auth/" },
       { name: "auth/csil.json", content: JSON.stringify({ type: "codex", prefix, refresh_token: `fixture-refresh-${revision}` }) },
       { name: "cpa-key-access-policy-state.json", content: JSON.stringify({ fixture: true }) },
+      ...(process.env.FAKE_CPA_AUTH_ENTRY === "backup" ? [
+        { name: "auth/csil.json.bak", content: "fixture-backup" },
+        { name: "auth/csil.json.bak-20260909", content: "fixture-backup" },
+        { name: "auth/csil.json.bak.20260909", content: "fixture-backup" },
+      ] : []),
+      ...(process.env.FAKE_CPA_AUTH_ENTRY === "non-json" ? [{ name: "auth/unapproved.txt", content: "fixture-unapproved" }] : []),
       ...(process.env.FAKE_CPA_UNSAFE_ARCHIVE === "traversal" ? [{ name: "../escape.json", content: "{}" }] : []),
       ...(process.env.FAKE_CPA_UNSAFE_ARCHIVE === "symlink" ? [{ name: "auth/escape.json", type: "symlink" as const, linkname: "/outside" }] : []),
     ]);
