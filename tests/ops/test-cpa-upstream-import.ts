@@ -73,6 +73,23 @@ describe("CPA upstream TypeScript operators", () => {
     assert.doesNotMatch(result.stdout + result.stderr, /fixture-only-|Fixture(Copilot|Cursor)Handle/);
   });
 
+  it("validates only the documented opaque created_at metadata field", () => {
+    for (const [name, createdAt, extra] of [
+      ["invalid-timestamp", "2026-99-09T12:00:00Z", {}],
+      ["unknown-field", "2026-09-09T12:00:00Z", { unexpected_metadata: true }],
+    ] as const) {
+      const root = mkdtempSync(join(tmpdir(), "mtc-cpa-opaque-metadata-"));
+      try {
+        const source = join(root, "source"); cpSync(join(fixtures, "supported"), source, { recursive: true });
+        const authPath = join(source, "auth", "copilot-account.json"), auth = JSON.parse(readFileSync(authPath, "utf8")) as Record<string, unknown>;
+        writeFileSync(authPath, JSON.stringify({ ...auth, created_at: createdAt, ...extra }), { mode: 0o600 }); privateTree(source);
+        const result = spawnSync(process.execPath, [importer, "--config", join(source, "config.yaml"), "--auth-dir", join(source, "auth")], { encoding: "utf8" });
+        assert.equal(result.status, 2, name);
+        assert.doesNotMatch(result.stderr, /2026-99-09|unexpected_metadata/);
+      } finally { rmSync(root, { recursive: true, force: true }); }
+    }
+  });
+
   it("rejects unsafe fixture permissions before parsing secret material", () => {
     const root = mkdtempSync(join(tmpdir(), "mtc-cpa-unsafe-"));
     const source = join(root, "source");

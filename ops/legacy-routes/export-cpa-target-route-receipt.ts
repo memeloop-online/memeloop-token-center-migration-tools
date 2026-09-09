@@ -19,6 +19,7 @@ import {
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { basename, dirname, isAbsolute, parse, relative, resolve, sep } from "node:path";
+import { invokedAsEntrypoint } from "../lib/invoked-as-entrypoint.ts";
 import { parseStrictJson } from "../lib/strict-json.ts";
 import {
   completeSinglePage,
@@ -409,4 +410,4 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   }
 }
 
-if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) process.exitCode = await main();
+if (invokedAsEntrypoint("export-cpa-target-route-receipt", import.meta.url)) process.exitCode = await main();

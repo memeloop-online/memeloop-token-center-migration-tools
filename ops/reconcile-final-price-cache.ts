@@ -10,6 +10,7 @@
 import { accessSync, constants as fsConstants, lstatSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { invokedAsEntrypoint } from "./lib/invoked-as-entrypoint.ts";
 
 class CliError extends Error {
   readonly exitCode: number;
@@ -469,9 +470,11 @@ function main(): void {
   if (blockers.length > 0) process.exitCode = 1;
 }
 
-try {
-  main();
-} catch (error) {
-  process.stderr.write(`${error instanceof Error ? error.message : "price/cache reconciliation failed"}\n`);
-  process.exitCode = error instanceof CliError ? error.exitCode : 1;
+if (invokedAsEntrypoint("reconcile-final-price-cache", import.meta.url)) {
+  try {
+    main();
+  } catch (error) {
+    process.stderr.write(`${error instanceof Error ? error.message : "price/cache reconciliation failed"}\n`);
+    process.exitCode = error instanceof CliError ? error.exitCode : 1;
+  }
 }

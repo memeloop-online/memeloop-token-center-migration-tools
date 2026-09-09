@@ -3,6 +3,7 @@
 
 import { spawn } from "node:child_process";
 import { accessSync, constants as fsConstants, statSync } from "node:fs";
+import { invokedAsEntrypoint } from "./lib/invoked-as-entrypoint.ts";
 
 class CliError extends Error {
   readonly exitCode: number;
@@ -83,9 +84,11 @@ async function main(): Promise<void> {
   process.exitCode = status;
 }
 
-try {
-  await main();
-} catch (error) {
-  process.stderr.write(`${error instanceof Error ? error.message : "session archive import failed"}\n`);
-  process.exitCode = error instanceof CliError ? error.exitCode : 1;
+if (invokedAsEntrypoint("import-cpa-session-archive", import.meta.url)) {
+  try {
+    await main();
+  } catch (error) {
+    process.stderr.write(`${error instanceof Error ? error.message : "session archive import failed"}\n`);
+    process.exitCode = error instanceof CliError ? error.exitCode : 1;
+  }
 }

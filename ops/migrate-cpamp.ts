@@ -13,6 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { invokedAsEntrypoint } from "./lib/invoked-as-entrypoint.ts";
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const correctionRevision = "cpamp-cache-pricing-v2";
@@ -435,14 +436,16 @@ SELECT count(*) FROM (
   }
 }
 
-try {
-  await main();
-} catch (error) {
-  if (error instanceof CliError) {
-    process.stderr.write(`${error.message}\n`);
-    process.exitCode = error.exitCode;
-  } else {
-    process.stderr.write(`CPAMP import failed: ${error instanceof Error ? error.message : "unknown error"}\n`);
-    process.exitCode = 1;
+if (invokedAsEntrypoint("migrate-cpamp", import.meta.url)) {
+  try {
+    await main();
+  } catch (error) {
+    if (error instanceof CliError) {
+      process.stderr.write(`${error.message}\n`);
+      process.exitCode = error.exitCode;
+    } else {
+      process.stderr.write(`CPAMP import failed: ${error instanceof Error ? error.message : "unknown error"}\n`);
+      process.exitCode = 1;
+    }
   }
 }

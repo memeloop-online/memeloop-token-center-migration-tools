@@ -19,6 +19,7 @@ import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { dirname } from "node:path";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { invokedAsEntrypoint } from "../lib/invoked-as-entrypoint.ts";
 import { parseStrictJson } from "../lib/strict-json.ts";
 
 const SHA256 = /^[0-9a-f]{64}$/;
@@ -385,4 +386,4 @@ async function main(): Promise<void> {
   } finally { session.close(); }
 }
 
-if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) main().catch((error) => { const failure = error instanceof ImportFailure ? error : new ImportFailure("policy import failed safely"); if (failure.counts) process.stdout.write(`${JSON.stringify(failure.counts)}\n`); process.stderr.write(`import-cpa-key-policy: ${failure.message}\n`); process.exitCode = 2; });
+if (invokedAsEntrypoint("import-cpa-key-policy", import.meta.url)) main().catch((error) => { const failure = error instanceof ImportFailure ? error : new ImportFailure("policy import failed safely"); if (failure.counts) process.stdout.write(`${JSON.stringify(failure.counts)}\n`); process.stderr.write(`import-cpa-key-policy: ${failure.message}\n`); process.exitCode = 2; });

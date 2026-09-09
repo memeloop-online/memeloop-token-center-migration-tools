@@ -56,7 +56,7 @@ function writeSource(root: string, invalidModel = false): { config: string; auth
     '        prefix: "codex-csil"',
     ...(invalidModel ? ["        unsupported: true"] : []),
     ""].join("\n"), { mode: 0o600 });
-  writeFileSync(join(auth, "copilot.json"), JSON.stringify({ type: "copilot", upstream: "copilot", handle: opaqueHandle, label: opaqueEmail }), { mode: 0o600 });
+  writeFileSync(join(auth, "copilot.json"), JSON.stringify({ type: "copilot", upstream: "copilot", handle: opaqueHandle, label: opaqueEmail, created_at: "2026-09-09T12:00:00Z" }), { mode: 0o600 });
   const policy = join(root, "native-policy.json");
   writeFileSync(policy, JSON.stringify({
     version: 1,

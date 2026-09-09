@@ -56,6 +56,12 @@ each record in `native_reauthorization_required` with only its provider,
 disabled state and keyed `source_stable_id`. Connect those accounts again
 through their native or plugin-provided authorization flow.
 
+The deployed `cpa-copilot-cursor` v0.2.0-rc.16 format may additionally carry
+an optional `created_at` field on those opaque records. The importer accepts
+only a valid RFC 3339 timestamp, validates it as metadata, and never includes
+it in a stable identity or emitted inventory. No other opaque-record fields are
+accepted without an explicit source-format update.
+
 ## Secret and transport boundary
 
 Before starting, make an immutable CPA volume snapshot and stage only its

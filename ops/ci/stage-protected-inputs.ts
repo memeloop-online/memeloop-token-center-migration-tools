@@ -31,6 +31,7 @@ import {
 } from "node:fs";
 import type { BigIntStats } from "node:fs";
 import { dirname, extname, isAbsolute, join } from "node:path";
+import { invokedAsEntrypoint } from "../lib/invoked-as-entrypoint.ts";
 
 const DEFAULT_UID = 10001;
 const DEFAULT_GID = 10001;
@@ -512,9 +513,11 @@ export function main(argv = process.argv.slice(2)): number {
   return 0;
 }
 
-try {
-  main();
-} catch (error) {
-  process.stderr.write(`${error instanceof StageError ? error.message : "protected-input staging failed"}\n`);
-  process.exitCode = 2;
+if (invokedAsEntrypoint("stage-protected-inputs", import.meta.url)) {
+  try {
+    main();
+  } catch (error) {
+    process.stderr.write(`${error instanceof StageError ? error.message : "protected-input staging failed"}\n`);
+    process.exitCode = 2;
+  }
 }

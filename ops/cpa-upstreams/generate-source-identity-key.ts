@@ -13,6 +13,7 @@ import {
   writeSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, parse, resolve, sep } from "node:path";
+import { invokedAsEntrypoint } from "../lib/invoked-as-entrypoint.ts";
 import { randomBytes } from "node:crypto";
 
 const KEY_PREFIX = Buffer.from("4d54432d534f555243452d49442d4b45590001", "hex");
@@ -136,4 +137,4 @@ function main(argv: string[]): void {
   }
 }
 
-if (basename(process.argv[1] ?? "").replace(/\.(?:ts|[cm]?js)$/, "") === "generate-source-identity-key") main(process.argv.slice(2));
+if (invokedAsEntrypoint("generate-source-identity-key", import.meta.url)) main(process.argv.slice(2));

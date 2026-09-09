@@ -29,6 +29,9 @@ test("release registry is the explicit non-container command contract", () => {
     assert.doesNotMatch(source, /cpa-managed-codex-route-parser/);
     const path = resolve(repository, source);
     assert.equal(lstatSync(path).isFile(), true);
-    assert.match(readFileSync(path, "utf8"), /^#!\/usr\/bin\/env node$/m);
+    const content = readFileSync(path, "utf8");
+    assert.match(content, /^#!\/usr\/bin\/env node$/m);
+    assert.match(content, /from ["'][^"']*invoked-as-entrypoint\.ts["']/u);
+    assert.match(content, new RegExp(`invokedAsEntrypoint\\("${name}", import\\.meta\\.url\\)`, "u"));
   }
 });

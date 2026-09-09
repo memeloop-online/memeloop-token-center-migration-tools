@@ -33,7 +33,8 @@ import { request as httpsRequest, type RequestOptions } from "node:https";
 import { isIP } from "node:net";
 import { basename, dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
+import { invokedAsEntrypoint } from "./lib/invoked-as-entrypoint.ts";
 import { parseArgs } from "node:util";
 import { parseStrictJson } from "./lib/strict-json.ts";
 
@@ -905,7 +906,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   return 0;
 }
 
-if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (invokedAsEntrypoint("export-cpa-session-archive-delta", import.meta.url)) {
   runCheckpointLockHolder(process.argv.slice(2)).then((held) => held ? 0 : main()).then((code) => { process.exitCode = code; }).catch((error: unknown) => {
     if (error instanceof DeltaError) process.stderr.write(`delta export refused: ${error.message}\n`);
     else if (process.env.MTC_DELTA_DEBUG === "1") process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);

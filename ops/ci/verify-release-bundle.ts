@@ -1,6 +1,7 @@
 /** Exercise the standalone bundle outside this checkout and its node_modules. */
 
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -33,6 +34,8 @@ function writePrivate(path: string, value: string): void {
   writeFileSync(path, value, { encoding: "utf8", mode: 0o600 });
   chmodSync(path, 0o600);
 }
+
+const sha256 = (value: Buffer): string => createHash("sha256").update(value).digest("hex");
 
 function command(name: string): string {
   return join(bundle, "commands", `${name}.mjs`);
@@ -101,6 +104,84 @@ try {
   ])) as Record<string, unknown>;
   assert.equal(yamlSummary.mode, "dry-run");
   assert.equal(yamlSummary.api_account_count, 6);
+
+  // Exercise a bundled command that imports two other release CLIs, then
+  // compose its exact output. This catches an imported command accidentally
+  // treating the outer bundle's import.meta.url as an instruction to run.
+  const routePolicy = join(root, "native-route-policy.json");
+  writePrivate(routePolicy, `${JSON.stringify({
+    version: 1,
+    policies: [{
+      key_hash: "a".repeat(64),
+      enabled: true,
+      grants: [{ provider: "fixture-openai-compatible", model: "fixture-model" }],
+    }],
+    usage: {},
+  })}\n`);
+  const routeArtifacts = join(root, "route-artifacts");
+  mkdirSync(routeArtifacts, { mode: 0o700 }); chmodSync(routeArtifacts, 0o700);
+  const sourceInventory = join(routeArtifacts, "source-inventory.json");
+  const candidateMaterial = join(routeArtifacts, "provider-candidate-material.json");
+  const exporter = JSON.parse(execute(command("export-cpa-source-route-inventory"), [
+    "--config", join(source, "config.yaml"),
+    "--auth-dir", join(source, "auth"),
+    "--policy-snapshot-file", routePolicy,
+    "--source-identity-key-file", identity,
+    "--source-inventory-output", sourceInventory,
+    "--provider-candidate-material-output", candidateMaterial,
+  ])) as Record<string, unknown>;
+  assert.equal(exporter.source_mapping_count, 1);
+  assert.equal(exporter.provider_candidate_set_count, 1);
+  const sourceRaw = readFileSync(sourceInventory), materialRaw = readFileSync(candidateMaterial);
+  const material = JSON.parse(materialRaw.toString("utf8")) as { provider_candidate_sets?: unknown };
+  assert.equal(Array.isArray(material.provider_candidate_sets), true);
+  const sets = material.provider_candidate_sets as Array<{ candidates?: unknown }>;
+  assert.equal(sets.length, 1);
+  assert.equal(Array.isArray(sets[0]?.candidates), true);
+  const candidates = sets[0]!.candidates as Array<Record<string, unknown>>;
+  assert.equal(candidates.length, 2);
+  assert.deepEqual(candidates.map((candidate) => candidate.driver), ["http-json", "http-json"]);
+  const receiptDirectory = join(root, "route-receipts");
+  mkdirSync(receiptDirectory, { mode: 0o700 }); chmodSync(receiptDirectory, 0o700);
+  const sourceDigest = sha256(sourceRaw), materialDigest = sha256(materialRaw);
+  const directReceipt = join(receiptDirectory, "direct-receipt.json");
+  writePrivate(directReceipt, `${JSON.stringify({
+    version: 1,
+    tenant_external_id: "fixture-tenant",
+    source_inventory_sha256: sourceDigest,
+    provider_candidate_material_sha256: materialDigest,
+    bindings: candidates.map((candidate, index) => ({
+      source_stable_id: candidate.source_stable_id,
+      source_provider: candidate.source_provider,
+      upstream_account_id: `10000000-0000-4000-8000-00000000000${index + 1}`,
+      driver: "http-json",
+      status: "active",
+      updated_at: index + 1,
+    })),
+    quarantined: [],
+  })}\n`);
+  const managedReceipt = join(receiptDirectory, "managed-receipt.json");
+  writePrivate(managedReceipt, `${JSON.stringify({
+    version: 1,
+    tenant_external_id: "fixture-tenant",
+    source_inventory_sha256: sourceDigest,
+    provider_candidate_material_sha256: materialDigest,
+    managed_provenance_evidence_sha256: "b".repeat(64),
+    bindings: [],
+    quarantined: [],
+  })}\n`);
+  const composedInventory = join(routeArtifacts, "upstream-inventory.json");
+  const composer = JSON.parse(execute(command("compose-cpa-upstream-inventory"), [
+    "--source-inventory-file", sourceInventory,
+    "--provider-candidate-material-file", candidateMaterial,
+    "--direct-binding-receipt-file", directReceipt,
+    "--managed-binding-receipt-file", managedReceipt,
+    "--upstream-inventory-output", composedInventory,
+  ])) as Record<string, unknown>;
+  assert.equal(composer.mode, "compose-cpa-upstream-inventory");
+  assert.equal(composer.upstream_count, 2);
+  assert.equal(composer.provider_candidate_set_count, 1);
+  assert.equal(existsSync(composedInventory), true);
 
   const psqlDirectory = join(root, "bin");
   // The audit runs an actual child process with its SQL on stdin; the stub is

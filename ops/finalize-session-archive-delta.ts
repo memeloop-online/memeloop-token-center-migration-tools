@@ -23,9 +23,10 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { canonicalBytes, formatTime, parseTime, sha256Bytes, STABLE_CURSOR_PROTOCOL } from "./export-cpa-session-archive-delta.ts";
+import { invokedAsEntrypoint } from "./lib/invoked-as-entrypoint.ts";
 import { parseStrictJson } from "./lib/strict-json.ts";
 
 const WORKFLOW = "final-session-archive-delta-v1";
@@ -432,7 +433,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   return 0;
 }
 
-if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (invokedAsEntrypoint("finalize-session-archive-delta", import.meta.url)) {
   main().then((code) => { process.exitCode = code; }).catch((error: unknown) => {
     process.stderr.write(`${error instanceof FinalArchiveError ? error.message : "final archive reconciliation failed"}\n`);
     process.exitCode = 2;

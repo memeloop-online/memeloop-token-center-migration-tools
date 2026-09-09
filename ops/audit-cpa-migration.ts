@@ -3,6 +3,7 @@
 
 import { accessSync, constants as fsConstants, lstatSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { invokedAsEntrypoint } from "./lib/invoked-as-entrypoint.ts";
 
 class CliError extends Error {
   readonly exitCode: number;
@@ -115,9 +116,11 @@ function main(): void {
   process.stdout.write(`{"archive_checkpoint":${archiveCheckpoint},"archive_correlated":${archiveCorrelated},"archive_exact":${archiveExact},"archive_unlinked":${archiveUnlinked},"archive_watermark_ms":${archiveWatermark},"content_locators":${BigInt(exactContentLocators) + BigInt(unlinkedContentLocators)},"exact_content_locators":${exactContentLocators},"unlinked_content_locators":${unlinkedContentLocators},"conversation_clusters":${clusters},"conversation_edges":${edges},"conversation_observations":${observations},"cpamp_checkpoint":${cpampCheckpoint},"cpamp_links":${cpampLinks},"gap_locators":0,"unresolved_quarantine":0}\n`);
 }
 
-try {
-  main();
-} catch (error) {
-  process.stderr.write(`${error instanceof Error ? error.message : "migration audit failed"}\n`);
-  process.exitCode = error instanceof CliError ? error.exitCode : 1;
+if (invokedAsEntrypoint("audit-cpa-migration", import.meta.url)) {
+  try {
+    main();
+  } catch (error) {
+    process.stderr.write(`${error instanceof Error ? error.message : "migration audit failed"}\n`);
+    process.exitCode = error instanceof CliError ? error.exitCode : 1;
+  }
 }

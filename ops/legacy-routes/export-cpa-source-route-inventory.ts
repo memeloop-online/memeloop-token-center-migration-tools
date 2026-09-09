@@ -5,6 +5,7 @@ import { createHash, createHmac, randomBytes } from "node:crypto";
 import { closeSync, constants, fstatSync, fsyncSync, linkSync, lstatSync, openSync, unlinkSync, writeSync } from "node:fs";
 import { basename, dirname, isAbsolute, parse, relative, resolve, sep } from "node:path";
 import { cpaRouteSourceStableId, inspectCpaSourceRoutes, readSourceIdentityKey, type CpaRouteModel } from "../cpa-upstreams/import-cpa-upstreams.ts";
+import { invokedAsEntrypoint } from "../lib/invoked-as-entrypoint.ts";
 import { parseNativePolicy, readProtectedFile, type SourceGrant } from "../legacy-policy/import-cpa-key-policy.ts";
 import {
   assertManagedCodexModelSnapshotConfig,
@@ -305,7 +306,7 @@ export function run(argv = process.argv.slice(2)): Readonly<Record<string, strin
   }
 }
 
-if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {
+if (invokedAsEntrypoint("export-cpa-source-route-inventory", import.meta.url)) {
   try { process.stdout.write(`${JSON.stringify(run())}\n`); }
   catch { process.stderr.write("CPA source-route inventory export stopped\n"); process.exitCode = 2; }
 }

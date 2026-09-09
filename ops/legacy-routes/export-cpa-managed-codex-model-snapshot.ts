@@ -6,6 +6,7 @@ import { closeSync, constants, fstatSync, fsyncSync, linkSync, lstatSync, openSy
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { basename, dirname, isAbsolute, parse, relative, resolve, sep } from "node:path";
+import { invokedAsEntrypoint } from "../lib/invoked-as-entrypoint.ts";
 import { parseStrictJson } from "../lib/strict-json.ts";
 
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
@@ -203,11 +204,6 @@ export async function run(argv = process.argv.slice(2)): Promise<Readonly<Record
   }
 }
 
-function invokedAsSnapshotEntrypoint(): boolean {
-  const invoked = process.argv[1];
-  return invoked !== undefined && ["export-cpa-managed-codex-model-snapshot.ts", "export-cpa-managed-codex-model-snapshot.mjs"].includes(basename(invoked));
-}
-
-if (invokedAsSnapshotEntrypoint()) {
+if (invokedAsEntrypoint("export-cpa-managed-codex-model-snapshot", import.meta.url)) {
   run().then((result) => process.stdout.write(`${JSON.stringify(result)}\n`)).catch(() => { process.stderr.write("CPA managed Codex model snapshot stopped\n"); process.exitCode = 2; });
 }

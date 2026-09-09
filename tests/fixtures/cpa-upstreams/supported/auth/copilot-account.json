@@ -3,5 +3,6 @@
   "upstream": "copilot",
   "handle": "FixtureCopilotHandle01",
   "label": "Fixture GitHub Copilot",
-  "login": "copilot-user@example.test"
+  "login": "copilot-user@example.test",
+  "created_at": "2026-09-09T12:00:00Z"
 }

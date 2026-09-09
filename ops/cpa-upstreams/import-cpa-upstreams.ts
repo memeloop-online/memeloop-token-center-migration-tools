@@ -7,6 +7,7 @@ import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
 import { basename, dirname, isAbsolute, parse, relative, resolve, sep } from "node:path";
+import { invokedAsEntrypoint } from "../lib/invoked-as-entrypoint.ts";
 import { parseDocument } from "yaml";
 import { parseStrictJson } from "../lib/strict-json.ts";
 
@@ -21,6 +22,7 @@ const SOURCE_KEY_BYTES = 32;
 const TENANT_PATTERN = /^[A-Za-z0-9._:-]{1,200}$/;
 const HANDLE_PATTERN = /^[A-Za-z0-9]{1,80}$/;
 const HEADER_NAME_PATTERN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,200}$/;
+const RFC3339_TIMESTAMP = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(?:Z|[+-](\d{2}):(\d{2}))$/u;
 const MANAGED_OAUTH_SOURCE_TYPES: Readonly<Record<string, string>> = { codex: "codex", gemini: "gemini-legacy" };
 const DIRECT_ROUTE_SOURCE_DOMAIN = "memeloop-token-center\0cpa-route-source-account-id\0v1\0";
 const SHA256 = /^[0-9a-f]{64}$/;
@@ -318,6 +320,16 @@ function validateOauth(document: JsonObject): void {
   if (access === undefined && refresh === undefined) throw new ImportFailure("CPA OAuth record contains no recognized token material");
   if (access !== undefined) secretString(access, "CPA OAuth access token"); if (refresh !== undefined) secretString(refresh, "CPA OAuth refresh token");
 }
+function validateOpaqueCreatedAt(value: unknown): void {
+  if (value === undefined) return;
+  if (typeof value !== "string" || Buffer.byteLength(value) > 64) throw new ImportFailure("CPA opaque Copilot/Cursor created_at metadata is invalid");
+  const matched = RFC3339_TIMESTAMP.exec(value);
+  if (!matched) throw new ImportFailure("CPA opaque Copilot/Cursor created_at metadata is invalid");
+  const year = Number(matched[1]!), month = Number(matched[2]!), day = Number(matched[3]!), hour = Number(matched[4]!), minute = Number(matched[5]!), second = Number(matched[6]!);
+  const offsetHour = matched[7] === undefined ? 0 : Number(matched[7]!), offsetMinute = matched[8] === undefined ? 0 : Number(matched[8]!);
+  const days = month >= 1 && month <= 12 ? new Date(Date.UTC(year, month, 0)).getUTCDate() : 0;
+  if (year < 1 || month < 1 || month > 12 || day < 1 || day > days || hour > 23 || minute > 59 || second > 59 || offsetHour > 23 || offsetMinute > 59) throw new ImportFailure("CPA opaque Copilot/Cursor created_at metadata is invalid");
+}
 function inventoryAuth(root: string, secrets: SecretStore, policy: TransportPolicy, allowHttp: boolean): [DirectAccount[], NativeReauthorization[], ManagedOAuth[], number] {
   const direct: DirectAccount[] = [], native: NativeReauthorization[] = [], managed: ManagedOAuth[] = []; let disabledCount = 0; const handles = new Set<string>();
   for (const [relativePath, path] of authFiles(root)) {
@@ -327,10 +339,14 @@ function inventoryAuth(root: string, secrets: SecretStore, policy: TransportPoli
     const recordType = document.type.trim().toLowerCase(); const upstream = document.upstream;
     if ((upstream === "copilot" || upstream === "cursor") && "handle" in document) {
       if (!["subscription-bridge", "cpa-subscription-bridge", "copilot", "cursor"].includes(recordType)) throw new ImportFailure("CPA opaque Copilot/Cursor auth document has an unsupported type");
-      exact(document, ["type", "upstream", "handle", "label", "login", "disabled"], "CPA opaque Copilot/Cursor auth document");
+      // cpa-copilot-cursor v0.2.0-rc.16 stores this optional RFC3339 metadata
+      // alongside its opaque bridge handle. It is schema-validated only and
+      // never contributes to the reauthorization identity or output.
+      exact(document, ["type", "upstream", "handle", "label", "login", "created_at", "disabled"], "CPA opaque Copilot/Cursor auth document");
       const handle = secretString(document.handle, "CPA opaque Copilot/Cursor handle"); if (!HANDLE_PATTERN.test(handle)) throw new ImportFailure("CPA opaque Copilot/Cursor handle has an unsupported shape");
       const handleDigest = digest(Buffer.concat([Buffer.from("cpa-opaque-account-handle\0"), Buffer.from(handle)])); if (handles.has(handleDigest)) throw new ImportFailure("CPA opaque Copilot/Cursor handle is duplicated"); handles.add(handleDigest);
       if (document.label !== undefined && (typeof document.label !== "string" || !document.label || document.label.length > 200)) throw new ImportFailure("CPA opaque Copilot/Cursor label is invalid");
+      validateOpaqueCreatedAt(document.created_at);
       native.push({ sourceId: sourceIdentity("auth", relativePath, recordType, upstream), provider: String(upstream), sourceDisabled: disabled }); disabledCount += Number(disabled); continue;
     }
     if (recordType === "api_key") {
@@ -739,6 +755,6 @@ async function main(): Promise<void> {
   if (!options.apply || (inventory.direct.length === 0 && inventory.managed.length === 0)) { process.stdout.write(`${JSON.stringify(summary(options.apply ? "apply" : "dry-run", inventory, native))}\n`); return; }
   if (!options.target || !options.token) throw new ImportFailure("apply requires target API base URL and service token file"); const base = upstreamUrl(options.target, "target API base URL", options.allowHttp); const token = secretString(decodeUtf8(readOwnerOnly(options.token, "target service token file", MAX_SECRET_BYTES), "target service token file").replace(/\n$/, ""), "target service token file"); const counts = await apply(base, token, options.tenant, inventory, secrets, options.ca); process.stdout.write(`${JSON.stringify(summary("apply", inventory, native, counts))}\n`);
 }
-if (basename(process.argv[1] ?? "").replace(/\.(?:ts|[cm]?js)$/, "") === "import-cpa-upstreams") {
+if (invokedAsEntrypoint("import-cpa-upstreams", import.meta.url)) {
   main().catch((error) => { process.stderr.write(`CPA upstream import stopped: ${error instanceof ImportFailure ? error.message : "unexpected operator failure"}\n`); process.exitCode = 2; });
 }

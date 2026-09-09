@@ -3,5 +3,6 @@
   "upstream": "cursor",
   "handle": "FixtureCursorHandle01",
   "label": "Fixture Cursor",
-  "login": "cursor-user@example.test"
+  "login": "cursor-user@example.test",
+  "created_at": "2026-09-09T12:00:00+00:00"
 }

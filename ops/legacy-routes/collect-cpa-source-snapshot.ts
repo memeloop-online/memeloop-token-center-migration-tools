@@ -17,6 +17,7 @@ import { dirname, isAbsolute, parse, relative, resolve, sep } from "node:path";
 import { Readable } from "node:stream";
 import { extract } from "tar-stream";
 import { parseDocument } from "yaml";
+import { invokedAsEntrypoint } from "../lib/invoked-as-entrypoint.ts";
 import { parseStrictJson } from "../lib/strict-json.ts";
 import { run as exportManagedCodexModelSnapshot } from "./export-cpa-managed-codex-model-snapshot.ts";
 
@@ -636,6 +637,6 @@ export async function run(argv = process.argv.slice(2)): Promise<Readonly<Record
   }
 }
 
-if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {
+if (invokedAsEntrypoint("collect-cpa-source-snapshot", import.meta.url)) {
   run().then((result) => process.stdout.write(`${JSON.stringify(result)}\n`)).catch(() => { process.stderr.write("CPA source collection stopped\n"); process.exitCode = 2; });
 }

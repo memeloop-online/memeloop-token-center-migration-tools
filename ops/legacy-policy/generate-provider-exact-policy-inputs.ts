@@ -18,6 +18,7 @@ import {
   writeSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, parse, relative, resolve, sep } from "node:path";
+import { invokedAsEntrypoint } from "../lib/invoked-as-entrypoint.ts";
 import { parseStrictJson } from "../lib/strict-json.ts";
 import { parseNativePolicy, readProtectedFile, type SourceGrant } from "./import-cpa-key-policy.ts";
 import {
@@ -397,7 +398,7 @@ export function main(argv = process.argv.slice(2)): Readonly<Record<string, numb
   }
 }
 
-if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {
+if (invokedAsEntrypoint("generate-provider-exact-policy-inputs", import.meta.url)) {
   try { process.stdout.write(`${JSON.stringify(main())}\n`); }
   catch { process.stderr.write("provider-exact policy input generation stopped\n"); process.exitCode = 2; }
 }

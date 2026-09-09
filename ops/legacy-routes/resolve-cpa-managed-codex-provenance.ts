@@ -16,6 +16,7 @@ import { createHash, createHmac, randomBytes } from "node:crypto";
 import { closeSync, constants, fstatSync, fsyncSync, linkSync, lstatSync, openSync, readSync, unlinkSync, writeSync } from "node:fs";
 import { basename, dirname, isAbsolute, parse, relative, resolve, sep } from "node:path";
 import { readSourceIdentityKey } from "../cpa-upstreams/import-cpa-upstreams.ts";
+import { invokedAsEntrypoint } from "../lib/invoked-as-entrypoint.ts";
 import { parseSourceInventory } from "./import-cpa-model-routes.ts";
 import { assertManagedCodexModelSnapshotConfig, managedCodexRouteSourceStableId, parseManagedCodexModelSnapshot } from "./cpa-managed-codex-route-parser.ts";
 import { parseStrictJson } from "../lib/strict-json.ts";
@@ -454,7 +455,7 @@ export function run(argv: readonly string[] = process.argv.slice(2)): Readonly<R
   }
 }
 
-if (basename(process.argv[1] ?? "").replace(/\.(?:ts|[cm]?js)$/, "") === "resolve-cpa-managed-codex-provenance") {
+if (invokedAsEntrypoint("resolve-cpa-managed-codex-provenance", import.meta.url)) {
   try { process.stdout.write(`${JSON.stringify(run())}\n`); }
   catch (error) { process.stderr.write(`managed Codex provenance stopped: ${error instanceof ManagedCodexProvenanceFailure ? error.message : "unexpected operator failure"}\n`); process.exitCode = 2; }
 }

@@ -7,6 +7,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { closeSync, constants, fstatSync, fsyncSync, linkSync, lstatSync, openSync, unlinkSync, writeSync } from "node:fs";
 import { basename, dirname, isAbsolute, parse, relative, resolve, sep } from "node:path";
+import { invokedAsEntrypoint } from "../lib/invoked-as-entrypoint.ts";
 import { parseStrictJson } from "../lib/strict-json.ts";
 import { parseSourceInventory, readProtected } from "./import-cpa-model-routes.ts";
 
@@ -267,7 +268,7 @@ export function run(argv = process.argv.slice(2)): Readonly<Record<string, numbe
   }
 }
 
-if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {
+if (invokedAsEntrypoint("compose-cpa-upstream-inventory", import.meta.url)) {
   try { process.stdout.write(`${JSON.stringify(run())}\n`); }
   catch { process.stderr.write("CPA upstream-inventory composition stopped\n"); process.exitCode = 2; }
 }

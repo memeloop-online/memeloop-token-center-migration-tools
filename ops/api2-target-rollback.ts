@@ -15,7 +15,7 @@ import {
   type BigIntStats,
 } from 'node:fs';
 import { basename } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { invokedAsEntrypoint } from './lib/invoked-as-entrypoint.ts';
 import { parseArgs } from 'node:util';
 import { StringDecoder } from 'node:string_decoder';
 
@@ -734,7 +734,7 @@ export async function main(argv: string[]): Promise<void> {
   }
 }
 
-if (pathToFileURL(process.argv[1] ?? '').href === import.meta.url) {
+if (invokedAsEntrypoint("api2-target-rollback", import.meta.url)) {
   main(process.argv.slice(2)).catch((error: unknown) => {
     process.stderr.write(`${error instanceof RollbackError ? error.message : 'unexpected rollback tool failure'}\n`);
     process.exitCode = 1;

@@ -6,7 +6,7 @@ import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { basename } from "node:path";
+import { invokedAsEntrypoint } from "../lib/invoked-as-entrypoint.ts";
 import { parseStrictJson } from "../lib/strict-json.ts";
 
 const MAX_INPUT_BYTES = 4 * 1024 * 1024;
@@ -179,6 +179,6 @@ async function main(): Promise<void> { const options = args(process.argv.slice(2
   const credentials = parseCandidates(raw, options.inputFormat); let target = "", serviceToken = ""; if (options.apply) { if (!options.targetUrl || !options.serviceToken) throw new ImportFailure("target API URL and service token file are required for apply"); target = normalizedUrl(String(options.targetUrl), "Token Center API URL", Boolean(options.allowHttpTarget)); serviceToken = token(String(options.serviceToken), "service token file"); } else if (options.targetUrl || options.serviceToken || options.targetCa) throw new ImportFailure("target API options are accepted only with --apply");
   const database = new PsqlSession(String(options.tenant), options.psql); try { const mappings = await database.mappings(); const plan = buildPlan(credentials, ...mappings); let attached = 0; if (options.apply) for (const pair of plan.candidates) { await database.heartbeat(); await attach(target, serviceToken, pair, options.targetCa ? String(options.targetCa) : undefined); await database.heartbeat(); attached += 1; } process.stdout.write(`${JSON.stringify({ mode: options.apply ? "apply" : "dry-run", candidate_count: plan.candidates.length, identity_count: plan.identityCount, existing_mapping_count: plan.existingCount, already_attached_count: plan.alreadyAttached, pending_count: plan.candidates.length - plan.alreadyAttached, attached_verified_count: attached })}\n`); } finally { database.close(); }
 }
-if (basename(process.argv[1] ?? "").replace(/\.(?:ts|[cm]?js)$/, "") === "attach-legacy-cpa-credentials") {
+if (invokedAsEntrypoint("attach-legacy-cpa-credentials", import.meta.url)) {
   main().catch((error) => { process.stderr.write(`legacy credential import failed: ${error instanceof ImportFailure ? error.message : "unexpected operator failure"}\n`); process.exitCode = 2; });
 }

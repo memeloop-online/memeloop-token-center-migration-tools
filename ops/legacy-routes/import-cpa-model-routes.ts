@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { constants, closeSync, existsSync, fstatSync, openSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
+import { invokedAsEntrypoint } from "../lib/invoked-as-entrypoint.ts";
 import { parseStrictJson } from "../lib/strict-json.ts";
 
 type Obj = Record<string, unknown>;
@@ -291,4 +292,4 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   catch (error) { const failure = error instanceof RouteImportFailure ? error : new RouteImportFailure("route importer failed"); process.stderr.write(`${encode({ error: failure.message, ...(failure.counts ?? {}) })}\n`); return 1; }
   finally { token?.fill(0); }
 }
-if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) process.exitCode = await main();
+if (invokedAsEntrypoint("import-cpa-model-routes", import.meta.url)) process.exitCode = await main();
