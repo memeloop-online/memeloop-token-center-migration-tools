@@ -85,12 +85,16 @@ jobs:
           runner_uid="$(id -u)"
           runner_gid="$(id -g)"
           node_binary="$(command -v node)"
-          fixture="$(mktemp -d "$RUNNER_TEMP/migration-tools-stage.XXXXXX")"
+          fixture="$(mktemp -d /tmp/migration-tools-stage.XXXXXX)"
+          staging_command="$fixture/stage-protected-inputs.mjs"
+          cp -- "$RELEASE_DIRECTORY/commands/stage-protected-inputs.mjs" "$staging_command"
+          cmp -- "$RELEASE_DIRECTORY/commands/stage-protected-inputs.mjs" "$staging_command"
           cleanup_fixture() { sudo rm -rf -- "$fixture"; }
           trap cleanup_fixture EXIT
-          sudo chown 0:0 "$fixture"
+          sudo chown 0:0 "$fixture" "$staging_command"
           sudo chmod 0711 "$fixture"
-          sudo env RELEASE_DIRECTORY="$RELEASE_DIRECTORY" FIXTURE="$fixture" TARGET_UID="$runner_uid" TARGET_GID="$runner_gid" NODE_BINARY="$node_binary" \
+          sudo chmod 0400 "$staging_command"
+          sudo env FIXTURE="$fixture" TARGET_UID="$runner_uid" TARGET_GID="$runner_gid" NODE_BINARY="$node_binary" STAGING_COMMAND="$staging_command" \
             setpriv --bounding-set=-all,+chown --inh-caps=-all --ambient-caps=-all --nnp \
             capsh --caps=cap_chown+ep -- -c '
               set -euo pipefail
@@ -101,6 +105,7 @@ jobs:
               test "$(grep ^CapAmb: /proc/self/status | awk "{print \$2}")" = "0000000000000000"
               test "$(grep ^NoNewPrivs: /proc/self/status | awk "{print \$2}")" = "1"
               test "$(cat /proc/sys/fs/protected_hardlinks)" = "1"
+              test -x "$NODE_BINARY"
               umask 077
               mkdir -p "$FIXTURE/source/auth/nested" "$FIXTURE/source/auth/logs" "$FIXTURE/inputs" "$FIXTURE/stage"
               printf "fixture\n" > "$FIXTURE/source/config.yaml"
@@ -110,7 +115,7 @@ jobs:
               printf "{\"version\":1,\"policies\":[],\"usage\":{}}\n" > "$FIXTURE/source/auth/cpa-key-access-policy-state.json"
               printf "fixture-identity\n" > "$FIXTURE/inputs/source-identity.key"
               chmod 0600 "$FIXTURE/source/config.yaml" "$FIXTURE/source/auth/account.json" "$FIXTURE/source/auth/nested/account.json" "$FIXTURE/source/auth/logs/debug.log" "$FIXTURE/source/auth/cpa-key-access-policy-state.json" "$FIXTURE/inputs/source-identity.key"
-              "$NODE_BINARY" "$RELEASE_DIRECTORY/commands/stage-protected-inputs.mjs" \
+              "$NODE_BINARY" "$STAGING_COMMAND" \
                 --target-uid "$TARGET_UID" --target-gid "$TARGET_GID" \
                 --copy "$FIXTURE/source/config.yaml" "$FIXTURE/stage/config.yaml" \
                 --copy-auth-dir "$FIXTURE/source/auth" "$FIXTURE/stage/auth" \
