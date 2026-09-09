@@ -4,7 +4,8 @@ import { chmodSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "n
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { RouteImportFailure, completeSinglePage, createPlan, execute, parseLiveRoute, parseManifest, parseSourceInventory, parseUpstreamInventory, readProtected, type LiveRoute, type RouteSpec, type RouteTarget } from "../../ops/legacy-routes/import-cpa-model-routes.ts";
+import { RouteImportFailure, completeSinglePage, createDirectBatchPreflightPlan, createPlan, execute, parseLiveRoute, parseManifest, parseSourceInventory, parseUpstreamInventory, readProtected, type LiveRoute, type RouteSpec, type RouteTarget } from "../../ops/legacy-routes/import-cpa-model-routes.ts";
+import { composeUpstreamInventory } from "../../ops/legacy-routes/compose-cpa-upstream-inventory.ts";
 
 const account = "018f1111-1111-7111-8111-111111111111";
 const routeId = "018f2222-2222-7222-8222-222222222222";
@@ -26,6 +27,59 @@ const routeSpec = (overrides: Record<string, unknown> = {}): Record<string, unkn
 const poolRouteSpec = (candidates: unknown[] = poolBindings(), overrides: Record<string, unknown> = {}): Record<string, unknown> => ({ source, target: { upstream_candidates: candidates, public_model: "gpt-5.6-sol-csil", upstream_model: "gpt-5.6-sol", protocol: "openai", priority: 10 }, expected_existing: { action: "create", route_id: null, updated_at: null, grant_revision: null, history_and_references_reviewed: false, history_and_references_evidence_sha256: null }, ...overrides });
 const live = (overrides: Partial<LiveRoute> = {}): LiveRoute => ({ id: routeId, publicModel: "gpt-5.6-sol-csil", upstreamModel: "gpt-5.6-sol", protocol: "openai", priority: 10, enabled: true, accountIds: [account], candidateAccountIds: [account], includedProviderGroupIds: [], excludedProviderGroupIds: [], routeGroupIds: [], grantedCredentialIds: [], customModelConfirmed: true, updatedAt: 22, grantRevision: 0, ...overrides });
 const accountInventory = [{ id: account, driver: "codex", status: "active", updatedAt: 11 }];
+
+function directBatchFixture() {
+  const managedSource = { provider: "codex", model: "fixture-managed-model", group: null, upstream_prefix: null, protocol: "openai" };
+  const anomaly = { provider: "kimi", model: "fixture-gap-model", reason: "source capability gap: target lacks a managed OAuth adapter" };
+  const reauthorization = { provider: "kimi", source_stable_id: "f".repeat(64) };
+  const sourceRaw = json({ version: 2, mappings: [source, managedSource], anomalies: [anomaly], reauthorization_required: [reauthorization] });
+  const material = json({ version: 1, source_inventory_sha256: hash(sourceRaw), provider_candidate_sets: [
+    { source, upstream_model: source.model, protocol: source.protocol, selection: "equal_round_robin", candidates: poolStables.map((source_stable_id) => ({ source_stable_id, source_provider: source.provider, driver: "http-json" })) },
+    { source: managedSource, upstream_model: managedSource.model, protocol: "openai", selection: "equal_round_robin", candidates: [{ source_stable_id: "e".repeat(64), source_provider: "codex", driver: "openai-codex" }] },
+  ] });
+  const direct = json({ version: 1, tenant_external_id: "legacy", source_inventory_sha256: hash(sourceRaw), provider_candidate_material_sha256: hash(material), bindings: poolAccounts.map((upstream_account_id, index) => ({ upstream_account_id, source_stable_id: poolStables[index], source_provider: source.provider, driver: "http-json", status: "active", updated_at: 11 + index })), quarantined: [] });
+  const composed = composeUpstreamInventory(sourceRaw, material, direct, undefined, true);
+  const accounts = poolAccounts.map((id, index) => ({ id, driver: "http-json", status: "active", updatedAt: 11 + index }));
+  return { sourceRaw, material, direct, composed, accounts, anomaly, reauthorization };
+}
+
+test("explicit direct preflight retains every deferred source and capability gap without authorizing writes", async () => {
+  const fixture = directBatchFixture(), { composed, sourceRaw, accounts } = fixture;
+  assert(composed.batchReceipt);
+  const receipt = JSON.parse(composed.batchReceipt.toString());
+  assert.equal(receipt.mode, "direct-route-batch-preflight-only");
+  assert.equal(receipt.deferred_mappings.length, 1);
+  assert.deepEqual(receipt.retained_anomalies, [fixture.anomaly]);
+  assert.deepEqual(receipt.retained_reauthorization_required, [fixture.reauthorization]);
+  assert.equal(receipt.route_apply_authorized, false); assert.equal(receipt.policy_mutation_authorized, false);
+  const manifest = manifestV2Document(sourceRaw, composed.inventory, [poolRouteSpec()]);
+  assert.throws(() => createPlan(sourceRaw, composed.inventory, manifest, [], accounts), /capability gap/u);
+  const selected = await createDirectBatchPreflightPlan(sourceRaw, composed.inventory, manifest, composed.batchReceipt, [], accounts);
+  assert.equal(selected.counts.matched_mapping_count, 1); assert.equal(selected.counts.unmatched_mapping_count, 1);
+  assert.equal(selected.counts.deferred_mapping_count, 1); assert.equal(selected.counts.retained_anomaly_count, 1);
+  assert.equal(selected.items[0]!.spec.candidates.length, 4);
+  const target = new MemoryTarget();
+  const counts = await execute(selected, "legacy", target, false);
+  assert.equal(counts.written_count, 0); assert.equal(counts.quarantined_anomaly_count, 0);
+  await assert.rejects(execute(selected, "legacy", target, true), /preflight-only/u);
+  assert.deepEqual(target.writes, []);
+});
+
+test("direct preflight rejects receipt drift, missing candidates, arbitrary route subsets, stale accounts and quarantine", async () => {
+  const { sourceRaw, material, direct, composed, accounts } = directBatchFixture();
+  assert(composed.batchReceipt);
+  const manifest = manifestV2Document(sourceRaw, composed.inventory, [poolRouteSpec()]);
+  const drift = JSON.parse(composed.batchReceipt.toString()); drift.retained_anomalies = [];
+  await assert.rejects(createDirectBatchPreflightPlan(sourceRaw, composed.inventory, manifest, json(drift), [], accounts), /differs/u);
+  await assert.rejects(createDirectBatchPreflightPlan(Buffer.concat([sourceRaw, Buffer.from(" ")]), composed.inventory, manifest, composed.batchReceipt, [], accounts), /recomposed/u);
+  const missingBinding = JSON.parse(direct.toString()); missingBinding.bindings.pop();
+  assert.throws(() => composeUpstreamInventory(sourceRaw, material, json(missingBinding), undefined, true), /exactly cover/u);
+  assert.throws(() => composeUpstreamInventory(sourceRaw, material, direct), /distinct binding inputs/u);
+  await assert.rejects(createDirectBatchPreflightPlan(sourceRaw, composed.inventory, manifestV2Document(sourceRaw, composed.inventory, []), composed.batchReceipt, [], accounts), /not complete/u);
+  await assert.rejects(createDirectBatchPreflightPlan(sourceRaw, composed.inventory, manifestV2Document(sourceRaw, composed.inventory, [poolRouteSpec(poolBindings().slice(1))]), composed.batchReceipt, [], accounts), /complete provider pool/u);
+  await assert.rejects(createDirectBatchPreflightPlan(sourceRaw, composed.inventory, manifest, composed.batchReceipt, [], accounts.map((item) => ({ ...item, updatedAt: item.updatedAt + 1 }))), /stale/u);
+  await assert.rejects(createDirectBatchPreflightPlan(sourceRaw, composed.inventory, manifestV2Document(sourceRaw, composed.inventory, [poolRouteSpec()], {}), composed.batchReceipt, [], accounts), /cannot quarantine/u);
+});
 
 class MemoryTarget implements RouteTarget {
   writes: string[] = [];

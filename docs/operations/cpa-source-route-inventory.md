@@ -197,6 +197,12 @@ will independently reject an incomplete or cross-provider/driver candidate set.
 
 ## Read-only deterministic direct-account binding receipt
 
+For an explicitly opted-in **preflight only** of complete direct pools while
+managed work is deferred, see [direct batch preflight](direct-route-batch-preflight.md).
+It retains the full source and all gaps; it does not authorize route apply or
+customer policy changes. The full-coverage behavior described here remains the
+default.
+
 If `import-cpa-upstreams --apply` has already replayed the direct API-key
 accounts, create the protected binding input for provider-exact review with:
 

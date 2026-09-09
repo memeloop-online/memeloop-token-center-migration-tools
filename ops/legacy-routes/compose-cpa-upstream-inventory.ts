@@ -25,7 +25,7 @@ type CandidateSet = Readonly<{ source: SourcePattern; upstreamModel: string; pro
 type CandidateMaterial = Readonly<{ sourceDigest: string; sets: readonly CandidateSet[]; candidates: ReadonlyMap<string, Candidate> }>;
 type Binding = Readonly<{ sourceStableId: string; sourceProvider: string; accountId: string; driver: Driver; updatedAt: number }>;
 type BindingReceipt = Readonly<{ tenant: string; sourceDigest: string; candidateMaterialDigest: string; bindings: readonly Binding[]; quarantined: number }>;
-type ComposedInventory = Readonly<{ inventory: Buffer; receipt: Readonly<Record<string, number | string>> }>;
+type ComposedInventory = Readonly<{ inventory: Buffer; receipt: Readonly<Record<string, number | string>>; batchReceipt?: Buffer }>;
 type OutputTarget = Readonly<{ target: string; parentDescriptor: number }>;
 
 export class UpstreamInventoryComposeFailure extends Error {}
@@ -131,24 +131,30 @@ function parseBindingReceipt(raw: Buffer, kind: "direct" | "managed"): BindingRe
 }
 
 /** Construct, but never publish, a complete version 2 upstream inventory. */
-export function composeUpstreamInventory(sourceRaw: Buffer, candidateMaterialRaw: Buffer, directReceiptRaw: Buffer, managedReceiptRaw: Buffer): ComposedInventory {
+export function composeUpstreamInventory(sourceRaw: Buffer, candidateMaterialRaw: Buffer, directReceiptRaw: Buffer, managedReceiptRaw?: Buffer, directBatchPreflight = false): ComposedInventory {
   const sourceDigest = digest(sourceRaw), materialDigest = digest(candidateMaterialRaw);
   let source: ReturnType<typeof parseSourceInventory>;
   try { source = parseSourceInventory(sourceRaw); }
   catch { throw new UpstreamInventoryComposeFailure("source inventory has an invalid schema"); }
   if (source.version !== 2) throw new UpstreamInventoryComposeFailure("upstream inventory composition requires a version 2 source inventory");
-  const material = parseCandidateMaterial(candidateMaterialRaw), direct = parseBindingReceipt(directReceiptRaw, "direct"), managed = parseBindingReceipt(managedReceiptRaw, "managed");
+  if (directBatchPreflight ? managedReceiptRaw !== undefined : managedReceiptRaw === undefined) throw new UpstreamInventoryComposeFailure("direct preflight and full composition require distinct binding inputs");
+  const material = parseCandidateMaterial(candidateMaterialRaw), direct = parseBindingReceipt(directReceiptRaw, "direct");
+  const managed = managedReceiptRaw === undefined ? { ...direct, bindings: [], quarantined: 0 } : parseBindingReceipt(managedReceiptRaw, "managed");
   if (material.sourceDigest !== sourceDigest || direct.sourceDigest !== sourceDigest || managed.sourceDigest !== sourceDigest) throw new UpstreamInventoryComposeFailure("binding inputs do not share the selected source inventory");
   if (direct.candidateMaterialDigest !== materialDigest || managed.candidateMaterialDigest !== materialDigest) throw new UpstreamInventoryComposeFailure("binding inputs do not share the selected provider candidate material");
   if (direct.tenant !== managed.tenant) throw new UpstreamInventoryComposeFailure("binding receipts select different tenants");
   if (direct.quarantined !== 0 || managed.quarantined !== 0) throw new UpstreamInventoryComposeFailure("binding receipts contain quarantined candidates");
   exactSet(source.mappings.map(sourceKey), material.sets.map((item) => sourceKey(item.source)), "provider candidate pools do not exactly cover the source mappings");
+  const selectedSets = directBatchPreflight ? material.sets.filter((set) => set.candidates.every((item) => item.driver === "http-json")) : material.sets;
+  if (directBatchPreflight && selectedSets.length === 0) throw new UpstreamInventoryComposeFailure("direct preflight has no complete direct pools");
+  const selectedIds = new Set(selectedSets.flatMap((set) => set.candidates.map((item) => item.sourceStableId)));
 
   const bindings = [...direct.bindings, ...managed.bindings];
   if (new Set(bindings.map((binding) => binding.sourceStableId)).size !== bindings.length || new Set(bindings.map((binding) => binding.accountId)).size !== bindings.length) throw new UpstreamInventoryComposeFailure("binding receipts overlap on a source or target account");
   const bound = new Map(bindings.map((binding) => [binding.sourceStableId, binding]));
-  exactSet([...material.candidates.keys()], [...bound.keys()], "binding receipts do not exactly cover the provider candidates");
+  exactSet([...selectedIds], [...bound.keys()], "binding receipts do not exactly cover the provider candidates");
   for (const [stableId, candidate] of material.candidates) {
+    if (!selectedIds.has(stableId)) continue;
     const binding = bound.get(stableId);
     if (!binding || binding.sourceProvider !== candidate.sourceProvider || binding.driver !== candidate.driver) throw new UpstreamInventoryComposeFailure("binding receipt does not match its exact provider candidate");
   }
@@ -158,7 +164,7 @@ export function composeUpstreamInventory(sourceRaw: Buffer, candidateMaterialRaw
     version: 2,
     tenant_external_id: direct.tenant,
     upstreams: upstreams.map((binding) => ({ upstream_account_id: binding.accountId, source_stable_id: binding.sourceStableId, source_provider: binding.sourceProvider, driver: binding.driver, status: "active", updated_at: binding.updatedAt })),
-    provider_candidate_sets: material.sets.map((set) => ({
+    provider_candidate_sets: selectedSets.map((set) => ({
       source: { provider: set.source.provider, model: set.source.model, group: set.source.group, upstream_prefix: set.source.upstreamPrefix, protocol: set.source.protocol },
       upstream_model: set.upstreamModel,
       protocol: set.protocol,
@@ -170,17 +176,40 @@ export function composeUpstreamInventory(sourceRaw: Buffer, candidateMaterialRaw
       }).sort((left, right) => compare(left.upstream_account_id, right.upstream_account_id)),
     })),
   })}\n`);
+  const sourceDocument = strictJson(sourceRaw, "source inventory") as JsonObject;
+  const selectedKeys = new Set(selectedSets.map((set) => sourceKey(set.source)));
+  const deferredMappings = source.mappings.filter((item) => !selectedKeys.has(sourceKey(item)));
+  // Retain the complete sealed evidence, not a filtered source or policy. Raw
+  // UTF-8 inputs preserve the exact digest binding when the importer recomposes.
+  const batchReceipt = directBatchPreflight ? Buffer.from(`${JSON.stringify({
+    version: 1, mode: "direct-route-batch-preflight-only",
+    source_inventory_sha256: sourceDigest,
+    provider_candidate_material_sha256: materialDigest,
+    direct_binding_receipt_sha256: digest(directReceiptRaw),
+    upstream_inventory_sha256: digest(inventory),
+    provider_candidate_material_utf8: candidateMaterialRaw.toString("utf8"),
+    direct_binding_receipt_utf8: directReceiptRaw.toString("utf8"),
+    selected_mapping_count: selectedSets.length,
+    deferred_mappings: deferredMappings,
+    retained_anomalies: sourceDocument.anomalies,
+    retained_reauthorization_required: sourceDocument.reauthorization_required,
+    policy_mutation_authorized: false,
+    route_apply_authorized: false,
+  })}\n`) : undefined;
+  if (batchReceipt && batchReceipt.length > 8 * 1024 * 1024) throw new UpstreamInventoryComposeFailure("direct batch receipt exceeds the protected reader size limit");
   return {
     inventory,
+    ...(batchReceipt ? { batchReceipt } : {}),
     receipt: {
-      mode: "compose-cpa-upstream-inventory",
+      mode: directBatchPreflight ? "direct-route-batch-preflight-only" : "compose-cpa-upstream-inventory",
       source_inventory_sha256: sourceDigest,
       provider_candidate_material_sha256: materialDigest,
       direct_binding_receipt_sha256: digest(directReceiptRaw),
-      managed_binding_receipt_sha256: digest(managedReceiptRaw),
+      ...(managedReceiptRaw ? { managed_binding_receipt_sha256: digest(managedReceiptRaw) } : {}),
       upstream_inventory_sha256: digest(inventory),
       upstream_count: upstreams.length,
-      provider_candidate_set_count: material.sets.length,
+      provider_candidate_set_count: selectedSets.length,
+      ...(batchReceipt ? { batch_receipt_sha256: digest(batchReceipt), deferred_mapping_count: deferredMappings.length, retained_anomaly_count: source.anomalies.length, retained_reauthorization_count: source.reauthorizationRequired } : {}),
     },
   };
 }
@@ -232,39 +261,47 @@ function writeAtomicNoOverwrite(output: OutputTarget, value: Buffer): void {
   }
 }
 
-type Options = { source?: string; material?: string; direct?: string; managed?: string; output?: string };
+type Options = { source?: string; material?: string; direct?: string; managed?: string; output?: string; batchOutput?: string; directBatchPreflight?: boolean };
 function options(argv: readonly string[]): Options {
   if (argv.includes("--help") || argv.includes("-h")) {
-    process.stdout.write("usage: compose-cpa-upstream-inventory --source-inventory-file FILE --provider-candidate-material-file FILE --direct-binding-receipt-file FILE --managed-binding-receipt-file FILE --upstream-inventory-output FILE\n\nOffline-compose complete typed CPA upstream bindings into a protected version 2 upstream inventory. It never calls or mutates an API.\n");
+    process.stdout.write("usage: compose-cpa-upstream-inventory --source-inventory-file FILE --provider-candidate-material-file FILE --direct-binding-receipt-file FILE --managed-binding-receipt-file FILE --upstream-inventory-output FILE\n       compose-cpa-upstream-inventory --direct-batch-preflight --source-inventory-file FILE --provider-candidate-material-file FILE --direct-binding-receipt-file FILE --upstream-inventory-output FILE --batch-receipt-output FILE\n\nOffline-compose typed CPA upstream bindings. Explicit direct preflight preserves all deferred evidence and never authorizes route or policy writes.\n");
     process.exit(0);
   }
-  const result: Options = {}, names: Record<string, keyof Options> = { "--source-inventory-file": "source", "--provider-candidate-material-file": "material", "--direct-binding-receipt-file": "direct", "--managed-binding-receipt-file": "managed", "--upstream-inventory-output": "output" };
+  const result: Options = {}, names: Record<string, Exclude<keyof Options, "directBatchPreflight">> = { "--source-inventory-file": "source", "--provider-candidate-material-file": "material", "--direct-binding-receipt-file": "direct", "--managed-binding-receipt-file": "managed", "--upstream-inventory-output": "output", "--batch-receipt-output": "batchOutput" };
   for (let index = 0; index < argv.length; index += 1) {
+    if (argv[index] === "--direct-batch-preflight") { if (result.directBatchPreflight) throw new UpstreamInventoryComposeFailure("duplicate preflight opt-in"); result.directBatchPreflight = true; continue; }
     const name = argv[index]!, field = names[name], value = argv[index + 1];
     if (!field || !value || value.startsWith("--") || result[field] !== undefined) throw new UpstreamInventoryComposeFailure("arguments are invalid");
     result[field] = value; index += 1;
   }
-  if (!result.source || !result.material || !result.direct || !result.managed || !result.output) throw new UpstreamInventoryComposeFailure("required arguments are missing");
-  if (new Set([result.source, result.material, result.direct, result.managed, result.output]).size !== 5) throw new UpstreamInventoryComposeFailure("input and output paths must be distinct");
+  if (!result.source || !result.material || !result.direct || !result.output || (result.directBatchPreflight ? !result.batchOutput || result.managed : !result.managed || result.batchOutput)) throw new UpstreamInventoryComposeFailure("required full or direct-preflight arguments are invalid");
+  const paths = [result.source, result.material, result.direct, result.managed, result.output, result.batchOutput].filter((item) => item !== undefined);
+  if (new Set(paths).size !== paths.length) throw new UpstreamInventoryComposeFailure("input and output paths must be distinct");
   return result;
 }
 
 export function run(argv = process.argv.slice(2)): Readonly<Record<string, number | string>> {
   const selected = options(argv);
   let source: Buffer | undefined, material: Buffer | undefined, direct: Buffer | undefined, managed: Buffer | undefined;
-  let output: OutputTarget | undefined;
+  let output: OutputTarget | undefined, batchOutput: OutputTarget | undefined;
   try {
     source = readProtected(protectedAbsolute(selected.source!, "source inventory"), "source inventory");
     material = readProtected(protectedAbsolute(selected.material!, "provider candidate material"), "provider candidate material");
     direct = readProtected(protectedAbsolute(selected.direct!, "direct binding receipt"), "direct binding receipt");
-    managed = readProtected(protectedAbsolute(selected.managed!, "managed binding receipt"), "managed binding receipt");
-    const composed = composeUpstreamInventory(source, material, direct, managed);
+    if (selected.managed) managed = readProtected(protectedAbsolute(selected.managed, "managed binding receipt"), "managed binding receipt");
+    const composed = composeUpstreamInventory(source, material, direct, managed, selected.directBatchPreflight);
     output = openSafeOutput(protectedAbsolute(selected.output!, "upstream inventory output"));
+    if (selected.batchOutput) batchOutput = openSafeOutput(protectedAbsolute(selected.batchOutput, "batch receipt output"));
     writeAtomicNoOverwrite(output, composed.inventory);
+    if (batchOutput && composed.batchReceipt) {
+      try { writeAtomicNoOverwrite(batchOutput, composed.batchReceipt); }
+      catch (error) { unlinkSync(output.target); fsyncSync(output.parentDescriptor); throw error; }
+    }
     return composed.receipt;
   } finally {
     source?.fill(0); material?.fill(0); direct?.fill(0); managed?.fill(0);
     if (output) closeSync(output.parentDescriptor);
+    if (batchOutput) closeSync(batchOutput.parentDescriptor);
   }
 }
 

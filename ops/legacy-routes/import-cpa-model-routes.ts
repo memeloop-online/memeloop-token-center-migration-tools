@@ -7,6 +7,7 @@ import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { invokedAsEntrypoint } from "../lib/invoked-as-entrypoint.ts";
 import { parseStrictJson } from "../lib/strict-json.ts";
+import { composeUpstreamInventory } from "./compose-cpa-upstream-inventory.ts";
 
 type Obj = Record<string, unknown>;
 type Protocol = "openai" | "anthropic";
@@ -22,7 +23,7 @@ type ExistingExpectation = Readonly<{ action: "create" | "update"; routeId: stri
 export type RouteSpec = Readonly<{ source: SourcePattern; accountId: string; sourceStableId: string; candidates: readonly CandidateBinding[]; publicModel: string; upstreamModel: string; protocol: Protocol; priority: number; existing: ExistingExpectation }>;
 export type LiveRoute = Readonly<{ id: string; publicModel: string; upstreamModel: string; protocol: LiveProtocol; priority: number; enabled: boolean; accountIds: readonly string[]; candidateAccountIds: readonly string[]; includedProviderGroupIds: readonly string[]; excludedProviderGroupIds: readonly string[]; routeGroupIds: readonly string[]; grantedCredentialIds: readonly string[]; customModelConfirmed: boolean; updatedAt: number; grantRevision: number }>;
 type PlanItem = Readonly<{ spec: RouteSpec; outcome: "create" | "replay" | "update" | "conflict"; live?: LiveRoute }>;
-export type RoutePlan = Readonly<{ items: readonly PlanItem[]; sourceDigest: string; upstreamDigest: string; manifestDigest: string; planDigest: string; targetBaseUrl: string; counts: Readonly<Record<string, number>> }>;
+export type RoutePlan = Readonly<{ items: readonly PlanItem[]; sourceDigest: string; upstreamDigest: string; manifestDigest: string; planDigest: string; targetBaseUrl: string; counts: Readonly<Record<string, number>>; directBatchReceiptDigest?: string }>;
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SHA = /^[0-9a-f]{64}$/;
@@ -131,16 +132,18 @@ export function parseUpstreamInventory(raw: Buffer): UpstreamInventory {
   return { version, tenant, upstreams, candidateSets };
 }
 
-export function parseManifest(raw: Buffer, sourceDigest: string, upstreamDigest: string, sourceInventory?: SourceInventory): { tenant: string; targetBaseUrl: string; specs: RouteSpec[]; quarantinedAnomalies: number } {
+export function parseManifest(raw: Buffer, sourceDigest: string, upstreamDigest: string, sourceInventory?: SourceInventory, directBatchPreflight = false): { tenant: string; targetBaseUrl: string; specs: RouteSpec[]; quarantinedAnomalies: number } {
   const parsed = strictJson(raw, "reviewed manifest"); if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new RouteImportFailure("reviewed manifest has an invalid schema");
   const version = (parsed as Obj).version;
   const root = record(parsed, version === 1 ? ["version", "tenant_external_id", "target_api_base_url", "source_inventory_sha256", "upstream_inventory_sha256", "routes"] : ["version", "tenant_external_id", "target_api_base_url", "source_inventory_sha256", "upstream_inventory_sha256", "anomaly_quarantine", "routes"], "reviewed manifest");
   if ((version !== 1 && version !== 2) || text(root.source_inventory_sha256, "reviewed manifest", SHA) !== sourceDigest || text(root.upstream_inventory_sha256, "reviewed manifest", SHA) !== upstreamDigest || !Array.isArray(root.routes) || root.routes.length > 1000) throw new RouteImportFailure("reviewed manifest does not match the selected inventories");
   const tenant = text(root.tenant_external_id, "reviewed manifest tenant");
   const targetBaseUrl = text(root.target_api_base_url, "reviewed target API base URL");
-  if (sourceInventory?.anomalies.some((item) => item.reason === MANAGED_OAUTH_CAPABILITY_GAP_REASON)) throw new RouteImportFailure("source capability gap has no target adapter and cannot be quarantined");
+  if (!directBatchPreflight && sourceInventory?.anomalies.some((item) => item.reason === MANAGED_OAUTH_CAPABILITY_GAP_REASON)) throw new RouteImportFailure("source capability gap has no target adapter and cannot be quarantined");
   let quarantinedAnomalies = 0;
-  if (version === 2) {
+  if (directBatchPreflight) {
+    if (version !== 2 || root.anomaly_quarantine !== null) throw new RouteImportFailure("direct preflight retains all anomalies; it cannot quarantine or authorize them");
+  } else if (version === 2) {
     if (!sourceInventory) throw new RouteImportFailure("reviewed manifest anomaly binding cannot be verified");
     if (sourceInventory.anomalies.length === 0) { if (root.anomaly_quarantine !== null) throw new RouteImportFailure("reviewed manifest anomaly quarantine is unexpected"); }
     else {
@@ -179,14 +182,33 @@ function summary(source: SourceInventory, items: readonly PlanItem[], quarantine
 }
 
 export function createPlan(sourceRaw: Buffer, upstreamRaw: Buffer, manifestRaw: Buffer, liveRoutes: readonly LiveRoute[], liveAccounts: readonly { id: string; driver: string; status: string; updatedAt: number }[]): RoutePlan {
+  return createPlanInternal(sourceRaw, upstreamRaw, manifestRaw, liveRoutes, liveAccounts);
+}
+
+/** Recompute, rather than trust, the protected opt-in batch evidence. */
+export async function createDirectBatchPreflightPlan(sourceRaw: Buffer, upstreamRaw: Buffer, manifestRaw: Buffer, batchReceiptRaw: Buffer, liveRoutes: readonly LiveRoute[], liveAccounts: readonly { id: string; driver: string; status: string; updatedAt: number }[]): Promise<RoutePlan> {
+  const batch = strictJson(batchReceiptRaw, "direct batch receipt") as Obj;
+  if (!batch || typeof batch !== "object" || Array.isArray(batch) || typeof batch.provider_candidate_material_utf8 !== "string" || typeof batch.direct_binding_receipt_utf8 !== "string") throw new RouteImportFailure("direct batch receipt has an invalid schema");
+  // Reuse the same strict composer. Both CLI modules guard entrypoint effects;
+  // their shared functions are invoked only after module initialization.
+  let recomposed: ReturnType<typeof composeUpstreamInventory>;
+  try { recomposed = composeUpstreamInventory(sourceRaw, Buffer.from(batch.provider_candidate_material_utf8), Buffer.from(batch.direct_binding_receipt_utf8), undefined, true); }
+  catch { throw new RouteImportFailure("direct batch evidence cannot be recomposed"); }
+  if (!recomposed.batchReceipt?.equals(batchReceiptRaw) || !recomposed.inventory.equals(upstreamRaw)) throw new RouteImportFailure("direct batch receipt or inventory differs from its complete sealed evidence");
+  return createPlanInternal(sourceRaw, upstreamRaw, manifestRaw, liveRoutes, liveAccounts, digest(batchReceiptRaw));
+}
+
+function createPlanInternal(sourceRaw: Buffer, upstreamRaw: Buffer, manifestRaw: Buffer, liveRoutes: readonly LiveRoute[], liveAccounts: readonly { id: string; driver: string; status: string; updatedAt: number }[], directBatchReceiptDigest?: string): RoutePlan {
   const sourceDigest = digest(sourceRaw), upstreamDigest = digest(upstreamRaw), manifestDigest = digest(manifestRaw);
-  const source = parseSourceInventory(sourceRaw), inventory = parseUpstreamInventory(upstreamRaw), manifest = parseManifest(manifestRaw, sourceDigest, upstreamDigest, source);
+  const directBatchPreflight = directBatchReceiptDigest !== undefined;
+  const source = parseSourceInventory(sourceRaw), inventory = parseUpstreamInventory(upstreamRaw), manifest = parseManifest(manifestRaw, sourceDigest, upstreamDigest, source, directBatchPreflight);
+  if (directBatchPreflight && (inventory.version !== 2 || inventory.upstreams.some((item) => item.driver !== "http-json"))) throw new RouteImportFailure("direct preflight requires only native direct candidate pools");
   if (inventory.tenant !== manifest.tenant) throw new RouteImportFailure("inventory tenant and reviewed tenant differ");
   const upstreams = new Map(inventory.upstreams.map((item) => [item.accountId, item]));
   const accounts = new Map(liveAccounts.map((item) => [item.id, item]));
   if (accounts.size !== liveAccounts.length) throw new RouteImportFailure("target upstream inventory contains duplicate accounts");
   if (inventory.version === 2) {
-    const sourceKeys = source.mappings.map(sourceKey).sort(), poolKeys = inventory.candidateSets.map((item) => sourceKey(item.source)).sort();
+    const sourceKeys = (directBatchPreflight ? manifest.specs.map((item) => item.source) : source.mappings).map(sourceKey).sort(), poolKeys = inventory.candidateSets.map((item) => sourceKey(item.source)).sort();
     if (!same(sourceKeys, poolKeys)) throw new RouteImportFailure("provider candidate sets are not complete for the source mappings");
   }
   const candidateSets = new Map(inventory.candidateSets.map((item) => [sourceKey(item.source), item]));
@@ -210,11 +232,16 @@ export function createPlan(sourceRaw: Buffer, upstreamRaw: Buffer, manifestRaw: 
     else items.push({ spec, outcome: "conflict", live: collisions[0] });
   }
   const counts = summary(source, items, manifest.quarantinedAnomalies);
+  if (directBatchPreflight) {
+    counts.deferred_mapping_count = source.mappings.length - items.length;
+    counts.retained_anomaly_count = source.anomalies.length;
+    counts.retained_reauthorization_count = source.reauthorizationRequired;
+  }
   // The intent digest deliberately excludes live outcomes. After an acknowledged
   // create whose response was lost, the same reviewed intent changes from
   // `create` to `replay` without invalidating the resume checkpoint.
-  const planDigest = digest(encode({ sourceDigest, upstreamDigest, targetBaseUrl: manifest.targetBaseUrl, specs: manifest.specs }));
-  return { items, sourceDigest, upstreamDigest, manifestDigest, planDigest, targetBaseUrl: manifest.targetBaseUrl, counts };
+  const planDigest = digest(encode({ sourceDigest, upstreamDigest, targetBaseUrl: manifest.targetBaseUrl, specs: manifest.specs, ...(directBatchReceiptDigest ? { directBatchReceiptDigest } : {}) }));
+  return { items, sourceDigest, upstreamDigest, manifestDigest, planDigest, targetBaseUrl: manifest.targetBaseUrl, counts, ...(directBatchReceiptDigest ? { directBatchReceiptDigest } : {}) };
 }
 
 export interface RouteTarget { listRoutes(tenant: string): Promise<LiveRoute[]>; listAccounts(tenant: string): Promise<{ id: string; driver: string; status: string; updatedAt: number }[]>; create(tenant: string, spec: RouteSpec): Promise<LiveRoute>; update(tenant: string, spec: RouteSpec): Promise<LiveRoute>; }
@@ -232,7 +259,8 @@ function resumeState(path: string, plan: RoutePlan): { completed: number; mode: 
 }
 export async function execute(plan: RoutePlan, tenant: string, target: RouteTarget, apply: boolean, checkpointPath?: string): Promise<Record<string, number>> {
   const counts: Record<string, number> = { ...plan.counts, written_count: 0, verified_count: 0, failed_count: 0 };
-  if (counts.unmatched_mapping_count || counts.conflict_count || counts.anomaly_count !== counts.quarantined_anomaly_count) throw new RouteImportFailure("route convergence is blocked by unmatched, conflicting, or unquarantined source mappings", counts);
+  if (plan.directBatchReceiptDigest && apply) throw new RouteImportFailure("direct batch is preflight-only; route and policy writes are not authorized", counts);
+  if (counts.conflict_count || (plan.directBatchReceiptDigest ? counts.unmatched_mapping_count !== counts.deferred_mapping_count || counts.anomaly_count !== counts.retained_anomaly_count : counts.unmatched_mapping_count || counts.anomaly_count !== counts.quarantined_anomaly_count)) throw new RouteImportFailure("route convergence is blocked by unmatched, conflicting, or unquarantined source mappings", counts);
   if (!apply) { if (checkpointPath) { const previous = resumeState(checkpointPath, plan); if (previous.mode === "apply") throw new RouteImportFailure("dry-run cannot overwrite an apply checkpoint"); checkpoint(checkpointPath, plan, "dry-run", 0, 0); } return counts; }
   if (!checkpointPath) throw new RouteImportFailure("apply requires an owner-only checkpoint file", counts);
   let completed = resumeState(checkpointPath, plan).completed;
@@ -279,18 +307,37 @@ export function completeSinglePage(value: unknown, label: string): unknown[] {
   return value;
 }
 
-type Options = { source?: string; upstream?: string; manifest?: string; target?: string; token?: string; checkpoint?: string; apply: boolean; allowHttpTarget: boolean };
+type Options = { source?: string; upstream?: string; manifest?: string; target?: string; token?: string; checkpoint?: string; batchReceipt?: string; directBatchPreflight?: boolean; apply: boolean; allowHttpTarget: boolean };
 function options(argv: string[]): Options {
-  if (argv.includes("--help") || argv.includes("-h")) { process.stdout.write("usage: import-cpa-model-routes --source-inventory-file FILE --upstream-inventory-file FILE --reviewed-manifest-file FILE --target-api-base-url URL --service-token-file FILE [--checkpoint-file FILE] [--apply] [--allow-http-target]\n\nProvider-exact CPA route convergence; live dry-run by default. Copilot/Cursor reauthorization is report-only. HTTP requires an exact owner-reviewed manifest URL.\n"); process.exit(0); }
+  if (argv.includes("--help") || argv.includes("-h")) { process.stdout.write("usage: import-cpa-model-routes --source-inventory-file FILE --upstream-inventory-file FILE --reviewed-manifest-file FILE --target-api-base-url URL --service-token-file FILE [--checkpoint-file FILE] [--apply] [--allow-http-target]\n       Add --direct-batch-preflight --batch-receipt-file FILE for explicit direct-only preflight; --apply is forbidden in that mode.\n\nProvider-exact CPA route convergence; live dry-run by default. Copilot/Cursor reauthorization is report-only. HTTP requires an exact owner-reviewed manifest URL.\n"); process.exit(0); }
   const output: Options = { apply: false, allowHttpTarget: false }; const names: Record<string, keyof Options> = { "--source-inventory-file": "source", "--upstream-inventory-file": "upstream", "--reviewed-manifest-file": "manifest", "--target-api-base-url": "target", "--service-token-file": "token", "--checkpoint-file": "checkpoint" };
-  for (let index = 0; index < argv.length; index++) { const argument = argv[index]!; if (argument === "--apply") output.apply = true; else if (argument === "--allow-http-target") output.allowHttpTarget = true; else { const key = names[argument], value = argv[++index]; if (!key || !value || value.startsWith("--")) throw new RouteImportFailure("arguments are invalid"); (output as Record<string, unknown>)[key] = value; } }
+  names["--batch-receipt-file"] = "batchReceipt";
+  for (let index = 0; index < argv.length; index++) { const argument = argv[index]!; if (argument === "--direct-batch-preflight") { if (output.directBatchPreflight) throw new RouteImportFailure("duplicate preflight opt-in"); output.directBatchPreflight = true; } else if (argument === "--apply") output.apply = true; else if (argument === "--allow-http-target") output.allowHttpTarget = true; else { const key = names[argument], value = argv[++index]; if (!key || !value || value.startsWith("--") || output[key] !== undefined) throw new RouteImportFailure("arguments are invalid"); (output as Record<string, unknown>)[key] = value; } }
+  if (Boolean(output.directBatchPreflight) !== Boolean(output.batchReceipt) || (output.directBatchPreflight && output.apply)) throw new RouteImportFailure("direct batch requires explicit preflight-only opt-in and its receipt; apply is forbidden");
   if (!output.source || !output.upstream || !output.manifest || !output.target || !output.token) throw new RouteImportFailure("required arguments are missing"); return output;
 }
 function safeBase(raw: string, reviewed: string, allowHttp: boolean): URL { if (raw !== reviewed) throw new RouteImportFailure("target API URL differs from the owner-reviewed manifest"); let url: URL; try { url = new URL(raw); } catch { throw new RouteImportFailure("target API URL is invalid"); } if (url.username || url.password || url.search || url.hash || url.pathname !== "/") throw new RouteImportFailure("target API URL is invalid"); if (url.protocol === "http:" && allowHttp) return url; if (url.protocol !== "https:") throw new RouteImportFailure("HTTP target requires explicit owner-reviewed opt-in"); return url; }
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   let token: Buffer | undefined;
-  try { const selected = options(argv); const source = readProtected(selected.source!, "source inventory"), upstream = readProtected(selected.upstream!, "upstream inventory"), manifest = readProtected(selected.manifest!, "reviewed manifest"); token = readProtected(selected.token!, "service token"); const tokenText = token.toString("utf8").trim(); if (!TOKEN.test(tokenText)) throw new RouteImportFailure("service token file is invalid"); token.fill(0); token = Buffer.from(tokenText); const reviewed = parseManifest(manifest, digest(source), digest(upstream), parseSourceInventory(source)); const target = new HttpTarget(safeBase(selected.target!, reviewed.targetBaseUrl, selected.allowHttpTarget), token); const parsed = parseUpstreamInventory(upstream); const plan = createPlan(source, upstream, manifest, await target.listRoutes(parsed.tenant), await target.listAccounts(parsed.tenant)); const counts = await execute(plan, parsed.tenant, target, selected.apply, selected.checkpoint); process.stdout.write(`${encode({ mode: selected.apply ? "apply" : "dry-run", source_inventory_sha256: plan.sourceDigest, upstream_inventory_sha256: plan.upstreamDigest, reviewed_manifest_sha256: plan.manifestDigest, plan_sha256: plan.planDigest, ...counts })}\n`); return 0; }
+  try {
+    const selected = options(argv);
+    const source = readProtected(selected.source!, "source inventory"), upstream = readProtected(selected.upstream!, "upstream inventory"), manifest = readProtected(selected.manifest!, "reviewed manifest");
+    const batch = selected.batchReceipt ? readProtected(selected.batchReceipt, "direct batch receipt") : undefined;
+    // Validate all local batch evidence before any target read.
+    if (batch) await createDirectBatchPreflightPlan(source, upstream, manifest, batch, [], parseUpstreamInventory(upstream).upstreams.map((item) => ({ id: item.accountId, driver: item.driver, status: item.status, updatedAt: item.updatedAt })));
+    token = readProtected(selected.token!, "service token");
+    const tokenText = token.toString("utf8").trim();
+    if (!TOKEN.test(tokenText)) throw new RouteImportFailure("service token file is invalid");
+    token.fill(0); token = Buffer.from(tokenText);
+    const reviewed = parseManifest(manifest, digest(source), digest(upstream), parseSourceInventory(source), Boolean(batch));
+    const target = new HttpTarget(safeBase(selected.target!, reviewed.targetBaseUrl, selected.allowHttpTarget), token);
+    const parsed = parseUpstreamInventory(upstream), routes = await target.listRoutes(parsed.tenant), accounts = await target.listAccounts(parsed.tenant);
+    const plan = batch ? await createDirectBatchPreflightPlan(source, upstream, manifest, batch, routes, accounts) : createPlan(source, upstream, manifest, routes, accounts);
+    const counts = await execute(plan, parsed.tenant, target, selected.apply, selected.checkpoint);
+    process.stdout.write(`${encode({ mode: batch ? "direct-route-batch-preflight-only" : selected.apply ? "apply" : "dry-run", source_inventory_sha256: plan.sourceDigest, upstream_inventory_sha256: plan.upstreamDigest, reviewed_manifest_sha256: plan.manifestDigest, plan_sha256: plan.planDigest, ...(plan.directBatchReceiptDigest ? { batch_receipt_sha256: plan.directBatchReceiptDigest } : {}), ...counts })}\n`);
+    return 0;
+  }
   catch (error) { const failure = error instanceof RouteImportFailure ? error : new RouteImportFailure("route importer failed"); process.stderr.write(`${encode({ error: failure.message, ...(failure.counts ?? {}) })}\n`); return 1; }
   finally { token?.fill(0); }
 }
