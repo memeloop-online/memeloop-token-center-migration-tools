@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, it } from "node:test";
 import { createHash } from "node:crypto";
+import { composeUpstreamInventory } from "../../ops/legacy-routes/compose-cpa-upstream-inventory.ts";
 import { parseSourceInventory } from "../../ops/legacy-routes/import-cpa-model-routes.ts";
 
 const repository = resolve(import.meta.dirname, "../..");
@@ -115,6 +116,66 @@ describe("CPA source route inventory exporter", () => {
     assert.deepEqual(readdirSync(output).sort(), ["provider-candidate-material.json", "source-inventory.json"]);
     const replayOutput = join(root, "replay-output"); mkdirSync(replayOutput, { mode: 0o700 }); const replay = spawnSync(process.execPath, exportArguments(source, replayOutput), { encoding: "utf8" }); assert.equal(replay.status, 0, replay.stderr);
     assert.deepEqual(JSON.parse(readFileSync(join(replayOutput, "source-inventory.json"), "utf8")).reauthorization_required, firstReauthorization);
+  });
+
+  it("keeps source-route artifacts identical for CPA bare and sha256-prefixed policy hashes", () => {
+    const root = mkdtempSync(join(tmpdir(), "mtc-source-route-policy-hash-")), source = writeSource(root), bareOutput = join(root, "bare"), prefixedOutput = join(root, "prefixed"); mkdirSync(bareOutput, { mode: 0o700 }); mkdirSync(prefixedOutput, { mode: 0o700 });
+    const bare = spawnSync(process.execPath, exportArguments(source, bareOutput), { encoding: "utf8" }); assert.equal(bare.status, 0, bare.stderr);
+    const policy = JSON.parse(readFileSync(source.policy, "utf8")) as { policies: Array<Record<string, unknown>> };
+    for (const item of policy.policies) item["key_hash"] = `sha256:${String(item["key_hash"])}`;
+    writeFileSync(source.policy, JSON.stringify(policy), { mode: 0o600 });
+    const prefixed = spawnSync(process.execPath, exportArguments(source, prefixedOutput), { encoding: "utf8" }); assert.equal(prefixed.status, 0, prefixed.stderr);
+    for (const name of ["source-inventory.json", "provider-candidate-material.json"]) assert.deepEqual(readFileSync(join(prefixedOutput, name)), readFileSync(join(bareOutput, name)));
+  });
+
+  it("preserves a Unicode CPA provider coordinate with a sha256-prefixed policy hash", () => {
+    const root = mkdtempSync(join(tmpdir(), "mtc-source-route-unicode-provider-")), source = writeSource(root), output = join(root, "output"), provider = "测试来源"; mkdirSync(output, { mode: 0o700 });
+    writeFileSync(source.config, [
+      'auth-dir: "/sealed/auth"',
+      "openai-compatibility:",
+      `  - name: "${provider}"`,
+      '    base-url: "https://unicode-provider.example.test/v1"',
+      "    api-key-entries:",
+      `      - api-key: "${apiKey}-unicode"`,
+      "    models:",
+      '      - name: "fixture-unicode-provider-upstream"',
+      "",
+    ].join("\n"), { mode: 0o600 });
+    writeFileSync(source.policy, JSON.stringify({
+      version: 1,
+      policies: [{ key_hash: `sha256:${"d".repeat(64)}`, enabled: true, grants: [{ provider, model: "fixture-unicode-provider-upstream" }] }],
+      usage: {},
+    }), { mode: 0o600 });
+    const result = spawnSync(process.execPath, exportArguments(source, output), { encoding: "utf8" }); assert.equal(result.status, 0, result.stderr);
+    const sourceRaw = readFileSync(join(output, "source-inventory.json")), materialRaw = readFileSync(join(output, "provider-candidate-material.json"));
+    const sourceInventory = JSON.parse(sourceRaw.toString("utf8")) as { mappings: Array<Record<string, unknown>> };
+    const material = JSON.parse(materialRaw.toString("utf8")) as { provider_candidate_sets: Array<Record<string, unknown>> };
+    assert.deepEqual(sourceInventory.mappings, [{ provider, model: "fixture-unicode-provider-upstream", group: null, upstream_prefix: null, protocol: "openai" }]);
+    const candidate = (material.provider_candidate_sets[0]?.candidates as Array<Record<string, unknown>>)[0];
+    assert(candidate);
+    assert.equal(candidate.source_provider, provider);
+    assert.deepEqual(parseSourceInventory(sourceRaw).mappings, [{ provider, model: "fixture-unicode-provider-upstream", group: null, upstreamPrefix: null, protocol: "openai" }]);
+    const sourceDigest = createHash("sha256").update(sourceRaw).digest("hex"), materialDigest = createHash("sha256").update(materialRaw).digest("hex");
+    const directReceipt = Buffer.from(`${JSON.stringify({
+      version: 1,
+      tenant_external_id: "default",
+      source_inventory_sha256: sourceDigest,
+      provider_candidate_material_sha256: materialDigest,
+      bindings: [{ source_stable_id: candidate.source_stable_id, source_provider: provider, upstream_account_id: "10000000-0000-4000-8000-000000000003", driver: "http-json", status: "active", updated_at: 1 }],
+      quarantined: [],
+    })}\n`);
+    const managedReceipt = Buffer.from(`${JSON.stringify({
+      version: 1,
+      tenant_external_id: "default",
+      source_inventory_sha256: sourceDigest,
+      provider_candidate_material_sha256: materialDigest,
+      managed_provenance_evidence_sha256: "e".repeat(64),
+      bindings: [],
+      quarantined: [],
+    })}\n`);
+    const composed = JSON.parse(composeUpstreamInventory(sourceRaw, materialRaw, directReceipt, managedReceipt).inventory.toString("utf8")) as { upstreams: Array<Record<string, unknown>>; provider_candidate_sets: Array<Record<string, unknown>> };
+    assert.equal(composed.upstreams[0]?.source_provider, provider);
+    assert.equal(((composed.provider_candidate_sets[0]?.source as Record<string, unknown>).provider), provider);
   });
 
   it("uses CPA's name fallback for omitted or empty aliases and ignores catalog-only display names", () => {

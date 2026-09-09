@@ -118,6 +118,18 @@ function hex(value: unknown, label: string): string {
   if (!SHA256.test(result) || result !== value) throw new ImportFailure(`${label} has an invalid schema`);
   return result;
 }
+/**
+ * CPA native policy snapshots may identify an API-key SHA-256 either as the
+ * historical bare lower-hex digest or as the explicit `sha256:` form. Keep
+ * that source-only spelling difference out of every target lookup: callers
+ * receive exactly the bare lower-hex identity used by the target inventory.
+ */
+function sourcePolicyKeyHash(value: unknown, label: string): string {
+  const raw = string(value, label);
+  const canonical = raw.startsWith("sha256:") ? raw.slice("sha256:".length) : raw;
+  if (!SHA256.test(canonical)) throw new ImportFailure(`${label} has an invalid schema`);
+  return canonical;
+}
 function uniqueSorted(values: unknown, label: string, parser: (value: unknown, label: string) => string): string[] {
   if (!Array.isArray(values) || values.length > 1000) throw new ImportFailure(`${label} has an invalid schema`);
   const result = values.map((value) => parser(value, label)).sort();
@@ -170,7 +182,7 @@ export function parseNativePolicy(raw: Buffer): NativePolicy[] {
   const seen = new Set<string>();
   return root["policies"].map((value, index) => {
     const record = object(value, ["key_hash", "enabled", "grants"], `source policy item ${index}`);
-    const keyHash = hex(record["key_hash"], "source policy hash");
+    const keyHash = sourcePolicyKeyHash(record["key_hash"], "source policy hash");
     if (seen.has(keyHash)) throw new ImportFailure("source policy contains a duplicate hash"); seen.add(keyHash);
     if (typeof record["enabled"] !== "boolean" || !Array.isArray(record["grants"]) || record["grants"].length > 500) throw new ImportFailure("source policy has an invalid schema");
     const grants = record["grants"].map((item) => grant(item, "source grant"));

@@ -18,7 +18,11 @@ import {
 const MAX_MAPPINGS = 1_000;
 const MAX_CONFIG_BYTES = 4 * 1024 * 1024;
 const STABLE_ID = /^[0-9a-f]{64}$/;
-const SOURCE_FIELD = /^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,199}$/;
+// CPA provider identifiers are source-owned opaque route coordinates. Permit
+// their documented Unicode letters/numbers without case-folding or Unicode
+// normalization, while retaining the ASCII delimiter grammar shared by the
+// sealed source/target inventory contracts.
+const SOURCE_FIELD = /^[\p{L}\p{N}][\p{L}\p{N}._:/+-]*$/u;
 const OPAQUE_ACCOUNT_DOMAIN = "memeloop-token-center\0cpa-native-reauthorization-source-id\0v1\0";
 const MANAGED_OAUTH_CAPABILITY_GAP_DOMAIN = "memeloop-token-center\0cpa-managed-oauth-capability-gap-source-id\0v1\0";
 const MANAGED_OAUTH_CAPABILITY_GAP_REASON = "source capability gap: target lacks a managed OAuth adapter";
@@ -39,7 +43,7 @@ function stableId(identityKey: Buffer, domain: string, sourceId: string): string
   return createHmac("sha256", identityKey).update(Buffer.concat([Buffer.from(domain), Buffer.from(sourceId)])).digest("hex");
 }
 function publicField(value: unknown): string | undefined {
-  return typeof value === "string" && SOURCE_FIELD.test(value) && !value.includes("@") && !value.startsWith("/") && !value.includes("//") && !/^(?:sk-|pk-|rk-|gh[oprsu]_|mtc_)/iu.test(value) ? value : undefined;
+  return typeof value === "string" && value.trim() === value && value.length > 0 && Buffer.byteLength(value) <= 500 && !/[\p{Cc}]/u.test(value) && SOURCE_FIELD.test(value) && !value.includes("@") && !value.startsWith("/") && !value.includes("//") && !/^(?:sk-|pk-|rk-|gh[oprsu]_|mtc_)/iu.test(value) ? value : undefined;
 }
 function anomalyField(value: unknown): string { return publicField(value) ?? "unknown"; }
 function nullableField(value: string | undefined): string | null | undefined {

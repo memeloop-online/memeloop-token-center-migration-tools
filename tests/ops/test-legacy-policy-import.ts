@@ -77,6 +77,30 @@ describe("legacy CPA policy import", () => {
     assert.deepEqual(result, { changed: 1, replayed: 1 }); assert.equal(target.puts, 0);
   });
 
+  it("canonicalizes CPA sha256-prefixed source hashes before identity lookup and rejects collisions or unknown algorithms", () => {
+    const selected = fixture();
+    const prefixedPolicy = JSON.parse(selected.policy.toString("utf8")) as { policies: Array<Record<string, unknown>> };
+    prefixedPolicy.policies[0]!["key_hash"] = `sha256:${firstHash}`;
+    const policy = bytes(prefixedPolicy);
+    const mapping = JSON.parse(selected.mapping.toString("utf8")) as Record<string, unknown>;
+    mapping["source_snapshot_sha256"] = digest(policy);
+    const parsed = parseNativePolicy(policy);
+    assert.equal(parsed[0]?.keyHash, firstHash);
+    assert.deepEqual(
+      buildPlan(policy, bytes(mapping), selected.inventory, [{ sourceHash: firstHash, keyId: firstKey }, { sourceHash: secondHash, keyId: secondKey }]).plan.items.map((item) => item.keyId),
+      [firstKey, secondKey],
+    );
+
+    const duplicate = bytes({ version: 1, policies: [
+      { key_hash: firstHash, enabled: true, grants: [source] },
+      { key_hash: `sha256:${firstHash}`, enabled: false, grants: [] },
+    ], usage: {} });
+    assert.throws(() => parseNativePolicy(duplicate), ImportFailure);
+    for (const invalid of [`sha512:${firstHash}`, `SHA256:${firstHash}`, `sha256:${"a".repeat(63)}`]) {
+      assert.throws(() => parseNativePolicy(bytes({ version: 1, policies: [{ key_hash: invalid, enabled: true, grants: [source] }], usage: {} })), ImportFailure);
+    }
+  });
+
   it("applies with CAS and treats the exact second run as a zero-change replay", async () => {
     const plan = planOf(), target = new MemoryTarget(plan);
     assert.deepEqual(await executePlan(plan, "fixture-tenant", target, true), { changed: 1, replayed: 1 });
