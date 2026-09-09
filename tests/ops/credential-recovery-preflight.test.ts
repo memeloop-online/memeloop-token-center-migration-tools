@@ -29,6 +29,10 @@ test("approved source must have exact digest/count, unique exact client keys and
 });
 
 test("identity is double-bound to active explicit tenant and current generation", () => {
+  assert.equal(verifyIdentity({ ...self, credential_generation: 0 },
+    [{ ...control, credential_generation: 0 }], "default", 0).credential_generation, 0);
+  assert.throws(() => verifyIdentity({ ...self, credential_generation: -1 },
+    [{ ...control, credential_generation: -1 }], "default", 0));
   assert.deepEqual(verifyIdentity(self, [control], "default", 0), {
     source_index: 0, key_id: keyId, credential_generation: 3, recovery_available: false,
   });
@@ -46,7 +50,7 @@ test("preflight rejects apply, missing inputs and HTTP outside explicit loopback
   await assert.rejects(runRecoveryPreflight([]));
 });
 
-for (const scenario of ["success", "revoked", "generation_changed", "duplicate_identity", "control_missing",
+for (const scenario of ["success", "generation_zero", "revoked", "generation_changed", "duplicate_identity", "control_missing",
   "control_wrapper", "tenant_wrong", "generation_string", "status_wrong", "recovery_missing",
   "self_wrapper", "self_generation_string"] as const) {
   test(`GET-only CLI ${scenario} never stores original keys or prints them`, { timeout: 20_000 }, async () => {
@@ -73,7 +77,7 @@ for (const scenario of ["success", "revoked", "generation_changed", "duplicate_i
         if (scenario === "revoked") { response.statusCode = 401; response.end(key); return; }
         if (scenario === "self_wrapper") { response.end(JSON.stringify({ data: self })); return; }
         response.end(JSON.stringify({
-          ...self, credential_generation: scenario === "self_generation_string" ? "3"
+          ...self, credential_generation: scenario === "generation_zero" ? 0 : scenario === "self_generation_string" ? "3"
             : scenario === "generation_changed" && selfRequests > 1 ? 4 : 3,
         }));
       } else {
@@ -85,6 +89,7 @@ for (const scenario of ["success", "revoked", "generation_changed", "duplicate_i
         if (scenario === "control_wrapper") { response.end(JSON.stringify({ items: [control] })); return; }
         response.end(JSON.stringify([{
           ...item,
+          ...(scenario === "generation_zero" ? { credential_generation: 0 } : {}),
           ...(scenario === "tenant_wrong" ? { tenant_external_id: "different" } : {}),
           ...(scenario === "generation_string" ? { credential_generation: "3" } : {}),
           ...(scenario === "status_wrong" ? { status: "revoked" } : {}),
@@ -111,9 +116,10 @@ for (const scenario of ["success", "revoked", "generation_changed", "duplicate_i
         child.on("error", fail);
         child.on("close", code => done({ code, stdout, stderr }));
       });
-      assert.equal(result.code, scenario === "success" ? 0 : 2, result.stderr);
+      const successful = scenario === "success" || scenario === "generation_zero";
+      assert.equal(result.code, successful ? 0 : 2, result.stderr);
       let receiptText = "";
-      if (scenario === "success") {
+      if (scenario === "success" || scenario === "generation_zero") {
         assert.equal(selfRequests, 2); assert.equal(controlRequests, 1);
         assert.deepEqual(JSON.parse(result.stdout), {
           mode: "dry-run", source_count: 1, verified_count: 1, recovery_available_count: 0, recovery_missing_count: 1, stored_count: 0,
@@ -123,7 +129,7 @@ for (const scenario of ["success", "revoked", "generation_changed", "duplicate_i
         const receipt = JSON.parse(receiptText);
         assert.equal(receipt.source_config_sha256, hash(rawSource));
         assert.equal(receipt.identities[0].key_id, keyId);
-        assert.equal(receipt.identities[0].credential_generation, 3);
+        assert.equal(receipt.identities[0].credential_generation, scenario === "generation_zero" ? 0 : 3);
       } else {
         assert.equal(result.stdout, "");
         assert.equal(existsSync(receiptPath), true);

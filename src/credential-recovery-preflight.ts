@@ -72,7 +72,7 @@ export type VerifiedIdentity = Readonly<{
 export function verifyIdentity(selfValue: unknown, controlValue: unknown, tenant: string, sourceIndex: number): VerifiedIdentity {
   const self = record(selfValue, "self_shape");
   if (typeof self.key_id !== "string" || !UUID.test(self.key_id)) fail("self_identity_shape");
-  if (!Number.isSafeInteger(self.credential_generation) || Number(self.credential_generation) < 1) fail("self_generation_type");
+  if (!Number.isSafeInteger(self.credential_generation) || Number(self.credential_generation) < 0) fail("self_generation_type");
   if (!Array.isArray(controlValue)) fail("control_shape");
   if (controlValue.length !== 1) fail("control_match_count");
   const control = record(controlValue[0], "control_shape");
@@ -81,7 +81,7 @@ export function verifyIdentity(selfValue: unknown, controlValue: unknown, tenant
   if (control.tenant_external_id !== tenant) fail("tenant_mismatch");
   if (typeof control.status !== "string") fail("status_type");
   if (control.status !== "active") fail("status_not_active");
-  if (!Number.isSafeInteger(control.credential_generation)) fail("generation_type");
+  if (!Number.isSafeInteger(control.credential_generation) || Number(control.credential_generation) < 0) fail("generation_type");
   if (control.credential_generation !== self.credential_generation) fail("generation_mismatch");
   if (typeof control.credential_recovery_available !== "boolean") fail("recovery_flag_type");
   return { source_index: sourceIndex, key_id: self.key_id, credential_generation: Number(self.credential_generation),
@@ -174,7 +174,7 @@ export async function runRecoveryPreflight(argv: readonly string[]): Promise<voi
       stage = "self";
       const self = record(await getJson(gateway, "/self/v1/key", keys[index]!), "self_shape");
       if (typeof self.key_id !== "string" || !UUID.test(self.key_id)) fail("self_identity_shape");
-      if (!Number.isSafeInteger(self.credential_generation) || Number(self.credential_generation) < 1) fail("self_generation_type");
+      if (!Number.isSafeInteger(self.credential_generation) || Number(self.credential_generation) < 0) fail("self_generation_type");
       selfSuccessCount++;
       stage = "control";
       const selected = await getJson(control, `/internal/v1/keys?tenant_external_id=${encodeURIComponent(tenant)}&key_id=${self.key_id}&limit=2`, token);
