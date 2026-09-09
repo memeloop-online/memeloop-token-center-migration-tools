@@ -38,6 +38,7 @@
 - CPA 会话增量导出、归档导入包装和迁移对账。
 - 最终 session/archive snapshot+delta 封存、审批导入、回放幂等与聚合收据：`ops/finalize-session-archive-delta.ts`；操作边界见 [`docs/final-session-archive-reconciliation.md`](docs/final-session-archive-reconciliation.md)。
 - 旧凭据、策略、模型路由和上游账户的严格导入；动态 CPA 源路由清单导出见 [`docs/operations/cpa-source-route-inventory.md`](docs/operations/cpa-source-route-inventory.md)。
+- 已导入客户凭据的加密 recovery envelope 回填：只接受受保护的、明确的目标 identity→原始 key 映射，默认 dry-run，并且只调用固定 private control `PUT` endpoint；操作边界见 [`docs/operations/credential-recovery-backfill.md`](docs/operations/credential-recovery-backfill.md)。
 - Provider-exact 策略输入生成器在已审核的原生路由回放后，交叉校验完整源策略、源清单、原生候选池、路由清单和目标路由回执，再生成待复核的路由清单/策略映射；它不写目标 API，也不会把任何源密钥散列写入输出。
 - 活跃迁移主键到目标正式余额不受限策略的查询、原子 CAS 迁移和计数/摘要收据。
 - 成对 PostgreSQL/对象存储备份、恢复和证据收据。

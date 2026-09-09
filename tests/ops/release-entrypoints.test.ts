@@ -19,13 +19,17 @@ test("release registry is the explicit non-container command contract", () => {
     "ops/legacy-routes/collect-cpa-source-snapshot.ts",
   );
   assert.equal(
+    releaseEntrypoints["credential-recovery-backfill"],
+    "src/credential-recovery-backfill.ts",
+  );
+  assert.equal(
     releaseEntrypoints["resolve-cpa-managed-codex-provenance"],
     "ops/legacy-routes/resolve-cpa-managed-codex-provenance.ts",
   );
 
   for (const [name, source] of Object.entries(releaseEntrypoints)) {
     assert.match(name, /^[a-z][a-z0-9-]+$/);
-    assert.match(source, /^ops\/.+\.ts$/);
+    assert.match(source, /^(?:ops|src)\/.+\.ts$/);
     assert.doesNotMatch(source, /cpa-managed-codex-route-parser/);
     const path = resolve(repository, source);
     assert.equal(lstatSync(path).isFile(), true);
