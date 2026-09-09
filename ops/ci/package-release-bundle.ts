@@ -5,6 +5,7 @@ import { lstatSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { releaseEntrypointNames, releaseEntrypoints } from "./release-entrypoints.ts";
+import { verifiedArchiveRuntime } from "../lib/session-archive-runtime.ts";
 
 const repository = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const releaseDirectory = resolve(repository, "dist/release");
@@ -49,13 +50,18 @@ const commandFiles = releaseEntrypointNames.map((name) => {
   return { name, source: releaseEntrypoints[name], path: releasePath(path), sha256: digest(path) };
 });
 const expected = new Set(commandFiles.map((entry) => entry.path));
+const runtimeFiles = ["import-cpa-session-archive", "compatibility.json", "source.tar"]
+  .map((name) => resolve(commandsDirectory, "runtime", name));
+verifiedArchiveRuntime(runtimeFiles[0]!);
+const runtimePaths = new Set(runtimeFiles.map(releasePath));
 for (const path of files(commandsDirectory)) {
   const packaged = releasePath(path);
-  if (!expected.has(packaged) && !packaged.startsWith("commands/sql/cpamp/")) throw new Error(`release artifact contains an unregistered file: ${packaged}`);
+  if (!expected.has(packaged) && !runtimePaths.has(packaged) && !packaged.startsWith("commands/sql/cpamp/")) throw new Error(`release artifact contains an unregistered file: ${packaged}`);
 }
 
 const assets = files(resolve(commandsDirectory, "sql", "cpamp")).map((path) => ({ path: releasePath(path), sha256: digest(path) }));
 if (assets.length === 0) throw new Error("release artifact is missing CPAMP SQL inputs");
+assets.push(...runtimeFiles.map((path) => ({ path: releasePath(path), sha256: digest(path) })));
 
 const manifest = {
   format_version: 1,

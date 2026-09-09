@@ -54,7 +54,7 @@ npm run typecheck
 npm test
 ```
 
-PostgreSQL acceptance 默认跳过，只有显式提供隔离 schema 的测试环境变量时才会执行。`ops/import-cpa-session-archive.ts` 目前仍依赖尚未提取的 Rust 可执行导入器，因此只能在边界关闭后作为完整链路使用。本地不安装依赖、不拉取源码、不接触真实源/目标数据；本地验证仅限 `git diff --check`。
+PostgreSQL acceptance 默认跳过，只有显式提供隔离 schema 的测试环境变量时才会执行。Release CI 为 archive 引擎提供隔离 PostgreSQL，并执行 SQLite/PostgreSQL 导入契约。`ops/import-cpa-session-archive.ts` 使用固定 product revision 构建并随 Release 封存的 Rust 二进制；这是交付中间步骤，并不表示历史源码闭包已提取或允许清理。本地不安装依赖、不拉取源码、不接触真实源/目标数据；本地验证仅限 `git diff --check`。
 
 ## 固定 revision 的 Release 执行模型
 
@@ -68,6 +68,6 @@ tar -xzf memeloop-token-center-migration-tools-<git-sha>.tar.gz
 node ./commands/import-cpa-upstreams.mjs --help
 ```
 
-Bundle 只封装 JavaScript 依赖，不会伪装为完整运行环境：涉及数据库的命令仍要求运行主机提供已审核的 `psql`；CPAMP 导入还要求 `sqlite3`；archive delta 导出使用 `flock`；archive wrapper 仍需边界外的 Rust 导入器；API2 rollback 的相应子命令还需要 `mc` 和 `pg_dump`。这些二进制、访问权限与受保护的输入须按每次迁移批准单单独核验。
+Bundle 不会伪装为完整运行环境：涉及数据库的命令仍要求运行主机提供已审核的 `psql`；CPAMP 导入还要求 `sqlite3`；archive delta 导出使用 `flock`；API2 rollback 的相应子命令还需要 `mc` 和 `pg_dump`。Archive wrapper 默认只执行包内 `commands/runtime/` 中通过 SHA-256、固定来源与兼容清单校验的 Rust 导入器，要求 Linux x86_64/glibc ≥2.39，不再隐式使用 PATH。详细来源与运行边界见 [固定 archive runtime](docs/operations/pinned-session-archive-runtime.md)。这些二进制、访问权限与受保护的输入须按每次迁移批准单单独核验。
 
 只在已获批的迁移主机上运行已验签的 Release，并继续把真实输入、PGPASS、token、输出和证据放在受保护的外部目录。CI 是唯一的 build/test 入口；获批本地运行只执行已验证的 Release 命令，不在本地重建或安装依赖。

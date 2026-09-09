@@ -40,6 +40,13 @@ must not be renamed.
 
 ## Compiled migration/runtime boundary
 
+The approved intermediate [pinned runtime delivery](operations/pinned-session-archive-runtime.md)
+builds the fixed product archive engine in migration-tools Release CI and retains
+its exact source tar, binary and compatibility manifest. This supersedes only
+the missing-binary delivery limitation below: it does not extract the closure,
+introduce a runtime dependency on the product process, or authorize deletion.
+No source fetch or compiler runs at execution time.
+
 The session-archive importer is implemented in Rust and is coupled to product database, archive, configuration and authorization modules. It was not copied or mechanically rewritten:
 
 - `src/bin/import-cpa-session-archive.rs`

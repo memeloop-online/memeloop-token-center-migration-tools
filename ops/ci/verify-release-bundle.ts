@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { releaseEntrypointNames } from "./release-entrypoints.ts";
+import { verifiedArchiveRuntime } from "../lib/session-archive-runtime.ts";
 
 const repository = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const bundleArgument = process.argv[2] ?? resolve(repository, "dist/release");
@@ -60,6 +61,12 @@ try {
   // Commands resolve from a copied directory under /tmp, so Node cannot fall
   // back to this checkout's node_modules for the bundled YAML dependency.
   bundle = isolated;
+  // Execute only the validated native binary from the isolated release tree.
+  const archiveBinary = join(bundle, "commands/runtime/import-cpa-session-archive");
+  verifiedArchiveRuntime(archiveBinary);
+  const archiveHelp = spawnSync(archiveBinary, ["--help"], { encoding: "utf8", timeout: 10_000 });
+  assert.equal(archiveHelp.status, 0, "isolated archive runtime must execute without product checkout");
+  assert.match(archiveHelp.stdout, /--max-plan-bytes/u);
 
   execute(command("export-cpa-managed-codex-model-snapshot"), ["--help"]);
   execute(command("resolve-cpa-managed-codex-provenance"), ["--help"]);

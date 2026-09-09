@@ -3,7 +3,9 @@
 
 import { spawn } from "node:child_process";
 import { accessSync, constants as fsConstants, statSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { invokedAsEntrypoint } from "./lib/invoked-as-entrypoint.ts";
+import { verifiedArchiveRuntime } from "./lib/session-archive-runtime.ts";
 
 class CliError extends Error {
   readonly exitCode: number;
@@ -58,8 +60,17 @@ async function main(): Promise<void> {
   }
   const allowUnmapped = booleanSetting("SESSION_ARCHIVE_ALLOW_UNMAPPED", false);
   const apply = booleanSetting("SESSION_ARCHIVE_APPLY", false);
-  const binary = process.env.MTC_SESSION_ARCHIVE_IMPORT_BIN ?? "import-cpa-session-archive";
+  const binary = process.env.MTC_SESSION_ARCHIVE_IMPORT_BIN
+    ?? fileURLToPath(new URL("./runtime/import-cpa-session-archive", import.meta.url));
   if (!binary || binary.includes("\0")) fail("session archive importer binary is unavailable");
+  verifiedArchiveRuntime(binary);
+  if (process.platform !== "linux" || process.arch !== "x64") fail("session archive runtime requires Linux x86_64");
+  const report = process.report.getReport() as { header?: { glibcVersionRuntime?: string } };
+  const glibc = report.header?.glibcVersionRuntime?.split(".").map(Number);
+  if (!glibc || glibc.length < 2 || !Number.isInteger(glibc[0]) || !Number.isInteger(glibc[1])
+    || glibc[0]! < 2 || (glibc[0] === 2 && glibc[1]! < 39)) {
+    fail("session archive runtime requires glibc 2.39 or newer");
+  }
 
   const args = [
     "--input", input,
@@ -79,7 +90,7 @@ async function main(): Promise<void> {
     child.once("error", reject);
     child.once("close", (code, signal) => resolve(code ?? (signal ? 128 : 1)));
   }).catch((error: unknown) => {
-    fail(error instanceof Error && "code" in error && error.code === "ENOENT" ? "session archive importer binary is unavailable" : `session archive importer failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    fail(error instanceof Error && "code" in error && error.code === "ENOENT" ? "session archive importer binary is unavailable" : "session archive importer failed");
   });
   process.exitCode = status;
 }
