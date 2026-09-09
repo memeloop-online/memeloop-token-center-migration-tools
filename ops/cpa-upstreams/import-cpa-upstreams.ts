@@ -398,20 +398,50 @@ function buildInventory(configPath: string, authDirectory: string, policy: Trans
 
 type RouteModelDefinition = { provider: string; model: string; upstreamModel: string; upstreamPrefix: string | null; protocol: "openai" | "anthropic"; candidateSourceIds: string[] };
 function routeText(value: unknown, label: string): string {
-  if (typeof value !== "string" || value.trim() !== value || value.length === 0 || Buffer.byteLength(value) > 500 || /[\0\r\n]/.test(value)) throw new ImportFailure(`${label} is invalid`);
-  return value;
+  if (typeof value !== "string" || /[\0\r\n]/.test(value)) throw new ImportFailure(`${label} is invalid`);
+  const normalized = value.trim();
+  if (normalized.length === 0 || Buffer.byteLength(normalized) > 500) throw new ImportFailure(`${label} is invalid`);
+  return normalized;
 }
-function routePrefix(value: unknown, label: string): string | null { return value === undefined ? null : routeText(value, label); }
+/**
+ * CPA's config model builder treats an absent/empty alias as the upstream name.
+ * Preserve that request-routing identity rather than requiring an alias which
+ * the source itself does not require.
+ */
+function routeAlias(value: unknown, upstreamModel: string, label: string): string {
+  if (value === undefined || value === null || value === "") return upstreamModel;
+  if (typeof value !== "string" || /[\0\r\n]/.test(value)) throw new ImportFailure(`${label} is invalid`);
+  const normalized = value.trim();
+  return normalized ? routeText(normalized, label) : upstreamModel;
+}
+/**
+ * Match CPA normalizeModelPrefix: surrounding whitespace and slashes are
+ * removed, while an empty or multi-segment prefix is not a route namespace.
+ * `null` is the YAML representation of the source string's zero value.
+ */
+function routePrefix(value: unknown, label: string): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string" || /[\0\r\n]/.test(value)) throw new ImportFailure(`${label} is invalid`);
+  const normalized = value.trim().replace(/^\/+|\/+$/gu, "");
+  if (!normalized || normalized.includes("/")) return null;
+  if (Buffer.byteLength(normalized) > 500) throw new ImportFailure(`${label} is invalid`);
+  return normalized;
+}
 function routeModelDefinitions(value: unknown, label: string, provider: string, upstreamPrefix: string | null, protocol: "openai" | "anthropic", candidateSourceIds: readonly string[], excluded: unknown): RouteModelDefinition[] {
   const entries = list(value, `${label} models`);
   const excludedModels = list(excluded, `${label} excluded models`).map((item) => routeText(item, `${label} excluded model`));
   if (new Set(excludedModels).size !== excludedModels.length) throw new ImportFailure(`${label} contains a duplicate excluded model`);
   const result = entries.map((raw) => {
-    const model = mapping(raw, `${label} model`); exact(model, ["name", "alias", "prefix"], `${label} model`);
+    // `display-name` is catalog-only CPA metadata. It neither changes the
+    // request alias nor the upstream model, so retain the route projection
+    // while refusing every other unknown model field.
+    const model = mapping(raw, `${label} model`); exact(model, ["name", "alias", "prefix", "display-name"], `${label} model`);
+    const upstreamModel = routeText(model.name, `${label} model name`);
+    const routeModel = routeAlias(model.alias, upstreamModel, `${label} model alias`);
     const modelPrefix = routePrefix(model.prefix, `${label} model prefix`);
     if (modelPrefix !== null && upstreamPrefix !== null && modelPrefix !== upstreamPrefix) throw new ImportFailure(`${label} model prefix conflicts with its provider prefix`);
     const exactPrefix = modelPrefix ?? upstreamPrefix;
-    return { provider, model: routeText(model.alias, `${label} model alias`), upstreamModel: routeText(model.name, `${label} model name`), upstreamPrefix: exactPrefix, protocol, candidateSourceIds: excludedModels.includes(routeText(model.alias, `${label} model alias`)) ? [] : [...candidateSourceIds] };
+    return { provider, model: routeModel, upstreamModel, upstreamPrefix: exactPrefix, protocol, candidateSourceIds: excludedModels.includes(routeModel) ? [] : [...candidateSourceIds] };
   });
   if (new Set(result.map((item) => JSON.stringify([item.model, item.upstreamPrefix]))).size !== result.length) throw new ImportFailure(`${label} contains a duplicate model alias/prefix pair`);
   if (excludedModels.some((model) => !result.some((item) => item.model === model))) throw new ImportFailure(`${label} excludes a model absent from its declared model list`);

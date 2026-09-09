@@ -117,6 +117,42 @@ describe("CPA source route inventory exporter", () => {
     assert.deepEqual(JSON.parse(readFileSync(join(replayOutput, "source-inventory.json"), "utf8")).reauthorization_required, firstReauthorization);
   });
 
+  it("uses CPA's name fallback for omitted or empty aliases and ignores catalog-only display names", () => {
+    const root = mkdtempSync(join(tmpdir(), "mtc-source-route-cpa-alias-")), source = writeSource(root), output = join(root, "output"); mkdirSync(output, { mode: 0o700 });
+    writeFileSync(source.config, [
+      'auth-dir: "/sealed/auth"',
+      "openai-compatibility:",
+      '  - name: "fixture-route-provider"',
+      '    base-url: "https://route-provider.example.test/v1"',
+      "    api-key-entries:",
+      `      - api-key: "${apiKey}-alias"`,
+      "    models:",
+      '      - name: "fixture-empty-alias-upstream"',
+      '        alias: ""',
+      '        display-name: "Fixture empty alias catalog label"',
+      '      - name: "fixture-omitted-alias-upstream"',
+      "",
+    ].join("\n"), { mode: 0o600 });
+    writeFileSync(source.policy, JSON.stringify({
+      version: 1,
+      policies: [{ key_hash: "c".repeat(64), enabled: true, grants: [
+        { provider: "fixture-route-provider", model: "fixture-empty-alias-upstream" },
+        { provider: "fixture-route-provider", model: "fixture-omitted-alias-upstream" },
+      ] }],
+      usage: {},
+    }), { mode: 0o600 });
+    const result = spawnSync(process.execPath, exportArguments(source, output), { encoding: "utf8" }); assert.equal(result.status, 0, result.stderr);
+    const sourceInventory = JSON.parse(readFileSync(join(output, "source-inventory.json"), "utf8")) as Record<string, unknown>;
+    assert.deepEqual(sourceInventory.mappings, [
+      { provider: "fixture-route-provider", model: "fixture-empty-alias-upstream", group: null, upstream_prefix: null, protocol: "openai" },
+      { provider: "fixture-route-provider", model: "fixture-omitted-alias-upstream", group: null, upstream_prefix: null, protocol: "openai" },
+    ]);
+
+    const invalidRoot = mkdtempSync(join(tmpdir(), "mtc-source-route-cpa-alias-invalid-")), invalid = writeSource(invalidRoot), invalidOutput = join(invalidRoot, "output"); mkdirSync(invalidOutput, { mode: 0o700 });
+    writeFileSync(invalid.config, readFileSync(invalid.config, "utf8").replace('        alias: "kimi-k2"', "        alias: 42"), { mode: 0o600 });
+    const rejected = spawnSync(process.execPath, exportArguments(invalid, invalidOutput), { encoding: "utf8" }); assert.equal(rejected.status, 2); assert.equal(existsSync(join(invalidOutput, "source-inventory.json")), false); assert.equal(existsSync(join(invalidOutput, "provider-candidate-material.json")), false);
+  });
+
   it("is no-overwrite on repetition and leaves no partial outputs for an unsupported source model shape", () => {
     const root = mkdtempSync(join(tmpdir(), "mtc-source-route-repeat-")), source = writeSource(root), output = join(root, "output"); mkdirSync(output, { mode: 0o700 });
     const first = spawnSync(process.execPath, exportArguments(source, output), { encoding: "utf8" }); assert.equal(first.status, 0, first.stderr);

@@ -33,7 +33,11 @@ and parent-directory fsync. Existing output is never overwritten.
 
 The exporter shares the upstream importer's strict YAML/auth parser and source
 identity logic. It resolves enabled native-policy grant coordinates against the
-config's declared `models[].{name,alias,prefix}`, provider and prefix.
+config's declared `models[].name`, optional `alias`/`prefix`, provider and
+prefix. CPA treats a missing or empty model alias as that model's `name`; the
+exporter preserves that exact fallback. Its optional `display-name` is catalog
+metadata, not a routing coordinate, and is therefore ignored. No other model
+field is silently accepted.
 `provider` and `model` are mandatory anchors for a route mapping; an absent one
 becomes an explicit anomaly and is never inferred. `group` and
 `upstream_prefix` are independently optional: an omitted field is preserved as
@@ -41,10 +45,10 @@ JSON `null`, then matched as part of the exact source pattern and candidate
 pool. Configuration determines the upstream model and protocol. Thus a
 source-declared model such as `gpt-6-astra` appears without changing this tool
 or relying on historical counts. Unknown config fields, unsupported model
-entries, missing aliases, ambiguous model/driver/configuration joins, an
-unresolved source grant, or an empty active source pool stop before either
-public output is created. A parseable policy shape without provider/model is a
-static anomaly and is never guessed or repaired.
+entries, ambiguous model/driver/configuration joins, an unresolved source
+grant, or an empty active source pool stop before either public output is
+created. A parseable policy shape without provider/model is a static anomaly
+and is never guessed or repaired.
 
 ## Local read-only source capture
 
