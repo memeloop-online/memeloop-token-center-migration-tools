@@ -183,6 +183,68 @@ try {
   assert.equal(composer.provider_candidate_set_count, 1);
   assert.equal(existsSync(composedInventory), true);
 
+  // Exercise both directions of the composer/importer bundle dependency.
+  // Their import.meta.url is shared after bundling, so only the command-name
+  // guard may select the CLI. No network or application writes are required.
+  const directInventory = join(routeArtifacts, "direct-preflight-upstreams.json");
+  const directBatch = join(receiptDirectory, "direct-preflight-batch.json");
+  const directSummary = JSON.parse(execute(command("compose-cpa-upstream-inventory"), [
+    "--direct-batch-preflight",
+    "--source-inventory-file", sourceInventory,
+    "--provider-candidate-material-file", candidateMaterial,
+    "--direct-binding-receipt-file", directReceipt,
+    "--upstream-inventory-output", directInventory,
+    "--batch-receipt-output", directBatch,
+  ])) as Record<string, unknown>;
+  assert.equal(directSummary.mode, "direct-route-batch-preflight-only");
+  assert.equal(directSummary.provider_candidate_set_count, 1);
+  assert.equal(directSummary.deferred_mapping_count, 0);
+  const directInventoryRaw = readFileSync(directInventory);
+  const directDocument = JSON.parse(directInventoryRaw.toString("utf8"));
+  const selectedPool = directDocument.provider_candidate_sets[0];
+  const reviewedDirect = join(receiptDirectory, "reviewed-direct-manifest.json");
+  writePrivate(reviewedDirect, `${JSON.stringify({
+    version: 2, tenant_external_id: "fixture-tenant",
+    target_api_base_url: "https://fixture-reviewed-control.invalid/",
+    source_inventory_sha256: sourceDigest,
+    upstream_inventory_sha256: sha256(directInventoryRaw),
+    anomaly_quarantine: null,
+    routes: [{
+      source: selectedPool.source,
+      target: {
+        upstream_candidates: selectedPool.candidates,
+        public_model: selectedPool.source.model,
+        upstream_model: selectedPool.upstream_model,
+        protocol: selectedPool.protocol, priority: 0,
+      },
+      expected_existing: {
+        action: "create", route_id: null, updated_at: null, grant_revision: null,
+        history_and_references_reviewed: false, history_and_references_evidence_sha256: null,
+      },
+    }],
+  })}\n`);
+  const readToken = join(receiptDirectory, "fixture-control-read-token");
+  writePrivate(readToken, "fixture-only-control-read-token");
+  const directArguments = [
+    "--direct-batch-preflight", "--batch-receipt-file", directBatch,
+    "--source-inventory-file", sourceInventory,
+    "--upstream-inventory-file", directInventory,
+    "--reviewed-manifest-file", reviewedDirect,
+    // Deliberately fail the existing exact-URL fence after local recomposition,
+    // but before constructing a request. A nested CLI or missing bundle import
+    // would produce a different error (or invalid/non-single JSON).
+    "--target-api-base-url", "https://fixture-different-control.invalid/",
+    "--service-token-file", readToken,
+  ];
+  const directPreflight = spawnSync(process.execPath, [command("import-cpa-model-routes"), ...directArguments], { cwd: bundle, encoding: "utf8", timeout: 30_000 });
+  assert.equal(directPreflight.status, 1);
+  assert.equal(directPreflight.stdout, "");
+  assert.equal(JSON.parse(directPreflight.stderr).error, "target API URL differs from the owner-reviewed manifest");
+  const directApply = spawnSync(process.execPath, [command("import-cpa-model-routes"), ...directArguments, "--apply"], { cwd: bundle, encoding: "utf8", timeout: 30_000 });
+  assert.equal(directApply.status, 1);
+  assert.equal(directApply.stdout, "");
+  assert.match(JSON.parse(directApply.stderr).error, /apply is forbidden/u);
+
   const psqlDirectory = join(root, "bin");
   // The audit runs an actual child process with its SQL on stdin; the stub is
   // intentionally outside the bundle and returns only synthetic counts.
