@@ -12,6 +12,7 @@ export const releaseEntrypoints = Object.freeze({
   "audit-cpa-migration": "ops/audit-cpa-migration.ts",
   "credential-recovery-backfill": "src/credential-recovery-backfill.ts",
   "credential-recovery-preflight": "src/credential-recovery-preflight.ts",
+  "source-credential-recovery-apply": "src/source-credential-recovery-apply.ts",
   "collect-cpa-source-snapshot": "ops/legacy-routes/collect-cpa-source-snapshot.ts",
   "compose-cpa-upstream-inventory": "ops/legacy-routes/compose-cpa-upstream-inventory.ts",
   "export-cpa-managed-codex-model-snapshot": "ops/legacy-routes/export-cpa-managed-codex-model-snapshot.ts",

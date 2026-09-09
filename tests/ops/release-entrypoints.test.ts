@@ -23,6 +23,10 @@ test("release registry is the explicit non-container command contract", () => {
     "src/credential-recovery-backfill.ts",
   );
   assert.equal(
+    releaseEntrypoints["source-credential-recovery-apply"],
+    "src/source-credential-recovery-apply.ts",
+  );
+  assert.equal(
     releaseEntrypoints["resolve-cpa-managed-codex-provenance"],
     "ops/legacy-routes/resolve-cpa-managed-codex-provenance.ts",
   );
