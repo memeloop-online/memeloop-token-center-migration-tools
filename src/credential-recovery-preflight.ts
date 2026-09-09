@@ -29,7 +29,13 @@ type Reason = "invalid_input" | "source_capture_invalid" | "source_digest_mismat
   | "response_too_large" | "request_failed" | "request_timeout" | "protected_file";
 type Stage = "arguments" | "source" | "self" | "control" | "secondpass" | "source_recheck" | "publish";
 class PreflightFailure extends Error {
-  constructor(readonly reason: Reason, readonly httpStatus?: number) { super("credential recovery preflight failed"); }
+  readonly reason: Reason;
+  readonly httpStatus?: number;
+  constructor(reason: Reason, httpStatus?: number) {
+    super("credential recovery preflight failed");
+    this.reason = reason;
+    this.httpStatus = httpStatus;
+  }
 }
 function fail(reason: Reason = "invalid_input"): never { throw new PreflightFailure(reason); }
 function record(value: unknown, reason: Reason = "invalid_input"): Record<string, unknown> {
