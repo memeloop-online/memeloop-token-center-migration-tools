@@ -167,52 +167,57 @@ describe("native Kimi target preflight and apply gate", () => {
         source_types: ["codex", "kimi"],
         account_name_policies: { kimi: "neutral-server-keyed-source-suffix-v1" },
         source_identity_contract: "operator-hmac-sha256-v1",
+        atomic_cohort_contracts: ["atomic_kimi_cohort_v1"],
       }));
       else if (request.method === "GET" && request.url === "/internal/v1/provider-types") response.end(JSON.stringify([{ id: "kimi-oauth" }]));
       else if (request.method === "GET" && request.url === "/internal/v1/upstreams?tenant_external_id=default&limit=100") response.end(JSON.stringify(accounts));
-      else if (request.method === "POST" && request.url === "/internal/v1/imports/cpa/managed-oauth") {
+      else if (request.method === "POST" && request.url === "/internal/v1/imports/cpa/managed-oauth/kimi-cohort") {
         let raw = "";
         request.setEncoding("utf8");
         request.on("data", (chunk: string) => { raw += chunk; });
         request.on("end", () => {
           const body = JSON.parse(raw) as Record<string, unknown>;
-          assert.equal(body.source_type, "kimi");
           assert.equal(body.tenant_external_id, "default");
-          assert.match(String(body.source_identity_hash), /^[0-9a-f]{64}$/u);
-          assert.match(String(body.source_document_sha256), /^[0-9a-f]{64}$/u);
-          assert.equal("timestamp" in (body.document as Record<string, unknown>), false);
-          assert.equal(body.source_document_sha256, sha256(canonicalJson(body.document)));
-          const existing = accounts.find((account) =>
-            account.import_source_identity_hash === body.source_identity_hash);
-          if (existing) {
-            response.statusCode = 200;
-            response.end(JSON.stringify({ disposition: "replayed", account: existing }));
-            return;
-          }
-          imported += 1;
-          const account = {
-            id: `10000000-0000-4000-8000-00000000000${imported}`,
-            tenant_external_id: "default",
-            name: `Kimi account ${String(body.source_identity_hash).slice(0, 12)}`,
-            driver: "kimi-oauth",
-            auth_kind: "oauth",
-            status: "active",
-            credential_generation: 1,
-            route_count: 0,
-            config: {
-              base_url: "https://api.kimi.com/coding",
-              network_scope: "public",
-              reservation_token_bounds: {},
-            },
-            import_source_identity_hash: body.source_identity_hash,
-            import_source_document_sha256: body.source_document_sha256,
-          };
-          accounts.push(account);
-          response.statusCode = 201;
-          response.end(JSON.stringify({
-            disposition: "created",
-            account,
-          }));
+          assert.equal(body.cohort_contract, "atomic_kimi_cohort_v1");
+          assert.equal(body.contract_version, 1);
+          assert.equal(Array.isArray(body.accounts) && body.accounts.length, 2);
+          const requested = body.accounts as Array<Record<string, unknown>>;
+          const existingCount = requested.filter((entry) => accounts.some((account) =>
+            account.import_source_identity_hash === entry.source_identity_hash)).length;
+          const returned = requested.map((entry) => {
+            assert.equal(entry.source_type, "kimi");
+            assert.match(String(entry.source_identity_hash), /^[0-9a-f]{64}$/u);
+            assert.match(String(entry.source_document_sha256), /^[0-9a-f]{64}$/u);
+            assert.equal("timestamp" in (entry.document as Record<string, unknown>), false);
+            assert.equal(entry.source_document_sha256, sha256(canonicalJson(entry.document)));
+            const existing = accounts.find((account) =>
+              account.import_source_identity_hash === entry.source_identity_hash);
+            if (existing) return existing;
+            imported += 1;
+            const account = {
+              id: `10000000-0000-4000-8000-00000000000${imported}`,
+              tenant_external_id: "default",
+              name: `Kimi account ${String(entry.source_identity_hash).slice(0, 12)}`,
+              driver: "kimi-oauth",
+              auth_kind: "oauth",
+              status: "active",
+              credential_generation: 1,
+              route_count: 0,
+              config: {
+                base_url: "https://api.kimi.com/coding",
+                network_scope: "public",
+                reservation_token_bounds: {},
+              },
+              import_source_identity_hash: entry.source_identity_hash,
+              import_source_document_sha256: entry.source_document_sha256,
+            };
+            accounts.push(account);
+            return account;
+          });
+          const disposition = existingCount === 0 ? "created"
+            : existingCount === 2 ? "replayed" : "converged";
+          response.statusCode = disposition === "created" ? 201 : 200;
+          response.end(JSON.stringify({ disposition, accounts: returned }));
         });
       } else { response.statusCode = 404; response.end("{}"); }
     });
@@ -261,8 +266,8 @@ describe("native Kimi target preflight and apply gate", () => {
       assert.equal(appliedValue.provider_request_count, 0);
       assert.equal(appliedValue.target_final_kimi_account_count, 2);
 
-      // A fresh reviewed dry-run can safely resume an exact one-account subset;
-      // the already imported source replays and only the absent source is made.
+      // A fresh reviewed dry-run can safely resume an exact one-account subset
+      // through the same all-or-nothing cohort transaction.
       accounts.pop();
       const resumeDryRun = join(receiptDirectory, "resume-dry-run.json");
       await run([
@@ -299,7 +304,7 @@ describe("native Kimi target preflight and apply gate", () => {
         "/internal/v1/imports/cpa/managed-oauth/capabilities",
         "/internal/v1/provider-types",
         "/internal/v1/upstreams?tenant_external_id=default&limit=100",
-        "/internal/v1/imports/cpa/managed-oauth",
+        "/internal/v1/imports/cpa/managed-oauth/kimi-cohort",
       ]));
       assert.equal(requests.every((entry) => entry.method === "GET" || entry.method === "POST"), true);
       assert.equal(requests.some((entry) => /models|health|quota|auth\.kimi/u.test(entry.url ?? "")), false);

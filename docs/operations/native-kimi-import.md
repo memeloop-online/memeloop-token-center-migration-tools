@@ -12,8 +12,8 @@ provider types, and the redacted upstream-account list. It does not invoke
 provider health, model catalog, quota, token refresh, or any Kimi endpoint.
 The target revision must match the explicitly reviewed 40-character release
 revision. Its capability document must attest the neutral server-keyed Kimi
-account-name policy and the operator-HMAC source-identity contract; older fixed
-account-name implementations fail closed.
+account-name policy, the operator-HMAC source-identity contract, and
+`atomic_kimi_cohort_v1`; older or per-account-only implementations fail closed.
 
 The protected dry-run receipt contains source and batch hashes, HMAC-based
 source/identity deduplication evidence, eight deferred route plans, and target
@@ -27,11 +27,13 @@ prices, catalog observations, or reservation bounds.
 Apply additionally requires `--apply`, `--expected-count 2`, and the exact
 successful target-bound dry-run receipt. Immediately before the first submission
 and after the batch it reopens and revalidates the complete sealed source. It
-calls only the global
-`imports:cpa:write` managed-OAuth endpoint. MTC derives server-keyed source
-identities for replay, stores credentials in its encrypted generation envelope,
-and returns sanitized account bindings. The expected Kimi release uses neutral,
-deterministic account names with no CPA/bridge terminology.
+calls the global `imports:cpa:write` atomic Kimi cohort endpoint exactly once.
+The target validates both records before taking its tenant-scoped lock, then
+creates/replays the exact cohort in one transaction: any conflict rolls back the
+whole batch. MTC derives server-keyed source identities for replay, stores
+credentials in its encrypted generation envelope, and returns sanitized account
+bindings. The expected Kimi release uses neutral, deterministic account names
+with no CPA/bridge terminology.
 
 ```text
 native-kimi-import \
@@ -66,12 +68,14 @@ the raw source-document digest. The target persists the former pair as non-secre
 replay provenance and
 returns them in its redacted inventory/account views. An interrupted apply can
 therefore be resumed only after producing and approving a fresh dry-run receipt;
-an unrelated or drifted Kimi account fails closed before any new POST.
+the atomic operation converges an exact 0/1/2-account subset without exposing a
+per-account partial state. An unrelated or drifted Kimi account fails closed
+before the single cohort POST.
 
 Any failure after the sealed source and protected output are admitted produces
 a protected terminal receipt. Source/admission failures create no artifact.
-Partial and uncertain receipts are hard stops for automatic retry: inspect target
-provenance, run a new target-bound dry-run, approve that new receipt, and then
-replay the same sealed batch. Credentials must retain at least ten minutes of
+An uncertain receipt is a hard stop for automatic retry: inspect target provenance,
+run a new target-bound dry-run, approve that new receipt, and then replay the same
+sealed batch. Credentials must retain at least ten minutes of
 access-token validity during every full-batch source inspection, so import cannot
 activate the separately deployed worker refresh loop or contact Kimi.

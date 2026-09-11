@@ -408,7 +408,9 @@ async function preflightTarget(
   if (capabilities.contract_version !== 1 || !Array.isArray(capabilities.source_types)
     || !capabilities.source_types.includes("kimi")
     || object(capabilities.account_name_policies).kimi !== "neutral-server-keyed-source-suffix-v1"
-    || capabilities.source_identity_contract !== "operator-hmac-sha256-v1") fail();
+    || capabilities.source_identity_contract !== "operator-hmac-sha256-v1"
+    || !Array.isArray(capabilities.atomic_cohort_contracts)
+    || !capabilities.atomic_cohort_contracts.includes("atomic_kimi_cohort_v1")) fail();
   const providers = (await requestJson("GET", `${origin}/internal/v1/provider-types`, token, "target provider types", [200])).value;
   if (!Array.isArray(providers) || !providers.some((value) => object(value).id === "kimi-oauth")) fail();
   const kimi = await targetCohort(origin, token, tenant, records);
@@ -522,30 +524,43 @@ export async function run(argv = process.argv.slice(2)): Promise<JsonObject> {
             || approved.provider_request_count !== 0) fail();
         } finally { approvedRaw.fill(0); }
         // Revalidate the complete sealed batch once, immediately before the
-        // first write. Every submitted object below is the already-validated
-        // in-memory projection, so no later deterministic source error can
-        // strand an avoidable one-account partial import.
+        // only write. Every submitted object below is the already-validated
+        // in-memory projection, so every deterministic source error precedes
+        // the target's atomic cohort transaction.
         if (inspectSealedKimiCohort(selected.sourceDirectory, selected.sourceIdentityKeyFile!).summary.batch_sha256
           !== cohort.summary.batch_sha256) fail();
-        for (const record of cohort.records) {
-          submitted += 1;
-          receipt.submitted_count = submitted;
-          const result = await requestJson("POST", `${origin}/internal/v1/imports/cpa/managed-oauth`, token, "native Kimi managed OAuth import", [200, 201], {
-            contract_version: 1,
-            tenant_external_id: selected.tenant,
+        submitted = EXPECTED_SOURCE_ACCOUNTS;
+        receipt.submitted_count = submitted;
+        const result = await requestJson("POST", `${origin}/internal/v1/imports/cpa/managed-oauth/kimi-cohort`, token, "atomic native Kimi cohort import", [200, 201], {
+          contract_version: 1,
+          tenant_external_id: selected.tenant,
+          cohort_contract: "atomic_kimi_cohort_v1",
+          accounts: cohort.records.map((record) => ({
             source: { kind: "auth_file", relative_path: record.relativePath },
             source_type: "kimi",
             source_identity_hash: record.sourceStableId,
             source_document_sha256: record.targetDocumentSha256,
             document: record.document,
-          });
-          const response = object(result.value);
+          })),
+        });
+        const response = object(result.value);
+        if (Object.keys(response).sort().join("\0") !== "accounts\0disposition"
+          || !Array.isArray(response.accounts) || response.accounts.length !== EXPECTED_SOURCE_ACCOUNTS) fail();
+        const existingCount = Number(receipt.target_existing_kimi_account_count);
+        const expectedDisposition = existingCount === 0 ? "created"
+          : existingCount === EXPECTED_SOURCE_ACCOUNTS ? "replayed" : "converged";
+        if (response.disposition !== expectedDisposition
+          || result.status !== (expectedDisposition === "created" ? 201 : 200)) fail();
+        const existingSources = new Set(
+          (receipt.target_existing_kimi_accounts as JsonObject[])
+            .map((account) => String(account.source_stable_id)),
+        );
+        response.accounts.forEach((value, index) => {
+          const record = cohort.records[index]!;
           const account = validateKimiTargetAccount(
-            validateTargetAccount(response.account, selected.tenant),
+            validateTargetAccount(value, selected.tenant),
             record,
           );
-          const expectedDisposition = result.status === 201 ? "created" : "replayed";
-          if (response.disposition !== expectedDisposition) fail();
           bindings.push({
             source_stable_id: record.sourceStableId,
             source_document_sha256: record.documentSha256,
@@ -553,11 +568,12 @@ export async function run(argv = process.argv.slice(2)): Promise<JsonObject> {
             upstream_account_id: account.id,
             account_name: account.name,
             driver: account.driver,
-            disposition: response.disposition,
+            disposition: existingSources.has(record.sourceStableId) ? "replayed" : "created",
           });
-          imported += 1;
-          receipt.import_count = imported;
-        }
+        });
+        imported = EXPECTED_SOURCE_ACCOUNTS;
+        receipt.import_count = imported;
+        receipt.batch_disposition = response.disposition;
         if (inspectSealedKimiCohort(selected.sourceDirectory, selected.sourceIdentityKeyFile!).summary.batch_sha256
           !== cohort.summary.batch_sha256) fail();
         const finalCohort = await targetCohort(origin, token, selected.tenant, cohort.records);
@@ -583,7 +599,7 @@ export async function run(argv = process.argv.slice(2)): Promise<JsonObject> {
     };
   } catch {
     receipt.outcome = submitted > imported ? "uncertain-stop-review-required"
-      : imported > 0 ? "partial-stop-review-required" : "failed";
+      : imported > 0 ? "committed-stop-review-required" : "failed";
     const encoded = Buffer.from(`${JSON.stringify(receipt)}\n`);
     try { writeBindingReceipt(output, encoded); }
     finally { encoded.fill(0); }
