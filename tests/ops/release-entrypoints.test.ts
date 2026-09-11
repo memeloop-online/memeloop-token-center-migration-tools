@@ -27,6 +27,10 @@ test("release registry is the explicit non-container command contract", () => {
     "src/source-credential-recovery-apply.ts",
   );
   assert.equal(
+    releaseEntrypoints["native-kimi-import"],
+    "src/native-kimi-import.ts",
+  );
+  assert.equal(
     releaseEntrypoints["resolve-cpa-managed-codex-provenance"],
     "ops/legacy-routes/resolve-cpa-managed-codex-provenance.ts",
   );

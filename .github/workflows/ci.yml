@@ -1,6 +1,9 @@
 name: CI
 
 on:
+  pull_request:
+    branches:
+      - master
   push:
     branches:
       - master
@@ -16,7 +19,7 @@ concurrency:
 jobs:
   verify:
     name: Verify migration tools
-    if: github.ref == 'refs/heads/master'
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/master'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
