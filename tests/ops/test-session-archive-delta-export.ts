@@ -13,6 +13,7 @@ import test, { after, before, beforeEach } from "node:test";
 import {
   ARCHIVE_SPOOL_SCHEMA,
   canonicalBytes,
+  collectorTransportDiagnostic,
   compareUtf8Bytewise,
   formatTime,
   parseTime,
@@ -47,6 +48,11 @@ type State = {
   snapshotSchemaVersion: 1 | 2;
   tombstoneFence: string;
   tombstones: Session[];
+  ready: boolean;
+  readyRequests: number;
+  statsRequests: number;
+  sessionsRequests: number;
+  onReadyRequest?: () => void;
 };
 
 function canonicalLine(value: unknown): Buffer { return Buffer.concat([canonicalBytes(value), Buffer.from("\n")]); }
@@ -95,6 +101,11 @@ let port = 0;
 const server = createServer((request: IncomingMessage, response: ServerResponse) => {
   const url = new URL(request.url ?? "/", `http://127.0.0.1:${port}`);
   if (url.pathname === "/leak") { state.leakCalls += 1; sendJson(response, { authorization: request.headers.authorization }); return; }
+  if (url.pathname === "/readyz") {
+    state.readyRequests += 1; state.onReadyRequest?.();
+    if (!state.ready) { sendJson(response, { error: "preparing-secret-must-not-be-logged" }, 503); return; }
+    response.writeHead(200, { "Content-Type": "text/plain", "Content-Length": "5" }); response.end("ready"); return;
+  }
   if (url.pathname.startsWith("/archive-api/v1/exports/")) {
     state.authorizationOnTicket ||= request.headers.authorization !== undefined;
     const capability = decodeURIComponent(url.pathname.slice("/archive-api/v1/exports/".length));
@@ -108,8 +119,9 @@ const server = createServer((request: IncomingMessage, response: ServerResponse)
   const direct = url.pathname.startsWith("/v1/");
   if (direct) state.directAuthorizationSeen ||= request.headers.authorization !== undefined;
   else if (request.headers.authorization !== `Bearer ${TOKEN}`) { sendJson(response, { error: "unauthorized" }, 401); return; }
-  if (url.pathname.endsWith("/stats")) { sendJson(response, { records: [...state.records.values()].reduce((sum, rows) => sum + rows.length, 0), ...(direct ? { session_cursor_protocols: [STABLE_CURSOR_PROTOCOL], offline_full_snapshot_enabled: true } : {}) }); return; }
+  if (url.pathname.endsWith("/stats")) { state.statsRequests += 1; sendJson(response, { records: [...state.records.values()].reduce((sum, rows) => sum + rows.length, 0), ...(direct ? { session_cursor_protocols: [STABLE_CURSOR_PROTOCOL], offline_full_snapshot_enabled: true } : {}) }); return; }
   if (url.pathname.endsWith("/sessions")) {
+    state.sessionsRequests += 1;
     if (state.redirects) { response.writeHead(302, { Location: "/leak" }); response.end(); return; }
     const all = sessions(state);
     if (url.searchParams.get("cursor_protocol") !== STABLE_CURSOR_PROTOCOL || !state.stable) { sendJson(response, { sessions: all }); return; }
@@ -151,7 +163,7 @@ before(async () => {
 });
 after(async () => { await new Promise<void>((resolveClose, reject) => server.close((error) => error === undefined ? resolveClose() : reject(error))); });
 beforeEach(() => {
-  state = { records: new Map(), stable: false, redirects: false, leakCalls: 0, authorizationOnTicket: false, directAuthorizationSeen: false, snapshot: "snapshot-one", fence: "7", snapshotSchemaVersion: 1, tombstoneFence: "0", tombstones: [] };
+  state = { records: new Map(), stable: false, redirects: false, leakCalls: 0, authorizationOnTicket: false, directAuthorizationSeen: false, snapshot: "snapshot-one", fence: "7", snapshotSchemaVersion: 1, tombstoneFence: "0", tombstones: [], ready: true, readyRequests: 0, statsRequests: 0, sessionsRequests: 0 };
 });
 
 async function run(arguments_: string[], environment: NodeJS.ProcessEnv = {}): Promise<{ code: number | null; stdout: string; stderr: string }> {
@@ -383,8 +395,55 @@ test("collector-direct offline baseline uses stable snapshots without CPA author
     assert.equal(result.code, 0, result.stderr);
     assert.equal(state.directAuthorizationSeen, false);
     assert.equal(state.authorizationOnTicket, false);
+    assert.equal(state.readyRequests, 1);
     const manifest = JSON.parse(readFileSync(`${paths.output}.manifest.json`, "utf8")) as Record<string, unknown>;
     assert.equal(manifest.source_mode, "collector-direct"); assert.equal(manifest.offline_full_snapshot, true);
+  } finally { rmSync(paths.directory, { recursive: true, force: true }); }
+});
+
+test("collector-direct waits for readiness before any archive projection read", async () => {
+  const paths = fixture();
+  try {
+    state.ready = false; state.stable = true;
+    state.records.set("session-deferred", [record("request-deferred", "session-deferred", "2025-01-02T01:00:00.000000Z", "2025-01-02T01:00:01.000000Z")]);
+    let observeReady!: () => void;
+    const readyRequested = new Promise<void>((resolve) => { observeReady = resolve; });
+    state.onReadyRequest = observeReady;
+    const resultPromise = run([
+      "--collector-direct", "--offline-full", "--base-url", `http://127.0.0.1:${port}`,
+      "--private-http-host", "127.0.0.1", "--checkpoint", paths.checkpoint, "--output", paths.output,
+      "--since", "1970-01-01T00:00:00Z", "--readiness-poll-milliseconds", "10", "--readiness-timeout-seconds", "5",
+    ]);
+    await readyRequested;
+    assert.equal(state.statsRequests, 0); assert.equal(state.sessionsRequests, 0);
+    state.ready = true;
+    const result = await resultPromise;
+    assert.equal(result.code, 0, result.stderr);
+    assert(state.readyRequests >= 2); assert(state.statsRequests > 0); assert(state.sessionsRequests > 0);
+  } finally { rmSync(paths.directory, { recursive: true, force: true }); }
+});
+
+test("collector transport diagnostics expose only stage and bounded cause", () => {
+  const secret = `${TOKEN}:http://secret.example/private-response-body`;
+  const timeout = Object.assign(new Error(secret), { code: "ETIMEDOUT" });
+  const diagnostic = collectorTransportDiagnostic("readyz", timeout);
+  assert.equal(diagnostic, "collector request failed (stage=readyz,cause=timeout)");
+  assert(!diagnostic.includes(secret)); assert(!diagnostic.includes("secret.example")); assert(!diagnostic.includes(TOKEN));
+});
+
+test("collector readiness deadline is explicit and never leaks the response body", async () => {
+  const paths = fixture();
+  try {
+    state.ready = false;
+    const result = await run([
+      "--collector-direct", "--offline-full", "--base-url", `http://127.0.0.1:${port}`,
+      "--private-http-host", "127.0.0.1", "--checkpoint", paths.checkpoint, "--output", paths.output,
+      "--since", "1970-01-01T00:00:00Z", "--readiness-poll-milliseconds", "10", "--readiness-timeout-seconds", "0.02",
+    ]);
+    assert.equal(result.code, 2);
+    assert.match(result.stderr, /stage=readyz,cause=http_503,limit=readiness/);
+    assert.equal(state.statsRequests, 0); assert.equal(state.sessionsRequests, 0);
+    assert(!result.stderr.includes("preparing-secret-must-not-be-logged")); assert(!result.stderr.includes(TOKEN));
   } finally { rmSync(paths.directory, { recursive: true, force: true }); }
 });
 
