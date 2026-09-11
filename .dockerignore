@@ -15,7 +15,6 @@
 !ops/legacy-policy/
 !ops/legacy-policy/import-cpa-key-policy.ts
 !ops/cpa-upstreams/
-!ops/cpa-upstreams/import-cpa-upstreams.ts
 !ops/cpa-upstreams/generate-source-identity-key.ts
 !ops/export-cpa-session-archive-delta.ts
 !ops/finalize-session-archive-delta.ts

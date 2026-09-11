@@ -36,7 +36,7 @@ set -eu
 umask 077
 test -d /evidence
 test "$(stat -c %a /evidence)" -le 700
-getent ahostsv4 cpa-session-archive-migration.cpa.svc.cluster.local
+getent ahostsv4 SOURCE_SERVICE.SOURCE_NAMESPACE.svc.cluster.local
 ```
 
 ## Offline baseline
@@ -49,8 +49,8 @@ exporter checks both again before it creates a snapshot.
 ```sh
 set -eu
 umask 077
-SOURCE_HOST=cpa-session-archive-migration.cpa.svc.cluster.local
-SOURCE_URL=http://${SOURCE_HOST}:8080
+SOURCE_HOST=SOURCE_SERVICE.SOURCE_NAMESPACE.svc.cluster.local
+SOURCE_URL=http://${SOURCE_HOST}:SOURCE_PORT
 node ops/export-cpa-session-archive-delta.ts \
   --collector-direct \
   --offline-full \
@@ -93,8 +93,8 @@ not pass `--offline-full`:
 ```sh
 set -eu
 umask 077
-SOURCE_HOST=cpa-session-archive-migration.cpa.svc.cluster.local
-SOURCE_URL=http://${SOURCE_HOST}:8080
+SOURCE_HOST=SOURCE_SERVICE.SOURCE_NAMESPACE.svc.cluster.local
+SOURCE_URL=http://${SOURCE_HOST}:SOURCE_PORT
 node ops/export-cpa-session-archive-delta.ts \
   --collector-direct \
   --base-url "${SOURCE_URL}" \

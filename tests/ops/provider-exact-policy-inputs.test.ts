@@ -20,13 +20,13 @@ function fixture(options: { missingSource?: boolean; retiredDriver?: boolean; st
   manifest: Buffer;
   receipt: Buffer;
 } {
-  const sourceCoordinate = { provider: "codex-csil", model: "gpt-5.6-sol", group: "classify:csil", upstream_prefix: "codex-csil", protocol: "openai" };
-  const policy = bytes({ version: 1, policies: [{ key_hash: keyHash, enabled: true, grants: [{ provider: "codex-csil", model: "gpt-5.6-sol", group: "classify:csil", upstream_prefix: "codex-csil" }] }], usage: {} });
+  const sourceCoordinate = { provider: "codex-alpha", model: "gpt-5.6-sol", group: "classify:alpha", upstream_prefix: "codex-alpha", protocol: "openai" };
+  const policy = bytes({ version: 1, policies: [{ key_hash: keyHash, enabled: true, grants: [{ provider: "codex-alpha", model: "gpt-5.6-sol", group: "classify:alpha", upstream_prefix: "codex-alpha" }] }], usage: {} });
   const source = bytes({ version: 2, mappings: options.missingSource ? [] : [sourceCoordinate], reauthorization_required: [], anomalies: [] });
   const upstream = bytes({
     version: 2,
     tenant_external_id: "default",
-    upstreams: [{ upstream_account_id: sourceId, source_stable_id: sourceStableId, source_provider: "codex-csil", driver: options.retiredDriver ? "legacy-cpa-bridge" : "http-json", status: "active", updated_at: 4 }],
+    upstreams: [{ upstream_account_id: sourceId, source_stable_id: sourceStableId, source_provider: "codex-alpha", driver: options.retiredDriver ? "legacy-cpa-bridge" : "http-json", status: "active", updated_at: 4 }],
     provider_candidate_sets: options.missingSource ? [] : [{ source: sourceCoordinate, upstream_model: "gpt-5.6-sol", protocol: "openai", selection: "equal_round_robin", candidates: [{ upstream_account_id: sourceId, source_stable_id: sourceStableId }] }],
   });
   const manifest = bytes({

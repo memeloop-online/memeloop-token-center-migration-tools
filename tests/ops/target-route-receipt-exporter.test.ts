@@ -15,12 +15,12 @@ const hash = (value: Buffer): string => createHash("sha256").update(value).diges
 const bytes = (value: unknown): Buffer => Buffer.from(`${JSON.stringify(value)}\n`);
 
 function fixture(options: { tenantMismatch?: boolean; staleDigest?: boolean; routeMismatch?: boolean; retiredCandidate?: boolean } = {}) {
-  const sourceCoordinate = { provider: "codex-csil", model: "gpt-5.6-sol", group: "classify:csil", upstream_prefix: "codex-csil", protocol: "openai" } as const;
+  const sourceCoordinate = { provider: "codex-alpha", model: "gpt-5.6-sol", group: "classify:alpha", upstream_prefix: "codex-alpha", protocol: "openai" } as const;
   const source = bytes({ version: 2, mappings: [sourceCoordinate], reauthorization_required: [], anomalies: [] });
   const upstream = bytes({
     version: 2,
     tenant_external_id: "default",
-    upstreams: [{ upstream_account_id: accountId, source_stable_id: sourceStableId, source_provider: "codex-csil", driver: options.retiredCandidate ? "legacy-cpa-bridge" : "http-json", status: "active", updated_at: 4 }],
+    upstreams: [{ upstream_account_id: accountId, source_stable_id: sourceStableId, source_provider: "codex-alpha", driver: options.retiredCandidate ? "legacy-cpa-bridge" : "http-json", status: "active", updated_at: 4 }],
     provider_candidate_sets: [{ source: sourceCoordinate, upstream_model: "gpt-5.6-sol", protocol: "openai", selection: "equal_round_robin", candidates: [{ upstream_account_id: accountId, source_stable_id: sourceStableId }] }],
   });
   const manifest = bytes({

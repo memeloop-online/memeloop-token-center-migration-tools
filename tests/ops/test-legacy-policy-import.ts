@@ -21,7 +21,7 @@ import {
 const firstHash = "a".repeat(64), secondHash = "b".repeat(64);
 const firstKey = "11111111-1111-7111-8111-111111111111", secondKey = "22222222-2222-7222-8222-222222222222";
 const routeId = "33333333-3333-7333-8333-333333333333", accountId = "44444444-4444-7444-8444-444444444444";
-const source = { provider: "codex-csil", model: "gpt-5.6-sol", group: "classify:csil", upstream_prefix: "codex-csil" };
+const source = { provider: "codex-alpha", model: "gpt-5.6-sol", group: "classify:alpha", upstream_prefix: "codex-alpha" };
 const digest = (value: Buffer): string => createHash("sha256").update(value).digest("hex");
 const bytes = (value: unknown): Buffer => Buffer.from(JSON.stringify(value));
 

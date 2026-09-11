@@ -7,7 +7,6 @@
  * cannot silently exist in one delivery path but not the other.
  */
 export const releaseEntrypoints = Object.freeze({
-  "api2-target-rollback": "ops/api2-target-rollback.ts",
   "attach-legacy-cpa-credentials": "ops/legacy-credentials/attach-legacy-cpa-credentials.ts",
   "audit-cpa-migration": "ops/audit-cpa-migration.ts",
   "credential-recovery-backfill": "src/credential-recovery-backfill.ts",
@@ -25,8 +24,6 @@ export const releaseEntrypoints = Object.freeze({
   "import-cpa-key-policy": "ops/legacy-policy/import-cpa-key-policy.ts",
   "import-cpa-model-routes": "ops/legacy-routes/import-cpa-model-routes.ts",
   "import-cpa-session-archive": "ops/import-cpa-session-archive.ts",
-  "import-cpa-upstreams": "ops/cpa-upstreams/import-cpa-upstreams.ts",
-  "native-kimi-import": "src/native-kimi-import.ts",
   "migrate-cpamp": "ops/migrate-cpamp.ts",
   "reconcile-final-price-cache": "ops/reconcile-final-price-cache.ts",
   "reconcile-existing-transport": "ops/cpa-upstreams/reconcile-existing-transport.ts",

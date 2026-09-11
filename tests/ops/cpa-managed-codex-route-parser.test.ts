@@ -26,7 +26,7 @@ const config = Buffer.from([
   "force-model-prefix: false",
   "oauth-model-alias:",
   "  codex:",
-  "    - name: gpt-5.6-terra-dongwu-upstream",
+  "    - name: gpt-5.6-terra-beta-upstream",
   "      alias: gpt-5.6-terra",
   "oauth-excluded-models:",
   "  codex:",
@@ -36,69 +36,69 @@ const config = Buffer.from([
   "    cpa-key-policy:",
   "      mode: native-access",
   "      classify_rules:",
-  "        - name: codex-dongwu-credential",
+  "        - name: codex-beta-credential",
   "          field: filename",
-  "          pattern: 'lindongwu11@gmail\\.com'",
-  "          group: dongwu",
+  "          pattern: 'beta-account@example\\.test'",
+  "          group: beta",
   "          enabled: true",
-  "        - name: codex-csil-credential",
+  "        - name: codex-alpha-credential",
   "          field: filename",
-  "          pattern: 'csil\\.ai\\.automation@gmail\\.com'",
-  "          group: csil",
+  "          pattern: 'alpha-account@example\\.test'",
+  "          group: alpha",
   "          enabled: true",
   "",
 ].join("\n"));
 
-const dongwu = "lindongwu11@gmail.com.json";
-const csil = "csil.ai.automation@gmail.com.json";
+const beta = "beta-account@example.test.json";
+const alpha = "alpha-account@example.test.json";
 const auths: readonly ManagedCodexAuthInput[] = [
-  { relative_path: dongwu, document: { type: "codex", prefix: "codex-dongwu", refresh_token: "fixture" } },
-  { relative_path: csil, document: { type: "codex", prefix: "codex-csil", refresh_token: "fixture", model_aliases: [{ name: "gpt-5.6-terra-csil-upstream", alias: "gpt-5.6-terra" }] } },
+  { relative_path: beta, document: { type: "codex", prefix: "codex-beta", refresh_token: "fixture" } },
+  { relative_path: alpha, document: { type: "codex", prefix: "codex-alpha", refresh_token: "fixture", model_aliases: [{ name: "gpt-5.6-terra-alpha-upstream", alias: "gpt-5.6-terra" }] } },
 ];
 const snapshot: readonly ManagedCodexModelSnapshotEntry[] = [
-  { auth_id: dongwu, provider: "codex", registered_models: ["codex-dongwu/gpt-5.6-terra", "gpt-5.6-terra-dongwu-upstream"] },
-  { auth_id: csil, provider: "codex", registered_models: ["codex-csil/gpt-5.6-terra", "gpt-5.6-terra-csil-upstream"] },
+  { auth_id: beta, provider: "codex", registered_models: ["codex-beta/gpt-5.6-terra", "gpt-5.6-terra-beta-upstream"] },
+  { auth_id: alpha, provider: "codex", registered_models: ["codex-alpha/gpt-5.6-terra", "gpt-5.6-terra-alpha-upstream"] },
 ];
-const csilCoordinate: ManagedCodexSourceCoordinate = { provider: "codex", model: "gpt-5.6-terra", group: "classify:csil", upstream_prefix: "codex-csil", protocol: "openai" };
-const dongwuCoordinate: ManagedCodexSourceCoordinate = { provider: "codex", model: "gpt-5.6-terra", group: "classify:dongwu", upstream_prefix: "codex-dongwu", protocol: "openai" };
+const alphaCoordinate: ManagedCodexSourceCoordinate = { provider: "codex", model: "gpt-5.6-terra", group: "classify:alpha", upstream_prefix: "codex-alpha", protocol: "openai" };
+const betaCoordinate: ManagedCodexSourceCoordinate = { provider: "codex", model: "gpt-5.6-terra", group: "classify:beta", upstream_prefix: "codex-beta", protocol: "openai" };
 
 describe("managed CPA Codex OAuth route parser", () => {
   it("uses source classify filename rules, per-auth aliases, prefixes, and registry evidence without group leakage", () => {
-    const routes = inspectManagedCodexRouteModels(config, auths, snapshot, [csilCoordinate, dongwuCoordinate], key);
+    const routes = inspectManagedCodexRouteModels(config, auths, snapshot, [alphaCoordinate, betaCoordinate], key);
     assert.equal(routes.length, 2);
-    const csilRoute = routes.find((item) => item.source.group === "classify:csil");
-    const dongwuRoute = routes.find((item) => item.source.group === "classify:dongwu");
-    assert(csilRoute); assert(dongwuRoute);
-    assert.equal(csilRoute.upstream_model, "gpt-5.6-terra-csil-upstream");
-    assert.equal(dongwuRoute.upstream_model, "gpt-5.6-terra-dongwu-upstream");
-    assert.deepEqual(csilRoute.candidates.map((item) => item.driver), ["openai-codex"]);
-    assert.deepEqual(dongwuRoute.candidates.map((item) => item.driver), ["openai-codex"]);
-    assert.equal(csilRoute.candidates.length, 1); assert.equal(dongwuRoute.candidates.length, 1);
-    assert.notEqual(csilRoute.candidates[0]!.source_stable_id, dongwuRoute.candidates[0]!.source_stable_id);
-    assert.equal(csilRoute.candidates[0]!.source_stable_id, managedCodexRouteSourceStableId(key, csil));
-    assert.equal(JSON.stringify(routes).includes(csil), false);
-    assert.equal(JSON.stringify(routes).includes(dongwu), false);
+    const alphaRoute = routes.find((item) => item.source.group === "classify:alpha");
+    const betaRoute = routes.find((item) => item.source.group === "classify:beta");
+    assert(alphaRoute); assert(betaRoute);
+    assert.equal(alphaRoute.upstream_model, "gpt-5.6-terra-alpha-upstream");
+    assert.equal(betaRoute.upstream_model, "gpt-5.6-terra-beta-upstream");
+    assert.deepEqual(alphaRoute.candidates.map((item) => item.driver), ["openai-codex"]);
+    assert.deepEqual(betaRoute.candidates.map((item) => item.driver), ["openai-codex"]);
+    assert.equal(alphaRoute.candidates.length, 1); assert.equal(betaRoute.candidates.length, 1);
+    assert.notEqual(alphaRoute.candidates[0]!.source_stable_id, betaRoute.candidates[0]!.source_stable_id);
+    assert.equal(alphaRoute.candidates[0]!.source_stable_id, managedCodexRouteSourceStableId(key, alpha));
+    assert.equal(JSON.stringify(routes).includes(alpha), false);
+    assert.equal(JSON.stringify(routes).includes(beta), false);
   });
 
   it("fails closed for missing custom-group, missing registry, and incompatible per-account alias mappings", () => {
-    const unknown: ManagedCodexSourceCoordinate = { ...csilCoordinate, group: "classify:not-configured" };
+    const unknown: ManagedCodexSourceCoordinate = { ...alphaCoordinate, group: "classify:not-configured" };
     assert.throws(() => inspectManagedCodexRouteModels(config, auths, snapshot, [unknown], key), ManagedCodexRouteFailure);
-    const missing = snapshot.filter((item) => item.auth_id !== csil);
-    assert.throws(() => inspectManagedCodexRouteModels(config, auths, missing, [csilCoordinate], key), ManagedCodexRouteFailure);
-    const secondCsil = {
-      relative_path: "csil.ai.automation@gmail.com-secondary.json",
-      document: { type: "codex", prefix: "codex-csil", refresh_token: "fixture", model_aliases: [{ name: "different-upstream", alias: "gpt-5.6-terra" }] },
+    const missing = snapshot.filter((item) => item.auth_id !== alpha);
+    assert.throws(() => inspectManagedCodexRouteModels(config, auths, missing, [alphaCoordinate], key), ManagedCodexRouteFailure);
+    const secondAlpha = {
+      relative_path: "alpha-account@example.test-secondary.json",
+      document: { type: "codex", prefix: "codex-alpha", refresh_token: "fixture", model_aliases: [{ name: "different-upstream", alias: "gpt-5.6-terra" }] },
     } as const;
-    const conflictingSnapshot = [...snapshot, { auth_id: secondCsil.relative_path, provider: "codex" as const, registered_models: ["codex-csil/gpt-5.6-terra", "different-upstream"] }];
-    assert.throws(() => inspectManagedCodexRouteModels(config, [...auths, secondCsil], conflictingSnapshot, [csilCoordinate], key), /incompatible per-account/u);
+    const conflictingSnapshot = [...snapshot, { auth_id: secondAlpha.relative_path, provider: "codex" as const, registered_models: ["codex-alpha/gpt-5.6-terra", "different-upstream"] }];
+    assert.throws(() => inspectManagedCodexRouteModels(config, [...auths, secondAlpha], conflictingSnapshot, [alphaCoordinate], key), /incompatible per-account/u);
   });
 
   it("pins a sealed registry observation to the same copied source config", () => {
     const authFiles: readonly CapturedAuth[] = [
-      { id: csil, provider: "codex" as const, disabled: false, status: "active" },
-      { id: dongwu, provider: "codex" as const, disabled: false, status: "active" },
+      { id: alpha, provider: "codex" as const, disabled: false, status: "active" },
+      { id: beta, provider: "codex" as const, disabled: false, status: "active" },
     ].sort((left, right) => left.id.localeCompare(right.id, "en"));
-    const modelEntries: readonly CapturedModels[] = authFiles.map((item) => ({ auth_id: item.id, provider: "codex", registered_models: item.id === csil ? ["codex-csil/gpt-5.6-terra"] : ["codex-dongwu/gpt-5.6-terra"] }));
+    const modelEntries: readonly CapturedModels[] = authFiles.map((item) => ({ auth_id: item.id, provider: "codex", registered_models: item.id === alpha ? ["codex-alpha/gpt-5.6-terra"] : ["codex-beta/gpt-5.6-terra"] }));
     const built = buildManagedCodexModelSnapshot(config, authFiles, modelEntries, authFiles, modelEntries);
     const parsed = parseManagedCodexModelSnapshot(built.snapshot);
     assert.equal(parsed.source_config_sha256, sha(config));

@@ -1,8 +1,8 @@
 # Importing cpa-session-archive
 
 The importer accepts both normalized archive envelopes emitted by
-`cpa-session-archive` v0.7.x. Releases through v0.7.21 emit
-`schema_version: 1`; newer identity-aware builds emit `schema_version: 2`.
+`cpa-session-archive`. Legacy releases emit `schema_version: 1`; newer
+identity-aware builds emit `schema_version: 2`.
 These are parsed as their actual versions rather than relabelled during export.
 Do not copy an active `archive.sqlite` file without its WAL. Obtain the JSONL
 through an authenticated export ticket, or export from a consistent SQLite
@@ -84,11 +84,11 @@ configured overlap once more:
 
 ```sh
 node ops/export-cpa-session-archive-delta.ts \
-  --base-url https://REPLACE_API2_ORIGIN \
+  --base-url https://REPLACE_SOURCE_ADAPTER_ORIGIN \
   --token-file /run/secrets/cpa-management-token \
   --checkpoint /private-evidence/archive-source-checkpoint.json \
   --output /private-evidence/archive-delta-000001.jsonl \
-  --since 2026-08-16T00:00:00Z \
+  --since OWNER_REVIEWED_BASELINE_FENCE \
   --overlap-seconds 86400
 ```
 
@@ -155,7 +155,7 @@ two session-list projections.
 
 ### Stable session cursor contract
 
-The deployed `cpa-session-archive` v0.7.21 list accepts only `limit=1..1000` and
+The legacy `cpa-session-archive` list accepts only `limit=1..1000` and
 facet filters. It orders by `last_at DESC`, has no stable tie-breaker, time upper
 bound, total or cursor, and treats unknown query parameters as facet filters.
 Consequently, an empty response to a cursor-looking parameter is not proof of an
@@ -315,9 +315,9 @@ GROUP BY tenant_id, source;
 
 Any nonzero row is a rollout blocker. Preserve it for investigation and obtain
 trusted old-locator provenance before an explicit repair; never synthesize a
-canonical gap or clear the row to force admission. The API2 trial baseline was
-reported empty, but trial and production must each be checked against their
-actual target database immediately before schema-v2 import.
+canonical gap or clear the row to force admission. Every target must be checked
+against its actual database immediately before schema-v2 import; historical
+environment observations are not reusable evidence.
 The standalone Kubernetes manifest includes its own default-deny NetworkPolicy
 and permits only cluster DNS, the selected PostgreSQL pods and the selected
 object-store pods. Review those selectors for the target cluster; never replace
@@ -410,9 +410,9 @@ therefore depends on the source session index being complete and current.
 Before the baseline, run the collector's supported session-index repair/backfill
 and prove on a consistent source SQLite snapshot that every record has a non-empty
 session id and exactly one `session_indexed_requests` row, and that every indexed
-session has an exact summary count/time range. API2 alone cannot prove those
-invariants. If the overlap contains at least 1000 sessions, v0.7.21 cannot prove
-the tail. Deploy the snapshot-cursor and snapshot-bound export contract above or
+session has an exact summary count/time range. The source adapter alone cannot
+prove those invariants. If the overlap reaches the legacy list limit, that
+adapter cannot prove the tail. Deploy the snapshot-cursor and snapshot-bound export contract above or
 use a proven source write barrier plus a separately reviewed complete baseline;
 do not override the exporter gate or attempt client-side `since`/`offset`
 parameters that the source interprets as facets.
@@ -439,13 +439,12 @@ a late-completed old-start record plus inverse start/completion order, injected
 partial failure, `overlap=0` recovery and a final zero-import replay. Its
 disposable PostgreSQL container is removed after the test.
 
-This is still **not live migration evidence**. No production/dev
-cpa-session-archive JSONL was imported, and no live target PostgreSQL/S3 counts
-have been reconciled. The release gate must run dry-run, apply, replay and
+This test evidence is **not live migration evidence**. The release gate must run
+dry-run, apply, replay and
 source/target body/count sampling against the reviewed live destination before
 traffic shift. The separately passing PostgreSQL CPAMP fixture validates usage
 metadata/checkpoints; the two import paths must still be reconciled together.
-The source-delta driver is covered by a local mock API2 test for deterministic
+The source-delta driver is covered by a local mock source-adapter test for deterministic
 overlap, pending-output resume, projection drift, saturated windows, session
 count disagreement, redirects, cross-origin tickets and an unstable freeze; that
-test is not evidence that the live API2 session index is complete.
+test is not evidence that a live source-adapter session index is complete.

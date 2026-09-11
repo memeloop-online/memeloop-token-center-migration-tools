@@ -66,9 +66,9 @@ Codex OAuth auth files. Do not put either the token or generated directory in
 Git, a ticket, chat, command substitution, or a shell trace. The command reads
 the fixed Pod and verifies its actual `app.kubernetes.io/name`, container,
 state-PVC claim, state/config volume relationship, config `subPath`, and
-management port before every sensitive stage. The names and mount paths below
-are the reviewed CPA deployment layout; `CONTEXT`, `POD`, and `POD_UID` must be
-copied from the operator's read-only approved observation, not guessed.
+management port before every sensitive stage. All deployment values below are
+placeholders. The real values must be copied from the operator's protected,
+read-only approved observation, never guessed or committed to this repository.
 The management token is a single nonempty UTF-8 value with no leading,
 trailing, or embedded line-break whitespace; do not add a final newline when
 creating its `0600` file.
@@ -77,15 +77,15 @@ creating its `0600` file.
 node /verified-release/operator-scripts/collect-cpa-source-snapshot.mjs \
   --kubectl-binary /usr/bin/kubectl \
   --context CONTEXT \
-  --namespace cliproxyapi \
+  --namespace SOURCE_NAMESPACE \
   --pod POD \
   --pod-uid POD_UID \
-  --container cliproxyapi \
-  --expected-app-name cliproxyapi \
-  --expected-pvc cliproxyapi-auth \
-  --source-state-root /root/.cli-proxy-api \
-  --config-mount-path /CLIProxyAPI/config.yaml \
-  --management-port 8317 \
+  --container SOURCE_CONTAINER \
+  --expected-app-name SOURCE_APP_NAME \
+  --expected-pvc SOURCE_STATE_PVC \
+  --source-state-root SOURCE_STATE_ROOT \
+  --config-mount-path SOURCE_CONFIG_MOUNT_PATH \
+  --management-port SOURCE_MANAGEMENT_PORT \
   --management-token-file /protected/cpa-management.token \
   --output-directory /protected/cpa-source-captures/CAPTURE_ID
 ```
@@ -195,37 +195,15 @@ upstream account from a read-only target snapshot, then create reviewed
 or drivers, select weights, or infer target IDs. The existing route importer
 will independently reject an incomplete or cross-provider/driver candidate set.
 
-## Read-only deterministic direct-account binding receipt
+## Target binding is intentionally unavailable
 
-For an explicitly opted-in **preflight only** of complete direct pools while
-managed work is deferred, see [direct batch preflight](direct-route-batch-preflight.md).
-It retains the full source and all gaps; it does not authorize route apply or
-customer policy changes. The full-coverage behavior described here remains the
-default.
+The former combined upstream import and target-binding command is retired and
+is not published in the release bundle. This exporter stops at
+target-independent source inventory and candidate material. It does not query
+a target, infer target account identifiers, or authorize account or route
+writes.
 
-If `import-cpa-upstreams --apply` has already replayed the direct API-key
-accounts, create the protected binding input for provider-exact review with:
-
-```text
-import-cpa-upstreams --resolve-existing-route-bindings --config /source/config.yaml --auth-dir /source/auth --source-identity-key-file /secrets/migration/source-identity.key --provider-candidate-material-file /sealed/provider-candidate-material.json --binding-receipt-output /sealed/direct-route-bindings.json --target-api-base-url https://target-control.example --service-token-file /secrets/migration/target-service-token [--transport-policy-file /sealed/transport-policy.json]
-```
-
-This mode makes exactly one target request: a read-only `GET` of the selected
-tenant's upstream inventory. It reconstructs the exporter’s domain-separated
-direct-account HMAC, deterministic target account name, strict `http-json`
-driver, canonical non-secret configuration, and active status. Exactly one
-match produces a binding; absent, mismatched, inactive, or duplicate accounts
-are recorded as quarantined. The receipt includes only opaque stable IDs,
-provider, target UUID, revision, driver, source-inventory digest, candidate
-material digest, and quarantine reasons. It never emits source IDs, account
-names, configurations, credentials, or service tokens. The output uses the
-same protected no-replace publication rules as the source outputs.
-
-When the direct import used a transport policy, supply that same protected
-policy file here; otherwise a policy-induced network scope or result-origin
-difference correctly quarantines the account.
-
-The mode does not create, update, or rotate target accounts; it does not cover
-managed OAuth imports or Copilot/Cursor native reauthorization. Those have
-separate provenance/reauthorization evidence and must be strictly composed
-with this direct receipt before reviewed `upstream-inventory.json` is made.
+For an explicitly opted-in source-side preflight while managed work is
+deferred, see [direct batch preflight](direct-route-batch-preflight.md). A
+complete binding and apply workflow requires a separately reviewed,
+provider-neutral target ABI and is intentionally outside this change.

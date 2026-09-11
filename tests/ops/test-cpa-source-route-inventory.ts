@@ -52,9 +52,9 @@ function writeSource(root: string, invalidModel = false): { config: string; auth
     '      - name: "gpt-6-prefix-default-upstream"',
     '        alias: "gpt-6-prefix"',
     '        prefix: "codex"',
-    '      - name: "gpt-6-prefix-csil-upstream"',
+    '      - name: "gpt-6-prefix-alpha-upstream"',
     '        alias: "gpt-6-prefix"',
-    '        prefix: "codex-csil"',
+    '        prefix: "codex-alpha"',
     ...(invalidModel ? ["        unsupported: true"] : []),
     ""].join("\n"), { mode: 0o600 });
   writeFileSync(join(auth, "copilot.json"), JSON.stringify({ type: "copilot", upstream: "copilot", handle: opaqueHandle, label: opaqueEmail, created_at: "2026-09-09T12:00:00Z" }), { mode: 0o600 });
@@ -67,9 +67,9 @@ function writeSource(root: string, invalidModel = false): { config: string; auth
         { provider: "kimi", model: "kimi-k2" },
         { provider: "westlake", model: "westlake-null", group: "westlake" },
         { provider: "westlake", model: "westlake-prefixed", group: "westlake", upstream_prefix: "westlake" },
-        { provider: "codex", model: "gpt-6-group-only", group: "csil" },
+        { provider: "codex", model: "gpt-6-group-only", group: "alpha" },
         { provider: "codex", model: "gpt-6-prefix", group: "standard", upstream_prefix: "codex" },
-        { provider: "codex", model: "gpt-6-prefix", group: "csil", upstream_prefix: "codex-csil" },
+        { provider: "codex", model: "gpt-6-prefix", group: "alpha", upstream_prefix: "codex-alpha" },
         { provider: "codex", group: "malformed" },
       ] },
       { key_hash: "b".repeat(64), enabled: false, grants: [{ provider: "codex", model: "disabled-only" }] },
@@ -100,9 +100,9 @@ describe("CPA source route inventory exporter", () => {
     assert.deepEqual(mappingFor("kimi", "kimi-k2", null), { provider: "kimi", model: "kimi-k2", group: null, upstream_prefix: null, protocol: "openai" });
     assert.deepEqual(mappingFor("westlake", "westlake-null", null), { provider: "westlake", model: "westlake-null", group: "westlake", upstream_prefix: null, protocol: "openai" });
     assert.deepEqual(mappingFor("westlake", "westlake-prefixed", "westlake"), { provider: "westlake", model: "westlake-prefixed", group: "westlake", upstream_prefix: "westlake", protocol: "openai" });
-    assert.deepEqual(mappingFor("codex", "gpt-6-group-only", null), { provider: "codex", model: "gpt-6-group-only", group: "csil", upstream_prefix: null, protocol: "openai" });
+    assert.deepEqual(mappingFor("codex", "gpt-6-group-only", null), { provider: "codex", model: "gpt-6-group-only", group: "alpha", upstream_prefix: null, protocol: "openai" });
     assert.deepEqual(mappingFor("codex", "gpt-6-prefix", "codex"), { provider: "codex", model: "gpt-6-prefix", group: "standard", upstream_prefix: "codex", protocol: "openai" });
-    assert.deepEqual(mappingFor("codex", "gpt-6-prefix", "codex-csil"), { provider: "codex", model: "gpt-6-prefix", group: "csil", upstream_prefix: "codex-csil", protocol: "openai" });
+    assert.deepEqual(mappingFor("codex", "gpt-6-prefix", "codex-alpha"), { provider: "codex", model: "gpt-6-prefix", group: "alpha", upstream_prefix: "codex-alpha", protocol: "openai" });
     assert.deepEqual(sourceInventory.anomalies, [{ provider: "codex", model: "unknown", reason: "source grant lacks provider or model route coordinates" }]);
     assert.equal(parseSourceInventory(readFileSync(sourcePath)).reauthorizationRequired, 1);
     assert.deepEqual(sourceInventory.reauthorization_required && (sourceInventory.reauthorization_required as unknown[]).map((item) => Object.keys(item as Record<string, unknown>).sort()), [["provider", "source_stable_id"]]);
@@ -296,14 +296,14 @@ describe("CPA source route inventory exporter", () => {
   it("unifies only registry-proven managed Codex OAuth candidates in their exact classify groups", () => {
     const root = mkdtempSync(join(tmpdir(), "mtc-managed-codex-route-")), source = join(root, "source"), auth = join(source, "auth"), output = join(root, "output");
     mkdirSync(auth, { recursive: true, mode: 0o700 }); mkdirSync(output, { mode: 0o700 }); chmodSync(source, 0o700); chmodSync(auth, 0o700);
-    const dongwu = "lindongwu11@gmail.com.json", csil = "csil.ai.automation@gmail.com.json";
+    const beta = "beta-account@example.test.json", alpha = "alpha-account@example.test.json";
     const config = join(source, "config.yaml");
     writeFileSync(config, [
       'auth-dir: "/sealed/auth"',
       "force-model-prefix: false",
       "oauth-model-alias:",
       "  codex:",
-      "    - name: gpt-5.6-terra-dongwu-upstream",
+      "    - name: gpt-5.6-terra-beta-upstream",
       "      alias: gpt-5.6-terra",
       "codex-api-key:",
       "  - api-key: fixture-only-direct-codex-key",
@@ -316,43 +316,43 @@ describe("CPA source route inventory exporter", () => {
       "    cpa-key-policy:",
       "      mode: native-access",
       "      classify_rules:",
-      "        - name: codex-dongwu-credential",
+      "        - name: codex-beta-credential",
       "          field: filename",
-      "          pattern: 'lindongwu11@gmail\\.com'",
-      "          group: dongwu",
+      "          pattern: 'beta-account@example\\.test'",
+      "          group: beta",
       "          enabled: true",
-      "        - name: codex-csil-credential",
+      "        - name: codex-alpha-credential",
       "          field: filename",
-      "          pattern: 'csil\\.ai\\.automation@gmail\\.com'",
-      "          group: csil",
+      "          pattern: 'alpha-account@example\\.test'",
+      "          group: alpha",
       "          enabled: true",
       "",
     ].join("\n"), { mode: 0o600 });
-    writeFileSync(join(auth, dongwu), JSON.stringify({ type: "codex", prefix: "codex-dongwu", refresh_token: "fixture-only" }), { mode: 0o600 });
-    writeFileSync(join(auth, csil), JSON.stringify({ type: "codex", prefix: "codex-csil", refresh_token: "fixture-only", model_aliases: [{ name: "gpt-5.6-terra-csil-upstream", alias: "gpt-5.6-terra" }] }), { mode: 0o600 });
+    writeFileSync(join(auth, beta), JSON.stringify({ type: "codex", prefix: "codex-beta", refresh_token: "fixture-only" }), { mode: 0o600 });
+    writeFileSync(join(auth, alpha), JSON.stringify({ type: "codex", prefix: "codex-alpha", refresh_token: "fixture-only", model_aliases: [{ name: "gpt-5.6-terra-alpha-upstream", alias: "gpt-5.6-terra" }] }), { mode: 0o600 });
     const policy = join(root, "native-policy.json");
     writeFileSync(policy, JSON.stringify({ version: 1, policies: [{ key_hash: "c".repeat(64), enabled: true, grants: [
       { provider: "codex", model: "gpt-5.6-direct" },
-      { provider: "codex", model: "gpt-5.6-terra", group: "classify:dongwu", upstream_prefix: "codex-dongwu" },
-      { provider: "codex", model: "gpt-5.6-terra", group: "classify:csil", upstream_prefix: "codex-csil" },
+      { provider: "codex", model: "gpt-5.6-terra", group: "classify:beta", upstream_prefix: "codex-beta" },
+      { provider: "codex", model: "gpt-5.6-terra", group: "classify:alpha", upstream_prefix: "codex-alpha" },
     ] }], usage: {} }), { mode: 0o600 });
     const snapshot = join(root, "managed-models.json"), authFiles = [
-      { id: csil, provider: "codex", disabled: false, status: "active" },
-      { id: dongwu, provider: "codex", disabled: false, status: "active" },
+      { id: alpha, provider: "codex", disabled: false, status: "active" },
+      { id: beta, provider: "codex", disabled: false, status: "active" },
     ];
     writeFileSync(snapshot, JSON.stringify({ version: 1, source_config_sha256: createHash("sha256").update(readFileSync(config)).digest("hex"), auth_files_sha256: createHash("sha256").update(`${JSON.stringify(authFiles)}\n`).digest("hex"), auth_models: [
-      { auth_id: csil, provider: "codex", registered_models: ["codex-csil/gpt-5.6-terra", "gpt-5.6-terra-csil-upstream"] },
-      { auth_id: dongwu, provider: "codex", registered_models: ["codex-dongwu/gpt-5.6-terra", "gpt-5.6-terra-dongwu-upstream"] },
+      { auth_id: alpha, provider: "codex", registered_models: ["codex-alpha/gpt-5.6-terra", "gpt-5.6-terra-alpha-upstream"] },
+      { auth_id: beta, provider: "codex", registered_models: ["codex-beta/gpt-5.6-terra", "gpt-5.6-terra-beta-upstream"] },
     ] }), { mode: 0o600 });
     const key = join(root, "source-identity.key"), generated = spawnSync(process.execPath, [keyGenerator, key], { encoding: "utf8" }); assert.equal(generated.status, 0, generated.stderr);
     const sourceOutput = join(output, "source-inventory.json"), materialOutput = join(output, "provider-candidate-material.json");
     const result = spawnSync(process.execPath, [exporter, "--config", config, "--auth-dir", auth, "--policy-snapshot-file", policy, "--source-identity-key-file", key, "--managed-codex-model-snapshot-file", snapshot, "--source-inventory-output", sourceOutput, "--provider-candidate-material-output", materialOutput], { encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
     const inventory = JSON.parse(readFileSync(sourceOutput, "utf8")) as { mappings: Array<Record<string, unknown>> }, material = JSON.parse(readFileSync(materialOutput, "utf8")) as { provider_candidate_sets: Array<Record<string, unknown>> };
-    assert.deepEqual(inventory.mappings.map((item) => item.group).sort(), ["classify:csil", "classify:dongwu", null]);
+    assert.deepEqual(inventory.mappings.map((item) => item.group).sort(), ["classify:alpha", "classify:beta", null]);
     assert.equal(material.provider_candidate_sets.length, 3);
     assert.deepEqual(material.provider_candidate_sets.map((item) => ((item.candidates as Array<Record<string, unknown>>)[0]!.driver)).sort(), ["http-json", "openai-codex", "openai-codex"]);
     const outputText = `${result.stdout}${result.stderr}${readFileSync(sourceOutput, "utf8")}${readFileSync(materialOutput, "utf8")}`;
-    assert.doesNotMatch(outputText, /lindongwu11@gmail\.com|csil\.ai\.automation@gmail\.com|fixture-only/u);
+    assert.doesNotMatch(outputText, /alpha-account@example\.test|beta-account@example\.test|fixture-only/u);
   });
 });

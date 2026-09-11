@@ -21,28 +21,12 @@
       "sha256": "1afde4e1547583bd56aba83b426b3f12e5bd6a700e46a579fb85a8d529278041"
     },
     {
-      "path": "docs/operations/2026-08-26-legacy-source-compatibility.md",
-      "sha256": "782785b988fb2939a1fc16a9b20e86d48c893ef24c660d60048e181dd2af0e33"
-    },
-    {
       "path": "docs/operations/backup-and-restore.md",
       "sha256": "a90e2f27092ccdc5ac19eaab624d4882065b9f87c1493e3871529684a41f1b59"
     },
     {
-      "path": "docs/operations/collector-direct-archive-runbook.md",
-      "sha256": "fd0b096ec17f32cdc6950898515b683881f0780978372abf3eb6fa0077c6d64e"
-    },
-    {
-      "path": "docs/operations/cpa-upstream-import.md",
-      "sha256": "c83d45e2b46920a903a154d3b178f311e06ee24d8e56da0025d84a994aa9481f"
-    },
-    {
       "path": "docs/operations/cpamp-cache-pricing-correction.md",
       "sha256": "0e82a804dc82a356e3b2b9b080e45522bbc80a031a937f588af54856e4e0fe57"
-    },
-    {
-      "path": "docs/operations/cutover-runbook.md",
-      "sha256": "d9550c105cead609862ca980004845ab13c76180c80357a149c11c61fb92cb6f"
     },
     {
       "path": "docs/operations/legacy-cpa-credentials.md",
@@ -51,14 +35,6 @@
     {
       "path": "docs/operations/legacy-cpa-key-policy.md",
       "sha256": "c48fb686eaa4fb210de80921b017d88abde5946555df86ef956e87fadb22d8ae"
-    },
-    {
-      "path": "docs/operations/legacy-cpa-routes.md",
-      "sha256": "5ca92e11de11149d029d163a49bd1ccdc39ef0dadb0d802179b0bae36175b92a"
-    },
-    {
-      "path": "docs/session-archive-import.md",
-      "sha256": "8b1bba59829992e18a6e40f940e448f93020abb5aae79fe8fcdc5b996ecb6c2c"
     },
     {
       "path": "migrations/common/0018_model_price_tiers.sql",
@@ -105,10 +81,6 @@
       "sha256": "00d7ada42f3484e54ce37f2f3ef54193d8effd63bd924f945e0e134122d06435"
     },
     {
-      "path": "ops/api2-target-rollback.ts",
-      "sha256": "aab3629b3e2b702266471277876de72c33c1245f9e12f037c850d157082c45a1"
-    },
-    {
       "path": "ops/audit-cpa-migration.ts",
       "sha256": "72985964dfa73bdaa8a51cb811d8e82499bfe79050ff92364ff54c5b1dc00c53"
     },
@@ -123,10 +95,6 @@
     {
       "path": "ops/cpa-upstreams/generate-source-identity-key.ts",
       "sha256": "03e9f07ba5e1b222a8b39b8c6b2e718c6cd94a96981ad734de190104d227f1b7"
-    },
-    {
-      "path": "ops/cpa-upstreams/import-cpa-upstreams.ts",
-      "sha256": "88be57dd60abfe37c876237c0e62ce6210cde77215c1804d4c8a9cb2a597bc47"
     },
     {
       "path": "ops/export-cpa-session-archive-delta.ts",
@@ -197,10 +165,6 @@
       "sha256": "93cc8c4db7e76dfe227bd1d51d9f580e87991137e5e4d0690b6e36a7e73652dd"
     },
     {
-      "path": "tests/fixtures/cpa-upstreams/oauth-blocked/config.yaml",
-      "sha256": "a1b0229b723484da2ae003c023163189e0f922384bc04c1a4a1c30df8999506e"
-    },
-    {
       "path": "tests/fixtures/cpa-upstreams/supported/auth/copilot-account.json",
       "sha256": "7589d742613effe9b6036552c8f8dc5698ca19d3962cc63ddb9896d30de7abd2"
     },
@@ -213,16 +177,8 @@
       "sha256": "edb82c1c05488bf694c846bd10ed44cb769432ad3db6daece53892f51a2f923b"
     },
     {
-      "path": "tests/fixtures/cpa-upstreams/supported/config.yaml",
-      "sha256": "c27baae5dd5b9ec5a90ab8ed050c1cdf7b22e94171ff9863b1d2e86f656903e1"
-    },
-    {
       "path": "tests/fixtures/cpa-upstreams/unknown/auth/unknown-account.json",
       "sha256": "fcf17037dd4971701cdd05a464b3bd0d0cfb52299662415c629daf1047c99d28"
-    },
-    {
-      "path": "tests/fixtures/cpa-upstreams/unknown/config.yaml",
-      "sha256": "56e33cebb4f0b57228b489a5deb47b67bbff2a0d741250b6ef5ff8618623b28e"
     },
     {
       "path": "tests/fixtures/cpamp/initial.sql",
@@ -239,10 +195,6 @@
     {
       "path": "tests/fixtures/legacy-credentials/cpamp-identities.csv",
       "sha256": "c7324f6b90c901f96cd90228103e2c9dfd5af020b54b99074675c94f9cafb4a3"
-    },
-    {
-      "path": "tests/ops/api2-target-rollback.test.ts",
-      "sha256": "085eb2c4deeaecda431e7eed173746cb7bf600dade1467f30718ec20b00e7bd8"
     },
     {
       "path": "tests/ops/contract-helpers.ts",
@@ -277,20 +229,8 @@
       "sha256": "686773b026c88d7f1d49f1a6ac6c90d94f72ed66699c1ca7db6b3b874bc0fd75"
     },
     {
-      "path": "tests/ops/test-cpa-upstream-import.ts",
-      "sha256": "fa834836167c24980a127aa35e9d43c7a297450bc13791d0a3ebf69b083ac319"
-    },
-    {
       "path": "tests/ops/test-legacy-credentials-bulk.ts",
       "sha256": "66dfa08c6aa99751b801b329b794555246eeefbd0527302e24df4dbc43bd970e"
-    },
-    {
-      "path": "tests/ops/test-legacy-policy-import.ts",
-      "sha256": "023ae98df615f45665618a2b53900f2834309f43460596b61dbcb860ea46460e"
-    },
-    {
-      "path": "tests/ops/test-legacy-route-import.ts",
-      "sha256": "6f64e6795fd26733b558511cb59b95d7d9b0d7b9b23c31715c16231c79f9eeac"
     },
     {
       "path": "tests/ops/test-session-archive-delta-export.ts",

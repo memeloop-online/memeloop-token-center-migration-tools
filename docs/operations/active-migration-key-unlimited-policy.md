@@ -4,10 +4,10 @@ This is a one-time, offline migration control. It does not deploy a workload,
 write Kubernetes resources, issue, rotate, suspend, or reactivate a credential,
 or connect to the public gateway. Its default is a read-only dry-run.
 
-The final read-only migration audit found 31 keys: 11 active keys with current
-credentials and 20 revoked keys. Those numbers are evidence, not configuration.
-The tool never contains a tenant ID, key ID, expected count, or migration
-version. At runtime, the target service must select only keys that are all of:
+Exact active and revoked key counts belong only in protected migration evidence,
+not this repository. The tool never contains a tenant ID, key ID, expected count,
+or migration version. At runtime, the target service must select only keys that
+are all of:
 
 1. currently `active`;
 2. proven by the target's migration-primary relation; and
@@ -15,7 +15,7 @@ version. At runtime, the target service must select only keys that are all of:
 
 The target is required to exclude every revoked key. A missing proof, an
 inactive key, a missing current credential, a duplicate candidate, or an empty
-candidate result fails closed. In particular, the remaining revoked keys must
+candidate result fails closed. In particular, revoked keys must
 not be guessed to be test keys or reactivated.
 
 ## Why a maximum balance grant is not this transition

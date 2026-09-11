@@ -1,14 +1,14 @@
 # Legacy CPA provider-exact route convergence
 
-Status: implemented as an owner-reviewed TypeScript planner/importer; checked-in Kubernetes mode is live `dry-run`. This procedure does not grant any credential and does not make the legacy-credential continuity gate pass by itself.
+This owner-reviewed TypeScript planner/importer does not grant any credential and does not make the legacy-credential continuity gate pass by itself. Deployment templates and live execution evidence remain outside this repository.
 
 ## Why routes stay provider-specific
 
-The old CPA inventory contains 23 provider/model mappings (DeepSeek 8, GLM 6, Qwen 5, Claude 2, other 2) and 61 exact policy grant shapes. MTC currently has fewer routes than those source mappings. A shared public model name is not permission to combine providers: each reviewed route binds exactly one source pattern to either one exact target account or one immutable, provider-exact candidate set. Every candidate repeats its pinned `source_stable_id`. Provider groups, route groups, credential grants, aliases, family inference, and guessed weights are forbidden.
+The source inventory may contain more provider/model mappings and exact policy grant shapes than the target currently exposes. A shared public model name is not permission to combine providers: each reviewed route binds exactly one source pattern to either one exact target account or one immutable, provider-exact candidate set. Every candidate repeats its pinned `source_stable_id`. Provider groups, route groups, credential grants, aliases, family inference, and guessed weights are forbidden. Exact source counts and provider distribution belong only in protected migration evidence.
 
-Two old provider/model mappings are an equal round-robin pool of four API keys in every immutable owner snapshot, with no per-key metadata or exclusion model. Selecting one account would change behavior. For those mappings the v2 contract requires the complete four-account set: candidates are deduplicated and ASCII-sorted, every account is active and bound to the same exact source provider and driver, the pool protocol/upstream model matches the route, and the selection is exactly `equal_round_robin`. A subset, superset, cross-provider member, mixed driver, stale member, duplicate, or any selection/weight guess fails closed. MTC's native `upstream_account_ids` array gives every direct association the same fixed scheduling weight; the importer does not synthesize routes or scheduling APIs.
+Some source provider/model mappings may be an equal round-robin pool of multiple API keys with no per-key metadata or exclusion model. Selecting one account would change behavior. For those mappings the v2 contract requires the complete source-defined account set: candidates are deduplicated and ASCII-sorted, every account is active and bound to the same exact source provider and driver, the pool protocol/upstream model matches the route, and the selection is exactly `equal_round_robin`. A subset, superset, cross-provider member, mixed driver, stale member, duplicate, or any selection/weight guess fails closed. MTC's native `upstream_account_ids` array gives every direct association the same fixed scheduling weight; the importer does not synthesize routes or scheduling APIs.
 
-MTC uniquely identifies a route choice by `(tenant, public_model, protocol, priority)`. When two source providers expose the same public model, the owner manifest must assign distinct priorities and explicitly review the selection semantics for credentials that receive both exact routes. The importer never invents the ordering and never combines the two managed Codex accounts.
+MTC uniquely identifies a route choice by `(tenant, public_model, protocol, priority)`. When multiple source providers expose the same public model, the owner manifest must assign distinct priorities and explicitly review the selection semantics for credentials that receive the exact routes. The importer never invents the ordering and never combines distinct managed Codex accounts.
 
 Image/video generation routes are outside this migration. In particular, Qwen-shaped or otherwise similar old text mappings cannot be redirected to the existing SiliconFlow image/video routes. The live inventory parser accepts unrelated `generation` routes so a full target listing remains readable, while reviewed legacy targets allow only the exact source `openai` or `anthropic` protocol.
 
@@ -44,19 +44,18 @@ mismatch. It does not choose a public model, priority, or any other reviewed
 manifest decision.
 
 The Job template also requires an explicit `REPLACE_TARGET_NAMESPACE`. It must
-be the namespace that owns the same database, key pepper and control Service
-named by the reviewed manifest. Never infer it from a historical production or
-trial name: during the current migration the accepted target is
-`memeloop-token-center-api2-trial`, not the older
-`memeloop-token-center`/`memeloop-token-center-dev` data planes.
+be the owner-reviewed namespace that owns the same database, key pepper and
+control Service named by the reviewed manifest. Never infer it from a historical
+production, trial or development name, and never publish the selected namespace
+in this repository.
 
-The known malformed legacy shape `{provider: codex, model: classify:csil, group: gpt-5.6-sol}` must remain in `anomalies`; it is never converted into a route. A v2 manifest may proceed only with an explicit `quarantine_unmapped` acknowledgement that pins the normalized anomaly-list SHA-256, exact count, and a separate owner-review evidence SHA-256. An absent acknowledgement, changed reason, new/unknown anomaly, count/digest drift, or any other disposition blocks dry-run and apply. A `source capability gap: target lacks a managed OAuth adapter` anomaly is never quarantinable: it blocks partial route migration until the adapter exists. Reports retain both `anomaly_count` and `quarantined_anomaly_count`; quarantine is auditable non-mutation, not silent ignore or permission expansion. Version 1 deliberately has no acknowledgement mechanism and remains blocked by any anomaly.
+A malformed legacy shape such as `{provider: codex, model: classify:fixture-a, group: example-model}` must remain in `anomalies`; it is never converted into a route. A v2 manifest may proceed only with an explicit `quarantine_unmapped` acknowledgement that pins the normalized anomaly-list SHA-256, exact count, and a separate owner-review evidence SHA-256. An absent acknowledgement, changed reason, new/unknown anomaly, count/digest drift, or any other disposition blocks dry-run and apply. A `source capability gap: target lacks a managed OAuth adapter` anomaly is never quarantinable: it blocks partial route migration until the adapter exists. Reports retain both `anomaly_count` and `quarantined_anomaly_count`; quarantine is auditable non-mutation, not silent ignore or permission expansion. Version 1 deliberately has no acknowledgement mechanism and remains blocked by any anomaly.
 
 Copilot and Cursor belong in `reauthorization_required`. That worklist is report-only and does not start OAuth. It does not block creation of otherwise fully reviewed routes, but any nonzero count means end-user continuity is still incomplete and production replacement remains blocked. An observed `provider: "kimi"` entry uses the same compatibility field to preserve an already-authorized source account whose target managed-OAuth adapter is absent; its paired capability-gap anomaly is a hard route-convergence blocker, not a reauthorization request or bridge fallback.
 
 ## Dry-run, apply, and recovery
 
-Build/run `/usr/local/bin/import-cpa-model-routes` from the immutable importer digest. The checked-in [Job template](../../ops/kubernetes/legacy-route-import-job.yaml) stages every file to memory as owner-only and runs a live dry-run:
+Build/run `/usr/local/bin/import-cpa-model-routes` from the immutable importer digest. Approved external orchestration stages every file to owner-only memory and runs a live dry-run:
 
 ```text
 import-cpa-model-routes --source-inventory-file /runtime/source-inventory.json --upstream-inventory-file /runtime/upstream-inventory.json --reviewed-manifest-file /runtime/reviewed-manifest.json --target-api-base-url EXACT_REVIEWED_URL --service-token-file /runtime/service-token --checkpoint-file /checkpoint/checkpoint.json
@@ -74,4 +73,4 @@ The current implementation deliberately fails if either live routes or upstream 
 
 ## Release gate
 
-Do not run apply until the 23-entry source inventory, complete provider candidate sets, target upstream inventory, priority choices, digest-bound anomaly quarantine, rollback point, and dry-run counts have an owner approval reference. Route convergence must be followed by the separate exact key-policy import, legacy credential `/v1/models` checks, real text/multimodal requests, and history/charge verification. Copilot/Cursor reauthorization, a Kimi target-adapter capability gap, and any missing Claude/Codex/upstream account remain explicit blockers; this tool never claims continuity merely because some routes were created.
+Do not run apply until the sealed source inventory, complete provider candidate sets, target upstream inventory, priority choices, digest-bound anomaly quarantine, rollback point, and dry-run counts have an owner approval reference. Route convergence must be followed by the separate exact key-policy import, legacy credential `/v1/models` checks, real text/multimodal requests, and history/charge verification. Copilot/Cursor reauthorization, a Kimi target-adapter capability gap, and any missing Claude/Codex/upstream account remain explicit blockers; this tool never claims continuity merely because some routes were created.

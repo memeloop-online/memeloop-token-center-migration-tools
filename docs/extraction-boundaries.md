@@ -109,7 +109,7 @@ The following were not copied because this repository must not deploy workloads 
 - `ops/kubernetes/legacy-route-import-job.yaml`;
 - `ops/kubernetes/session-archive-import-job.yaml`;
 - GitHub Actions and cluster manifests;
-- `docs/evidence/` and live API2 acceptance reports;
+- `docs/evidence/` and live environment acceptance reports;
 - database dumps, JSONL exports, checkpoints, plan files, receipts, screenshots, ciphertext and Secret material.
 
 Evidence must remain in the approved external audit store by digest. A future operator may record only non-secret content hashes and owner approvals here.
