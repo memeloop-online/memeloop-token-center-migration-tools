@@ -58,7 +58,7 @@ function fixture(options: { duplicateIdentity?: boolean; disabled?: boolean; exp
   const root = join(parent, "capture"), auth = join(root, "auth");
   mkdirSync(root, { mode: 0o700 });
   mkdirSync(auth, { mode: 0o700 });
-  const config = Buffer.from("auth-dir: /root/.cli-proxy-api/auth\n");
+  const config = Buffer.from("auth-dir: /fixture/source-state/auth\n");
   const policy = Buffer.from(`${JSON.stringify(policies())}\n`);
   writePrivate(join(root, "config.yaml"), config);
   writePrivate(join(root, "native-key-policy.json"), policy);

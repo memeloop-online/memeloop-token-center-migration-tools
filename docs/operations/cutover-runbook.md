@@ -1,12 +1,11 @@
 # CPA to Token Center cutover
 
-This runbook keeps CPA available until the new gateway and its imported history
-have been validated. It assumes a full CPAMP and session-archive baseline was
-imported after recording a trusted UTC fence immediately before that baseline
-started. A 2026-08-23 override permits a temporary, reversible CPA/API2 trial,
-but no command below authorizes API3 mutation or a final source write barrier.
-API3 remains unchanged until the user explicitly declares a production window
-open; only that later approved barrier may change source availability.
+This runbook keeps the legacy source available until the new gateway and its
+imported history have been validated. It assumes a full CPAMP and session-archive
+baseline was imported after recording a trusted UTC fence immediately before that
+baseline started. No command below authorizes a production mutation or a final
+source write barrier; only an explicitly approved production window may change
+source availability.
 
 ## Preconditions
 
@@ -62,16 +61,18 @@ open; only that later approved barrier may change source availability.
 - A private evidence directory has capacity for whole-session downloads, the
   de-duplication spool, output JSONL and importer plan. Management tokens are
   projected as mode-`0600` regular files, never passed in argv or environment.
-- CPA, API2, PostgreSQL and the export host are time-synchronized; the measured
-  clock skew is below the exporter's reviewed future-skew limit.
+- The legacy source, archive adapter, PostgreSQL and the export host are
+  time-synchronized; the measured clock skew is below the exporter's reviewed
+  future-skew limit.
 - The same tenant, `CPAMP_IMPORT_SOURCE` and `SESSION_ARCHIVE_IMPORT_SOURCE` are
   used for every baseline and delta. Changing a source name creates a different
   idempotency namespace and is forbidden during cutover.
 
 ## Online catch-up
 
-Repeat this while CPA remains live. With the legacy v0.7.21 source, run it
-frequently enough that fewer than 1000 sessions can enter one overlap window.
+Repeat this while the legacy source remains live. When it lacks a stable cursor,
+run it frequently enough that fewer than 1000 sessions can enter one overlap
+window.
 Larger windows require the reviewed
 `session-snapshot-cursor-v1`/snapshot-bound export contract documented in
 `docs/session-archive-import.md`; no client-side time split can replace its
@@ -86,17 +87,17 @@ observed collector/CPAMP queue delay.
    code is normalized to `502`/`upstream_error`. It must never enter target
    facts or aggregates as a success merely because the legacy collector stored
    an HTTP-success code next to a failed outcome.
-2. Acquire an archive delta through API2. The first post-baseline invocation uses
-   the recorded fence; every later invocation omits `--since` and uses a new
-   output filename:
+2. Acquire an archive delta through the reviewed source adapter. The first
+   post-baseline invocation uses the recorded fence; every later invocation
+   omits `--since` and uses a new output filename:
 
    ```sh
    node ops/export-cpa-session-archive-delta.ts \
-     --base-url https://REPLACE_API2_ORIGIN \
+     --base-url https://REPLACE_SOURCE_ADAPTER_ORIGIN \
      --token-file /run/secrets/cpa-management-token \
      --checkpoint /private-evidence/archive-source-checkpoint.json \
      --output /private-evidence/archive-delta-000001.jsonl \
-     --since 2026-08-16T00:00:00Z \
+     --since OWNER_REVIEWED_BASELINE_FENCE \
      --overlap-seconds 86400
    ```
 
@@ -131,13 +132,14 @@ observed collector/CPAMP queue delay.
    object storage. Before any traffic shift, run
    `node ops/audit-cpa-migration.ts` with `EXPECTED_CPAMP_EVENTS` from the
    consistent CPAMP snapshot and `EXPECTED_ARCHIVE_RECORDS` from the verified
-   API2 manifest. The command must pass and report its archive checkpoint,
+   source-adapter manifest. The command must pass and report its archive
+   checkpoint,
    exact/unlinked correlations, unresolved quarantine, watermark, correlated
    conversation clusters/observations/edges, and CPAMP link counts. A zero
    archive checkpoint or remaining `gap://` baseline is incomplete migration.
-   If the target correlation count lags API2's indexed-record count, first
-   widen the overlap (up to the exporter limit) or fall back to a new consistent
-   full export; never advance a checkpoint by hand.
+   If the target correlation count lags the source adapter's indexed-record
+   count, first widen the overlap (up to the exporter limit) or fall back to a
+   new consistent full export; never advance a checkpoint by hand.
 
 ## Final delta
 
@@ -148,7 +150,7 @@ observed collector/CPAMP queue delay.
    is not a barrier or a consistent snapshot.
 3. Take the approved final CPA, CPAMP and archive SQLite backups. Re-run the source
    session-index invariant from Preconditions on that snapshot. If it is nonzero,
-   abort; API2 deltas cannot see the missing rows.
+   abort; source-adapter deltas cannot see the missing rows.
 4. Run the final CPAMP import, followed by the final archive export with a new
    output name and `--require-stable-source`, then archive dry-run/apply/replay.
    The stable-source flag supplements the operational barrier; it does not
@@ -239,6 +241,6 @@ Abort and roll back when any of these occurs:
 - database pool acquisition errors, archive gaps or generation queue age grow;
 - the final import cannot establish a fixed watermark;
 - source/target totals, exact/unlinked provenance or object samples disagree;
-- API2 reaches the session-list completeness boundary or the final source index
-  invariant is nonzero;
+- The source adapter reaches the session-list completeness boundary or the final
+  source index invariant is nonzero;
 - PostgreSQL, object storage or proxy loses redundancy.

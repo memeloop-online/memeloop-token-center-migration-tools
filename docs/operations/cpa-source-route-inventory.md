@@ -66,9 +66,9 @@ Codex OAuth auth files. Do not put either the token or generated directory in
 Git, a ticket, chat, command substitution, or a shell trace. The command reads
 the fixed Pod and verifies its actual `app.kubernetes.io/name`, container,
 state-PVC claim, state/config volume relationship, config `subPath`, and
-management port before every sensitive stage. The names and mount paths below
-are the reviewed CPA deployment layout; `CONTEXT`, `POD`, and `POD_UID` must be
-copied from the operator's read-only approved observation, not guessed.
+management port before every sensitive stage. All deployment values below are
+placeholders. The real values must be copied from the operator's protected,
+read-only approved observation, never guessed or committed to this repository.
 The management token is a single nonempty UTF-8 value with no leading,
 trailing, or embedded line-break whitespace; do not add a final newline when
 creating its `0600` file.
@@ -77,15 +77,15 @@ creating its `0600` file.
 node /verified-release/operator-scripts/collect-cpa-source-snapshot.mjs \
   --kubectl-binary /usr/bin/kubectl \
   --context CONTEXT \
-  --namespace cliproxyapi \
+  --namespace SOURCE_NAMESPACE \
   --pod POD \
   --pod-uid POD_UID \
-  --container cliproxyapi \
-  --expected-app-name cliproxyapi \
-  --expected-pvc cliproxyapi-auth \
-  --source-state-root /root/.cli-proxy-api \
-  --config-mount-path /CLIProxyAPI/config.yaml \
-  --management-port 8317 \
+  --container SOURCE_CONTAINER \
+  --expected-app-name SOURCE_APP_NAME \
+  --expected-pvc SOURCE_STATE_PVC \
+  --source-state-root SOURCE_STATE_ROOT \
+  --config-mount-path SOURCE_CONFIG_MOUNT_PATH \
+  --management-port SOURCE_MANAGEMENT_PORT \
   --management-token-file /protected/cpa-management.token \
   --output-directory /protected/cpa-source-captures/CAPTURE_ID
 ```

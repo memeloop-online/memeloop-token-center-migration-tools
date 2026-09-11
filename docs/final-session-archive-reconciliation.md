@@ -43,7 +43,7 @@ provided. The approval is metadata only and must match the artifact-set digest,
 migration-window ID, tenant, source labels and expected request-event count:
 
 ```json
-{"approval_id":"approved-window-01","approved_at":"2026-09-06T00:00:00.000000Z","archive_source":"session-archive-final","artifact_set_sha256":"<sealed digest>","cpamp_source":"request-events-final","expected_cpamp_records":"350631","migration_window_id":"window-01","tenant_external_id":"default","version":1,"workflow":"final-session-archive-delta-v1"}
+{"approval_id":"approved-window-01","approved_at":"<OWNER_REVIEWED_UTC_TIMESTAMP>","archive_source":"session-archive-final","artifact_set_sha256":"<SEALED_DIGEST>","cpamp_source":"request-events-final","expected_cpamp_records":"<OWNER_REVIEWED_COUNT>","migration_window_id":"window-01","tenant_external_id":"default","version":1,"workflow":"final-session-archive-delta-v1"}
 ```
 
 The final operator supplies the normal importer and PostgreSQL credentials only
@@ -63,7 +63,7 @@ node ops/finalize-session-archive-delta.ts --apply \
   --tenant-external-id default \
   --archive-source session-archive-final \
   --cpamp-source request-events-final \
-  --expected-cpamp-records 350631 \
+  --expected-cpamp-records OWNER_REVIEWED_COUNT \
   --overlap-ms 86400000 \
   --plan-directory /plan
 ```

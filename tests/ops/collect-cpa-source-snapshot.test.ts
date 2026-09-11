@@ -22,14 +22,14 @@ function argumentsFor(root: string, output: string): string[] {
     "--kubectl-argument", fakeKubectl,
     "--context", "fixture-context",
     "--namespace", "fixture-cpa",
-    "--pod", "cliproxyapi-0",
+    "--pod", "source-adapter-0",
     "--pod-uid", podUid,
-    "--container", "cliproxyapi",
-    "--expected-app-name", "cliproxyapi",
-    "--expected-pvc", "cliproxyapi-auth",
-    "--source-state-root", "/root/.cli-proxy-api",
-    "--config-mount-path", "/CLIProxyAPI/config.yaml",
-    "--management-port", "8317",
+    "--container", "source-adapter",
+    "--expected-app-name", "source-adapter",
+    "--expected-pvc", "source-state",
+    "--source-state-root", "/fixture/source-state",
+    "--config-mount-path", "/fixture/config/config.yaml",
+    "--management-port", "18443",
     "--management-token-file", join(root, "management.token"),
     "--output-directory", output,
     "--timeout-ms", "10000",
@@ -97,7 +97,7 @@ describe("local CPA source snapshot collector", () => {
       writeFileSync(join(root, "management.token"), "fixture-management-token", { mode: 0o600 }); chmodSync(join(root, "management.token"), 0o600);
       const backupOutput = join(root, "backup-capture"), result = await run(root, backupOutput, "backup");
       assert.equal(result.auth_file_count, 1);
-      assert.deepEqual(readdirSync(join(backupOutput, "auth")), ["csil.json"]);
+      assert.deepEqual(readdirSync(join(backupOutput, "auth")), ["fixture-account.json"]);
       await expectFailure(root, join(root, "non-json-capture"), "non-json", "source archive contains a non-JSON auth entry");
     } finally { rmSync(root, { recursive: true, force: true }); }
   });

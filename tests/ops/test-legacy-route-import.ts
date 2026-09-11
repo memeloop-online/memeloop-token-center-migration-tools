@@ -12,7 +12,7 @@ const routeId = "018f2222-2222-7222-8222-222222222222";
 const stable = "a".repeat(64);
 const poolAccounts = [account, "018f1111-1111-7111-8111-111111111112", "018f1111-1111-7111-8111-111111111113", "018f1111-1111-7111-8111-111111111114"];
 const poolStables = [stable, "b".repeat(64), "c".repeat(64), "d".repeat(64)];
-const source = { provider: "codex-csil", model: "gpt-5.6-sol", group: null, upstream_prefix: "codex-csil", protocol: "openai" };
+const source = { provider: "codex-alpha", model: "gpt-5.6-sol", group: null, upstream_prefix: "codex-alpha", protocol: "openai" };
 const json = (value: unknown): Buffer => Buffer.from(JSON.stringify(value));
 const sourceDocument = (mappings: unknown[] = [source], reauthorization_required: unknown[] = [], anomalies: unknown[] = []): Buffer => json({ version: 1, mappings, reauthorization_required, anomalies });
 const upstreamDocument = (): Buffer => json({ version: 1, tenant_external_id: "legacy", upstreams: [{ upstream_account_id: account, source_stable_id: stable, driver: "codex", status: "active", updated_at: 11 }] });
@@ -23,9 +23,9 @@ const manifestDocument = (sourceRaw: Buffer, upstreamRaw: Buffer, routes: unknow
   return json({ version: 1, tenant_external_id: "legacy", target_api_base_url: "https://control.invalid/", source_inventory_sha256: sha(sourceRaw), upstream_inventory_sha256: sha(upstreamRaw), routes });
 };
 const manifestV2Document = (sourceRaw: Buffer, upstreamRaw: Buffer, routes: unknown[], anomaly_quarantine: unknown = null): Buffer => json({ version: 2, tenant_external_id: "legacy", target_api_base_url: "https://control.invalid/", source_inventory_sha256: hash(sourceRaw), upstream_inventory_sha256: hash(upstreamRaw), anomaly_quarantine, routes });
-const routeSpec = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({ source, target: { upstream_account_id: account, source_stable_id: stable, public_model: "gpt-5.6-sol-csil", upstream_model: "gpt-5.6-sol", protocol: "openai", priority: 10 }, expected_existing: { action: "create", route_id: null, updated_at: null, grant_revision: null, history_and_references_reviewed: false, history_and_references_evidence_sha256: null }, ...overrides });
-const poolRouteSpec = (candidates: unknown[] = poolBindings(), overrides: Record<string, unknown> = {}): Record<string, unknown> => ({ source, target: { upstream_candidates: candidates, public_model: "gpt-5.6-sol-csil", upstream_model: "gpt-5.6-sol", protocol: "openai", priority: 10 }, expected_existing: { action: "create", route_id: null, updated_at: null, grant_revision: null, history_and_references_reviewed: false, history_and_references_evidence_sha256: null }, ...overrides });
-const live = (overrides: Partial<LiveRoute> = {}): LiveRoute => ({ id: routeId, publicModel: "gpt-5.6-sol-csil", upstreamModel: "gpt-5.6-sol", protocol: "openai", priority: 10, enabled: true, accountIds: [account], candidateAccountIds: [account], includedProviderGroupIds: [], excludedProviderGroupIds: [], routeGroupIds: [], grantedCredentialIds: [], customModelConfirmed: true, updatedAt: 22, grantRevision: 0, ...overrides });
+const routeSpec = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({ source, target: { upstream_account_id: account, source_stable_id: stable, public_model: "gpt-5.6-sol-alpha", upstream_model: "gpt-5.6-sol", protocol: "openai", priority: 10 }, expected_existing: { action: "create", route_id: null, updated_at: null, grant_revision: null, history_and_references_reviewed: false, history_and_references_evidence_sha256: null }, ...overrides });
+const poolRouteSpec = (candidates: unknown[] = poolBindings(), overrides: Record<string, unknown> = {}): Record<string, unknown> => ({ source, target: { upstream_candidates: candidates, public_model: "gpt-5.6-sol-alpha", upstream_model: "gpt-5.6-sol", protocol: "openai", priority: 10 }, expected_existing: { action: "create", route_id: null, updated_at: null, grant_revision: null, history_and_references_reviewed: false, history_and_references_evidence_sha256: null }, ...overrides });
+const live = (overrides: Partial<LiveRoute> = {}): LiveRoute => ({ id: routeId, publicModel: "gpt-5.6-sol-alpha", upstreamModel: "gpt-5.6-sol", protocol: "openai", priority: 10, enabled: true, accountIds: [account], candidateAccountIds: [account], includedProviderGroupIds: [], excludedProviderGroupIds: [], routeGroupIds: [], grantedCredentialIds: [], customModelConfirmed: true, updatedAt: 22, grantRevision: 0, ...overrides });
 const accountInventory = [{ id: account, driver: "codex", status: "active", updatedAt: 11 }];
 
 function directBatchFixture() {
@@ -108,16 +108,16 @@ test("manifest pins both inventories and rejects provider merging and generation
   const duplicate = routeSpec({ source: { ...source, provider: "codex-second" } });
   assert.throws(() => parseManifest(manifestDocument(sourceRaw, upstreamRaw, [routeSpec(), duplicate]), hash(sourceRaw), hash(upstreamRaw)), /merges provider-specific/u);
   assert.throws(() => parseManifest(manifestDocument(sourceRaw, upstreamRaw, [routeSpec({ target: { upstream_account_id: account, source_stable_id: stable, public_model: "unsafe-image", upstream_model: "Qwen-Image", protocol: "generation", priority: 0 } })]), hash(sourceRaw), hash(upstreamRaw)), /schema/u);
-  assert.throws(() => parseManifest(manifestDocument(sourceRaw, upstreamRaw, [routeSpec({ target: { upstream_account_id: account, source_stable_id: stable, public_model: "gpt-5.6-sol-csil", upstream_model: "gpt-5.6-sol", protocol: "anthropic", priority: 10 } })]), hash(sourceRaw), hash(upstreamRaw)), /protocol differs/u);
-  assert.throws(() => parseManifest(manifestDocument(sourceRaw, upstreamRaw, [routeSpec({ target: { upstream_account_id: account, source_stable_id: stable, public_model: "gpt-5.6-sol-csil", upstream_model: "gpt-5.6-sol", protocol: "openai", priority: 1_000_001 } })]), hash(sourceRaw), hash(upstreamRaw)), /schema/u);
+  assert.throws(() => parseManifest(manifestDocument(sourceRaw, upstreamRaw, [routeSpec({ target: { upstream_account_id: account, source_stable_id: stable, public_model: "gpt-5.6-sol-alpha", upstream_model: "gpt-5.6-sol", protocol: "anthropic", priority: 10 } })]), hash(sourceRaw), hash(upstreamRaw)), /protocol differs/u);
+  assert.throws(() => parseManifest(manifestDocument(sourceRaw, upstreamRaw, [routeSpec({ target: { upstream_account_id: account, source_stable_id: stable, public_model: "gpt-5.6-sol-alpha", upstream_model: "gpt-5.6-sol", protocol: "openai", priority: 1_000_001 } })]), hash(sourceRaw), hash(upstreamRaw)), /schema/u);
 });
 
 test("provider-specific same public model requires owner-selected distinct priorities", () => {
-  const second = { ...source, provider: "codex-dongwu", upstream_prefix: "codex-dongwu" };
+  const second = { ...source, provider: "codex-beta", upstream_prefix: "codex-beta" };
   const sourceRaw = sourceDocument([source, second]), upstreamRaw = upstreamDocument();
   const collision = routeSpec({ source: second });
   assert.throws(() => parseManifest(manifestDocument(sourceRaw, upstreamRaw, [routeSpec(), collision]), hash(sourceRaw), hash(upstreamRaw)), /merges provider-specific/u);
-  const distinct = routeSpec({ source: second, target: { upstream_account_id: account, source_stable_id: stable, public_model: "gpt-5.6-sol-csil", upstream_model: "gpt-5.6-sol", protocol: "openai", priority: 20 } });
+  const distinct = routeSpec({ source: second, target: { upstream_account_id: account, source_stable_id: stable, public_model: "gpt-5.6-sol-alpha", upstream_model: "gpt-5.6-sol", protocol: "openai", priority: 20 } });
   assert.equal(parseManifest(manifestDocument(sourceRaw, upstreamRaw, [routeSpec(), distinct]), hash(sourceRaw), hash(upstreamRaw)).specs.length, 2);
 });
 
@@ -168,12 +168,12 @@ test("v2 provider pool rejects subsets, supersets, duplicates, cross-provider bi
   assert.throws(() => parseUpstreamInventory(json(cross)), /crosses or lacks/u);
   const mixedDriver = JSON.parse(upstreamV2Document().toString()); mixedDriver.upstreams[3].driver = "other-driver";
   assert.throws(() => parseUpstreamInventory(json(mixedDriver)), /crosses provider drivers/u);
-  assert.throws(() => create([poolRouteSpec(undefined, { target: { upstream_candidates: poolBindings(), public_model: "gpt-5.6-sol-csil", upstream_model: "different-model", protocol: "openai", priority: 10 } })]), /complete provider pool/u);
+  assert.throws(() => create([poolRouteSpec(undefined, { target: { upstream_candidates: poolBindings(), public_model: "gpt-5.6-sol-alpha", upstream_model: "different-model", protocol: "openai", priority: 10 } })]), /complete provider pool/u);
   assert.throws(() => create([poolRouteSpec()], upstreamRaw, liveAccounts.map((item, index) => index === 3 ? { ...item, status: "disabled" } : item)), /stale or conflicting/u);
 });
 
 test("v2 anomaly quarantine is exact, digest-bound, count-visible, and does not remove the anomaly", async () => {
-  const anomalies = [{ provider: "codex", model: "classify:csil", reason: "legacy field-shape anomaly; do not infer group/model" }];
+  const anomalies = [{ provider: "codex", model: "classify:alpha", reason: "legacy field-shape anomaly; do not infer group/model" }];
   const sourceRaw = sourceDocument([source], [], anomalies), parsed = parseSourceInventory(sourceRaw), upstreamRaw = upstreamV2Document();
   const quarantine = { source_anomalies_sha256: parsed.anomalyDigest, anomaly_count: 1, disposition: "quarantine_unmapped", owner_review_evidence_sha256: "f".repeat(64) };
   const manifest = manifestV2Document(sourceRaw, upstreamRaw, [poolRouteSpec()], quarantine), liveAccounts = poolAccounts.map((id, index) => ({ id, driver: "http-json", status: "active", updatedAt: 11 + index }));
@@ -238,7 +238,7 @@ test("live inventory accepts unrelated generation routes but reviewed legacy tar
 test("missing mappings and the preserved alias anomaly block apply while reauthorization remains report-only", async () => {
   const second = { ...source, provider: "deepseek-self", model: "deepseek-v4-pro" };
   const missing = plan([], sourceDocument([source, second])); assert.equal(missing.counts.unmatched_mapping_count, 1); await assert.rejects(execute(missing, "legacy", new MemoryTarget(), true), /blocked/u);
-  const anomalySource = sourceDocument([source], [{ provider: "copilot", model: "gpt-5-mini", reason: "native OAuth must be reauthorized" }], [{ provider: "codex", model: "classify:csil", reason: "legacy field-shape anomaly; do not infer group/model" }]);
+  const anomalySource = sourceDocument([source], [{ provider: "copilot", model: "gpt-5-mini", reason: "native OAuth must be reauthorized" }], [{ provider: "codex", model: "classify:alpha", reason: "legacy field-shape anomaly; do not infer group/model" }]);
   const anomaly = plan([], anomalySource); assert.equal(anomaly.counts.reauthorization_required_count, 1); assert.equal(anomaly.counts.anomaly_count, 1); await assert.rejects(execute(anomaly, "legacy", new MemoryTarget(), true), /blocked/u);
 });
 
@@ -246,7 +246,7 @@ test("partial failure persists count-only checkpoint without identifiers or secr
   const sourceRaw = sourceDocument(), selected = plan([]), directory = mkdtempSync(join(tmpdir(), "mtc-routes-fail-")), path = join(directory, "checkpoint.json");
   const target = new MemoryTarget(); target.create = async () => { throw new Error(`must redact ${account} secret-value account@example.test`); };
   await assert.rejects(execute(selected, "legacy", target, true, path), /mutation failed/u);
-  const output = readFileSync(path, "utf8"); assert.doesNotMatch(output, /018f|secret|example\.test|codex-csil|gpt-5/u); assert.equal(JSON.parse(output).failed_count, 1); assert.ok(hash(sourceRaw));
+  const output = readFileSync(path, "utf8"); assert.doesNotMatch(output, /018f|secret|example\.test|codex-alpha|gpt-5/u); assert.equal(JSON.parse(output).failed_count, 1); assert.ok(hash(sourceRaw));
 });
 
 test("protected input files require owner-only regular files", () => { const directory = mkdtempSync(join(tmpdir(), "mtc-route-input-")), path = join(directory, "input.json"); writeFileSync(path, "{}", { mode: 0o600 }); assert.equal(readProtected(path, "fixture").toString(), "{}"); chmodSync(path, 0o640); assert.throws(() => readProtected(path, "fixture"), /0600/u); });

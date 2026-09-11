@@ -7,7 +7,6 @@
  * cannot silently exist in one delivery path but not the other.
  */
 export const releaseEntrypoints = Object.freeze({
-  "api2-target-rollback": "ops/api2-target-rollback.ts",
   "attach-legacy-cpa-credentials": "ops/legacy-credentials/attach-legacy-cpa-credentials.ts",
   "audit-cpa-migration": "ops/audit-cpa-migration.ts",
   "credential-recovery-backfill": "src/credential-recovery-backfill.ts",

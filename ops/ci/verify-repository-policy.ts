@@ -10,6 +10,17 @@ const forbiddenSecretPatterns: readonly [string, RegExp][] = [
   ["GitHub token", /\bgh[oprsu]_[A-Za-z0-9]{20,}\b/u],
   ["live MTC credential", /\bmtc_[A-Za-z0-9_-]{20,}\b/u],
 ];
+const forbiddenPublicEnvironmentPatterns: readonly [string, RegExp][] = [
+  ["internal service domain", /\b(?:token|token-operator)\.k3s\.[a-z0-9.-]+\b/iu],
+  ["retired environment name", /\bmemeloop-token-center-(?:api[0-9]+-)?(?:trial|dev)\b/iu],
+  ["environment-specific source workload", /\bcliproxyapi[-](?:auth|[0-9]+)\b/iu],
+  ["host-specific absolute path", /\/(?:home|Users|root)\//u],
+  ["Kubernetes Secret retrieval command", /\bkubectl\b[^\n]{0,160}\bget\s+secrets?\b/iu],
+  ["Secret decoding command", /\bjsonpath\b[^\n]{0,160}\bbase64\s+(?:--decode|-d)\b/iu],
+  ["internal route alias", new RegExp([["c", "sil"].join(""), ["dong", "wu"].join("")].join("|"), "iu")],
+  ["internal failure-domain alias", new RegExp([["hub", "ble"].join(""), ["xuan", "yuan"].join("")].join("|"), "iu")],
+];
+const emailPattern = /\b[A-Z0-9._%+-]+@([A-Z0-9.-]+\.[A-Z]{2,})\b/giu;
 
 function walk(directory: string): string[] {
   const paths: string[] = [];
@@ -44,6 +55,16 @@ for (const path of walk(root)) {
   }
   for (const [label, pattern] of forbiddenSecretPatterns) {
     if (pattern.test(body)) violations.push(`${repositoryPath}: possible ${label}`);
+  }
+  for (const [label, pattern] of forbiddenPublicEnvironmentPatterns) {
+    if (pattern.test(body)) violations.push(`${repositoryPath}: possible ${label}`);
+  }
+  for (const match of body.matchAll(emailPattern)) {
+    const domain = match[1]?.toLowerCase().replace(/\.json$/u, "");
+    if (domain !== "example.test") {
+      violations.push(`${repositoryPath}: non-fixture email address`);
+      break;
+    }
   }
 }
 

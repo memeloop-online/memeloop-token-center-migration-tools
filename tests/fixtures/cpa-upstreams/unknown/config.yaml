@@ -1,1 +1,1 @@
-auth-dir: "/root/.cli-proxy-api/auth"
+auth-dir: "/fixture/source-state/auth"

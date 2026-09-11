@@ -28,7 +28,7 @@
 
 尚未搬入的 Rust 产品运行时/导入器、历史证据和部署模板见 [`docs/extraction-boundaries.md`](docs/extraction-boundaries.md)。在最终数据对账与双仓审查完成前，不得据此从产品仓库删除源文件。
 
-原样迁入文件中的环境硬编码和大型单体债务见 [`docs/engineering-debt.md`](docs/engineering-debt.md)；在实际复用前必须独立评审，不能因保留了来源校验哈希就视为已经符合当前工程标准。
+原样迁入文件中的历史默认值和大型单体债务见 [`docs/engineering-debt.md`](docs/engineering-debt.md)；在实际复用前必须独立评审，不能因保留了来源校验哈希就视为已经符合当前工程标准。
 
 当前 CLI、文件名和输入字段仍保留 `Memeloop Token Center`/`CPA` 的来源专名，以保持正在进行的迁移链路兼容。去除这些专名、引入通用 provider/source/target 适配层、或改变命令别名属于明确的后续兼容性工作；在独立版本化适配器、迁移夹具和双仓审查完成前，不要重命名现有 CLI 或文件。
 
@@ -41,7 +41,6 @@
 - 已导入客户凭据的加密 recovery envelope 回填：只接受受保护的、明确的目标 identity→原始 key 映射，默认 dry-run，并且只调用固定 private control `PUT` endpoint；操作边界见 [`docs/operations/credential-recovery-backfill.md`](docs/operations/credential-recovery-backfill.md)。
 - Provider-exact 策略输入生成器在已审核的原生路由回放后，交叉校验完整源策略、源清单、原生候选池、路由清单和目标路由回执，再生成待复核的路由清单/策略映射；它不写目标 API，也不会把任何源密钥散列写入输出。
 - 活跃迁移主键到目标正式余额不受限策略的查询、原子 CAS 迁移和计数/摘要收据。
-- 成对 PostgreSQL/对象存储备份、恢复和证据收据。
 - 对应的 TypeScript 契约测试与完全合成 fixtures。
 
 ## CI 验证
@@ -68,6 +67,6 @@ tar -xzf memeloop-token-center-migration-tools-<git-sha>.tar.gz
 node ./commands/import-cpa-upstreams.mjs --help
 ```
 
-Bundle 不会伪装为完整运行环境：涉及数据库的命令仍要求运行主机提供已审核的 `psql`；CPAMP 导入还要求 `sqlite3`；archive delta 导出使用 `flock`；API2 rollback 的相应子命令还需要 `mc` 和 `pg_dump`。Archive wrapper 默认只执行包内 `commands/runtime/` 中通过 SHA-256、固定来源与兼容清单校验的 Rust 导入器，要求 Linux x86_64/glibc ≥2.39，不再隐式使用 PATH。详细来源与运行边界见 [固定 archive runtime](docs/operations/pinned-session-archive-runtime.md)。这些二进制、访问权限与受保护的输入须按每次迁移批准单单独核验。
+Bundle 不会伪装为完整运行环境：涉及数据库的命令仍要求运行主机提供已审核的 `psql`；CPAMP 导入还要求 `sqlite3`；archive delta 导出使用 `flock`。Archive wrapper 默认只执行包内 `commands/runtime/` 中通过 SHA-256、固定来源与兼容清单校验的 Rust 导入器，要求 Linux x86_64/glibc ≥2.39，不再隐式使用 PATH。详细来源与运行边界见 [固定 archive runtime](docs/operations/pinned-session-archive-runtime.md)。这些二进制、访问权限与受保护的输入须按每次迁移批准单单独核验。
 
 只在已获批的迁移主机上运行已验签的 Release，并继续把真实输入、PGPASS、token、输出和证据放在受保护的外部目录。CI 是唯一的 build/test 入口；获批本地运行只执行已验证的 Release 命令，不在本地重建或安装依赖。

@@ -344,7 +344,7 @@ function inventoryAuth(root: string, secrets: SecretStore, policy: TransportPoli
     const recordType = document.type.trim().toLowerCase(); const upstream = document.upstream;
     if ((upstream === "copilot" || upstream === "cursor") && "handle" in document) {
       if (!["subscription-bridge", "cpa-subscription-bridge", "copilot", "cursor"].includes(recordType)) throw new ImportFailure("CPA opaque Copilot/Cursor auth document has an unsupported type");
-      // cpa-copilot-cursor v0.2.0-rc.16 stores this optional RFC3339 metadata
+      // Some versioned cpa-copilot-cursor records store this optional RFC3339 metadata.
       // alongside its opaque bridge handle. It is schema-validated only and
       // never contributes to the reauthorization identity or output.
       exact(document, ["type", "upstream", "handle", "label", "login", "created_at", "disabled"], "CPA opaque Copilot/Cursor auth document");

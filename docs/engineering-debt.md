@@ -4,16 +4,13 @@ The files listed in `SOURCE-MANIFEST.json` are byte-identical evidence from the 
 
 ## Environment coupling
 
-`ops/api2-target-rollback.ts` contains fixed API2 PostgreSQL, object-store and database identities. It is retained for exact rollback provenance and must not be pointed at another environment. Before any reuse, replace those identities with a typed, schema-validated owner configuration while retaining fail-closed source/target separation and receipt binding. Never silently select an environment from ambient Kubernetes context.
-
-Several other imported tools have historical default tenant/source labels. Defaults must be reviewed against the exact migration plan; owner identity, target URL, data digest and apply authorization must stay explicit.
+Imported tools may retain historical default tenant/source labels. Defaults must be reviewed against the exact migration plan; owner identity, target URL, data digest and apply authorization must stay explicit. Environment-specific endpoint identities and topology must remain in protected operator inputs, never in this repository or in ambient Kubernetes context.
 
 ## Module size
 
 The largest preserved TypeScript modules are:
 
 - `ops/export-cpa-session-archive-delta.ts` — about 915 lines;
-- `ops/api2-target-rollback.ts` — about 742 lines;
 - `ops/cpa-upstreams/import-cpa-upstreams.ts` — about 464 lines;
 - `ops/migrate-cpamp.ts` — about 448 lines;
 - `ops/legacy-policy/import-cpa-key-policy.ts` — about 388 lines.
