@@ -13,7 +13,9 @@ provider health, model catalog, quota, token refresh, or any Kimi endpoint.
 The target revision must match the explicitly reviewed 40-character release
 revision. Its capability document must attest the neutral server-keyed Kimi
 account-name policy, the operator-HMAC source-identity contract, and
-`atomic_kimi_cohort_v1`; older or per-account-only implementations fail closed.
+`atomic_kimi_cohort_v1`. It must also attest the reviewed
+ChaCha20-Poly1305/HKDF-SHA256 v2 credential envelope and its fixed v1 AAD domain;
+older or per-account-only implementations fail closed.
 
 The protected dry-run receipt contains source and batch hashes, HMAC-based
 source/identity deduplication evidence, eight deferred route plans, and target

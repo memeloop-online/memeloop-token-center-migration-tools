@@ -313,6 +313,7 @@ export function inspectSealedKimiCohort(root: string, identityKeyPath: string, n
         permission_write_count: 0,
         provider_request_count: 0,
         credential_storage: "target-encrypted-managed-oauth-envelope",
+        credential_envelope_contract: "chacha20poly1305-hkdf-sha256-v2-aad-v1",
         target_source_type: "kimi",
         target_driver: "kimi-oauth",
       },
@@ -409,6 +410,7 @@ async function preflightTarget(
     || !capabilities.source_types.includes("kimi")
     || object(capabilities.account_name_policies).kimi !== "neutral-server-keyed-source-suffix-v1"
     || capabilities.source_identity_contract !== "operator-hmac-sha256-v1"
+    || capabilities.credential_envelope_contract !== "chacha20poly1305-hkdf-sha256-v2-aad-v1"
     || !Array.isArray(capabilities.atomic_cohort_contracts)
     || !capabilities.atomic_cohort_contracts.includes("atomic_kimi_cohort_v1")) fail();
   const providers = (await requestJson("GET", `${origin}/internal/v1/provider-types`, token, "target provider types", [200])).value;

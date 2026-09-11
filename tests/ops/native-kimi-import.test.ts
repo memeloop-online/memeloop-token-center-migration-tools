@@ -167,6 +167,7 @@ describe("native Kimi target preflight and apply gate", () => {
         source_types: ["codex", "kimi"],
         account_name_policies: { kimi: "neutral-server-keyed-source-suffix-v1" },
         source_identity_contract: "operator-hmac-sha256-v1",
+        credential_envelope_contract: "chacha20poly1305-hkdf-sha256-v2-aad-v1",
         atomic_cohort_contracts: ["atomic_kimi_cohort_v1"],
       }));
       else if (request.method === "GET" && request.url === "/internal/v1/provider-types") response.end(JSON.stringify([{ id: "kimi-oauth" }]));
