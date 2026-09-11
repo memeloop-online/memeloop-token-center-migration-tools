@@ -814,7 +814,7 @@ if (invokedAsEntrypoint("import-cpa-upstreams", import.meta.url)) {
 
 /** Shared protected IO and source parsing for the separate read-only reconciler. */
 export {
-  buildInventory, canonicalJson, decodeUtf8, openSafeOutput, parseTransportPolicy,
+  authFiles, buildInventory, canonicalJson, decodeUtf8, openSafeOutput, parseTransportPolicy,
   providerCandidates, readOwnerOnly, requestJson, targetAccount, upstreamUrl,
   writeBindingReceipt,
 };
