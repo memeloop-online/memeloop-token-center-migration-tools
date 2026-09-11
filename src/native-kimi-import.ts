@@ -25,11 +25,10 @@ type KimiDocument = JsonObject & {
 };
 type KimiRecord = {
   relativePath: string;
-  document: KimiDocument;
   documentSha256: string;
-  targetDocumentSha256: string;
   sourceStableId: string;
   assertedIdentityHmacSha256: string;
+  expiresAt: string;
 };
 type SourceCohort = { summary: JsonObject; records: KimiRecord[] };
 
@@ -39,8 +38,8 @@ const MAX_RECEIPT_BYTES = 4 * 1024 * 1024;
 const EXPECTED_SOURCE_ACCOUNTS = 2;
 const EXPECTED_SOURCE_POLICIES = 10;
 const EXPECTED_SOURCE_GRANTS = 131;
-const TARGET_SOURCE_PATH_BYTES = 512;
-const MINIMUM_TARGET_ACTIVE_MS = 10 * 60 * 1_000;
+const MAX_SOURCE_PATH_BYTES = 512;
+const MINIMUM_SOURCE_ACTIVE_MS = 10 * 60 * 1_000;
 const EXPECTED_KIMI_MODELS = Object.freeze([
   "kimi-k2",
   "kimi-k2-thinking",
@@ -57,7 +56,7 @@ const SOURCE_KEY_HASH = /^(?:sha256:)?[0-9a-f]{64}$/iu;
 const UTF8 = new TextDecoder("utf-8", { fatal: true });
 
 export class NativeKimiImportFailure extends Error {
-  constructor() { super("native Kimi import precondition or operation failed"); }
+  constructor() { super("native Kimi source audit failed"); }
 }
 
 function fail(): never { throw new NativeKimiImportFailure(); }
@@ -104,8 +103,8 @@ function optionalRfc3339(value: unknown): void {
 }
 
 export function validateKimiDocument(value: unknown, identityKey: Buffer, now = Date.now()): {
-  document: KimiDocument;
   assertedIdentityHmacSha256: string;
+  expiresAt: string;
 } {
   const document = object(value) as KimiDocument;
   const allowed = new Set([
@@ -136,27 +135,22 @@ export function validateKimiDocument(value: unknown, identityKey: Buffer, now = 
     || claims.exp < 0) fail();
   if (typeof document.expired !== "string"
     || claims.exp * 1_000 !== Date.parse(document.expired)
-    || claims.exp * 1_000 <= now + MINIMUM_TARGET_ACTIVE_MS) fail();
+    || claims.exp * 1_000 <= now + MINIMUM_SOURCE_ACTIVE_MS) fail();
   const assertedIdentityHmacSha256 = hmac(
     identityKey,
     ASSERTED_IDENTITY_DOMAIN,
     canonicalJson({ issuer, subject, user_id: userId }, "Kimi asserted identity"),
   );
-  return { document, assertedIdentityHmacSha256 };
+  return { assertedIdentityHmacSha256, expiresAt: document.expired };
 }
 
-function targetSourcePath(value: string): void {
-  if (Buffer.byteLength(value) > TARGET_SOURCE_PATH_BYTES || value.startsWith("/")
+function sourcePath(value: string): void {
+  if (Buffer.byteLength(value) > MAX_SOURCE_PATH_BYTES || value.startsWith("/")
     || value.includes("\\") || /\p{Cc}/u.test(value)
     || value.split("/").some((part) => !part || part === "." || part === "..")) fail();
 }
 
-function sourcePolicy(raw: Buffer, sourceStableIds: readonly string[]): {
-  routePlan: JsonObject[];
-  sourcePolicyCount: number;
-  sourceGrantCount: number;
-  kimiGrantCount: number;
-} {
+function validateSourcePolicy(raw: Buffer): void {
   const policy = strictJson(raw);
   if (policy.version !== 1 || !Array.isArray(policy.policies)
     || policy.policies.length !== EXPECTED_SOURCE_POLICIES) fail();
@@ -187,21 +181,6 @@ function sourcePolicy(raw: Buffer, sourceStableIds: readonly string[]): {
     || [...modelPolicies.keys()].sort().join("\0") !== [...EXPECTED_KIMI_MODELS].sort().join("\0")
     || [...modelPolicies.values()].some((indexes) => indexes.length !== 3
       || new Set(indexes).size !== indexes.length)) fail();
-  const routePlan = [...modelPolicies.entries()].sort(([left], [right]) => left.localeCompare(right, "en"))
-    .map(([model, sourcePolicyIndexes]) => ({
-      public_model: model,
-      upstream_model: model,
-      required_protocols: ["openai", "anthropic"],
-      candidate_source_stable_ids: [...sourceStableIds],
-      source_policy_indexes: sourcePolicyIndexes,
-      state: "deferred_pending_route_price_and_protocol_review",
-    }));
-  return {
-    routePlan,
-    sourcePolicyCount: policy.policies.length,
-    sourceGrantCount,
-    kimiGrantCount: [...modelPolicies.values()].reduce((sum, indexes) => sum + indexes.length, 0),
-  };
 }
 
 export function inspectSealedKimiCohort(root: string, identityKeyPath: string, now = Date.now()): SourceCohort {
@@ -223,20 +202,14 @@ export function inspectSealedKimiCohort(root: string, identityKeyPath: string, n
         if (parsed.type !== "kimi") continue;
         if (!relativePath.toLowerCase().endsWith(".json")
           || /(?:^|[._-])(?:bak|backup|old|refresh)(?:[._-]|$)/iu.test(relativePath)) fail();
-        targetSourcePath(relativePath);
+        sourcePath(relativePath);
         const validated = validateKimiDocument(parsed, identityKey, now);
-        // `timestamp` is source capture metadata, not part of the target Kimi
-        // managed-OAuth contract. Keep its source digest in the sealed batch,
-        // but never rely on the target to ignore unsupported source fields.
-        const targetDocument = { ...validated.document };
-        delete targetDocument.timestamp;
         records.push({
           relativePath,
-          document: targetDocument,
           documentSha256,
-          targetDocumentSha256: sha256(canonicalJson(targetDocument, "target Kimi document")),
           sourceStableId: hmac(identityKey, SOURCE_ACCOUNT_DOMAIN, relativePath),
           assertedIdentityHmacSha256: validated.assertedIdentityHmacSha256,
+          expiresAt: validated.expiresAt,
         });
       } finally { raw.fill(0); }
     }
@@ -255,49 +228,36 @@ export function inspectSealedKimiCohort(root: string, identityKeyPath: string, n
       || new Set(records.map((record) => record.assertedIdentityHmacSha256)).size !== records.length) fail();
 
     records.sort((left, right) => left.sourceStableId.localeCompare(right.sourceStableId, "en"));
-    const policy = sourcePolicy(policyRaw, records.map((record) => record.sourceStableId));
+    validateSourcePolicy(policyRaw);
     const sourceAccounts = records.map((record) => ({
       source_stable_id: record.sourceStableId,
       source_document_sha256: record.documentSha256,
-      target_document_sha256: record.targetDocumentSha256,
       asserted_identity_hmac_sha256: record.assertedIdentityHmacSha256,
-      target_driver: "kimi-oauth",
-      target_status: "active",
-      target_name_policy: "neutral-server-keyed-source-suffix",
+      source_status: "active",
+      source_expires_at: record.expiresAt,
+      source_document_validation: "verified",
     }));
-    const batchSha256 = sha256(canonicalJson({
+    const batchSourceSha256 = sha256(canonicalJson({
       source_capture_sha256: sourceCaptureSha256,
       source_accounts: sourceAccounts,
-      route_plan: policy.routePlan,
-    }, "native Kimi import batch"));
+    }, "sealed Kimi source batch"));
     return {
       records,
       summary: {
         version: 1,
-        workflow: "native-kimi-import-v1",
+        workflow: "sealed-kimi-source-audit-v1",
         source_capture_sha256: sourceCaptureSha256,
         source_receipt_sha256: sha256(captureRaw),
         source_config_sha256: configSha256,
         source_policy_sha256: policySha256,
         auth_payload_revision_sha256: authPayloadRevisionSha256,
-        batch_sha256: batchSha256,
+        batch_source_sha256: batchSourceSha256,
         source_account_count: records.length,
         source_active_account_count: records.length,
         source_unique_identity_count: records.length,
-        source_expired_access_count: records.filter((record) =>
-          typeof record.document.expired === "string" && Date.parse(record.document.expired) <= now).length,
-        source_policy_count: policy.sourcePolicyCount,
-        source_grant_count: policy.sourceGrantCount,
-        kimi_grant_count: policy.kimiGrantCount,
+        source_expired_access_count: records.filter((record) => Date.parse(record.expiresAt) <= now).length,
+        source_validation: "verified",
         source_accounts: sourceAccounts,
-        route_plan: policy.routePlan,
-        route_write_count: 0,
-        permission_write_count: 0,
-        provider_request_count: 0,
-        credential_storage: "target-encrypted-managed-oauth-envelope",
-        credential_envelope_contract: "chacha20poly1305-hkdf-sha256-v2-aad-v1",
-        target_source_type: "kimi",
-        target_driver: "kimi-oauth",
       },
     };
   } finally {
@@ -353,8 +313,6 @@ export async function run(argv = process.argv.slice(2)): Promise<JsonObject> {
     ...cohort.summary,
     mode: "source-audit",
     outcome: "pending",
-    target_access_count: 0,
-    target_write_count: 0,
   };
   try {
     receipt.outcome = "verified";
@@ -367,9 +325,7 @@ export async function run(argv = process.argv.slice(2)): Promise<JsonObject> {
       source_account_count: receipt.source_account_count,
       source_unique_identity_count: receipt.source_unique_identity_count,
       source_expired_access_count: receipt.source_expired_access_count,
-      route_plan_count: Array.isArray(receipt.route_plan) ? receipt.route_plan.length : 0,
-      target_access_count: 0,
-      target_write_count: 0,
+      batch_source_sha256: receipt.batch_source_sha256,
       receipt_sha256: sha256(`${JSON.stringify(receipt)}\n`),
     };
   } catch {
