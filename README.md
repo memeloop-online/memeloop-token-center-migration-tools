@@ -64,9 +64,11 @@ PostgreSQL acceptance 默认跳过，只有显式提供隔离 schema 的测试�
 ```text
 sha256sum -c SHA256SUMS
 tar -xzf memeloop-token-center-migration-tools-<git-sha>.tar.gz
-node ./commands/import-cpa-upstreams.mjs --help
+node ./commands/export-cpa-source-route-inventory.mjs --help
 ```
 
 Bundle 不会伪装为完整运行环境：涉及数据库的命令仍要求运行主机提供已审核的 `psql`；CPAMP 导入还要求 `sqlite3`；archive delta 导出使用 `flock`。Archive wrapper 默认只执行包内 `commands/runtime/` 中通过 SHA-256、固定来源与兼容清单校验的 Rust 导入器，要求 Linux x86_64/glibc ≥2.39，不再隐式使用 PATH。详细来源与运行边界见 [固定 archive runtime](docs/operations/pinned-session-archive-runtime.md)。这些二进制、访问权限与受保护的输入须按每次迁移批准单单独核验。
 
 只在已获批的迁移主机上运行已验签的 Release，并继续把真实输入、PGPASS、token、输出和证据放在受保护的外部目录。CI 是唯一的 build/test 入口；获批本地运行只执行已验证的 Release 命令，不在本地重建或安装依赖。
+
+旧的 `import-cpa-upstreams` 与 `native-kimi-import` 目标写入命令已退役，不会进入 Release。仓库暂时只保留其源格式解析与离线审计代码；在另行审核的中性目标 ABI 发布前，任何旧 target/apply 参数都会 fail-closed，且不会访问目标服务。

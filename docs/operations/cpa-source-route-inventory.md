@@ -195,37 +195,15 @@ upstream account from a read-only target snapshot, then create reviewed
 or drivers, select weights, or infer target IDs. The existing route importer
 will independently reject an incomplete or cross-provider/driver candidate set.
 
-## Read-only deterministic direct-account binding receipt
+## Target binding is intentionally unavailable
 
-For an explicitly opted-in **preflight only** of complete direct pools while
-managed work is deferred, see [direct batch preflight](direct-route-batch-preflight.md).
-It retains the full source and all gaps; it does not authorize route apply or
-customer policy changes. The full-coverage behavior described here remains the
-default.
+The former combined upstream import and target-binding command is retired and
+is not published in the release bundle. This exporter stops at
+target-independent source inventory and candidate material. It does not query
+a target, infer target account identifiers, or authorize account or route
+writes.
 
-If `import-cpa-upstreams --apply` has already replayed the direct API-key
-accounts, create the protected binding input for provider-exact review with:
-
-```text
-import-cpa-upstreams --resolve-existing-route-bindings --config /source/config.yaml --auth-dir /source/auth --source-identity-key-file /secrets/migration/source-identity.key --provider-candidate-material-file /sealed/provider-candidate-material.json --binding-receipt-output /sealed/direct-route-bindings.json --target-api-base-url https://target-control.example --service-token-file /secrets/migration/target-service-token [--transport-policy-file /sealed/transport-policy.json]
-```
-
-This mode makes exactly one target request: a read-only `GET` of the selected
-tenant's upstream inventory. It reconstructs the exporter’s domain-separated
-direct-account HMAC, deterministic target account name, strict `http-json`
-driver, canonical non-secret configuration, and active status. Exactly one
-match produces a binding; absent, mismatched, inactive, or duplicate accounts
-are recorded as quarantined. The receipt includes only opaque stable IDs,
-provider, target UUID, revision, driver, source-inventory digest, candidate
-material digest, and quarantine reasons. It never emits source IDs, account
-names, configurations, credentials, or service tokens. The output uses the
-same protected no-replace publication rules as the source outputs.
-
-When the direct import used a transport policy, supply that same protected
-policy file here; otherwise a policy-induced network scope or result-origin
-difference correctly quarantines the account.
-
-The mode does not create, update, or rotate target accounts; it does not cover
-managed OAuth imports or Copilot/Cursor native reauthorization. Those have
-separate provenance/reauthorization evidence and must be strictly composed
-with this direct receipt before reviewed `upstream-inventory.json` is made.
+For an explicitly opted-in source-side preflight while managed work is
+deferred, see [direct batch preflight](direct-route-batch-preflight.md). A
+complete binding and apply workflow requires a separately reviewed,
+provider-neutral target ABI and is intentionally outside this change.

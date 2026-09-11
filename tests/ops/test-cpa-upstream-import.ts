@@ -1,13 +1,10 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
-import { createHash, createHmac } from "node:crypto";
-import { chmodSync, copyFileSync, cpSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { createServer } from "node:http";
+import { chmodSync, cpSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { execFile, spawnSync } from "node:child_process";
-import { promisify } from "node:util";
+import { spawnSync } from "node:child_process";
 import { describe, it } from "node:test";
 
 const repository = resolve(import.meta.dirname, "../..");
@@ -15,7 +12,6 @@ const importer = join(repository, "ops/cpa-upstreams/import-cpa-upstreams.ts");
 const generator = join(repository, "ops/cpa-upstreams/generate-source-identity-key.ts");
 const sanitizer = join(repository, "tests/ops/sanitize-cpa-upstream-fixtures.ts");
 const fixtures = join(repository, "tests/fixtures/cpa-upstreams");
-const execFileAsync = promisify(execFile);
 
 function privateTree(path: string): void {
   const metadata = lstatSync(path);
@@ -54,7 +50,7 @@ describe("CPA upstream TypeScript operators", () => {
     assert.deepEqual(readFileSync(path), value);
   });
 
-  it("produces a count-only dry-run without leaking fixture secrets", () => {
+  it("produces a count-only source audit without leaking fixture secrets", () => {
     const root = mkdtempSync(join(tmpdir(), "mtc-cpa-import-"));
     const source = join(root, "source");
     cpSync(join(fixtures, "supported"), source, { recursive: true });
@@ -65,7 +61,7 @@ describe("CPA upstream TypeScript operators", () => {
     const result = spawnSync(process.execPath, [importer, "--config", join(source, "config.yaml"), "--auth-dir", join(source, "auth"), "--source-identity-key-file", key, "--transport-policy-file", policy], { encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
     const summary = JSON.parse(result.stdout) as Record<string, unknown>;
-    assert.equal(summary.mode, "dry-run");
+    assert.equal(summary.mode, "source-audit");
     assert.equal(summary.api_account_count, 6);
     assert.equal(summary.proxied_api_account_count, 2);
     assert.equal(summary.private_target_api_account_count, 2);
@@ -73,7 +69,7 @@ describe("CPA upstream TypeScript operators", () => {
     assert.doesNotMatch(result.stdout + result.stderr, /fixture-only-|Fixture(Copilot|Cursor)Handle/);
   });
 
-  it("records the observed Kimi OAuth type as a target capability gap and blocks apply before network access", async () => {
+  it("records Kimi as a source capability gap and rejects every retired target flag", () => {
     const root = mkdtempSync(join(tmpdir(), "mtc-cpa-kimi-capability-gap-"));
     const source = join(root, "source"); cpSync(join(fixtures, "supported"), source, { recursive: true });
     const auth = join(source, "auth");
@@ -96,15 +92,11 @@ describe("CPA upstream TypeScript operators", () => {
       assert.equal(new Set(gaps.map((item) => item.source_stable_id)).size, 2);
       assert.doesNotMatch(`${dry.stdout}${dry.stderr}`, /fixture-only-kimi|kimi-(?:first|second)\.json/u);
 
-      let requests = 0;
-      const server = createServer((_request, response) => { requests += 1; response.statusCode = 500; response.end("{}"); });
-      await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
-      try {
-        const address = server.address(); assert(address && typeof address === "object");
-        const token = join(root, "service-token"); writeFileSync(token, "fixture-only-target-service-token\n", { mode: 0o600 });
-        await assert.rejects(execFileAsync(process.execPath, [importer, "--config", join(source, "config.yaml"), "--auth-dir", auth, "--source-identity-key-file", key, "--apply", "--allow-http-loopback", "--target-api-base-url", `http://127.0.0.1:${address.port}`, "--service-token-file", token], { timeout: 20_000 }), /capability gap/u);
-        assert.equal(requests, 0);
-      } finally { await new Promise<void>((resolveClose, rejectClose) => server.close((error) => error ? rejectClose(error) : resolveClose())); }
+      for (const retired of ["--apply", "--target-api-base-url", "--service-token-file", "--resolve-existing-route-bindings"]) {
+        const stopped = spawnSync(process.execPath, [importer, "--config", join(source, "config.yaml"), "--auth-dir", auth, "--source-identity-key-file", key, retired], { encoding: "utf8" });
+        assert.equal(stopped.status, 2);
+        assert.match(stopped.stderr, /unrecognized argument/u);
+      }
 
       writeFileSync(join(auth, "unknown.json"), JSON.stringify({ type: "unknown-kimi-like", refresh_token: "fixture-only-unknown" }), { mode: 0o600 }); privateTree(source);
       const unknown = spawnSync(process.execPath, [importer, "--config", join(source, "config.yaml"), "--auth-dir", auth, "--source-identity-key-file", key], { encoding: "utf8" });
@@ -206,167 +198,4 @@ describe("CPA upstream TypeScript operators", () => {
     assert.doesNotMatch(reviewed.stdout + reviewed.stderr, /10\.20\.30\.40/);
   });
 
-  it("rejects a private target without a proxy before any target request", async () => {
-    const root = mkdtempSync(join(tmpdir(), "mtc-cpa-private-without-proxy-"));
-    const source = join(root, "source");
-    cpSync(join(fixtures, "supported"), source, { recursive: true });
-    const config = join(source, "config.yaml");
-    writeFileSync(config, readFileSync(config, "utf8").replace('    proxy-url: "socks5://fixture-proxy.internal:1080"\n', ""));
-    privateTree(source);
-    const key = join(source, "source-identity.key");
-    assert.equal(spawnSync(process.execPath, [generator, key]).status, 0);
-    const token = join(root, "service-token");
-    writeFileSync(token, "fixture-only-target-service-token\n", { mode: 0o600 });
-    const policy = writeTransportPolicy(root, ["https://openai-compatible.example.test/v1"]);
-    let requests = 0;
-    const server = createServer((_request, response) => { requests += 1; response.statusCode = 500; response.end("{}"); });
-    await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
-    try {
-      const address = server.address(); assert(address && typeof address === "object");
-      await assert.rejects(execFileAsync(process.execPath, [importer,
-        "--config", config, "--auth-dir", join(source, "auth"), "--source-identity-key-file", key,
-        "--transport-policy-file", policy, "--apply", "--allow-http-loopback",
-        "--target-api-base-url", `http://127.0.0.1:${address.port}`, "--service-token-file", token,
-      ], { timeout: 20_000 }), /private target requires an approved private SOCKS5 proxy/);
-      assert.equal(requests, 0);
-    } finally { await new Promise<void>((resolveClose, rejectClose) => server.close((error) => error ? rejectClose(error) : resolveClose())); }
-  });
-
-  it("preflights every direct conflict before any managed OAuth write", async () => {
-    const root = mkdtempSync(join(tmpdir(), "mtc-cpa-preflight-"));
-    const source = join(root, "source");
-    cpSync(join(fixtures, "supported"), source, { recursive: true });
-    copyFileSync(join(fixtures, "oauth-blocked/auth/codex-account.json"), join(source, "auth/managed-codex.json"));
-    privateTree(source);
-    const key = join(source, "source-identity.key");
-    assert.equal(spawnSync(process.execPath, [generator, key]).status, 0);
-    const token = join(root, "service-token");
-    writeFileSync(token, "fixture-only-target-service-token\n", { mode: 0o600 });
-    let managedWrites = 0;
-    const stableSource = ["cpa-upstream-import-v1", "config", "openai-compatibility", "fixture-openai-compatible", "0"].join("\0");
-    const stableName = `cpa-fixture-openai-compatible-${createHash("sha256").update(stableSource).digest("hex").slice(0, 16)}`;
-    const server = createServer((request, response) => {
-      response.setHeader("content-type", "application/json");
-      if (request.url === "/internal/v1/imports/cpa/managed-oauth/capabilities") response.end(JSON.stringify({ contract_version: 1, source_types: ["codex"] }));
-      else if (request.url === "/internal/v1/provider-types") response.end(JSON.stringify([{ id: "http-json" }]));
-      else if (request.url?.startsWith("/internal/v1/upstreams?")) response.end(JSON.stringify([{ id: "10000000-0000-4000-8000-000000000001", tenant_external_id: "default", name: stableName, driver: "http-json", config: { base_url: "https://conflict.example.test", network_scope: "public" }, status: "active", updated_at: 1 }]));
-      else if (request.url === "/internal/v1/imports/cpa/managed-oauth") { managedWrites += 1; response.statusCode = 201; response.end("{}"); }
-      else { response.statusCode = 404; response.end("{}"); }
-    });
-    await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
-    try {
-      const address = server.address(); assert(address && typeof address === "object");
-      await assert.rejects(execFileAsync(process.execPath, [importer,
-        "--config", join(source, "config.yaml"), "--auth-dir", join(source, "auth"),
-        "--source-identity-key-file", key, "--apply", "--allow-http-loopback",
-        "--target-api-base-url", `http://127.0.0.1:${address.port}`, "--service-token-file", token,
-      ], { timeout: 20_000 }), /target account conflicts with a stable CPA source identity/);
-      assert.equal(managedWrites, 0);
-    } finally { await new Promise<void>((resolveClose, rejectClose) => server.close((error) => error ? rejectClose(error) : resolveClose())); }
-  });
-
-  it("writes a redacted read-only direct binding receipt and quarantines target drift", async () => {
-    const root = mkdtempSync(join(tmpdir(), "mtc-cpa-route-binding-"));
-    const source = join(root, "source"); cpSync(join(fixtures, "supported"), source, { recursive: true }); privateTree(source);
-    const key = join(source, "source-identity.key"); assert.equal(spawnSync(process.execPath, [generator, key]).status, 0);
-    const token = join(root, "service-token"); writeFileSync(token, "fixture-only-target-service-token\n", { mode: 0o600 });
-    const sourceId = ["cpa-upstream-import-v1", "config", "openai-compatibility", "fixture-openai-compatible", "0"].join("\0");
-    const stableName = `cpa-fixture-openai-compatible-${createHash("sha256").update(sourceId).digest("hex").slice(0, 16)}`;
-    const stableId = createHmac("sha256", readFileSync(key).subarray(19)).update(Buffer.concat([Buffer.from("memeloop-token-center\0cpa-route-source-account-id\0v1\0"), Buffer.from(sourceId)])).digest("hex");
-    const material = join(root, "provider-candidate-material.json");
-    writeFileSync(material, `${JSON.stringify({ version: 1, source_inventory_sha256: "a".repeat(64), provider_candidate_sets: [
-      { source: { provider: "fixture-openai-compatible", model: "fixture-model", group: null, upstream_prefix: null, protocol: "openai" }, upstream_model: "fixture-model-upstream", protocol: "openai", selection: "equal_round_robin", candidates: [{ source_stable_id: stableId, source_provider: "fixture-openai-compatible", driver: "http-json" }] },
-      { source: { provider: "codex", model: "fixture-codex-model", group: null, upstream_prefix: null, protocol: "openai" }, upstream_model: "fixture-codex-upstream", protocol: "openai", selection: "equal_round_robin", candidates: [{ source_stable_id: "b".repeat(64), source_provider: "codex", driver: "openai-codex" }] },
-    ] })}\n`, { mode: 0o600 });
-    let drifted = false, requests = 0;
-    const server = createServer((request, response) => {
-      requests += 1; response.setHeader("content-type", "application/json");
-      if (request.method !== "GET" || !request.url?.startsWith("/internal/v1/upstreams?") || request.headers.authorization !== "Bearer fixture-only-target-service-token") { response.statusCode = 403; response.end("{}"); return; }
-      response.end(JSON.stringify([{
-        id: "10000000-0000-4000-8000-000000000001", tenant_external_id: "default", name: stableName, driver: "http-json",
-        config: drifted ? { base_url: "https://drift.example.test", network_scope: "public" } : { network_scope: "public", base_url: "https://openai-compatible.example.test/v1" },
-        status: "active", updated_at: 7,
-      }]));
-    });
-    await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
-    try {
-      const address = server.address(); assert(address && typeof address === "object");
-      const receipt = join(root, "binding-receipt.json");
-      const arguments_ = [importer, "--resolve-existing-route-bindings", "--config", join(source, "config.yaml"), "--auth-dir", join(source, "auth"), "--source-identity-key-file", key, "--provider-candidate-material-file", material, "--binding-receipt-output", receipt, "--target-api-base-url", `http://127.0.0.1:${address.port}`, "--service-token-file", token, "--allow-http-loopback"];
-      const result = await execFileAsync(process.execPath, arguments_, { timeout: 20_000 });
-      const summary = JSON.parse(result.stdout) as Record<string, unknown>, parsed = JSON.parse(readFileSync(receipt, "utf8")) as Record<string, unknown>;
-      assert.equal(summary.mode, "resolve-existing-route-bindings"); assert.equal(summary.bound_count, 1); assert.equal(summary.quarantined_count, 0); assert.equal(requests, 1);
-      assert.equal(statSync(receipt).mode & 0o777, 0o600);
-      assert.deepEqual(parsed.bindings, [{ source_stable_id: stableId, source_provider: "fixture-openai-compatible", upstream_account_id: "10000000-0000-4000-8000-000000000001", driver: "http-json", status: "active", updated_at: 7 }]);
-      const visible = `${result.stdout}${result.stderr}${readFileSync(receipt, "utf8")}`;
-      for (const forbidden of ["fixture-only-target-service-token", "fixture-only-cpa-openai-key-a", stableName, "openai-compatible.example.test"]) assert.doesNotMatch(visible, new RegExp(forbidden.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")));
-      const retained = readFileSync(receipt);
-      const overwrite = spawnSync(process.execPath, arguments_, { encoding: "utf8" });
-      assert.equal(overwrite.status, 2);
-      assert.deepEqual(readFileSync(receipt), retained);
-
-      drifted = true;
-      const quarantinedReceipt = join(root, "binding-receipt-drifted.json");
-      const quarantined = await execFileAsync(process.execPath, [...arguments_.map((value, index, values) => value === receipt && values[index - 1] === "--binding-receipt-output" ? quarantinedReceipt : value)], { timeout: 20_000 });
-      const quarantineSummary = JSON.parse(quarantined.stdout) as Record<string, unknown>, quarantine = JSON.parse(readFileSync(quarantinedReceipt, "utf8")) as Record<string, unknown>;
-      assert.equal(quarantineSummary.bound_count, 0); assert.equal(quarantineSummary.quarantined_count, 1);
-      assert.deepEqual(quarantine.quarantined, [{ source_stable_id: stableId, source_provider: "fixture-openai-compatible", reason: "target_config_mismatch" }]);
-    } finally { await new Promise<void>((resolveClose, rejectClose) => server.close((error) => error ? rejectClose(error) : resolveClose())); }
-  });
-
-  it("applies and replays stable direct accounts without leaking credentials", async () => {
-    const root = mkdtempSync(join(tmpdir(), "mtc-cpa-apply-"));
-    const source = join(root, "source"); cpSync(join(fixtures, "supported"), source, { recursive: true });
-    const config = join(source, "config.yaml");
-    writeFileSync(config, readFileSync(config, "utf8").replaceAll("socks5://fixture-proxy.internal:1080", "socks5h://100.64.0.16:1080"));
-    privateTree(source);
-    const key = join(source, "source-identity.key"); assert.equal(spawnSync(process.execPath, [generator, key]).status, 0);
-    const token = join(root, "service-token"); writeFileSync(token, "fixture-only-target-service-token\n", { mode: 0o600 });
-    const policy = writeTransportPolicy(root, ["https://openai-compatible.example.test/v1"], {
-      "https://openai-compatible.example.test/v1": ["https://assets.example.test"],
-    });
-    const accounts = new Map<string, Record<string, unknown>>(); const credentials: Record<string, unknown>[] = []; let rotations = 0;
-    const server = createServer(async (request, response) => {
-      const chunks: Buffer[] = []; for await (const chunk of request) chunks.push(Buffer.from(chunk));
-      const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown> : undefined;
-      response.setHeader("content-type", "application/json");
-      if (request.headers.authorization !== "Bearer fixture-only-target-service-token") { response.statusCode = 403; response.end("{}"); return; }
-      if (request.method === "GET" && request.url === "/internal/v1/provider-types") response.end(JSON.stringify([{ id: "http-json" }]));
-      else if (request.method === "GET" && request.url?.startsWith("/internal/v1/upstreams?")) response.end(JSON.stringify([...accounts.values()]));
-      else if (request.method === "POST" && request.url === "/internal/v1/upstreams") {
-        credentials.push(body?.credential as Record<string, unknown>);
-        const name = String(body?.name); const account = { id: `10000000-0000-4000-8000-${String(accounts.size + 1).padStart(12, "0")}`, tenant_external_id: body?.tenant_external_id, name, driver: body?.driver, config: body?.config, status: "active", updated_at: 1 };
-        accounts.set(name, account); response.statusCode = 201; response.end(JSON.stringify(account));
-      } else if (request.method === "PUT" && request.url?.endsWith("/credential")) {
-        rotations += 1; credentials.push(body?.credential as Record<string, unknown>); const id = request.url.split("/")[4]; const account = [...accounts.values()].find((item) => item.id === id); response.end(JSON.stringify(account));
-      } else { response.statusCode = 404; response.end("{}"); }
-    });
-    await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
-    try {
-      const address = server.address(); assert(address && typeof address === "object");
-      const arguments_ = [importer, "--config", join(source, "config.yaml"), "--auth-dir", join(source, "auth"), "--source-identity-key-file", key, "--transport-policy-file", policy, "--apply", "--allow-http-loopback", "--target-api-base-url", `http://127.0.0.1:${address.port}`, "--service-token-file", token];
-      const firstRun = await execFileAsync(process.execPath, arguments_, { timeout: 20_000 });
-      const secondRun = await execFileAsync(process.execPath, arguments_, { timeout: 20_000 });
-      const firstSummary = JSON.parse(firstRun.stdout) as Record<string, unknown>, secondSummary = JSON.parse(secondRun.stdout) as Record<string, unknown>;
-      assert.equal(firstSummary.created_count, 6); assert.equal(firstSummary.replayed_count, 0);
-      assert.equal(secondSummary.created_count, 0); assert.equal(secondSummary.replayed_count, 6);
-      assert.equal(accounts.size, 6); assert.equal(rotations, 12);
-      assert.equal([...accounts.values()].filter((account) => (account.config as Record<string, unknown>).network_scope === "private").length, 2);
-      assert.equal([...accounts.values()].filter((account) => (account.config as Record<string, unknown>).network_scope === "public").length, 4);
-      assert.equal([...accounts.values()].filter((account) => Array.isArray((account.config as Record<string, unknown>).result_origins)).length, 2);
-      await assert.rejects(
-        execFileAsync(process.execPath, arguments_.filter((value, index, values) => value !== "--transport-policy-file" && values[index - 1] !== "--transport-policy-file"), { timeout: 20_000 }),
-        /target account conflicts with a stable CPA source identity/,
-      );
-      assert.equal(accounts.size, 6);
-      assert.equal(rotations, 12);
-      const proxied = credentials.filter((credential) => credential.type === "api_key_proxy");
-      assert.equal(proxied.length, 6);
-      for (const credential of proxied) {
-        assert.equal(credential.proxy_url, "socks5h://100.64.0.16:1080");
-        assert.equal(credential.proxy_network_scope, "private");
-      }
-      assert.doesNotMatch(firstRun.stdout + firstRun.stderr + secondRun.stdout + secondRun.stderr, /fixture-only-/);
-    } finally { await new Promise<void>((resolveClose, rejectClose) => server.close((error) => error ? rejectClose(error) : resolveClose())); }
-  });
 });

@@ -11,7 +11,7 @@ Imported tools may retain historical default tenant/source labels. Defaults must
 The largest preserved TypeScript modules are:
 
 - `ops/export-cpa-session-archive-delta.ts` — about 915 lines;
-- `ops/cpa-upstreams/import-cpa-upstreams.ts` — about 464 lines;
+- `ops/cpa-upstreams/import-cpa-upstreams.ts` — retained source parsing and shared protected I/O only;
 - `ops/migrate-cpamp.ts` — about 448 lines;
 - `ops/legacy-policy/import-cpa-key-policy.ts` — about 388 lines.
 

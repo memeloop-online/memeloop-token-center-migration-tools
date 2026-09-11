@@ -229,10 +229,6 @@
       "sha256": "686773b026c88d7f1d49f1a6ac6c90d94f72ed66699c1ca7db6b3b874bc0fd75"
     },
     {
-      "path": "tests/ops/test-cpa-upstream-import.ts",
-      "sha256": "fa834836167c24980a127aa35e9d43c7a297450bc13791d0a3ebf69b083ac319"
-    },
-    {
       "path": "tests/ops/test-legacy-credentials-bulk.ts",
       "sha256": "66dfa08c6aa99751b801b329b794555246eeefbd0527302e24df4dbc43bd970e"
     },

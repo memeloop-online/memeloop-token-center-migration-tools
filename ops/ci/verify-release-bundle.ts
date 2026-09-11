@@ -51,6 +51,9 @@ assert.deepEqual(
   releaseEntrypointNames,
 );
 for (const name of releaseEntrypointNames) assert.equal(existsSync(command(name)), true, `release command is missing: ${name}`);
+for (const retiredName of [["native", "kimi", "import"].join("-"), ["import", "cpa", "upstreams"].join("-")]) {
+  assert.equal(existsSync(command(retiredName)), false, `retired target command was packaged: ${retiredName}`);
+}
 
 const root = mkdtempSync(join(tmpdir(), "mtc-release-bundle-"));
 try {
@@ -72,7 +75,6 @@ try {
   execute(command("reconcile-existing-transport"), ["--help"]);
   execute(command("credential-recovery-preflight"), ["--help"]);
   execute(command("source-credential-recovery-apply"), ["--help"]);
-  execute(command("native-kimi-import"), ["--help"]);
 
   const captureRoot = join(root, "source-capture");
   mkdirSync(captureRoot, { mode: 0o700 }); chmodSync(captureRoot, 0o700);
@@ -104,17 +106,6 @@ try {
   privateTree(source);
   const identity = join(source, "source-identity.key");
   execute(command("generate-source-identity-key"), [identity]);
-  const policy = join(root, "transport-policy.json");
-  writePrivate(policy, `${JSON.stringify({ contract_version: 1, private_target_base_urls: ["https://openai-compatible.example.test/v1"], result_origins_by_base_url: {} })}\n`);
-  const yamlSummary = JSON.parse(execute(command("import-cpa-upstreams"), [
-    "--config", join(source, "config.yaml"),
-    "--auth-dir", join(source, "auth"),
-    "--source-identity-key-file", identity,
-    "--transport-policy-file", policy,
-  ])) as Record<string, unknown>;
-  assert.equal(yamlSummary.mode, "dry-run");
-  assert.equal(yamlSummary.api_account_count, 6);
-
   // Exercise a bundled command that imports two other release CLIs, then
   // compose its exact output. This catches an imported command accidentally
   // treating the outer bundle's import.meta.url as an instruction to run.

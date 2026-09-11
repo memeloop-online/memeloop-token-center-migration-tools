@@ -1,6 +1,7 @@
 import { lstatSync, readFileSync, readdirSync } from "node:fs";
 import { extname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { releaseEntrypoints } from "./release-entrypoints.ts";
 
 const root = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const ignoredDirectories = new Set([".git", "dist", "node_modules"]);
@@ -20,12 +21,16 @@ const forbiddenPublicEnvironmentPatterns: readonly [string, RegExp][] = [
   ["internal route alias", new RegExp([["c", "sil"].join(""), ["dong", "wu"].join("")].join("|"), "iu")],
   ["internal failure-domain alias", new RegExp([["hub", "ble"].join(""), ["xuan", "yuan"].join("")].join("|"), "iu")],
 ];
+const retiredTargetSurfacePatterns: readonly [string, RegExp][] = [
+  ["retired provider-specific target endpoint", new RegExp(["internal", "v1", "imports", "cpa", "managed-oauth"].join("/"), "u")],
+  ["retired provider-specific write scope", new RegExp(["imports", "cpa", "write"].join(":"), "u")],
+];
 const emailPattern = /\b[A-Z0-9._%+-]+@([A-Z0-9.-]+\.[A-Z]{2,})\b/giu;
 
 function walk(directory: string): string[] {
   const paths: string[] = [];
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
-    if (entry.isDirectory() && ignoredDirectories.has(entry.name)) continue;
+    if (ignoredDirectories.has(entry.name)) continue;
     const path = join(directory, entry.name);
     if (entry.isDirectory()) paths.push(...walk(path));
     else if (entry.isFile()) paths.push(path);
@@ -35,6 +40,9 @@ function walk(directory: string): string[] {
 }
 
 const violations: string[] = [];
+for (const retiredName of [["native", "kimi", "import"].join("-"), ["import", "cpa", "upstreams"].join("-")]) {
+  if (retiredName in releaseEntrypoints) violations.push(`release registry: retired target command is published: ${retiredName}`);
+}
 for (const path of walk(root)) {
   const repositoryPath = relative(root, path);
   const stat = lstatSync(path);
@@ -57,6 +65,9 @@ for (const path of walk(root)) {
     if (pattern.test(body)) violations.push(`${repositoryPath}: possible ${label}`);
   }
   for (const [label, pattern] of forbiddenPublicEnvironmentPatterns) {
+    if (pattern.test(body)) violations.push(`${repositoryPath}: possible ${label}`);
+  }
+  for (const [label, pattern] of retiredTargetSurfacePatterns) {
     if (pattern.test(body)) violations.push(`${repositoryPath}: possible ${label}`);
   }
   for (const match of body.matchAll(emailPattern)) {

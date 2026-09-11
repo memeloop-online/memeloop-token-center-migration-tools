@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/** Inventory and import CPA upstream accounts through the control API. */
+/** Inspect CPA upstream source material without contacting a target. */
 
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { readdirSync, lstatSync, openSync, closeSync, fstatSync, fsyncSync, linkSync, readSync, unlinkSync, writeSync, constants } from "node:fs";
@@ -19,7 +19,6 @@ const MAX_ACCOUNTS = 10_000;
 const SOURCE_VERSION = "cpa-upstream-import-v1";
 const SOURCE_KEY_PREFIX = Buffer.from("4d54432d534f555243452d49442d4b45590001", "hex");
 const SOURCE_KEY_BYTES = 32;
-const TENANT_PATTERN = /^[A-Za-z0-9._:-]{1,200}$/;
 const HANDLE_PATTERN = /^[A-Za-z0-9]{1,80}$/;
 const HEADER_NAME_PATTERN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,200}$/;
 const RFC3339_TIMESTAMP = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(?:Z|[+-](\d{2}):(\d{2}))$/u;
@@ -27,7 +26,6 @@ const MANAGED_OAUTH_SOURCE_TYPES: Readonly<Record<string, string>> = { codex: "c
 const DIRECT_ROUTE_SOURCE_DOMAIN = "memeloop-token-center\0cpa-route-source-account-id\0v1\0";
 const NATIVE_REAUTHORIZATION_SOURCE_DOMAIN = "memeloop-token-center\0cpa-native-reauthorization-source-id\0v1\0";
 const MANAGED_OAUTH_CAPABILITY_GAP_SOURCE_DOMAIN = "memeloop-token-center\0cpa-managed-oauth-capability-gap-source-id\0v1\0";
-const SHA256 = /^[0-9a-f]{64}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 
 export class ImportFailure extends Error {}
@@ -45,14 +43,6 @@ type TransportPolicy = {
   resultOriginsByBaseUrl: Map<string, string[]>;
   matchedResultOriginBaseUrls: Set<string>;
 };
-type ProviderCandidate = Readonly<{ sourceStableId: string; sourceProvider: string; driver: "http-json" }>;
-type BindingReceipt = Readonly<{
-  sourceInventoryDigest: string;
-  providerCandidateMaterialDigest: string;
-  tenant: string;
-  bindings: readonly Readonly<{ sourceStableId: string; sourceProvider: string; accountId: string; driver: "http-json"; updatedAt: number }>[];
-  quarantined: readonly Readonly<{ sourceStableId: string; sourceProvider: string; reason: "source_candidate_unavailable" | "source_candidate_metadata_mismatch" | "target_absent" | "target_driver_mismatch" | "target_config_mismatch" | "target_inactive" | "target_ambiguous" }>[];
-}>;
 
 /** Non-secret source coordinates reused by route-inventory export. */
 export type CpaRouteSourceAccount = Readonly<{ sourceId: string; sourceProvider: string; driver: "http-json"; disabled: boolean }>;
@@ -555,41 +545,6 @@ function canonicalJson(value: unknown, label: string, depth = 0): string {
   if (keys.length > MAX_ACCOUNTS) throw new ImportFailure(`${label} is invalid`);
   return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalJson(object[key], label, depth + 1)}`).join(",")}}`;
 }
-function providerCandidates(raw: Buffer): { sourceInventoryDigest: string; candidates: ProviderCandidate[] } {
-  let parsed: unknown;
-  try { parsed = parseStrictJson(decodeUtf8(raw, "provider candidate material")); }
-  catch { throw new ImportFailure("provider candidate material is invalid"); }
-  const root = mapping(parsed, "provider candidate material");
-  exact(root, ["version", "source_inventory_sha256", "provider_candidate_sets"], "provider candidate material");
-  if (root.version !== 1 || !Array.isArray(root.provider_candidate_sets) || root.provider_candidate_sets.length > MAX_ACCOUNTS) throw new ImportFailure("provider candidate material is invalid");
-  const sourceInventoryDigest = text(root.source_inventory_sha256, "provider candidate material source inventory digest", SHA256);
-  const candidates = new Map<string, ProviderCandidate>();
-  for (const rawSet of root.provider_candidate_sets) {
-    const set = mapping(rawSet, "provider candidate set");
-    exact(set, ["source", "upstream_model", "protocol", "selection", "candidates"], "provider candidate set");
-    const source = mapping(set.source, "provider candidate source");
-    exact(source, ["provider", "model", "group", "upstream_prefix", "protocol"], "provider candidate source");
-    const provider = text(source.provider, "provider candidate source provider");
-    text(source.model, "provider candidate source model");
-    if ((source.group !== null && typeof source.group !== "string") || (source.upstream_prefix !== null && typeof source.upstream_prefix !== "string") || (source.protocol !== "openai" && source.protocol !== "anthropic") || set.protocol !== source.protocol || set.selection !== "equal_round_robin" || !Array.isArray(set.candidates) || set.candidates.length === 0 || set.candidates.length > MAX_ACCOUNTS) throw new ImportFailure("provider candidate set is invalid");
-    if (source.group !== null) text(source.group, "provider candidate source group");
-    if (source.upstream_prefix !== null) text(source.upstream_prefix, "provider candidate source prefix");
-    const poolDrivers = new Set<"http-json" | "openai-codex">();
-    for (const rawCandidate of set.candidates) {
-      const candidate = mapping(rawCandidate, "provider source candidate");
-      exact(candidate, ["source_stable_id", "source_provider", "driver"], "provider source candidate");
-      const sourceStableId = text(candidate.source_stable_id, "provider source candidate stable ID", SHA256), sourceProvider = text(candidate.source_provider, "provider source candidate provider"), candidateDriver = candidate.driver;
-      if (sourceProvider !== provider || (candidateDriver !== "http-json" && candidateDriver !== "openai-codex")) throw new ImportFailure("provider source candidate is invalid");
-      poolDrivers.add(candidateDriver);
-      if (candidateDriver === "openai-codex") continue;
-      const prior = candidates.get(sourceStableId), current: ProviderCandidate = { sourceStableId, sourceProvider, driver: "http-json" };
-      if (prior && (prior.sourceProvider !== current.sourceProvider || prior.driver !== current.driver)) throw new ImportFailure("provider candidate material has a conflicting source binding");
-      candidates.set(sourceStableId, current);
-    }
-    if (poolDrivers.size !== 1) throw new ImportFailure("provider candidate set mixes unsupported resolver drivers");
-  }
-  return { sourceInventoryDigest, candidates: [...candidates.values()].sort((left, right) => left.sourceStableId.localeCompare(right.sourceStableId, "en")) };
-}
 type TargetAccount = Readonly<{ id: string; name: string; driver: string; config: string; status: string; updatedAt: number }>;
 function targetAccount(value: unknown, tenant: string): TargetAccount {
   const account = validateAccount(value, tenant, "target upstream inventory");
@@ -601,48 +556,6 @@ function targetAccount(value: unknown, tenant: string): TargetAccount {
     status: text(account.status, "target upstream status"),
     updatedAt: integer(account.updated_at, "target upstream revision"),
   };
-}
-function buildBindingReceipt(candidateRaw: Buffer, inventory: Inventory, identityKey: Buffer, tenant: string, targetAccounts: readonly TargetAccount[]): BindingReceipt {
-  const material = providerCandidates(candidateRaw), sourceAccounts = new Map<string, DirectAccount>();
-  for (const account of inventory.direct) {
-    if (account.disabled) continue;
-    const stableId = cpaRouteSourceStableId(identityKey, account.sourceId);
-    if (sourceAccounts.has(stableId)) throw new ImportFailure("source route identity is duplicated");
-    sourceAccounts.set(stableId, account);
-  }
-  if (new Set(targetAccounts.map((account) => account.id)).size !== targetAccounts.length) throw new ImportFailure("target upstream inventory contains duplicate account IDs");
-  const targetsByName = new Map<string, TargetAccount[]>();
-  for (const account of targetAccounts) {
-    const current = targetsByName.get(account.name); if (current) current.push(account); else targetsByName.set(account.name, [account]);
-  }
-  const bindings: Array<BindingReceipt["bindings"][number]> = [], quarantined: Array<BindingReceipt["quarantined"][number]> = [];
-  for (const candidate of material.candidates) {
-    const source = sourceAccounts.get(candidate.sourceStableId);
-    if (!source) { quarantined.push({ sourceStableId: candidate.sourceStableId, sourceProvider: candidate.sourceProvider, reason: "source_candidate_unavailable" }); continue; }
-    if (source.sourceProvider !== candidate.sourceProvider || source.driver !== candidate.driver) { quarantined.push({ sourceStableId: candidate.sourceStableId, sourceProvider: candidate.sourceProvider, reason: "source_candidate_metadata_mismatch" }); continue; }
-    const named = targetsByName.get(source.name) ?? [];
-    if (named.length === 0) { quarantined.push({ sourceStableId: candidate.sourceStableId, sourceProvider: candidate.sourceProvider, reason: "target_absent" }); continue; }
-    const sameDriver = named.filter((account) => account.driver === source.driver);
-    if (sameDriver.length === 0) { quarantined.push({ sourceStableId: candidate.sourceStableId, sourceProvider: candidate.sourceProvider, reason: "target_driver_mismatch" }); continue; }
-    const sameConfig = sameDriver.filter((account) => account.config === canonicalJson(source.config, "source upstream configuration"));
-    if (sameConfig.length === 0) { quarantined.push({ sourceStableId: candidate.sourceStableId, sourceProvider: candidate.sourceProvider, reason: "target_config_mismatch" }); continue; }
-    const active = sameConfig.filter((account) => account.status === "active");
-    if (active.length === 0) { quarantined.push({ sourceStableId: candidate.sourceStableId, sourceProvider: candidate.sourceProvider, reason: "target_inactive" }); continue; }
-    if (active.length !== 1) { quarantined.push({ sourceStableId: candidate.sourceStableId, sourceProvider: candidate.sourceProvider, reason: "target_ambiguous" }); continue; }
-    const target = active[0]!;
-    bindings.push({ sourceStableId: candidate.sourceStableId, sourceProvider: candidate.sourceProvider, accountId: target.id, driver: "http-json", updatedAt: target.updatedAt });
-  }
-  return { sourceInventoryDigest: material.sourceInventoryDigest, providerCandidateMaterialDigest: digest(candidateRaw), tenant, bindings, quarantined };
-}
-function encodeBindingReceipt(receipt: BindingReceipt): Buffer {
-  return Buffer.from(`${JSON.stringify({
-    version: 1,
-    tenant_external_id: receipt.tenant,
-    source_inventory_sha256: receipt.sourceInventoryDigest,
-    provider_candidate_material_sha256: receipt.providerCandidateMaterialDigest,
-    bindings: receipt.bindings.map((binding) => ({ source_stable_id: binding.sourceStableId, source_provider: binding.sourceProvider, upstream_account_id: binding.accountId, driver: binding.driver, status: "active", updated_at: binding.updatedAt })),
-    quarantined: receipt.quarantined.map((item) => ({ source_stable_id: item.sourceStableId, source_provider: item.sourceProvider, reason: item.reason })),
-  })}\n`);
 }
 type OutputTarget = Readonly<{ target: string; parentDescriptor: number }>;
 function openSafeOutput(path: string): OutputTarget {
@@ -687,88 +600,22 @@ function writeBindingReceipt(output: OutputTarget, receipt: Buffer): void {
     throw new ImportFailure("binding receipt could not be persisted");
   }
 }
-async function resolveExistingRouteBindings(baseUrl: string, token: string, tenant: string, inventory: Inventory, identityKey: Buffer, candidateMaterial: Buffer, caFile?: string): Promise<Buffer> {
-  const response = (await requestJson("GET", `${baseUrl}/internal/v1/upstreams?tenant_external_id=${encodeURIComponent(tenant)}&limit=100`, token, "target upstream inventory", [200], undefined, undefined, caFile)).value;
-  if (!Array.isArray(response) || response.length >= 100) throw new ImportFailure("target upstream inventory is incomplete");
-  const receipt = buildBindingReceipt(candidateMaterial, inventory, identityKey, tenant, response.map((item) => targetAccount(item, tenant)));
-  return encodeBindingReceipt(receipt);
-}
-async function apply(baseUrl: string, token: string, tenant: string, inventory: Inventory, secrets: SecretStore, caFile?: string): Promise<[number, number, number, number]> {
-  if (inventory.managed.length > 0) {
-    const capabilities = mapping((await requestJson("GET", `${baseUrl}/internal/v1/imports/cpa/managed-oauth/capabilities`, token, "CPA managed OAuth capability discovery", [200], undefined, undefined, caFile)).value, "CPA managed OAuth capability response");
-    if (Object.keys(capabilities).sort().join("\0") !== "contract_version\0source_types") throw new ImportFailure("CPA managed OAuth capability response has an unsupported shape");
-    const sourceTypes = capabilities.source_types;
-    if (capabilities.contract_version !== 1) throw new ImportFailure("target does not support the required CPA managed OAuth contract");
-    if (!Array.isArray(sourceTypes) || sourceTypes.length === 0 || !sourceTypes.every((item) => typeof item === "string" && /^[a-z0-9._-]{1,64}$/.test(item)) || new Set(sourceTypes).size !== sourceTypes.length) throw new ImportFailure("CPA managed OAuth capability response has invalid source types");
-    if (inventory.managed.some((item) => !sourceTypes.includes(item.sourceType))) throw new ImportFailure("target is missing a managed OAuth source type required by the CPA source");
-  }
-  const providers = (await requestJson("GET", `${baseUrl}/internal/v1/provider-types`, token, "target provider discovery", [200], undefined, undefined, caFile)).value;
-  if (!Array.isArray(providers)) throw new ImportFailure("target provider discovery returned an invalid document");
-  if (inventory.direct.length > 0 && !providers.some((item) => mapping(item, "target provider discovery").id === "http-json")) throw new ImportFailure("target is missing a provider driver required by the CPA source");
-  const existingValue = (await requestJson("GET", `${baseUrl}/internal/v1/upstreams?tenant_external_id=${encodeURIComponent(tenant)}`, token, "target upstream inventory", [200], undefined, undefined, caFile)).value;
-  if (!Array.isArray(existingValue)) throw new ImportFailure("target upstream inventory returned an invalid document");
-  const existing = new Map<string, JsonObject>();
-  for (const value of existingValue) {
-    const account = validateAccount(value, tenant, "target upstream inventory");
-    if (typeof account.name !== "string" || existing.has(account.name)) throw new ImportFailure("target upstream inventory contains a name conflict");
-    existing.set(account.name, account);
-  }
-  for (const record of inventory.direct) {
-    const account = existing.get(record.name);
-    if (account && (account.driver !== record.driver || JSON.stringify(account.config) !== JSON.stringify(record.config))) throw new ImportFailure("target account conflicts with a stable CPA source identity");
-  }
-  let createdManaged = 0, replayedManaged = 0;
-  for (const record of inventory.managed) {
-    const payload = secrets.take(record.payloadRef);
-    if (Object.keys(payload).sort().join("\0") !== "document\0source") throw new ImportFailure("internal managed OAuth payload is invalid");
-    Object.assign(payload, { contract_version: 1, tenant_external_id: tenant, source_type: record.sourceType });
-    const result = await requestJson("POST", `${baseUrl}/internal/v1/imports/cpa/managed-oauth`, token, "CPA managed OAuth import", [200, 201], payload, undefined, caFile);
-    const response = mapping(result.value, "CPA managed OAuth import response");
-    if (Object.keys(response).sort().join("\0") !== "account\0disposition") throw new ImportFailure("CPA managed OAuth import returned an unsupported response");
-    const expectedDisposition = result.status === 201 ? "created" : "replayed";
-    if (response.disposition !== expectedDisposition) throw new ImportFailure("CPA managed OAuth import returned an inconsistent disposition");
-    validateAccount(response.account, tenant, "CPA managed OAuth import");
-    if (result.status === 201) createdManaged += 1; else replayedManaged += 1;
-  }
-  let created = 0, replayed = 0;
-  for (const record of inventory.direct) {
-    const credential = record.proxySecretRef === undefined
-      ? { type: "api_key", value: secrets.string(record.secretRef), header: record.header, prefix: record.prefix }
-      : { type: "api_key_proxy", value: secrets.string(record.secretRef), header: record.header, prefix: record.prefix, proxy_url: secrets.string(record.proxySecretRef), proxy_network_scope: record.proxyNetworkScope };
-    let account = existing.get(record.name);
-    if (!account) {
-      account = validateAccount((await requestJson("POST", `${baseUrl}/internal/v1/upstreams`, token, "target upstream creation", [201], { tenant_external_id: tenant, name: record.name, driver: record.driver, config: record.config, credential }, undefined, caFile)).value, tenant, "target upstream creation");
-      if (account.name !== record.name || account.driver !== record.driver || JSON.stringify(account.config) !== JSON.stringify(record.config)) throw new ImportFailure("target upstream creation returned another account");
-      created += 1;
-    } else {
-      if (account.driver !== record.driver || JSON.stringify(account.config) !== JSON.stringify(record.config)) throw new ImportFailure("target account conflicts with a stable CPA source identity");
-      replayed += 1;
-    }
-    const id = account.id; if (typeof id !== "string") throw new ImportFailure("target account identifier is invalid"); account = validateAccount((await requestJson("PUT", `${baseUrl}/internal/v1/upstreams/${encodeURIComponent(id)}/credential`, token, "target upstream credential convergence", [200], { credential }, `cpa-import-v1-${digest(record.sourceId).slice(0, 48)}`, caFile)).value, tenant, "target upstream credential convergence");
-    const status = record.disabled ? "disabled" : "active";
-    if (account.status !== status) account = validateAccount((await requestJson("PATCH", `${baseUrl}/internal/v1/upstreams/${encodeURIComponent(id)}`, token, "target upstream status convergence", [200], { tenant_external_id: tenant, status, expected_updated_at: account.updated_at }, undefined, caFile)).value, tenant, "target upstream status convergence");
-    if (account.status !== status) throw new ImportFailure("target upstream status did not converge");
-  }
-  return [created, replayed, createdManaged, replayedManaged];
-}
 export function readSourceIdentityKey(path: string): Buffer {
   if (!isAbsolute(path)) throw new ImportFailure("source identity key file path must be absolute"); const value = readOwnerOnly(path, "source identity key file", MAX_SECRET_BYTES);
   if (value.length !== SOURCE_KEY_PREFIX.length + SOURCE_KEY_BYTES || !timingSafeEqual(value.subarray(0, SOURCE_KEY_PREFIX.length), SOURCE_KEY_PREFIX)) throw new ImportFailure("source identity key has an invalid binary format"); const payload = Buffer.from(value.subarray(SOURCE_KEY_PREFIX.length)); value.fill(0); if (payload.every((byte) => byte === payload[0])) throw new ImportFailure("source identity key payload is invalid"); return payload;
 }
-function summary(mode: string, inventory: Inventory, native: JsonObject[], capabilityGaps: JsonObject[], counts = [0, 0, 0, 0]): JsonObject {
+function summary(inventory: Inventory, native: JsonObject[], capabilityGaps: JsonObject[]): JsonObject {
   const sourceCounts: Record<string, number> = {}; for (const record of inventory.managed) sourceCounts[record.sourceType] = (sourceCounts[record.sourceType] ?? 0) + 1;
   const capabilityCounts: Record<string, number> = {}; for (const record of inventory.unsupportedManagedOAuth) capabilityCounts[record.sourceType] = (capabilityCounts[record.sourceType] ?? 0) + 1;
-  return { api_account_count: inventory.direct.length, created_count: counts[0], created_managed_oauth_count: counts[2], disabled_source_count: inventory.disabledSourceCount, managed_oauth_account_count: inventory.managed.length, managed_oauth_source_type_counts: Object.fromEntries(Object.entries(sourceCounts).sort()), mode, native_reauthorization_required: native, native_reauthorization_required_count: native.length, private_target_api_account_count: inventory.direct.filter((record) => record.config.network_scope === "private").length, proxied_api_account_count: inventory.direct.filter((record) => record.proxySecretRef !== undefined).length, replayed_count: counts[1], replayed_managed_oauth_count: counts[3], source_capability_gap_count: capabilityGaps.length, source_capability_gap_source_type_counts: Object.fromEntries(Object.entries(capabilityCounts).sort()), source_capability_gaps: capabilityGaps };
+  return { api_account_count: inventory.direct.length, disabled_source_count: inventory.disabledSourceCount, managed_oauth_account_count: inventory.managed.length, managed_oauth_source_type_counts: Object.fromEntries(Object.entries(sourceCounts).sort()), mode: "source-audit", native_reauthorization_required: native, native_reauthorization_required_count: native.length, private_target_api_account_count: inventory.direct.filter((record) => record.config.network_scope === "private").length, proxied_api_account_count: inventory.direct.filter((record) => record.proxySecretRef !== undefined).length, source_capability_gap_count: capabilityGaps.length, source_capability_gap_source_type_counts: Object.fromEntries(Object.entries(capabilityCounts).sort()), source_capability_gaps: capabilityGaps, target_access_count: 0, target_write_count: 0 };
 }
-type Options = { config?: string; authDir?: string; tenant: string; apply: boolean; resolveBindings: boolean; target?: string; token?: string; sourceKey?: string; candidateMaterial?: string; bindingReceipt?: string; transportPolicy?: string; ca?: string; allowHttp: boolean };
+type Options = { config?: string; authDir?: string; sourceKey?: string; transportPolicy?: string; allowHttp: boolean };
 function args(argv: string[]): Options {
-  if (argv.includes("--help") || argv.includes("-h")) { process.stdout.write("usage: import-cpa-upstreams --config FILE --auth-dir DIR [--transport-policy-file FILE] [--tenant ID] [--apply] [--target-api-base-url URL] [--service-token-file FILE] [--source-identity-key-file FILE] [--ca-file FILE] [--allow-http-loopback]\n       import-cpa-upstreams --resolve-existing-route-bindings --config FILE --auth-dir DIR --source-identity-key-file FILE --provider-candidate-material-file FILE --binding-receipt-output FILE --target-api-base-url URL --service-token-file FILE [--transport-policy-file FILE] [--tenant ID] [--ca-file FILE] [--allow-http-loopback]\n\nImport real CPA config.yaml/auth-dir upstreams (dry-run by default), or read only deterministic direct-account bindings for provider-exact route review.\n"); process.exit(0); }
-  const result: Options = { tenant: "default", apply: false, resolveBindings: false, allowHttp: false }; const valued: Record<string, keyof Options> = { "--config": "config", "--auth-dir": "authDir", "--transport-policy-file": "transportPolicy", "--tenant": "tenant", "--target-api-base-url": "target", "--service-token-file": "token", "--source-identity-key-file": "sourceKey", "--provider-candidate-material-file": "candidateMaterial", "--binding-receipt-output": "bindingReceipt", "--ca-file": "ca" };
+  if (argv.includes("--help") || argv.includes("-h")) { process.stdout.write("usage: import-cpa-upstreams --config FILE --auth-dir DIR [--transport-policy-file FILE] [--source-identity-key-file FILE] [--allow-http-loopback]\n\nOffline source audit only; target import/apply support is retired.\n"); process.exit(0); }
+  const result: Options = { allowHttp: false }; const valued: Record<string, keyof Options> = { "--config": "config", "--auth-dir": "authDir", "--transport-policy-file": "transportPolicy", "--source-identity-key-file": "sourceKey" };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]!;
-    if (arg === "--apply") { if (result.apply) throw new ImportFailure("arguments are invalid"); result.apply = true; }
-    else if (arg === "--resolve-existing-route-bindings") { if (result.resolveBindings) throw new ImportFailure("arguments are invalid"); result.resolveBindings = true; }
-    else if (arg === "--allow-http-loopback") { if (result.allowHttp) throw new ImportFailure("arguments are invalid"); result.allowHttp = true; }
+    if (arg === "--allow-http-loopback") { if (result.allowHttp) throw new ImportFailure("arguments are invalid"); result.allowHttp = true; }
     else if (valued[arg]) { const value = argv[++index]; if (!value || result[valued[arg]!] !== undefined) throw new ImportFailure(`${arg} requires one value`); (result as unknown as Record<string, unknown>)[valued[arg]!] = value; }
     else throw new ImportFailure(`unrecognized argument: ${arg}`);
   }
@@ -776,7 +623,6 @@ function args(argv: string[]): Options {
 }
 async function main(): Promise<void> {
   const options = args(process.argv.slice(2));
-  if (!TENANT_PATTERN.test(options.tenant)) throw new ImportFailure("target tenant external ID is invalid");
   if (options.transportPolicy && !isAbsolute(options.transportPolicy)) throw new ImportFailure("transport policy file path must be absolute");
   const policy = options.transportPolicy
     ? parseTransportPolicy(readOwnerOnly(options.transportPolicy, "CPA transport policy file", MAX_CONFIG_BYTES), options.allowHttp)
@@ -786,24 +632,7 @@ async function main(): Promise<void> {
       resultOriginsByBaseUrl: new Map<string, string[]>(),
       matchedResultOriginBaseUrls: new Set<string>(),
   };
-  const [inventory, secrets] = buildInventory(options.config!, options.authDir!, policy, options.allowHttp);
-  if (options.resolveBindings) {
-    if (options.apply || !options.target || !options.token || !options.sourceKey || !options.candidateMaterial || !options.bindingReceipt) throw new ImportFailure("binding resolution requires its explicit read-only inputs");
-    const identityKey = readSourceIdentityKey(options.sourceKey), candidateMaterial = readOwnerOnly(options.candidateMaterial, "provider candidate material", MAX_CONFIG_BYTES);
-    let output: OutputTarget | undefined;
-    try {
-      const target = upstreamUrl(options.target, "target API base URL", options.allowHttp);
-      const token = secretString(decodeUtf8(readOwnerOnly(options.token, "target service token file", MAX_SECRET_BYTES), "target service token file").replace(/\n$/, ""), "target service token file");
-      const receipt = await resolveExistingRouteBindings(target, token, options.tenant, inventory, identityKey, candidateMaterial, options.ca);
-      output = openSafeOutput(options.bindingReceipt); writeBindingReceipt(output, receipt);
-      const parsed = JSON.parse(receipt.toString("utf8")) as { bindings: unknown[]; quarantined: unknown[] };
-      process.stdout.write(`${JSON.stringify({ mode: "resolve-existing-route-bindings", provider_candidate_material_sha256: digest(candidateMaterial), binding_receipt_sha256: digest(receipt), bound_count: parsed.bindings.length, quarantined_count: parsed.quarantined.length })}\n`);
-      return;
-    } finally {
-      candidateMaterial.fill(0); identityKey.fill(0);
-      if (output) closeSync(output.parentDescriptor);
-    }
-  }
+  const [inventory] = buildInventory(options.config!, options.authDir!, policy, options.allowHttp);
   let native: JsonObject[] = [], capabilityGaps: JsonObject[] = [];
   if (inventory.native.length > 0 || inventory.unsupportedManagedOAuth.length > 0) {
     if (!options.sourceKey) throw new ImportFailure("source identity key file is required for source authorization remediation records");
@@ -813,17 +642,15 @@ async function main(): Promise<void> {
       capabilityGaps = inventory.unsupportedManagedOAuth.map((record) => ({ source_type: record.sourceType, source_disabled: record.sourceDisabled, source_stable_id: createHmac("sha256", key).update(Buffer.concat([Buffer.from(MANAGED_OAUTH_CAPABILITY_GAP_SOURCE_DOMAIN), Buffer.from(record.sourceId)])).digest("hex") })).sort((left, right) => String(left.source_stable_id).localeCompare(String(right.source_stable_id), "en"));
     } finally { key.fill(0); }
   }
-  if (options.apply && inventory.unsupportedManagedOAuth.length > 0) throw new ImportFailure("CPA source has a managed OAuth capability gap with no target adapter");
-  if (!options.apply || (inventory.direct.length === 0 && inventory.managed.length === 0)) { process.stdout.write(`${JSON.stringify(summary(options.apply ? "apply" : "dry-run", inventory, native, capabilityGaps))}\n`); return; }
-  if (!options.target || !options.token) throw new ImportFailure("apply requires target API base URL and service token file"); const base = upstreamUrl(options.target, "target API base URL", options.allowHttp); const token = secretString(decodeUtf8(readOwnerOnly(options.token, "target service token file", MAX_SECRET_BYTES), "target service token file").replace(/\n$/, ""), "target service token file"); const counts = await apply(base, token, options.tenant, inventory, secrets, options.ca); process.stdout.write(`${JSON.stringify(summary("apply", inventory, native, capabilityGaps, counts))}\n`);
+  process.stdout.write(`${JSON.stringify(summary(inventory, native, capabilityGaps))}\n`);
 }
 if (invokedAsEntrypoint("import-cpa-upstreams", import.meta.url)) {
-  main().catch((error) => { process.stderr.write(`CPA upstream import stopped: ${error instanceof ImportFailure ? error.message : "unexpected operator failure"}\n`); process.exitCode = 2; });
+  main().catch((error) => { process.stderr.write(`CPA upstream source audit stopped: ${error instanceof ImportFailure ? error.message : "unexpected operator failure"}\n`); process.exitCode = 2; });
 }
 
 /** Shared protected IO and source parsing for the separate read-only reconciler. */
 export {
   authFiles, buildInventory, canonicalJson, decodeUtf8, openSafeOutput, parseTransportPolicy,
-  providerCandidates, readOwnerOnly, requestJson, targetAccount, upstreamUrl,
+  readOwnerOnly, requestJson, targetAccount, upstreamUrl,
   writeBindingReceipt,
 };
