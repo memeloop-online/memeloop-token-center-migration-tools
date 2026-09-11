@@ -515,10 +515,19 @@ async function requestJson(method: string, rawUrl: string, token: string, label:
   const url = new URL(rawUrl); const encoded = body === undefined ? undefined : Buffer.from(JSON.stringify(body));
   return await new Promise<HttpResponse>((fulfill, reject) => {
     const request = (url.protocol === "https:" ? httpsRequest : httpRequest)({ protocol: url.protocol, hostname: url.hostname, port: url.port, path: `${url.pathname}${url.search}`, method, timeout: 30_000, maxHeaderSize: 64 * 1024, ca: caFile ? caBytes(caFile) : undefined, headers: { Accept: "application/json", Authorization: `Bearer ${token}`, ...(encoded ? { "Content-Type": "application/json", "Content-Length": encoded.length } : {}), ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}) } }, (response) => {
-      let size = 0; const chunks: Buffer[] = []; response.on("data", (chunk: Buffer) => { size += chunk.length; if (size > MAX_RESPONSE_BYTES) request.destroy(new ImportFailure(`${label} response exceeds the allowed size`)); else chunks.push(chunk); });
-      response.on("end", () => { if (!statuses.includes(response.statusCode ?? 0)) { reject(new ImportFailure(`${label} returned an unexpected status`)); return; } try { fulfill({ status: response.statusCode!, value: parseStrictJson(decodeUtf8(Buffer.concat(chunks), `${label} response`)) }); } catch { reject(new ImportFailure(`${label} returned invalid JSON`)); } });
+      let size = 0; const chunks: Buffer[] = [];
+      const clearChunks = (): void => { for (const chunk of chunks) chunk.fill(0); chunks.length = 0; };
+      response.on("data", (chunk: Buffer) => { size += chunk.length; if (size > MAX_RESPONSE_BYTES) { chunk.fill(0); clearChunks(); request.destroy(new ImportFailure(`${label} response exceeds the allowed size`)); } else chunks.push(chunk); });
+      response.on("end", () => {
+        if (!statuses.includes(response.statusCode ?? 0)) { clearChunks(); reject(new ImportFailure(`${label} returned an unexpected status`)); return; }
+        const raw = Buffer.concat(chunks);
+        try { fulfill({ status: response.statusCode!, value: parseStrictJson(decodeUtf8(raw, `${label} response`)) }); }
+        catch { reject(new ImportFailure(`${label} returned invalid JSON`)); }
+        finally { raw.fill(0); clearChunks(); }
+      });
+      response.on("aborted", clearChunks); response.on("error", clearChunks);
     });
-    request.on("timeout", () => request.destroy()); request.on("error", (error) => reject(error instanceof ImportFailure ? error : new ImportFailure(`${label} failed`))); if (encoded) request.end(encoded); else request.end();
+    request.on("close", () => encoded?.fill(0)); request.on("timeout", () => request.destroy()); request.on("error", (error) => reject(error instanceof ImportFailure ? error : new ImportFailure(`${label} failed`))); if (encoded) request.end(encoded); else request.end();
   });
 }
 function validateAccount(value: unknown, tenant: string, label: string): JsonObject {

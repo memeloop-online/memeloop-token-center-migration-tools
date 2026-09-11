@@ -29,12 +29,14 @@ type KimiDocument = JsonObject & {
   access_token: string;
   refresh_token: string;
   token_type: string;
+  timestamp?: number;
   disabled?: boolean;
 };
 type KimiRecord = {
   relativePath: string;
   document: KimiDocument;
   documentSha256: string;
+  targetDocumentSha256: string;
   sourceStableId: string;
   assertedIdentityHmacSha256: string;
 };
@@ -47,6 +49,8 @@ const MAX_TARGET_ACCOUNTS = 100;
 const EXPECTED_SOURCE_ACCOUNTS = 2;
 const EXPECTED_SOURCE_POLICIES = 10;
 const EXPECTED_SOURCE_GRANTS = 131;
+const TARGET_SOURCE_PATH_BYTES = 512;
+const MINIMUM_TARGET_ACTIVE_MS = 10 * 60 * 1_000;
 const EXPECTED_KIMI_MODELS = Object.freeze([
   "kimi-k2",
   "kimi-k2-thinking",
@@ -64,6 +68,11 @@ const REVISION = /^[0-9a-f]{40}$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 const TENANT = /^[A-Za-z0-9._:-]{1,200}$/u;
 const UTF8 = new TextDecoder("utf-8", { fatal: true });
+const TARGET_KIMI_CONFIG = Object.freeze({
+  base_url: "https://api.kimi.com/coding",
+  network_scope: "public",
+  reservation_token_bounds: {},
+});
 
 export class NativeKimiImportFailure extends Error {
   constructor() { super("native Kimi import precondition or operation failed"); }
@@ -112,7 +121,7 @@ function optionalRfc3339(value: unknown): void {
   if (!/^\d{4}-\d\d-\d\dT.+(?:Z|[+-]\d\d:\d\d)$/u.test(text) || !Number.isFinite(Date.parse(text))) fail();
 }
 
-export function validateKimiDocument(value: unknown, identityKey: Buffer): {
+export function validateKimiDocument(value: unknown, identityKey: Buffer, now = Date.now()): {
   document: KimiDocument;
   assertedIdentityHmacSha256: string;
 } {
@@ -127,9 +136,8 @@ export function validateKimiDocument(value: unknown, identityKey: Buffer): {
   const accessToken = secret(document.access_token);
   secret(document.refresh_token);
   if (document.disabled === true) fail();
-  for (const key of ["scope", "device_id"] as const) {
-    if (document[key] !== undefined && document[key] !== null) controlledText(document[key]);
-  }
+  if (document.scope !== undefined && document.scope !== null) controlledText(document.scope);
+  const documentDevice = controlledText(document.device_id, 2_048, false);
   optionalRfc3339(document.expired);
   optionalRfc3339(document.last_refresh);
   timestamp(document.timestamp);
@@ -141,19 +149,24 @@ export function validateKimiDocument(value: unknown, identityKey: Buffer): {
   const issuer = controlledText(claims.iss, 1_024, false);
   const subject = controlledText(claims.sub, 1_024, false);
   const userId = controlledText(claims.user_id, 1_024, false);
-  const documentDevice = document.device_id;
-  if (subject !== userId || typeof documentDevice !== "string"
-    || claims.device_id !== documentDevice) fail();
+  if (subject !== userId || claims.device_id !== documentDevice) fail();
   if (typeof claims.exp !== "number" || !Number.isSafeInteger(claims.exp)
     || claims.exp < 0) fail();
-  if (typeof document.expired === "string"
-    && claims.exp * 1_000 !== Date.parse(document.expired)) fail();
+  if (typeof document.expired !== "string"
+    || claims.exp * 1_000 !== Date.parse(document.expired)
+    || claims.exp * 1_000 <= now + MINIMUM_TARGET_ACTIVE_MS) fail();
   const assertedIdentityHmacSha256 = hmac(
     identityKey,
     ASSERTED_IDENTITY_DOMAIN,
     canonicalJson({ issuer, subject, user_id: userId }, "Kimi asserted identity"),
   );
   return { document, assertedIdentityHmacSha256 };
+}
+
+function targetSourcePath(value: string): void {
+  if (Buffer.byteLength(value) > TARGET_SOURCE_PATH_BYTES || value.startsWith("/")
+    || value.includes("\\") || /\p{Cc}/u.test(value)
+    || value.split("/").some((part) => !part || part === "." || part === "..")) fail();
 }
 
 function sourcePolicy(raw: Buffer, sourceStableIds: readonly string[]): {
@@ -175,6 +188,7 @@ function sourcePolicy(raw: Buffer, sourceStableIds: readonly string[]): {
     for (const rawGrant of entry.grants) {
       const grant = object(rawGrant);
       if (grant.provider !== "kimi") continue;
+      if (entry.enabled !== true) fail();
       if (grant.group !== undefined && grant.group !== null && typeof grant.group !== "string") fail();
       if (grant.upstream_prefix !== undefined && grant.upstream_prefix !== null
         && typeof grant.upstream_prefix !== "string") fail();
@@ -189,7 +203,8 @@ function sourcePolicy(raw: Buffer, sourceStableIds: readonly string[]): {
   });
   if (sourceGrantCount !== EXPECTED_SOURCE_GRANTS
     || [...modelPolicies.keys()].sort().join("\0") !== [...EXPECTED_KIMI_MODELS].sort().join("\0")
-    || [...modelPolicies.values()].some((indexes) => indexes.length !== 3)) fail();
+    || [...modelPolicies.values()].some((indexes) => indexes.length !== 3
+      || new Set(indexes).size !== indexes.length)) fail();
   const routePlan = [...modelPolicies.entries()].sort(([left], [right]) => left.localeCompare(right, "en"))
     .map(([model, sourcePolicyIndexes]) => ({
       public_model: model,
@@ -226,11 +241,18 @@ export function inspectSealedKimiCohort(root: string, identityKeyPath: string, n
         if (parsed.type !== "kimi") continue;
         if (!relativePath.toLowerCase().endsWith(".json")
           || /(?:^|[._-])(?:bak|backup|old|refresh)(?:[._-]|$)/iu.test(relativePath)) fail();
-        const validated = validateKimiDocument(parsed, identityKey);
+        targetSourcePath(relativePath);
+        const validated = validateKimiDocument(parsed, identityKey, now);
+        // `timestamp` is source capture metadata, not part of the target Kimi
+        // managed-OAuth contract. Keep its source digest in the sealed batch,
+        // but never rely on the target to ignore unsupported source fields.
+        const targetDocument = { ...validated.document };
+        delete targetDocument.timestamp;
         records.push({
           relativePath,
-          document: validated.document,
+          document: targetDocument,
           documentSha256,
+          targetDocumentSha256: sha256(canonicalJson(targetDocument, "target Kimi document")),
           sourceStableId: hmac(identityKey, SOURCE_ACCOUNT_DOMAIN, relativePath),
           assertedIdentityHmacSha256: validated.assertedIdentityHmacSha256,
         });
@@ -255,6 +277,7 @@ export function inspectSealedKimiCohort(root: string, identityKeyPath: string, n
     const sourceAccounts = records.map((record) => ({
       source_stable_id: record.sourceStableId,
       source_document_sha256: record.documentSha256,
+      target_document_sha256: record.targetDocumentSha256,
       asserted_identity_hmac_sha256: record.assertedIdentityHmacSha256,
       target_driver: "kimi-oauth",
       target_status: "active",
@@ -317,8 +340,59 @@ function validateTargetAccount(value: unknown, tenant: string): JsonObject {
   const account = object(value);
   if (account.tenant_external_id !== tenant || typeof account.id !== "string"
     || !UUID.test(account.id) || typeof account.name !== "string" || typeof account.driver !== "string"
-    || typeof account.status !== "string" || "credential" in account) fail();
+    || typeof account.status !== "string"
+    || ["credential", "access_token", "refresh_token", "api_key"].some((key) => key in account)) fail();
   return account;
+}
+
+function validateKimiTargetAccount(account: JsonObject, expected: KimiRecord): JsonObject {
+  const name = controlledText(account.name, 200, false);
+  if (account.driver !== "kimi-oauth" || account.auth_kind !== "oauth" || account.status !== "active"
+    || account.credential_generation !== 1 || account.route_count !== 0
+    || account.import_source_identity_hash !== expected.sourceStableId
+    || account.import_source_document_sha256 !== expected.targetDocumentSha256
+    || /cpa|bridge/iu.test(name)
+    || canonicalJson(account.config, "target Kimi configuration")
+      !== canonicalJson(TARGET_KIMI_CONFIG, "expected target Kimi configuration")) fail();
+  return account;
+}
+
+async function targetCohort(
+  origin: string,
+  token: string,
+  tenant: string,
+  records: readonly KimiRecord[],
+): Promise<{ evidence: JsonObject[]; digest: string }> {
+  const targetAccounts = (await requestJson("GET", `${origin}/internal/v1/upstreams?tenant_external_id=${encodeURIComponent(tenant)}&limit=${MAX_TARGET_ACCOUNTS}`, token, "target upstream accounts", [200])).value;
+  if (!Array.isArray(targetAccounts) || targetAccounts.length >= MAX_TARGET_ACCOUNTS) fail();
+  const expected = new Map(records.map((record) => [record.sourceStableId, record]));
+  const seenIds = new Set<string>();
+  const seenSources = new Set<string>();
+  const evidence: JsonObject[] = [];
+  for (const value of targetAccounts) {
+    const account = validateTargetAccount(value, tenant);
+    if (seenIds.has(String(account.id))) fail();
+    seenIds.add(String(account.id));
+    if (account.driver !== "kimi-oauth") continue;
+    const sourceIdentity = controlledText(account.import_source_identity_hash, 64, false);
+    const record = expected.get(sourceIdentity);
+    if (!record || seenSources.has(sourceIdentity)) fail();
+    seenSources.add(sourceIdentity);
+    validateKimiTargetAccount(account, record);
+    evidence.push({
+      source_stable_id: sourceIdentity,
+      source_document_sha256: record.documentSha256,
+      target_document_sha256: record.targetDocumentSha256,
+      upstream_account_id: account.id,
+      credential_generation: account.credential_generation,
+      status: account.status,
+    });
+  }
+  evidence.sort((left, right) => String(left.source_stable_id).localeCompare(String(right.source_stable_id), "en"));
+  return {
+    evidence,
+    digest: sha256(canonicalJson(evidence, "target Kimi cohort evidence")),
+  };
 }
 
 async function preflightTarget(
@@ -326,31 +400,28 @@ async function preflightTarget(
   token: string,
   tenant: string,
   expectedRevision: string,
+  records: readonly KimiRecord[],
 ): Promise<JsonObject> {
   const version = object((await requestJson("GET", `${origin}/version`, token, "target version", [200])).value);
   if (version.service !== "memeloop-token-center" || version.revision !== expectedRevision) fail();
   const capabilities = object((await requestJson("GET", `${origin}/internal/v1/imports/cpa/managed-oauth/capabilities`, token, "target managed OAuth capabilities", [200])).value);
   if (capabilities.contract_version !== 1 || !Array.isArray(capabilities.source_types)
-    || !capabilities.source_types.includes("kimi")) fail();
+    || !capabilities.source_types.includes("kimi")
+    || object(capabilities.account_name_policies).kimi !== "neutral-server-keyed-source-suffix-v1"
+    || capabilities.source_identity_contract !== "operator-hmac-sha256-v1") fail();
   const providers = (await requestJson("GET", `${origin}/internal/v1/provider-types`, token, "target provider types", [200])).value;
   if (!Array.isArray(providers) || !providers.some((value) => object(value).id === "kimi-oauth")) fail();
-  const targetAccounts = (await requestJson("GET", `${origin}/internal/v1/upstreams?tenant_external_id=${encodeURIComponent(tenant)}&limit=${MAX_TARGET_ACCOUNTS}`, token, "target upstream accounts", [200])).value;
-  if (!Array.isArray(targetAccounts) || targetAccounts.length >= MAX_TARGET_ACCOUNTS) fail();
-  const kimi = targetAccounts.map((value) => validateTargetAccount(value, tenant))
-    .filter((account) => account.driver === "kimi-oauth");
-  // This is a closed two-account cohort. A nonempty partial or unrelated
-  // cohort is neither safe to resume nor safe to merge implicitly: the
-  // server-owned source key can resolve exact replays only during an approved
-  // import. Keep the target preflight at the same cardinality boundary as the
-  // sealed source.
-  if ((kimi.length !== 0 && kimi.length !== EXPECTED_SOURCE_ACCOUNTS)
-    || kimi.some((account) => account.status !== "active" || /cpa|bridge/iu.test(String(account.name)))) fail();
+  const kimi = await targetCohort(origin, token, tenant, records);
   return {
     target_origin: origin,
     target_revision: expectedRevision,
     target_capabilities_verified: true,
-    target_existing_kimi_account_count: kimi.length,
-    target_replay_resolution: kimi.length === 0 ? "create_expected" : "server_source_key_replay_required",
+    target_existing_kimi_account_count: kimi.evidence.length,
+    target_existing_kimi_sha256: kimi.digest,
+    target_existing_kimi_accounts: kimi.evidence,
+    target_replay_resolution: kimi.evidence.length === 0 ? "create_expected"
+      : kimi.evidence.length === EXPECTED_SOURCE_ACCOUNTS ? "exact_replay_expected"
+        : "exact_subset_resume_expected",
   };
 }
 
@@ -436,23 +507,27 @@ export async function run(argv = process.argv.slice(2)): Promise<JsonObject> {
     if (selected.target) {
       const origin = targetOrigin(selected.target, selected.allowLoopback);
       token = targetToken(selected.tokenFile!);
-      Object.assign(receipt, await preflightTarget(origin, token, selected.tenant, selected.expectedTargetRevision!));
+      Object.assign(receipt, await preflightTarget(origin, token, selected.tenant, selected.expectedTargetRevision!, cohort.records));
       if (selected.apply) {
         const approvedRaw = readOwnerOnly(selected.approvalReceipt!, "approved Kimi dry-run receipt", MAX_RECEIPT_BYTES);
         try {
           const approved = strictJson(approvedRaw);
           for (const key of [
             "workflow", "batch_sha256", "source_capture_sha256", "source_receipt_sha256",
-            "tenant_external_id", "target_origin", "target_revision",
+            "tenant_external_id", "target_origin", "target_revision", "target_existing_kimi_sha256",
           ]) if (approved[key] !== receipt[key]) fail();
           if (approved.mode !== "dry-run" || approved.outcome !== "verified"
             || approved.target_capabilities_verified !== true || approved.source_account_count !== 2
             || approved.route_write_count !== 0 || approved.permission_write_count !== 0
             || approved.provider_request_count !== 0) fail();
         } finally { approvedRaw.fill(0); }
+        // Revalidate the complete sealed batch once, immediately before the
+        // first write. Every submitted object below is the already-validated
+        // in-memory projection, so no later deterministic source error can
+        // strand an avoidable one-account partial import.
+        if (inspectSealedKimiCohort(selected.sourceDirectory, selected.sourceIdentityKeyFile!).summary.batch_sha256
+          !== cohort.summary.batch_sha256) fail();
         for (const record of cohort.records) {
-          if (inspectSealedKimiCohort(selected.sourceDirectory, selected.sourceIdentityKeyFile!).summary.batch_sha256
-            !== cohort.summary.batch_sha256) fail();
           submitted += 1;
           receipt.submitted_count = submitted;
           const result = await requestJson("POST", `${origin}/internal/v1/imports/cpa/managed-oauth`, token, "native Kimi managed OAuth import", [200, 201], {
@@ -460,16 +535,21 @@ export async function run(argv = process.argv.slice(2)): Promise<JsonObject> {
             tenant_external_id: selected.tenant,
             source: { kind: "auth_file", relative_path: record.relativePath },
             source_type: "kimi",
+            source_identity_hash: record.sourceStableId,
+            source_document_sha256: record.targetDocumentSha256,
             document: record.document,
           });
           const response = object(result.value);
-          const account = validateTargetAccount(response.account, selected.tenant);
+          const account = validateKimiTargetAccount(
+            validateTargetAccount(response.account, selected.tenant),
+            record,
+          );
           const expectedDisposition = result.status === 201 ? "created" : "replayed";
-          if (response.disposition !== expectedDisposition || account.driver !== "kimi-oauth"
-            || account.status !== "active" || /cpa|bridge/iu.test(String(account.name))) fail();
+          if (response.disposition !== expectedDisposition) fail();
           bindings.push({
             source_stable_id: record.sourceStableId,
             source_document_sha256: record.documentSha256,
+            target_document_sha256: record.targetDocumentSha256,
             upstream_account_id: account.id,
             account_name: account.name,
             driver: account.driver,
@@ -480,6 +560,10 @@ export async function run(argv = process.argv.slice(2)): Promise<JsonObject> {
         }
         if (inspectSealedKimiCohort(selected.sourceDirectory, selected.sourceIdentityKeyFile!).summary.batch_sha256
           !== cohort.summary.batch_sha256) fail();
+        const finalCohort = await targetCohort(origin, token, selected.tenant, cohort.records);
+        if (finalCohort.evidence.length !== EXPECTED_SOURCE_ACCOUNTS) fail();
+        receipt.target_final_kimi_account_count = finalCohort.evidence.length;
+        receipt.target_final_kimi_sha256 = finalCohort.digest;
       }
     }
     receipt.outcome = "verified";

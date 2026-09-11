@@ -3,25 +3,31 @@
 `native-kimi-import` migrates the exact reviewed two-account Kimi OAuth cohort
 from an owner-only `collect-cpa-source-snapshot` directory. It excludes inactive
 backup revisions, verifies the capture receipt and every source digest, rejects
-disabled or duplicate asserted identities, and never prints source paths,
-claims, device identifiers, or tokens.
+disabled, expired/near-expiry, duplicate-identity, or target-incompatible-path
+records, and never prints source paths, claims, device identifiers, or tokens.
 
 The default mode is offline and read-only. Supplying a target performs only
 bounded control-plane GET requests for `/version`, managed-OAuth capabilities,
 provider types, and the redacted upstream-account list. It does not invoke
 provider health, model catalog, quota, token refresh, or any Kimi endpoint.
 The target revision must match the explicitly reviewed 40-character release
-revision.
+revision. Its capability document must attest the neutral server-keyed Kimi
+account-name policy and the operator-HMAC source-identity contract; older fixed
+account-name implementations fail closed.
 
 The protected dry-run receipt contains source and batch hashes, HMAC-based
 source/identity deduplication evidence, eight deferred route plans, and target
-capability evidence. Route plans retain both OpenAI and Anthropic coverage as a
+capability evidence. Existing Kimi accounts are accepted only when their stored
+source-identity/document hashes, generation, configuration, active status, zero
+route count, and neutral names are an exact subset of the sealed two-account
+cohort. Route plans retain both OpenAI and Anthropic coverage as a
 review requirement; this command deliberately creates no routes, grants, keys,
 prices, catalog observations, or reservation bounds.
 
 Apply additionally requires `--apply`, `--expected-count 2`, and the exact
-successful target-bound dry-run receipt. Before every submission and after the
-batch it reopens and revalidates the sealed source. It calls only the global
+successful target-bound dry-run receipt. Immediately before the first submission
+and after the batch it reopens and revalidates the complete sealed source. It
+calls only the global
 `imports:cpa:write` managed-OAuth endpoint. MTC derives server-keyed source
 identities for replay, stores credentials in its encrypted generation envelope,
 and returns sanitized account bindings. The expected Kimi release uses neutral,
@@ -54,11 +60,18 @@ native-kimi-import \
   --apply
 ```
 
+Each import carries the protected operator-HMAC source identity and the canonical
+projected target-document digest. The sealed receipt retains both that digest and
+the raw source-document digest. The target persists the former pair as non-secret
+replay provenance and
+returns them in its redacted inventory/account views. An interrupted apply can
+therefore be resumed only after producing and approving a fresh dry-run receipt;
+an unrelated or drifted Kimi account fails closed before any new POST.
+
 Any failure after the sealed source and protected output are admitted produces
 a protected terminal receipt. Source/admission failures create no artifact.
-`partial-stop-no-retry` and
-`uncertain-stop-no-retry` are hard stops: inspect target source-key provenance;
-never rerun automatically. Import may make expired active credentials eligible
-for the separately deployed worker refresh loop, so production apply also
-requires an operator-reviewed refresh/activation window. This repository does
-not perform that rollout.
+Partial and uncertain receipts are hard stops for automatic retry: inspect target
+provenance, run a new target-bound dry-run, approve that new receipt, and then
+replay the same sealed batch. Credentials must retain at least ten minutes of
+access-token validity during every full-batch source inspection, so import cannot
+activate the separately deployed worker refresh loop or contact Kimi.

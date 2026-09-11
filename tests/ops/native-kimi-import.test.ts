@@ -14,6 +14,13 @@ const roots: string[] = [];
 function sha256(value: Buffer | string): string {
   return createHash("sha256").update(value).digest("hex");
 }
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  const entry = value as Record<string, unknown>;
+  return `{${Object.keys(entry).sort().map((key) =>
+    `${JSON.stringify(key)}:${canonicalJson(entry[key])}`).join(",")}}`;
+}
 function writePrivate(path: string, value: string | Buffer): void {
   writeFileSync(path, value, { mode: 0o600 });
   chmodSync(path, 0o600);
@@ -44,7 +51,7 @@ function policies(): Record<string, unknown> {
   return { version: 1, policies: entries, usage: {} };
 }
 type Fixture = { root: string; identityKey: string; secrets: string[]; devices: string[]; subjects: string[] };
-function fixture(options: { duplicateIdentity?: boolean; disabled?: boolean } = {}): Fixture {
+function fixture(options: { duplicateIdentity?: boolean; disabled?: boolean; expired?: boolean; unsafePath?: boolean } = {}): Fixture {
   const parent = mkdtempSync(join(tmpdir(), "mtc-native-kimi-"));
   roots.push(parent);
   chmodSync(parent, 0o700);
@@ -55,13 +62,13 @@ function fixture(options: { duplicateIdentity?: boolean; disabled?: boolean } = 
   const policy = Buffer.from(`${JSON.stringify(policies())}\n`);
   writePrivate(join(root, "config.yaml"), config);
   writePrivate(join(root, "native-key-policy.json"), policy);
-  const exp = 4_070_908_800;
+  const exp = options.expired ? 1_600_000_000 : 4_070_908_800;
   const subjects = ["fixture-user-one", options.duplicateIdentity ? "fixture-user-one" : "fixture-user-two"];
   const devices = ["fixture-device-one", "fixture-device-two"];
   const secrets = ["fixture-access-secret-one", "fixture-refresh-secret-one", "fixture-access-secret-two", "fixture-refresh-secret-two"];
   const payloads: Array<{ path: string; sha256: string }> = [];
   for (let index = 0; index < 2; index += 1) {
-    const path = `kimi-${index + 1}.json`;
+    const path = options.unsafePath && index === 1 ? "kimi\\unsafe.json" : `kimi-${index + 1}.json`;
     const document = {
       type: "kimi",
       access_token: jwt(subjects[index]!, devices[index]!, exp),
@@ -131,7 +138,9 @@ describe("native Kimi sealed cohort", () => {
   });
 
   it("rejects disabled, duplicate, changed, and backup-like source cohorts before target access", () => {
-    for (const options of [{ disabled: true }, { duplicateIdentity: true }]) {
+    for (const options of [
+      { disabled: true }, { duplicateIdentity: true }, { expired: true }, { unsafePath: true },
+    ]) {
       const source = fixture(options);
       assert.throws(() => inspectSealedKimiCohort(source.root, source.identityKey), NativeKimiImportFailure);
     }
@@ -148,13 +157,19 @@ describe("native Kimi target preflight and apply gate", () => {
   it("uses only reviewed control endpoints and binds apply to the dry-run receipt", async () => {
     const source = fixture(), requests: Array<{ method?: string; url?: string }> = [];
     let imported = 0;
+    const accounts: Array<Record<string, unknown>> = [];
     const server = createServer((request: IncomingMessage, response: ServerResponse) => {
       requests.push({ method: request.method, url: request.url });
       response.setHeader("content-type", "application/json");
       if (request.method === "GET" && request.url === "/version") response.end(JSON.stringify({ service: "memeloop-token-center", revision: REVISION }));
-      else if (request.method === "GET" && request.url === "/internal/v1/imports/cpa/managed-oauth/capabilities") response.end(JSON.stringify({ contract_version: 1, source_types: ["codex", "kimi"] }));
+      else if (request.method === "GET" && request.url === "/internal/v1/imports/cpa/managed-oauth/capabilities") response.end(JSON.stringify({
+        contract_version: 1,
+        source_types: ["codex", "kimi"],
+        account_name_policies: { kimi: "neutral-server-keyed-source-suffix-v1" },
+        source_identity_contract: "operator-hmac-sha256-v1",
+      }));
       else if (request.method === "GET" && request.url === "/internal/v1/provider-types") response.end(JSON.stringify([{ id: "kimi-oauth" }]));
-      else if (request.method === "GET" && request.url === "/internal/v1/upstreams?tenant_external_id=default&limit=100") response.end("[]");
+      else if (request.method === "GET" && request.url === "/internal/v1/upstreams?tenant_external_id=default&limit=100") response.end(JSON.stringify(accounts));
       else if (request.method === "POST" && request.url === "/internal/v1/imports/cpa/managed-oauth") {
         let raw = "";
         request.setEncoding("utf8");
@@ -163,17 +178,40 @@ describe("native Kimi target preflight and apply gate", () => {
           const body = JSON.parse(raw) as Record<string, unknown>;
           assert.equal(body.source_type, "kimi");
           assert.equal(body.tenant_external_id, "default");
+          assert.match(String(body.source_identity_hash), /^[0-9a-f]{64}$/u);
+          assert.match(String(body.source_document_sha256), /^[0-9a-f]{64}$/u);
+          assert.equal("timestamp" in (body.document as Record<string, unknown>), false);
+          assert.equal(body.source_document_sha256, sha256(canonicalJson(body.document)));
+          const existing = accounts.find((account) =>
+            account.import_source_identity_hash === body.source_identity_hash);
+          if (existing) {
+            response.statusCode = 200;
+            response.end(JSON.stringify({ disposition: "replayed", account: existing }));
+            return;
+          }
           imported += 1;
+          const account = {
+            id: `10000000-0000-4000-8000-00000000000${imported}`,
+            tenant_external_id: "default",
+            name: `Kimi account ${String(body.source_identity_hash).slice(0, 12)}`,
+            driver: "kimi-oauth",
+            auth_kind: "oauth",
+            status: "active",
+            credential_generation: 1,
+            route_count: 0,
+            config: {
+              base_url: "https://api.kimi.com/coding",
+              network_scope: "public",
+              reservation_token_bounds: {},
+            },
+            import_source_identity_hash: body.source_identity_hash,
+            import_source_document_sha256: body.source_document_sha256,
+          };
+          accounts.push(account);
           response.statusCode = 201;
           response.end(JSON.stringify({
             disposition: "created",
-            account: {
-              id: `10000000-0000-4000-8000-00000000000${imported}`,
-              tenant_external_id: "default",
-              name: `Kimi account ${String(imported).repeat(12)}`,
-              driver: "kimi-oauth",
-              status: "active",
-            },
+            account,
           }));
         });
       } else { response.statusCode = 404; response.end("{}"); }
@@ -221,6 +259,41 @@ describe("native Kimi target preflight and apply gate", () => {
       assert.equal(appliedValue.route_write_count, 0);
       assert.equal(appliedValue.permission_write_count, 0);
       assert.equal(appliedValue.provider_request_count, 0);
+      assert.equal(appliedValue.target_final_kimi_account_count, 2);
+
+      // A fresh reviewed dry-run can safely resume an exact one-account subset;
+      // the already imported source replays and only the absent source is made.
+      accounts.pop();
+      const resumeDryRun = join(receiptDirectory, "resume-dry-run.json");
+      await run([
+        "--source-directory", source.root,
+        "--source-identity-key-file", source.identityKey,
+        "--receipt", resumeDryRun,
+        "--target-api-base-url", origin,
+        "--service-token-file", tokenFile,
+        "--tenant", "default",
+        "--expected-target-revision", REVISION,
+        "--allow-http-loopback",
+      ]);
+      const resumeDryValue = JSON.parse(readFileSync(resumeDryRun, "utf8")) as Record<string, unknown>;
+      assert.equal(resumeDryValue.target_existing_kimi_account_count, 1);
+      const resumeApply = join(receiptDirectory, "resume-apply.json");
+      const resumed = await run([
+        "--source-directory", source.root,
+        "--source-identity-key-file", source.identityKey,
+        "--receipt", resumeApply,
+        "--target-api-base-url", origin,
+        "--service-token-file", tokenFile,
+        "--tenant", "default",
+        "--expected-target-revision", REVISION,
+        "--approved-dry-run-receipt", resumeDryRun,
+        "--expected-count", "2",
+        "--apply",
+        "--allow-http-loopback",
+      ]);
+      assert.equal(resumed.import_count, 2);
+      assert.equal(accounts.length, 2);
+      assert.equal(imported, 3);
       assert.deepEqual(new Set(requests.map((entry) => entry.url)), new Set([
         "/version",
         "/internal/v1/imports/cpa/managed-oauth/capabilities",
@@ -228,6 +301,7 @@ describe("native Kimi target preflight and apply gate", () => {
         "/internal/v1/upstreams?tenant_external_id=default&limit=100",
         "/internal/v1/imports/cpa/managed-oauth",
       ]));
+      assert.equal(requests.every((entry) => entry.method === "GET" || entry.method === "POST"), true);
       assert.equal(requests.some((entry) => /models|health|quota|auth\.kimi/u.test(entry.url ?? "")), false);
     } finally {
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
