@@ -60,7 +60,7 @@ for (const path of walk(root)) {
     if (pattern.test(body)) violations.push(`${repositoryPath}: possible ${label}`);
   }
   for (const match of body.matchAll(emailPattern)) {
-    const domain = match[1]?.toLowerCase().replace(/\.json$/u, "");
+    const domain = match[1]?.toLowerCase().replace(/(?:-secondary)?\.json$/u, "");
     if (domain !== "example.test") {
       violations.push(`${repositoryPath}: non-fixture email address`);
       break;

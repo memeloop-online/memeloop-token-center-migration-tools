@@ -86,7 +86,7 @@ describe("managed CPA Codex OAuth route parser", () => {
     const missing = snapshot.filter((item) => item.auth_id !== alpha);
     assert.throws(() => inspectManagedCodexRouteModels(config, auths, missing, [alphaCoordinate], key), ManagedCodexRouteFailure);
     const secondAlpha = {
-      relative_path: "alpha-account-secondary@example.test.json",
+      relative_path: "alpha-account@example.test-secondary.json",
       document: { type: "codex", prefix: "codex-alpha", refresh_token: "fixture", model_aliases: [{ name: "different-upstream", alias: "gpt-5.6-terra" }] },
     } as const;
     const conflictingSnapshot = [...snapshot, { auth_id: secondAlpha.relative_path, provider: "codex" as const, registered_models: ["codex-alpha/gpt-5.6-terra", "different-upstream"] }];
