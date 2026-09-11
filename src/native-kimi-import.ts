@@ -582,8 +582,8 @@ export async function run(argv = process.argv.slice(2)): Promise<JsonObject> {
       receipt_sha256: sha256(`${JSON.stringify(receipt)}\n`),
     };
   } catch {
-    receipt.outcome = submitted > imported ? "uncertain-stop-no-retry"
-      : imported > 0 ? "partial-stop-no-retry" : "failed";
+    receipt.outcome = submitted > imported ? "uncertain-stop-review-required"
+      : imported > 0 ? "partial-stop-review-required" : "failed";
     const encoded = Buffer.from(`${JSON.stringify(receipt)}\n`);
     try { writeBindingReceipt(output, encoded); }
     finally { encoded.fill(0); }
