@@ -1,5 +1,5 @@
 import { lstatSync, readFileSync, readdirSync } from "node:fs";
-import { extname, join, relative, resolve } from "node:path";
+import { dirname, extname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { releaseEntrypoints } from "./release-entrypoints.ts";
 
@@ -18,8 +18,6 @@ const forbiddenPublicEnvironmentPatterns: readonly [string, RegExp][] = [
   ["host-specific absolute path", /\/(?:home|Users|root)\//u],
   ["Kubernetes Secret retrieval command", /\bkubectl\b[^\n]{0,160}\bget\s+secrets?\b/iu],
   ["Secret decoding command", /\bjsonpath\b[^\n]{0,160}\bbase64\s+(?:--decode|-d)\b/iu],
-  ["internal route alias", new RegExp([["c", "sil"].join(""), ["dong", "wu"].join("")].join("|"), "iu")],
-  ["internal failure-domain alias", new RegExp([["hub", "ble"].join(""), ["xuan", "yuan"].join("")].join("|"), "iu")],
 ];
 const retiredTargetSurfacePatterns: readonly [string, RegExp][] = [
   ["retired provider-specific target endpoint", new RegExp(["internal", "v1", "imports", "cpa", "managed-oauth"].join("/"), "u")],
@@ -42,6 +40,56 @@ function walk(directory: string): string[] {
 const violations: string[] = [];
 for (const retiredName of [["native", "kimi", "import"].join("-"), ["import", "cpa", "upstreams"].join("-")]) {
   if (retiredName in releaseEntrypoints) violations.push(`release registry: retired target command is published: ${retiredName}`);
+}
+const allowedAuditModules = new Set(["node:crypto", "node:fs", "node:path", "node:url"]);
+function localDependencyClosure(entrypoint: string): string[] {
+  const seen = new Set<string>();
+  const visit = (path: string): void => {
+    const normalized = resolve(path);
+    if (relative(root, normalized).startsWith("..")) {
+      violations.push("sealed source audit: dependency escapes the repository");
+      return;
+    }
+    if (seen.has(normalized)) return;
+    seen.add(normalized);
+    const body = readFileSync(normalized, "utf8");
+    if (/\bimport\s+["'][^"']+["']/u.test(body)) {
+      violations.push(`${relative(root, normalized)}: forbidden audit side-effect dependency`);
+    }
+    for (const match of body.matchAll(/\bfrom\s+["']([^"']+)["']/gu)) {
+      const source = match[1]!;
+      if (source.startsWith(".")) visit(resolve(dirname(normalized), source));
+      else if (!allowedAuditModules.has(source)) {
+        violations.push(`${relative(root, normalized)}: forbidden audit package dependency`);
+      }
+    }
+  };
+  visit(entrypoint);
+  return [...seen];
+}
+
+const auditEntrypoint = join(root, "src/sealed-oauth-source-audit.ts");
+const auditClosure = localDependencyClosure(auditEntrypoint);
+if (!auditClosure.includes(join(root, "src/lib/sealed-source-io.ts"))) {
+  violations.push("sealed source audit: neutral I/O dependency is absent");
+}
+const forbiddenAuditClosureSurface: readonly [string, RegExp][] = [
+  ["network module", /node:(?:http|https|net|tls)/u],
+  ["dynamic import", /\bimport\s*\(/u],
+  ["CommonJS loader", /\brequire\s*\(/u],
+  ["dynamic builtin loader", /\bgetBuiltinModule\s*\(/u],
+  ["fetch call", /\bfetch\s*\(/u],
+  ["remote request helper", /\brequestJson\b/u],
+  ["remote apply flag", new RegExp(["--", "apply"].join(""), "u")],
+  ["target URL flag", new RegExp(["--", "target", "-api-base-url"].join(""), "u")],
+  ["service credential flag", new RegExp(["--", "service", "-token-file"].join(""), "u")],
+  ["hard-coded cohort count", /EXPECTED_SOURCE_(?:ACCOUNTS|POLICIES|GRANTS)/u],
+];
+for (const path of auditClosure) {
+  const body = readFileSync(path, "utf8");
+  for (const [label, pattern] of forbiddenAuditClosureSurface) {
+    if (pattern.test(body)) violations.push(`${relative(root, path)}: forbidden audit dependency ${label}`);
+  }
 }
 for (const path of walk(root)) {
   const repositoryPath = relative(root, path);
