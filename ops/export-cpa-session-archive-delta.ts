@@ -60,6 +60,7 @@ const COLLECTOR_PATHS = {
   export: "/v1/export-tickets",
   stats: "/v1/stats",
 } as const;
+const COLLECTOR_READY_PATH = "/readyz";
 
 /**
  * One canonical payload copy is sufficient for de-duplication, per-session
@@ -332,11 +333,37 @@ export function unwrapJson(value: unknown): unknown {
 }
 
 type HttpResponse = { status: number; headers: IncomingMessage["headers"]; response: IncomingMessage };
+type CollectorRequestStage = "readyz" | "stats" | "sessions" | "export-ticket" | "archive-download";
+export type CollectorReadinessDriver = {
+  now: () => number;
+  wait: (milliseconds: number) => Promise<void>;
+  probe: (timeoutMilliseconds: number) => Promise<{ status: number; drain: () => void }>;
+};
+
+export function classifyTransportFailure(error: unknown): string {
+  const code = isObject(error) && typeof error.code === "string" ? error.code.toUpperCase() : "";
+  if (["ETIMEDOUT", "ESOCKETTIMEDOUT"].includes(code)) return "timeout";
+  if (["ENOTFOUND", "EAI_AGAIN", "EAI_FAIL"].includes(code)) return "dns";
+  if (["ECONNREFUSED", "ENETUNREACH", "EHOSTUNREACH"].includes(code)) return "connect";
+  if (["ECONNRESET", "EPIPE"].includes(code)) return "reset";
+  if (code.startsWith("ERR_TLS_") || code.includes("CERT")) return "tls";
+  if (code === "ABORT_ERR") return "cancelled";
+  return "unknown";
+}
+
+export function collectorTransportDiagnostic(stage: CollectorRequestStage, error: unknown): string {
+  return `collector request failed (stage=${stage},cause=${classifyTransportFailure(error)})`;
+}
+
+function requestTimeoutError(): Error & { code: string } {
+  return Object.assign(new Error("request timed out"), { code: "ETIMEDOUT" });
+}
+
 function request(url: URL, headers: Record<string, string>, timeoutMs: number, tls?: TlsFiles): Promise<HttpResponse> {
   return new Promise((resolve, reject) => {
     const options: RequestOptions = { method: "GET", headers, timeout: timeoutMs, agent: false, cert: tls?.cert, key: tls?.key };
     const operation = (url.protocol === "https:" ? httpsRequest : httpRequest)(url, options, (response) => resolve({ status: response.statusCode ?? 0, headers: response.headers, response }));
-    operation.once("timeout", () => operation.destroy(new Error("timeout")));
+    operation.once("timeout", () => operation.destroy(requestTimeoutError()));
     operation.once("error", reject);
     operation.end();
   });
@@ -417,6 +444,45 @@ export class SourceClient {
     if (milliseconds <= 0) throw new DeltaError("source export exceeded the configured elapsed-time limit");
     await delay(milliseconds);
   }
+  private stage(path: string): CollectorRequestStage {
+    if (path === this.paths.stats) return "stats";
+    if (path === this.paths.sessions) return "sessions";
+    return "export-ticket";
+  }
+  async waitUntilReady(timeoutSeconds: number, intervalMilliseconds: number, injected?: CollectorReadinessDriver): Promise<void> {
+    if (!this.collectorDirect) throw new DeltaError("collector readiness preflight requires collector-direct mode");
+    const driver: CollectorReadinessDriver = injected ?? {
+      now: () => performance.now(),
+      wait: delay,
+      probe: async (timeoutMilliseconds) => {
+        const result = await request(new URL(this.base + COLLECTOR_READY_PATH), { Accept: "text/plain", "User-Agent": "memeloop-token-center-delta-export/1" }, timeoutMilliseconds, this.tls);
+        return { status: result.status, drain: () => result.response.resume() };
+      },
+    };
+    const configuredDeadline = driver.now() + timeoutSeconds * 1000;
+    const deadline = this.deadline === undefined ? configuredDeadline : Math.min(configuredDeadline, this.deadline);
+    const limit = this.deadline !== undefined && this.deadline <= configuredDeadline ? "overall" : "readiness";
+    let lastCause = "not_ready";
+    while (driver.now() < deadline) {
+      let result: { status: number; drain: () => void };
+      try {
+        result = await driver.probe(Math.min(this.timeoutSeconds * 1000, deadline - driver.now()));
+      } catch (error) {
+        lastCause = classifyTransportFailure(error);
+        if (!["timeout", "dns", "connect", "reset"].includes(lastCause)) throw new DeltaError(collectorTransportDiagnostic("readyz", error));
+        if (driver.now() >= deadline) break;
+        await driver.wait(Math.min(intervalMilliseconds, Math.max(1, deadline - driver.now())));
+        continue;
+      }
+      result.drain();
+      if (result.status === 200) return;
+      lastCause = `http_${result.status}`;
+      if (![429, 503].includes(result.status)) throw new DeltaError(`collector request failed (stage=readyz,cause=${lastCause})`);
+      if (driver.now() >= deadline) break;
+      await driver.wait(Math.min(intervalMilliseconds, Math.max(1, deadline - driver.now())));
+    }
+    throw new DeltaError(`collector request failed (stage=readyz,cause=${lastCause},limit=${limit})`);
+  }
   private async managementJson(path: string, query: Record<string, string>): Promise<unknown> {
     const url = new URL(this.base + path);
     for (const [key, value] of Object.entries(query)) url.searchParams.set(key, value);
@@ -426,11 +492,27 @@ export class SourceClient {
     while (true) {
       let result: HttpResponse;
       try { result = await request(url, headers, this.timeout(), this.tls); }
-      catch { throw new DeltaError("source management request failed"); }
+      catch (error) {
+        if (error instanceof DeltaError) {
+          if (this.collectorDirect && error.message === "source export exceeded the configured elapsed-time limit") throw new DeltaError(`collector request failed (stage=${this.stage(path)},cause=overall_timeout)`);
+          throw error;
+        }
+        if (this.collectorDirect) throw new DeltaError(collectorTransportDiagnostic(this.stage(path), error));
+        throw new DeltaError("source management request failed");
+      }
       if (result.status === 200) {
-        const payload = await readBounded(result.response, MAX_MANAGEMENT_RESPONSE_BYTES);
+        let payload: Buffer;
+        try { payload = await readBounded(result.response, MAX_MANAGEMENT_RESPONSE_BYTES); }
+        catch (error) {
+          if (this.collectorDirect) throw new DeltaError(`collector request failed (stage=${this.stage(path)},cause=${error instanceof DeltaError ? "response_too_large" : classifyTransportFailure(error)})`);
+          throw error;
+        }
         try { return unwrapJson(parseStrictJson(payload.toString("utf8"))); }
-        catch (error) { if (error instanceof DeltaError) throw error; throw new DeltaError("source management response is not valid JSON"); }
+        catch (error) {
+          if (this.collectorDirect) throw new DeltaError(`collector request failed (stage=${this.stage(path)},cause=invalid_json)`);
+          if (error instanceof DeltaError) throw error;
+          throw new DeltaError("source management response is not valid JSON");
+        }
       }
       result.response.resume();
       if (result.status === 410) throw new SnapshotExpired();
@@ -439,6 +521,7 @@ export class SourceClient {
         await this.waitForRetry(attempt, Array.isArray(result.headers["retry-after"]) ? result.headers["retry-after"]?.[0] : result.headers["retry-after"]);
         attempt += 1; continue;
       }
+      if (this.collectorDirect) throw new DeltaError(`collector request failed (stage=${this.stage(path)},cause=http_${result.status})`);
       throw new SourceHTTPError(result.status);
     }
   }
@@ -569,11 +652,19 @@ export class SourceClient {
       const ticket = await this.ticketUrl(sessionId, snapshot, recordsSha256);
       let result: HttpResponse;
       try { result = await request(ticket, { Accept: "application/x-ndjson", "User-Agent": "memeloop-token-center-delta-export/1" }, this.timeout(), this.tls); }
-      catch { throw new DeltaError("source archive export failed"); }
+      catch (error) {
+        if (error instanceof DeltaError) {
+          if (this.collectorDirect && error.message === "source export exceeded the configured elapsed-time limit") throw new DeltaError("collector request failed (stage=archive-download,cause=overall_timeout)");
+          throw error;
+        }
+        if (this.collectorDirect) throw new DeltaError(collectorTransportDiagnostic("archive-download", error));
+        throw new DeltaError("source archive export failed");
+      }
       if (result.status === 200) { response = result.response; break; }
       result.response.resume();
       if (this.collectorDirect && snapshot !== undefined && result.status === 404 && attempt < this.maxRetries) { await this.waitForRetry(attempt); continue; }
       if (this.collectorDirect && snapshot !== undefined && result.status === 404) throw new SnapshotExpired();
+      if (this.collectorDirect) throw new DeltaError(`collector request failed (stage=archive-download,cause=http_${result.status})`);
       throw new DeltaError(`source archive export returned HTTP ${result.status}`);
     }
     if (response === undefined) throw new DeltaError("source archive export failed");
@@ -592,7 +683,11 @@ export class SourceClient {
         if (buffered.length > maximum) throw new DeltaError("source archive record exceeds the configured line limit");
       }
       if (buffered.length > 0 && buffered.toString("utf8").trim()) yield buffered;
-    } catch (error) { if (error instanceof DeltaError) throw error; throw new DeltaError("source archive export stream failed"); }
+    } catch (error) {
+      if (error instanceof DeltaError) throw error;
+      if (this.collectorDirect) throw new DeltaError(collectorTransportDiagnostic("archive-download", error));
+      throw new DeltaError("source archive export stream failed");
+    }
   }
 }
 
@@ -716,13 +811,13 @@ type Arguments = {
   baseUrl: string; downloadBaseUrl?: string; tokenFile?: string; tokenEnv?: string; checkpoint: string; output: string;
   collectorDirect: boolean; offlineFull: boolean; privateHttpHosts: string[]; clientCertFile?: string; clientKeyFile?: string; since?: string;
   overlapSeconds: number; sessionLimit: number; maxLineBytes: number; maxDownloadBytes: number; maxOutputBytes: number; timeoutSeconds: number;
-  maxElapsedSeconds: number; maxRetries: number; retryBaseSeconds: number; maxFutureSkewSeconds: number; requireStableSource: boolean; allowHttp: boolean; resume: boolean; deadline: number;
+  maxElapsedSeconds: number; readinessTimeoutSeconds: number; readinessPollMilliseconds: number; maxRetries: number; retryBaseSeconds: number;
+  maxFutureSkewSeconds: number; requireStableSource: boolean; allowHttp: boolean; resume: boolean; deadline: number;
 };
 
 async function exportDelta(args: Arguments): Promise<JsonObject> {
   const token = args.collectorDirect ? undefined : args.tokenFile !== undefined ? loadToken(args.tokenFile) : loadTokenEnv(args.tokenEnv!);
   const hosts = new Set(args.privateHttpHosts.map(normalizeHost));
-  if (!args.allowHttp) for (const host of hosts) if (!await verifyPrivateHost(host, hosts)) throw new DeltaError("private HTTP host allowlist did not resolve exclusively to private addresses");
   let tls: TlsFiles | undefined;
   if (args.clientCertFile !== undefined && args.clientKeyFile !== undefined) {
     const certificate = lstatSync(args.clientCertFile); if (certificate.isSymbolicLink() || !certificate.isFile()) throw new DeltaError("mTLS certificate must be a regular non-symlink file");
@@ -739,10 +834,14 @@ async function exportDelta(args: Arguments): Promise<JsonObject> {
   let prior: Time, priorFence: string | undefined, sequence: number;
   if (checkpoint === undefined) { if (args.since === undefined) throw new DeltaError("--since is required before the first checkpoint"); prior = parseTime(args.since, "initial since watermark"); sequence = 1; }
   else { if (args.since !== undefined) throw new DeltaError("--since cannot replace an existing checkpoint"); prior = parseTime(checkpoint.watermark_completed_at, "checkpoint watermark"); priorFence = checkpoint.source_ingest_fence === null ? undefined : checkpoint.source_ingest_fence as string | undefined; sequence = (checkpoint.sequence as number) + 1; }
-  if (args.collectorDirect && priorFence === undefined) { if (!args.offlineFull) throw new DeltaError("the first collector-direct snapshot requires --offline-full"); await client.verifyOfflineFull(); }
+  const initialCollectorSnapshot = args.collectorDirect && priorFence === undefined;
+  if (initialCollectorSnapshot) { if (!args.offlineFull) throw new DeltaError("the first collector-direct snapshot requires --offline-full"); }
   else if (args.offlineFull) throw new DeltaError("--offline-full is only valid for the first collector-direct snapshot");
   const lower = addSeconds(prior, -args.overlapSeconds); const observed: Time = { nanos: BigInt(Date.now()) * 1_000_000n }; const maximum = addSeconds(observed, args.maxFutureSkewSeconds);
   if (compareTime(prior, maximum) > 0) throw new DeltaError("source checkpoint timestamp exceeds the future-skew limit");
+  if (!args.allowHttp) for (const host of hosts) if (!await verifyPrivateHost(host, hosts)) throw new DeltaError("private HTTP host allowlist did not resolve exclusively to private addresses");
+  if (args.collectorDirect) await client.waitUntilReady(args.readinessTimeoutSeconds, args.readinessPollMilliseconds);
+  if (initialCollectorSnapshot) await client.verifyOfflineFull();
   const before = await client.statsRecords();
   if (checkpoint !== undefined && before < (checkpoint.last_source_records as number)) throw new DeltaError("source record count moved backwards since the checkpoint");
   const first = await loadProjection(client, lower, args.sessionLimit, before, undefined, priorFence); verifyClock(first.sessions, maximum); const firstDigest = selectionDigest(first.sessions);
@@ -843,13 +942,15 @@ function parseCli(argv: string[]): Arguments {
   const { values } = parseArgs({ args: argv, strict: true, allowPositionals: false, options: {
     "base-url": { type: "string" }, "download-base-url": { type: "string" }, "token-file": { type: "string" }, "token-env": { type: "string" }, checkpoint: { type: "string" }, output: { type: "string" },
     "collector-direct": { type: "boolean", default: false }, "offline-full": { type: "boolean", default: false }, "private-http-host": { type: "string", multiple: true, default: [] }, "client-cert-file": { type: "string" }, "client-key-file": { type: "string" }, since: { type: "string" },
-    "overlap-seconds": { type: "string" }, "session-limit": { type: "string" }, "max-line-bytes": { type: "string" }, "max-download-bytes": { type: "string" }, "max-output-bytes": { type: "string" }, "timeout-seconds": { type: "string" }, "max-elapsed-seconds": { type: "string" }, "max-retries": { type: "string" }, "retry-base-seconds": { type: "string" }, "max-future-skew-seconds": { type: "string" },
+    "overlap-seconds": { type: "string" }, "session-limit": { type: "string" }, "max-line-bytes": { type: "string" }, "max-download-bytes": { type: "string" }, "max-output-bytes": { type: "string" }, "timeout-seconds": { type: "string" }, "max-elapsed-seconds": { type: "string" },
+    "readiness-timeout-seconds": { type: "string" }, "readiness-poll-milliseconds": { type: "string" }, "max-retries": { type: "string" }, "retry-base-seconds": { type: "string" }, "max-future-skew-seconds": { type: "string" },
     "require-stable-source": { type: "boolean", default: false }, "allow-http": { type: "boolean", default: false }, resume: { type: "boolean", default: false },
   } });
   if (typeof values["base-url"] !== "string" || typeof values.checkpoint !== "string" || typeof values.output !== "string") throw new DeltaError("--base-url, --checkpoint, and --output are required");
   const args: Arguments = { baseUrl: values["base-url"], downloadBaseUrl: values["download-base-url"], tokenFile: values["token-file"], tokenEnv: values["token-env"], checkpoint: values.checkpoint, output: values.output,
     collectorDirect: values["collector-direct"]!, offlineFull: values["offline-full"]!, privateHttpHosts: values["private-http-host"]!, clientCertFile: values["client-cert-file"], clientKeyFile: values["client-key-file"], since: values.since,
-    overlapSeconds: numberOption(values, "overlap-seconds", 86_400), sessionLimit: numberOption(values, "session-limit", 1000), maxLineBytes: numberOption(values, "max-line-bytes", 16 * 1024 * 1024), maxDownloadBytes: numberOption(values, "max-download-bytes", 64 * 1024 ** 3), maxOutputBytes: numberOption(values, "max-output-bytes", 64 * 1024 ** 3), timeoutSeconds: numberOption(values, "timeout-seconds", 60), maxElapsedSeconds: numberOption(values, "max-elapsed-seconds", 6 * 3600), maxRetries: numberOption(values, "max-retries", 5), retryBaseSeconds: numberOption(values, "retry-base-seconds", 0.5), maxFutureSkewSeconds: numberOption(values, "max-future-skew-seconds", 3600), requireStableSource: values["require-stable-source"]!, allowHttp: values["allow-http"]!, resume: values.resume!, deadline: 0 };
+    overlapSeconds: numberOption(values, "overlap-seconds", 86_400), sessionLimit: numberOption(values, "session-limit", 1000), maxLineBytes: numberOption(values, "max-line-bytes", 16 * 1024 * 1024), maxDownloadBytes: numberOption(values, "max-download-bytes", 64 * 1024 ** 3), maxOutputBytes: numberOption(values, "max-output-bytes", 64 * 1024 ** 3), timeoutSeconds: numberOption(values, "timeout-seconds", 60), maxElapsedSeconds: numberOption(values, "max-elapsed-seconds", 6 * 3600),
+    readinessTimeoutSeconds: numberOption(values, "readiness-timeout-seconds", 900), readinessPollMilliseconds: numberOption(values, "readiness-poll-milliseconds", 1000), maxRetries: numberOption(values, "max-retries", 5), retryBaseSeconds: numberOption(values, "retry-base-seconds", 0.5), maxFutureSkewSeconds: numberOption(values, "max-future-skew-seconds", 3600), requireStableSource: values["require-stable-source"]!, allowHttp: values["allow-http"]!, resume: values.resume!, deadline: 0 };
   if (!Number.isInteger(args.overlapSeconds) || args.overlapSeconds < 1 || args.overlapSeconds > 31 * 86_400) throw new DeltaError("overlap seconds must be between one second and 31 days");
   if (!Number.isInteger(args.sessionLimit) || args.sessionLimit < 1 || args.sessionLimit > 1000) throw new DeltaError("session limit must be between 1 and 1000");
   if (!Number.isInteger(args.maxLineBytes) || args.maxLineBytes < 1024 || args.maxLineBytes > 16 * 1024 * 1024) throw new DeltaError("max line bytes must be between 1 KiB and 16 MiB");
@@ -857,6 +958,8 @@ function parseCli(argv: string[]): Arguments {
   if (!Number.isInteger(args.maxOutputBytes) || args.maxOutputBytes < args.maxLineBytes || args.maxOutputBytes > 1024 ** 4) throw new DeltaError("max output bytes must cover one line and be at most 1 TiB");
   if (args.timeoutSeconds <= 0 || args.timeoutSeconds > 3600) throw new DeltaError("timeout seconds must be between 0 and 3600");
   if (args.maxElapsedSeconds <= 0 || args.maxElapsedSeconds > 86_400) throw new DeltaError("max elapsed seconds must be between 0 and 86400");
+  if (args.readinessTimeoutSeconds <= 0 || args.readinessTimeoutSeconds > 86_400) throw new DeltaError("readiness timeout seconds must be between 0 and 86400");
+  if (!Number.isInteger(args.readinessPollMilliseconds) || args.readinessPollMilliseconds < 10 || args.readinessPollMilliseconds > 60_000) throw new DeltaError("readiness poll milliseconds must be between 10 and 60000");
   if (!Number.isInteger(args.maxRetries) || args.maxRetries < 0 || args.maxRetries > 20) throw new DeltaError("max retries must be between 0 and 20");
   if (args.retryBaseSeconds <= 0 || args.retryBaseSeconds > 30) throw new DeltaError("retry base seconds must be between 0 and 30");
   if (!Number.isInteger(args.maxFutureSkewSeconds) || args.maxFutureSkewSeconds < 0 || args.maxFutureSkewSeconds > 86_400) throw new DeltaError("max future skew seconds must be between 0 and 86400");
@@ -865,6 +968,7 @@ function parseCli(argv: string[]): Arguments {
   if (!args.collectorDirect && args.tokenFile === undefined && args.tokenEnv === undefined) throw new DeltaError("the legacy CPA plugin input requires --token-file or --token-env");
   if (args.tokenFile !== undefined && args.tokenEnv !== undefined) throw new DeltaError("--token-file and --token-env are mutually exclusive");
   if (args.collectorDirect && args.allowHttp) throw new DeltaError("collector-direct HTTP requires an exact --private-http-host allowlist");
+  if (!args.collectorDirect && (values["readiness-timeout-seconds"] !== undefined || values["readiness-poll-milliseconds"] !== undefined)) throw new DeltaError("readiness options require --collector-direct");
   if (args.allowHttp && args.privateHttpHosts.length > 0) throw new DeltaError("--allow-http and --private-http-host cannot be combined");
   if ((args.clientCertFile === undefined) !== (args.clientKeyFile === undefined)) throw new DeltaError("mTLS requires both --client-cert-file and --client-key-file");
   if (args.clientCertFile !== undefined && !args.collectorDirect) throw new DeltaError("mTLS client files are only valid with --collector-direct");
@@ -894,6 +998,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       "  --token-file FILE              read the legacy CPA token from a protected file\n" +
       "  --token-env NAME               read the legacy CPA token from the named environment variable\n" +
       "  --private-http-host HOST       allow one exact private HTTP collector host\n" +
+      "  --readiness-timeout-seconds N bound collector readiness within the overall elapsed limit\n" +
+      "  --readiness-poll-milliseconds N poll /readyz without starting archive reads early\n" +
       "  --client-cert-file FILE        mTLS client certificate for collector-direct\n" +
       "  --client-key-file FILE         mTLS client key for collector-direct\n" +
       "  --resume                       resume from the sealed checkpoint\n",
