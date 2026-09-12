@@ -57,7 +57,7 @@ export function readOwnerOnly(path: string, _label: string, limit: number): Buff
     return readBoundedDescriptor(descriptor, limit);
   } catch (error) {
     if (error instanceof SealedSourceIOFailure) throw error;
-    fail();
+    return fail();
   } finally {
     if (descriptor !== undefined) closeSync(descriptor);
   }
