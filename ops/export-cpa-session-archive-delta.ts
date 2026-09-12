@@ -334,6 +334,11 @@ export function unwrapJson(value: unknown): unknown {
 
 type HttpResponse = { status: number; headers: IncomingMessage["headers"]; response: IncomingMessage };
 type CollectorRequestStage = "readyz" | "stats" | "sessions" | "export-ticket" | "archive-download";
+export type CollectorReadinessDriver = {
+  now: () => number;
+  wait: (milliseconds: number) => Promise<void>;
+  probe: (timeoutMilliseconds: number) => Promise<{ status: number; drain: () => void }>;
+};
 
 export function classifyTransportFailure(error: unknown): string {
   const code = isObject(error) && typeof error.code === "string" ? error.code.toUpperCase() : "";
@@ -421,10 +426,9 @@ export class SourceClient {
     if (collectorDirect && tls === undefined && !privateHttpHosts.has(source.host)) throw new DeltaError("collector-direct requires a private host allowlist or mTLS");
   }
 
-  private timeout(stageDeadline?: number): number {
-    const deadline = this.deadline === undefined ? stageDeadline : stageDeadline === undefined ? this.deadline : Math.min(this.deadline, stageDeadline);
-    if (deadline === undefined) return this.timeoutSeconds * 1000;
-    const remaining = deadline - performance.now();
+  private timeout(): number {
+    if (this.deadline === undefined) return this.timeoutSeconds * 1000;
+    const remaining = this.deadline - performance.now();
     if (remaining <= 0) throw new DeltaError("source export exceeded the configured elapsed-time limit");
     return Math.min(this.timeoutSeconds * 1000, remaining);
   }
@@ -445,33 +449,37 @@ export class SourceClient {
     if (path === this.paths.sessions) return "sessions";
     return "export-ticket";
   }
-  async waitUntilReady(timeoutSeconds: number, intervalMilliseconds: number): Promise<void> {
+  async waitUntilReady(timeoutSeconds: number, intervalMilliseconds: number, injected?: CollectorReadinessDriver): Promise<void> {
     if (!this.collectorDirect) throw new DeltaError("collector readiness preflight requires collector-direct mode");
-    const configuredDeadline = performance.now() + timeoutSeconds * 1000;
+    const driver: CollectorReadinessDriver = injected ?? {
+      now: () => performance.now(),
+      wait: delay,
+      probe: async (timeoutMilliseconds) => {
+        const result = await request(new URL(this.base + COLLECTOR_READY_PATH), { Accept: "text/plain", "User-Agent": "memeloop-token-center-delta-export/1" }, timeoutMilliseconds, this.tls);
+        return { status: result.status, drain: () => result.response.resume() };
+      },
+    };
+    const configuredDeadline = driver.now() + timeoutSeconds * 1000;
     const deadline = this.deadline === undefined ? configuredDeadline : Math.min(configuredDeadline, this.deadline);
     const limit = this.deadline !== undefined && this.deadline <= configuredDeadline ? "overall" : "readiness";
     let lastCause = "not_ready";
-    while (performance.now() < deadline) {
-      let result: HttpResponse;
+    while (driver.now() < deadline) {
+      let result: { status: number; drain: () => void };
       try {
-        result = await request(new URL(this.base + COLLECTOR_READY_PATH), { Accept: "text/plain", "User-Agent": "memeloop-token-center-delta-export/1" }, this.timeout(deadline), this.tls);
+        result = await driver.probe(Math.min(this.timeoutSeconds * 1000, deadline - driver.now()));
       } catch (error) {
-        if (error instanceof DeltaError) {
-          if (performance.now() >= deadline) break;
-          throw error;
-        }
         lastCause = classifyTransportFailure(error);
         if (!["timeout", "dns", "connect", "reset"].includes(lastCause)) throw new DeltaError(collectorTransportDiagnostic("readyz", error));
-        if (performance.now() >= deadline) break;
-        await delay(Math.min(intervalMilliseconds, Math.max(1, deadline - performance.now())));
+        if (driver.now() >= deadline) break;
+        await driver.wait(Math.min(intervalMilliseconds, Math.max(1, deadline - driver.now())));
         continue;
       }
-      result.response.resume();
+      result.drain();
       if (result.status === 200) return;
       lastCause = `http_${result.status}`;
       if (![429, 503].includes(result.status)) throw new DeltaError(`collector request failed (stage=readyz,cause=${lastCause})`);
-      if (performance.now() >= deadline) break;
-      await delay(Math.min(intervalMilliseconds, Math.max(1, deadline - performance.now())));
+      if (driver.now() >= deadline) break;
+      await driver.wait(Math.min(intervalMilliseconds, Math.max(1, deadline - driver.now())));
     }
     throw new DeltaError(`collector request failed (stage=readyz,cause=${lastCause},limit=${limit})`);
   }
@@ -810,7 +818,6 @@ type Arguments = {
 async function exportDelta(args: Arguments): Promise<JsonObject> {
   const token = args.collectorDirect ? undefined : args.tokenFile !== undefined ? loadToken(args.tokenFile) : loadTokenEnv(args.tokenEnv!);
   const hosts = new Set(args.privateHttpHosts.map(normalizeHost));
-  if (!args.allowHttp) for (const host of hosts) if (!await verifyPrivateHost(host, hosts)) throw new DeltaError("private HTTP host allowlist did not resolve exclusively to private addresses");
   let tls: TlsFiles | undefined;
   if (args.clientCertFile !== undefined && args.clientKeyFile !== undefined) {
     const certificate = lstatSync(args.clientCertFile); if (certificate.isSymbolicLink() || !certificate.isFile()) throw new DeltaError("mTLS certificate must be a regular non-symlink file");
@@ -827,11 +834,14 @@ async function exportDelta(args: Arguments): Promise<JsonObject> {
   let prior: Time, priorFence: string | undefined, sequence: number;
   if (checkpoint === undefined) { if (args.since === undefined) throw new DeltaError("--since is required before the first checkpoint"); prior = parseTime(args.since, "initial since watermark"); sequence = 1; }
   else { if (args.since !== undefined) throw new DeltaError("--since cannot replace an existing checkpoint"); prior = parseTime(checkpoint.watermark_completed_at, "checkpoint watermark"); priorFence = checkpoint.source_ingest_fence === null ? undefined : checkpoint.source_ingest_fence as string | undefined; sequence = (checkpoint.sequence as number) + 1; }
-  if (args.collectorDirect) await client.waitUntilReady(args.readinessTimeoutSeconds, args.readinessPollMilliseconds);
-  if (args.collectorDirect && priorFence === undefined) { if (!args.offlineFull) throw new DeltaError("the first collector-direct snapshot requires --offline-full"); await client.verifyOfflineFull(); }
+  const initialCollectorSnapshot = args.collectorDirect && priorFence === undefined;
+  if (initialCollectorSnapshot) { if (!args.offlineFull) throw new DeltaError("the first collector-direct snapshot requires --offline-full"); }
   else if (args.offlineFull) throw new DeltaError("--offline-full is only valid for the first collector-direct snapshot");
   const lower = addSeconds(prior, -args.overlapSeconds); const observed: Time = { nanos: BigInt(Date.now()) * 1_000_000n }; const maximum = addSeconds(observed, args.maxFutureSkewSeconds);
   if (compareTime(prior, maximum) > 0) throw new DeltaError("source checkpoint timestamp exceeds the future-skew limit");
+  if (!args.allowHttp) for (const host of hosts) if (!await verifyPrivateHost(host, hosts)) throw new DeltaError("private HTTP host allowlist did not resolve exclusively to private addresses");
+  if (args.collectorDirect) await client.waitUntilReady(args.readinessTimeoutSeconds, args.readinessPollMilliseconds);
+  if (initialCollectorSnapshot) await client.verifyOfflineFull();
   const before = await client.statsRecords();
   if (checkpoint !== undefined && before < (checkpoint.last_source_records as number)) throw new DeltaError("source record count moved backwards since the checkpoint");
   const first = await loadProjection(client, lower, args.sessionLimit, before, undefined, priorFence); verifyClock(first.sessions, maximum); const firstDigest = selectionDigest(first.sessions);
