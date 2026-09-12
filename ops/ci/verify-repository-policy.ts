@@ -43,6 +43,18 @@ const violations: string[] = [];
 for (const retiredName of [["native", "kimi", "import"].join("-"), ["import", "cpa", "upstreams"].join("-")]) {
   if (retiredName in releaseEntrypoints) violations.push(`release registry: retired target command is published: ${retiredName}`);
 }
+const sealedAudit = readFileSync(join(root, "src/sealed-oauth-source-audit.ts"), "utf8");
+const forbiddenAuditSurface: readonly [string, RegExp][] = [
+  ["network module", /from\s+["']node:(?:http|https|net|tls)["']/u],
+  ["remote request helper", /\brequestJson\b/u],
+  ["remote apply flag", new RegExp(["--", "apply"].join(""), "u")],
+  ["target URL flag", new RegExp(["--", "target", "-api-base-url"].join(""), "u")],
+  ["service credential flag", new RegExp(["--", "service", "-token-file"].join(""), "u")],
+  ["hard-coded cohort count", /EXPECTED_SOURCE_(?:ACCOUNTS|POLICIES|GRANTS)/u],
+];
+for (const [label, pattern] of forbiddenAuditSurface) {
+  if (pattern.test(sealedAudit)) violations.push(`src/sealed-oauth-source-audit.ts: forbidden ${label}`);
+}
 for (const path of walk(root)) {
   const repositoryPath = relative(root, path);
   const stat = lstatSync(path);

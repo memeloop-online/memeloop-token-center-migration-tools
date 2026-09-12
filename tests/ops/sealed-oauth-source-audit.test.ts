@@ -1,14 +1,16 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
-import { inspectSealedKimiCohort, NativeKimiImportFailure, run } from "../../src/native-kimi-import.ts";
+import { inspectSealedOAuthCohort, SealedOAuthSourceAuditFailure, run } from "../../src/sealed-oauth-source-audit.ts";
 
 const SOURCE_KEY_PREFIX = Buffer.from("4d54432d534f555243452d49442d4b45590001", "hex");
 const NOW = 1_789_000_000_000;
 const roots: string[] = [];
+const FIXTURE_CAPTURE_MODE = "fixture-sealed-source-snapshot";
+const FIXTURE_MODELS = ["fixture-model-alpha", "fixture-model-beta", "fixture-model-gamma"];
 
 function sha256(value: Buffer | string): string {
   return createHash("sha256").update(value).digest("hex");
@@ -34,19 +36,15 @@ function jwt(subject: string, device: string, exp: number): string {
   })}.${Buffer.from(`sig-${subject}`).toString("base64url")}`;
 }
 function policies(): Record<string, unknown> {
-  const models = [
-    "kimi-k2", "kimi-k2-thinking", "kimi-k2.5", "kimi-k2.6",
-    "kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k3", "kimi-k3-256k",
-  ];
-  const entries = Array.from({ length: 10 }, (_, index) => ({
+  const entries = Array.from({ length: 4 }, (_, index) => ({
     key_hash: index.toString(16).padStart(64, "0"),
     enabled: true,
-    grants: [3, 4, 9].includes(index)
-      ? models.map((model) => ({ provider: "kimi", model }))
+    grants: [0, 2].includes(index)
+      ? FIXTURE_MODELS.map((model) => ({ provider: "kimi", model }))
       : [],
   }));
-  for (let index = 0; index < 107; index += 1) {
-    (entries[index % 7]!.grants as Array<Record<string, unknown>>).push({
+  for (let index = 0; index < 3; index += 1) {
+    (entries[index]!.grants as Array<Record<string, unknown>>).push({
       provider: "other",
       model: `other-${index}`,
     });
@@ -57,6 +55,7 @@ function policies(): Record<string, unknown> {
 type Fixture = {
   root: string;
   identityKey: string;
+  expectation: string;
   sensitiveValues: string[];
 };
 function fixture(options: {
@@ -76,18 +75,24 @@ function fixture(options: {
   const config = Buffer.from("auth-dir: /fixture/source-state/auth\n");
   const policy = Buffer.from(`${JSON.stringify(policies())}\n`);
   writePrivate(join(root, "config.yaml"), config);
-  writePrivate(join(root, "native-key-policy.json"), policy);
+  writePrivate(join(root, "fixture-policy.json"), policy);
 
   const exp = options.expired ? 1_600_000_000 : 4_070_908_800;
-  const subjects = ["fixture-user-one", options.duplicateIdentity ? "fixture-user-one" : "fixture-user-two"];
-  const devices = ["fixture-device-one", "fixture-device-two"];
-  const refreshTokens = ["fixture-refresh-one", "fixture-refresh-two"];
+  const subjects = [
+    "fixture-user-one",
+    options.duplicateIdentity ? "fixture-user-one" : "fixture-user-two",
+    "fixture-user-three",
+  ];
+  const devices = ["fixture-device-one", "fixture-device-two", "fixture-device-three"];
+  const refreshTokens = ["fixture-refresh-one", "fixture-refresh-two", "fixture-refresh-three"];
   const payloads: Array<{ path: string; sha256: string }> = [];
   const accessTokens: string[] = [];
-  for (let index = 0; index < 2; index += 1) {
-    const relativePath = index !== 1 ? "kimi-1.json"
-      : options.pathKind === "backup" ? "kimi-backup.json"
-        : options.pathKind === "unsafe" ? "kimi\\unsafe.json" : "kimi-2.json";
+  for (let index = 0; index < 3; index += 1) {
+    const relativePath = index === 0 ? "fixture-oauth-1.json"
+      : index === 1
+        ? options.pathKind === "backup" ? "fixture-oauth-backup.json"
+          : options.pathKind === "unsafe" ? "fixture-oauth\\unsafe.json" : "fixture-oauth-2.json"
+        : "fixture-oauth-3.json";
     const accessToken = jwt(subjects[index]!, devices[index]!, exp);
     accessTokens.push(accessToken);
     const raw = Buffer.from(`${JSON.stringify({
@@ -100,7 +105,7 @@ function fixture(options: {
       expired: new Date(exp * 1_000).toISOString(),
       last_refresh: "2026-09-08T00:00:00.000Z",
       timestamp: 1_789_000_000 + index,
-      disabled: options.disabled && index === 1,
+      disabled: options.disabled && index === 2,
     })}\n`);
     writePrivate(join(auth, relativePath), raw);
     payloads.push({ path: relativePath, sha256: sha256(raw) });
@@ -117,7 +122,7 @@ function fixture(options: {
   })}\n`);
   writePrivate(join(root, "source-capture-receipt.json"), `${JSON.stringify({
     version: 1,
-    mode: "collect-cpa-source-snapshot",
+    mode: FIXTURE_CAPTURE_MODE,
     source_config_sha256: configSha256,
     source_policy_sha256: policySha256,
     auth_payload_revision_sha256: authPayloadRevisionSha256,
@@ -129,10 +134,30 @@ function fixture(options: {
     SOURCE_KEY_PREFIX,
     Buffer.from(Array.from({ length: 32 }, (_, index) => index + 1)),
   ]));
+  const expectation = join(parent, "source-expectation.json");
+  writePrivate(expectation, `${JSON.stringify({
+    version: 1,
+    capture_mode: FIXTURE_CAPTURE_MODE,
+    source_policy_file: "fixture-policy.json",
+    source_type: "kimi",
+    source_account_count: 3,
+    source_policy_count: 4,
+    source_grant_count: 9,
+    provider_model_policy_counts: Object.fromEntries(FIXTURE_MODELS.map((model) => [model, 2])),
+  })}\n`);
   return {
     root,
     identityKey,
-    sensitiveValues: [...subjects, ...devices, ...refreshTokens, ...accessTokens, ...payloads.map((item) => item.path)],
+    expectation,
+    sensitiveValues: [
+      "https://auth.kimi.test",
+      ...subjects,
+      ...devices,
+      ...refreshTokens,
+      ...accessTokens,
+      ...accessTokens.flatMap((token) => token.split(".")),
+      ...payloads.map((item) => item.path),
+    ],
   };
 }
 
@@ -140,8 +165,8 @@ afterEach(() => {
   while (roots.length > 0) rmSync(roots.pop()!, { recursive: true, force: true });
 });
 
-describe("native Kimi sealed source cohort", () => {
-  it("audits two accounts end-to-end and writes only redacted source evidence", async () => {
+describe("sealed managed-OAuth source cohort", () => {
+  it("audits an externally-bound synthetic cohort and writes only redacted source evidence", async () => {
     const source = fixture();
     const receiptDirectory = join(source.root, "receipts");
     mkdirSync(receiptDirectory, { mode: 0o700 });
@@ -149,24 +174,26 @@ describe("native Kimi sealed source cohort", () => {
     const result = await run([
       "--source-directory", source.root,
       "--source-identity-key-file", source.identityKey,
+      "--source-expectation-file", source.expectation,
       "--receipt", receipt,
     ]);
     assert.equal(result.mode, "source-audit");
-    assert.equal(result.source_account_count, 2);
-    assert.equal(result.source_unique_identity_count, 2);
+    assert.equal(result.source_account_count, 3);
+    assert.equal(result.source_unique_identity_count, 3);
     assert.match(String(result.batch_source_sha256), /^[0-9a-f]{64}$/u);
 
     const raw = readFileSync(receipt, "utf8");
     const value = JSON.parse(raw) as Record<string, unknown>;
-    assert.equal(value.workflow, "sealed-kimi-source-audit-v1");
+    assert.equal(value.workflow, "sealed-managed-oauth-source-audit-v1");
     assert.equal(value.outcome, "verified");
     assert.equal(value.source_validation, "verified");
     assert.equal(value.source_expired_access_count, 0);
     const accounts = value.source_accounts as Array<Record<string, unknown>>;
-    assert.equal(accounts.length, 2);
+    assert.equal(accounts.length, 3);
     assert.equal(value.batch_source_sha256, sha256(canonicalJson({
       source_capture_sha256: value.source_capture_sha256,
       source_accounts: accounts,
+      source_expectation_sha256: value.source_expectation_sha256,
     })));
     for (const account of accounts) {
       assert.deepEqual(Object.keys(account).sort(), [
@@ -195,22 +222,101 @@ describe("native Kimi sealed source cohort", () => {
       { pathKind: "backup" as const },
     ]) {
       const source = fixture(options);
-      assert.throws(() => inspectSealedKimiCohort(source.root, source.identityKey, NOW), NativeKimiImportFailure);
+      assert.throws(() => inspectSealedOAuthCohort(source.root, source.identityKey, source.expectation, NOW), SealedOAuthSourceAuditFailure);
     }
     const changed = fixture();
     writePrivate(join(changed.root, "config.yaml"), "auth-dir: /changed/source-state/auth\n");
-    assert.throws(() => inspectSealedKimiCohort(changed.root, changed.identityKey, NOW), NativeKimiImportFailure);
+    assert.throws(() => inspectSealedOAuthCohort(changed.root, changed.identityKey, changed.expectation, NOW), SealedOAuthSourceAuditFailure);
     const tampered = fixture();
     const capturePath = join(tampered.root, "source-capture-receipt.json");
     const capture = JSON.parse(readFileSync(capturePath, "utf8")) as Record<string, unknown>;
     capture.source_capture_sha256 = "0".repeat(64);
     writePrivate(capturePath, `${JSON.stringify(capture)}\n`);
-    assert.throws(() => inspectSealedKimiCohort(tampered.root, tampered.identityKey, NOW), NativeKimiImportFailure);
+    assert.throws(() => inspectSealedOAuthCohort(tampered.root, tampered.identityKey, tampered.expectation, NOW), SealedOAuthSourceAuditFailure);
   });
 
-  it("rejects retired target/apply arguments before reading source material", async () => {
-    for (const retired of ["--apply", "--target-api-base-url", "--service-token-file", "--approved-dry-run-receipt"]) {
-      await assert.rejects(run([retired]), NativeKimiImportFailure);
+  it("rejects retired remote-operation arguments before reading source material", async () => {
+    for (const retired of [
+      ["--", "apply"].join(""),
+      ["--", "target", "-api-base-url"].join(""),
+      ["--", "service", "-token-file"].join(""),
+      ["--", "approved", "-dry-run-receipt"].join(""),
+    ]) {
+      await assert.rejects(run([retired]), SealedOAuthSourceAuditFailure);
     }
+  });
+
+  it("validates all bindings before creating a receipt and never overwrites a terminal receipt", async () => {
+    const invalid = fixture({ disabled: true });
+    const invalidReceiptDirectory = join(invalid.root, "receipts");
+    mkdirSync(invalidReceiptDirectory, { mode: 0o700 });
+    const invalidReceipt = join(invalidReceiptDirectory, "source-audit.json");
+    await assert.rejects(run([
+      "--source-directory", invalid.root,
+      "--source-identity-key-file", invalid.identityKey,
+      "--source-expectation-file", invalid.expectation,
+      "--receipt", invalidReceipt,
+    ]), (error: unknown) => {
+      assert(error instanceof SealedOAuthSourceAuditFailure);
+      assert.equal(error.outcome, "failed");
+      return true;
+    });
+    assert.equal(existsSync(invalidReceipt), false);
+
+    const source = fixture();
+    const receiptDirectory = join(source.root, "receipts");
+    mkdirSync(receiptDirectory, { mode: 0o700 });
+    const receipt = join(receiptDirectory, "source-audit.json");
+    const expectation = JSON.parse(readFileSync(source.expectation, "utf8")) as Record<string, unknown>;
+    expectation.source_account_count = 4;
+    writePrivate(source.expectation, `${JSON.stringify(expectation)}\n`);
+    await assert.rejects(run([
+      "--source-directory", source.root,
+      "--source-identity-key-file", source.identityKey,
+      "--source-expectation-file", source.expectation,
+      "--receipt", receipt,
+    ]), SealedOAuthSourceAuditFailure);
+    assert.equal(existsSync(receipt), false);
+
+    expectation.source_account_count = 3;
+    writePrivate(source.expectation, `${JSON.stringify(expectation)}\n`);
+    await run([
+      "--source-directory", source.root,
+      "--source-identity-key-file", source.identityKey,
+      "--source-expectation-file", source.expectation,
+      "--receipt", receipt,
+    ]);
+    const terminal = readFileSync(receipt);
+    await assert.rejects(run([
+      "--source-directory", source.root,
+      "--source-identity-key-file", source.identityKey,
+      "--source-expectation-file", source.expectation,
+      "--receipt", receipt,
+    ]), SealedOAuthSourceAuditFailure);
+    assert.deepEqual(readFileSync(receipt), terminal);
+  });
+
+  it("classifies a single atomic receipt-write exception as uncertain without retrying or leaking tokens", async () => {
+    const source = fixture();
+    const receiptDirectory = join(source.root, "receipts");
+    mkdirSync(receiptDirectory, { mode: 0o700 });
+    const receipt = join(receiptDirectory, "source-audit.json");
+    let writes = 0;
+    await assert.rejects(run([
+      "--source-directory", source.root,
+      "--source-identity-key-file", source.identityKey,
+      "--source-expectation-file", source.expectation,
+      "--receipt", receipt,
+    ], () => {
+      writes += 1;
+      throw new Error(source.sensitiveValues.join("."));
+    }), (error: unknown) => {
+      assert(error instanceof SealedOAuthSourceAuditFailure);
+      assert.equal(error.outcome, "uncertain");
+      for (const secret of source.sensitiveValues) assert.equal(String(error).includes(secret), false);
+      return true;
+    });
+    assert.equal(writes, 1);
+    assert.equal(existsSync(receipt), false);
   });
 });
