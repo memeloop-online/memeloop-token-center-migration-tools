@@ -6,13 +6,13 @@ import { isAbsolute, join } from "node:path";
 import {
   authFiles,
   canonicalJson,
+  invokedAsEntrypoint,
   openSafeOutput,
+  parseStrictJson,
   readOwnerOnly,
   readSourceIdentityKey,
   writeBindingReceipt,
-} from "../ops/cpa-upstreams/import-cpa-upstreams.ts";
-import { invokedAsEntrypoint } from "../ops/lib/invoked-as-entrypoint.ts";
-import { parseStrictJson } from "../ops/lib/strict-json.ts";
+} from "./lib/sealed-source-io.ts";
 
 type JsonObject = Record<string, unknown>;
 type KimiDocument = JsonObject & {
@@ -363,6 +363,7 @@ function options(argv: readonly string[]): ParsedOptions {
 export async function run(
   argv = process.argv.slice(2),
   receiptWriter: typeof writeBindingReceipt = writeBindingReceipt,
+  parentDescriptorCloser: (descriptor: number) => void = closeSync,
 ): Promise<JsonObject> {
   const selected = options(argv);
   if (!selected.sourceDirectory) return {};
@@ -385,12 +386,13 @@ export async function run(
     mode: "source-audit",
     outcome: "pending",
   };
+  let closeAttempted = false;
   try {
     receipt.outcome = "verified";
     const encoded = Buffer.from(`${JSON.stringify(receipt)}\n`);
     try { receiptWriter(output, encoded); }
     finally { encoded.fill(0); }
-    return {
+    const result = {
       mode: receipt.mode,
       outcome: receipt.outcome,
       source_account_count: receipt.source_account_count,
@@ -399,13 +401,19 @@ export async function run(
       batch_source_sha256: receipt.batch_source_sha256,
       receipt_sha256: sha256(`${JSON.stringify(receipt)}\n`),
     };
+    closeAttempted = true;
+    parentDescriptorCloser(output.parentDescriptor);
+    return result;
   } catch {
     // Persistence is atomic, but an I/O failure after the final link is an
     // uncertain local outcome. Never overwrite or retry the same output path.
     throw new SealedOAuthSourceAuditFailure("uncertain");
   } finally {
     cohort.records.length = 0;
-    closeSync(output.parentDescriptor);
+    if (!closeAttempted) {
+      try { parentDescriptorCloser(output.parentDescriptor); }
+      catch { /* preserve the primary uncertain write outcome */ }
+    }
   }
 }
 

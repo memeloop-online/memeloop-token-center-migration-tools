@@ -1,14 +1,16 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, it } from "node:test";
 import { inspectSealedOAuthCohort, SealedOAuthSourceAuditFailure, run } from "../../src/sealed-oauth-source-audit.ts";
 
 const SOURCE_KEY_PREFIX = Buffer.from("4d54432d534f555243452d49442d4b45590001", "hex");
 const NOW = 1_789_000_000_000;
 const roots: string[] = [];
+const repository = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const FIXTURE_CAPTURE_MODE = "fixture-sealed-source-snapshot";
 const FIXTURE_MODELS = ["fixture-model-alpha", "fixture-model-beta", "fixture-model-gamma"];
 
@@ -166,6 +168,44 @@ afterEach(() => {
 });
 
 describe("sealed managed-OAuth source cohort", () => {
+  it("has a recursively verified no-network dependency closure", () => {
+    const entrypoint = join(repository, "src/sealed-oauth-source-audit.ts");
+    const seen = new Set<string>();
+    const allowedModules = new Set(["node:crypto", "node:fs", "node:path", "node:url"]);
+    const visit = (path: string): void => {
+      const normalized = resolve(path);
+      assert.equal(relative(repository, normalized).startsWith(".."), false);
+      if (seen.has(normalized)) return;
+      seen.add(normalized);
+      const body = readFileSync(normalized, "utf8");
+      assert.doesNotMatch(body, /\bimport\s+["'][^"']+["']/u, "side-effect imports are forbidden");
+      for (const pattern of [
+        /node:(?:http|https|net|tls)/u,
+        /\bimport\s*\(/u,
+        /\brequire\s*\(/u,
+        /\bgetBuiltinModule\s*\(/u,
+        /\bfetch\s*\(/u,
+        /\brequestJson\b/u,
+        new RegExp(["--", "apply"].join(""), "u"),
+        new RegExp(["--", "target", "-api-base-url"].join(""), "u"),
+        new RegExp(["--", "service", "-token-file"].join(""), "u"),
+      ]) assert.doesNotMatch(body, pattern, `forbidden dependency surface in ${relative(repository, normalized)}`);
+      for (const match of body.matchAll(/\bfrom\s+["']([^"']+)["']/gu)) {
+        const source = match[1]!;
+        if (source.startsWith(".")) visit(resolve(dirname(normalized), source));
+        else assert(allowedModules.has(source), `forbidden package dependency ${source}`);
+      }
+    };
+    visit(entrypoint);
+    assert(seen.has(join(repository, "src/lib/sealed-source-io.ts")));
+    assert.deepEqual([...seen].map((path) => relative(repository, path)).sort(), [
+      "ops/lib/invoked-as-entrypoint.ts",
+      "ops/lib/strict-json.ts",
+      "src/lib/sealed-source-io.ts",
+      "src/sealed-oauth-source-audit.ts",
+    ]);
+  });
+
   it("audits an externally-bound synthetic cohort and writes only redacted source evidence", async () => {
     const source = fixture();
     const receiptDirectory = join(source.root, "receipts");
@@ -233,6 +273,20 @@ describe("sealed managed-OAuth source cohort", () => {
     capture.source_capture_sha256 = "0".repeat(64);
     writePrivate(capturePath, `${JSON.stringify(capture)}\n`);
     assert.throws(() => inspectSealedOAuthCohort(tampered.root, tampered.identityKey, tampered.expectation, NOW), SealedOAuthSourceAuditFailure);
+  });
+
+  it("does not expose source paths when directory traversal fails", () => {
+    const source = fixture();
+    rmSync(join(source.root, "auth"), { recursive: true });
+    assert.throws(
+      () => inspectSealedOAuthCohort(source.root, source.identityKey, source.expectation, NOW),
+      (error: unknown) => {
+        assert(error instanceof Error);
+        assert.equal(error.message, "sealed source I/O validation failed");
+        assert.equal(String(error).includes(source.root), false);
+        return true;
+      },
+    );
   });
 
   it("rejects retired remote-operation arguments before reading source material", async () => {
@@ -318,5 +372,29 @@ describe("sealed managed-OAuth source cohort", () => {
     });
     assert.equal(writes, 1);
     assert.equal(existsSync(receipt), false);
+  });
+
+  it("classifies a descriptor-close failure after durable persistence as uncertain", async () => {
+    const source = fixture();
+    const receiptDirectory = join(source.root, "receipts");
+    mkdirSync(receiptDirectory, { mode: 0o700 });
+    const receipt = join(receiptDirectory, "source-audit.json");
+    const closeCause = source.sensitiveValues[0]!;
+    await assert.rejects(run([
+      "--source-directory", source.root,
+      "--source-identity-key-file", source.identityKey,
+      "--source-expectation-file", source.expectation,
+      "--receipt", receipt,
+    ], undefined, (descriptor) => {
+      closeSync(descriptor);
+      throw new Error(closeCause);
+    }), (error: unknown) => {
+      assert(error instanceof SealedOAuthSourceAuditFailure);
+      assert.equal(error.outcome, "uncertain");
+      assert.equal(String(error).includes(closeCause), false);
+      return true;
+    });
+    assert.equal(existsSync(receipt), true);
+    assert.equal((JSON.parse(readFileSync(receipt, "utf8")) as Record<string, unknown>).outcome, "verified");
   });
 });
