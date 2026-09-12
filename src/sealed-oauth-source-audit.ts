@@ -55,8 +55,10 @@ const SOURCE_KEY_HASH = /^(?:sha256:)?[0-9a-f]{64}$/iu;
 const UTF8 = new TextDecoder("utf-8", { fatal: true });
 
 export class SealedOAuthSourceAuditFailure extends Error {
-  constructor(readonly outcome: "failed" | "uncertain" = "failed") {
+  readonly outcome: "failed" | "uncertain";
+  constructor(outcome: "failed" | "uncertain" = "failed") {
     super("sealed managed-OAuth source audit failed");
+    this.outcome = outcome;
   }
 }
 
