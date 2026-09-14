@@ -169,6 +169,83 @@ beforeEach(() => {
   state = { records: new Map(), stable: false, redirects: false, leakCalls: 0, authorizationOnTicket: false, directAuthorizationSeen: false, snapshot: "snapshot-one", fence: "7", snapshotSchemaVersion: 1, tombstoneFence: "0", tombstones: [], ready: true, readyRequests: 0, statsRequests: 0, sessionsRequests: 0 };
 });
 
+test("collector 102 progress restarts the bounded archive-download idle timer", async () => {
+  const progressServer = createServer((_request, response) => {
+    response.writeProcessing();
+    setTimeout(() => response.writeProcessing(), 20);
+    setTimeout(() => {
+      response.writeHead(200, { "Content-Type": "application/x-ndjson" });
+      response.end('{"schema_version":2}\n');
+    }, 45);
+  });
+  await new Promise<void>((resolveListen, rejectListen) => {
+    progressServer.once("error", rejectListen);
+    progressServer.listen(0, "127.0.0.1", resolveListen);
+  });
+  const address = progressServer.address();
+  assert(address !== null && typeof address === "object");
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    const diagnostics: string[] = [];
+    const client = new SourceClient(base, base, undefined, 0.03, true, new Set(["127.0.0.1"]), true, 5, 0.5, undefined, undefined, undefined, false, (message) => diagnostics.push(message));
+    (client as unknown as { ticketUrl: () => Promise<URL> }).ticketUrl = async () => new URL(`/archive-api/v1/exports/${"a".repeat(64)}`, base);
+    const lines: Buffer[] = [];
+    for await (const line of client.exportLines("session", 1024, "snapshot", "0".repeat(64))) lines.push(line);
+    assert.deepEqual(lines.map((line) => line.toString("utf8")), ['{"schema_version":2}\n']);
+    assert(diagnostics.some((message) => /^archive download progress status=102 elapsed_seconds=\d+ idle_seconds=0 idle_timer_reset=true$/.test(message)));
+  } finally {
+    await new Promise<void>((resolveClose, rejectClose) => progressServer.close((error) => error === undefined ? resolveClose() : rejectClose(error)));
+  }
+});
+
+test("collector 102 progress cannot extend the overall archive-download deadline", async () => {
+  const progressServer = createServer((_request, response) => {
+    response.writeProcessing();
+    const progress = setInterval(() => response.writeProcessing(), 5);
+    response.once("close", () => clearInterval(progress));
+  });
+  await new Promise<void>((resolveListen, rejectListen) => {
+    progressServer.once("error", rejectListen);
+    progressServer.listen(0, "127.0.0.1", resolveListen);
+  });
+  const address = progressServer.address();
+  assert(address !== null && typeof address === "object");
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    const client = new SourceClient(base, base, undefined, 0.1, true, new Set(["127.0.0.1"]), true, 0, 0.5, performance.now() + 0.04 * 1000);
+    (client as unknown as { ticketUrl: () => Promise<URL> }).ticketUrl = async () => new URL(`/archive-api/v1/exports/${"b".repeat(64)}`, base);
+    await assert.rejects(async () => {
+      for await (const _line of client.exportLines("session", 1024, "snapshot", "0".repeat(64))) { /* no body is sent */ }
+    }, /stage=archive-download,cause=overall_timeout/);
+  } finally {
+    await new Promise<void>((resolveClose, rejectClose) => progressServer.close((error) => error === undefined ? resolveClose() : rejectClose(error)));
+  }
+});
+
+test("overall archive-download deadline also covers a final response body", async () => {
+  const bodyServer = createServer((_request, response) => {
+    response.writeHead(200, { "Content-Type": "application/x-ndjson" });
+    const body = setInterval(() => response.write('{"schema_version":2}\n'), 5);
+    response.once("close", () => clearInterval(body));
+  });
+  await new Promise<void>((resolveListen, rejectListen) => {
+    bodyServer.once("error", rejectListen);
+    bodyServer.listen(0, "127.0.0.1", resolveListen);
+  });
+  const address = bodyServer.address();
+  assert(address !== null && typeof address === "object");
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    const client = new SourceClient(base, base, undefined, 0.1, true, new Set(["127.0.0.1"]), true, 0, 0.5, performance.now() + 0.04 * 1000);
+    (client as unknown as { ticketUrl: () => Promise<URL> }).ticketUrl = async () => new URL(`/archive-api/v1/exports/${"c".repeat(64)}`, base);
+    await assert.rejects(async () => {
+      for await (const _line of client.exportLines("session", 1024, "snapshot", "0".repeat(64))) { /* body continues beyond the deadline */ }
+    }, /stage=archive-download,cause=overall_timeout/);
+  } finally {
+    await new Promise<void>((resolveClose, rejectClose) => bodyServer.close((error) => error === undefined ? resolveClose() : rejectClose(error)));
+  }
+});
+
 async function run(arguments_: string[], environment: NodeJS.ProcessEnv = {}): Promise<{ code: number | null; stdout: string; stderr: string }> {
   const child = spawn(process.execPath, [EXPORTER, ...arguments_], { cwd: ROOT, env: { ...process.env, ...environment }, stdio: ["ignore", "pipe", "pipe"] });
   let stdout = "", stderr = ""; child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8"); child.stdout.on("data", (chunk: string) => { stdout += chunk; }); child.stderr.on("data", (chunk: string) => { stderr += chunk; });
