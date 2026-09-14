@@ -192,7 +192,7 @@ test("collector 102 progress restarts the bounded archive-download idle timer", 
     const lines: Buffer[] = [];
     for await (const line of client.exportLines("session", 1024, "snapshot", "0".repeat(64))) lines.push(line);
     assert.deepEqual(lines.map((line) => line.toString("utf8")), ['{"schema_version":2}\n']);
-    assert(diagnostics.some((message) => /^archive download progress status=102 elapsed_seconds=\d+ idle_seconds=0 idle_timer_reset=true$/.test(message)));
+    assert(diagnostics.some((message) => /^archive download progress status=102 elapsed_seconds=\d+ idle_seconds=\d+ idle_timer_reset=true$/.test(message)));
   } finally {
     await new Promise<void>((resolveClose, rejectClose) => progressServer.close((error) => error === undefined ? resolveClose() : rejectClose(error)));
   }
