@@ -392,9 +392,8 @@ function request(url: URL, headers: Record<string, string>, timeoutMs: number, t
     // intentionally unchanged.
     operation.on("information", (information: IncomingMessage) => {
       if (information.statusCode === 102) {
-        const remaining = deadline === undefined ? timeoutMs : Math.min(timeoutMs, deadline - performance.now());
-        if (remaining <= 0) exceedDeadline();
-        else operation.setTimeout(remaining);
+        if (deadline !== undefined && deadline <= performance.now()) exceedDeadline();
+        else operation.setTimeout(timeoutMs);
         onInformation?.(information.statusCode);
       }
     });
@@ -708,8 +707,8 @@ export class SourceClient {
       let result: HttpResponse;
       try {
         result = await request(ticket, { Accept: "application/x-ndjson", "User-Agent": "memeloop-token-center-delta-export/1" }, this.timeout(), this.tls, this.deadline, () => {
-          lastActivityAt = performance.now();
           this.archiveDownloadDiagnostic("progress", downloadStartedAt, lastActivityAt);
+          lastActivityAt = performance.now();
         });
       }
       catch (error) {
