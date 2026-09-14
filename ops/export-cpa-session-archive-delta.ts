@@ -332,7 +332,7 @@ export function unwrapJson(value: unknown): unknown {
   return current;
 }
 
-type HttpResponse = { status: number; headers: IncomingMessage["headers"]; response: IncomingMessage };
+type HttpResponse = { status: number; headers: IncomingMessage["headers"]; response: IncomingMessage; deadlineExceeded: () => boolean };
 type CollectorRequestStage = "readyz" | "stats" | "sessions" | "export-ticket" | "archive-download";
 export type CollectorReadinessDriver = {
   now: () => number;
@@ -359,12 +359,48 @@ function requestTimeoutError(): Error & { code: string } {
   return Object.assign(new Error("request timed out"), { code: "ETIMEDOUT" });
 }
 
-function request(url: URL, headers: Record<string, string>, timeoutMs: number, tls?: TlsFiles): Promise<HttpResponse> {
+function requestDeadlineError(): Error & { code: string; overallDeadline: true } {
+  return Object.assign(new Error("request exceeded the overall deadline"), { code: "ETIMEDOUT", overallDeadline: true as const });
+}
+
+function isOverallDeadlineError(error: unknown): boolean {
+  return isObject(error) && error.overallDeadline === true;
+}
+
+function request(url: URL, headers: Record<string, string>, timeoutMs: number, tls?: TlsFiles, deadline?: number, onInformation?: (statusCode: number) => void): Promise<HttpResponse> {
   return new Promise((resolve, reject) => {
     const options: RequestOptions = { method: "GET", headers, timeout: timeoutMs, agent: false, cert: tls?.cert, key: tls?.key };
-    const operation = (url.protocol === "https:" ? httpsRequest : httpRequest)(url, options, (response) => resolve({ status: response.statusCode ?? 0, headers: response.headers, response }));
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    let deadlineExceeded = false;
+    const clearDeadline = () => { if (deadlineTimer !== undefined) clearTimeout(deadlineTimer); };
+    const exceedDeadline = () => { deadlineExceeded = true; operation.destroy(requestDeadlineError()); };
+    const operation = (url.protocol === "https:" ? httpsRequest : httpRequest)(url, options, (response) => {
+      response.once("end", clearDeadline);
+      response.once("close", clearDeadline);
+      response.once("error", clearDeadline);
+      resolve({ status: response.statusCode ?? 0, headers: response.headers, response, deadlineExceeded: () => deadlineExceeded });
+    });
+    if (deadline !== undefined) {
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) queueMicrotask(exceedDeadline);
+      else deadlineTimer = setTimeout(exceedDeadline, remaining);
+    }
+    // Node does not treat an HTTP informational response as response-body
+    // activity for the request timeout. The collector sends 102 while it
+    // materializes a stable artifact, so explicitly restart this bounded idle
+    // timer when that progress signal arrives. The overall export deadline is
+    // intentionally unchanged.
+    operation.on("information", (information: IncomingMessage) => {
+      if (information.statusCode === 102) {
+        const remaining = deadline === undefined ? timeoutMs : Math.min(timeoutMs, deadline - performance.now());
+        if (remaining <= 0) exceedDeadline();
+        else operation.setTimeout(remaining);
+        onInformation?.(information.statusCode);
+      }
+    });
     operation.once("timeout", () => operation.destroy(requestTimeoutError()));
-    operation.once("error", reject);
+    operation.once("error", (error) => { clearDeadline(); reject(error); });
+    operation.once("close", clearDeadline);
     operation.end();
   });
 }
@@ -396,6 +432,7 @@ export class SourceClient {
   readonly tls: TlsFiles | undefined;
   readonly maxDownloadBytes: number | undefined;
   readonly offlineFull: boolean;
+  readonly archiveDownloadDiagnostics: ((message: string) => void) | undefined;
   downloadedBytes = 0;
   constructor(
     baseUrl: string,
@@ -411,6 +448,7 @@ export class SourceClient {
     tls?: TlsFiles,
     maxDownloadBytes?: number,
     offlineFull = false,
+    archiveDownloadDiagnostics?: (message: string) => void,
   ) {
     const source = safeOrigin(baseUrl, allowAllHttp, privateHttpHosts, "archive source base URL");
     const download = safeOrigin(downloadBaseUrl, allowAllHttp, privateHttpHosts, "archive download base URL");
@@ -421,6 +459,7 @@ export class SourceClient {
     this.privateHttpHosts = privateHttpHosts; this.collectorDirect = collectorDirect;
     this.maxRetries = maxRetries; this.retryBaseSeconds = retryBaseSeconds; this.deadline = deadline;
     this.tls = tls; this.maxDownloadBytes = maxDownloadBytes; this.offlineFull = offlineFull;
+    this.archiveDownloadDiagnostics = archiveDownloadDiagnostics;
     if (collectorDirect && this.downloadOrigin !== this.origin) throw new DeltaError("collector-direct ticket downloads must use the collector origin");
     if (collectorDirect && token !== undefined) throw new DeltaError("collector-direct requests must not carry a CPA token");
     if (collectorDirect && tls === undefined && !privateHttpHosts.has(source.host)) throw new DeltaError("collector-direct requires a private host allowlist or mTLS");
@@ -431,6 +470,17 @@ export class SourceClient {
     const remaining = this.deadline - performance.now();
     if (remaining <= 0) throw new DeltaError("source export exceeded the configured elapsed-time limit");
     return Math.min(this.timeoutSeconds * 1000, remaining);
+  }
+  private archiveDownloadDiagnostic(event: "progress" | "failure", startedAt: number, lastActivityAt: number, cause?: string): void {
+    if (!this.collectorDirect || this.archiveDownloadDiagnostics === undefined) return;
+    const now = performance.now();
+    const elapsedSeconds = Math.max(0, Math.floor((now - startedAt) / 1000));
+    const idleSeconds = Math.max(0, Math.floor((now - lastActivityAt) / 1000));
+    if (event === "progress") {
+      this.archiveDownloadDiagnostics(`archive download progress status=102 elapsed_seconds=${elapsedSeconds} idle_seconds=${idleSeconds} idle_timer_reset=true`);
+      return;
+    }
+    this.archiveDownloadDiagnostics(`archive download failure cause=${cause ?? "internal"} elapsed_seconds=${elapsedSeconds} idle_seconds=${idleSeconds}`);
   }
   private retryDelay(attempt: number, retryAfter?: string): number {
     let seconds = Math.min(this.retryBaseSeconds * 2 ** Math.min(attempt, 20), 10);
@@ -648,19 +698,30 @@ export class SourceClient {
   }
   async *exportLines(sessionId: string, maximum: number, snapshot?: string, recordsSha256?: string): AsyncGenerator<Buffer> {
     let response: IncomingMessage | undefined;
+    let responseDeadlineExceeded = () => false;
+    let downloadStartedAt = performance.now();
+    let lastActivityAt = downloadStartedAt;
     for (let attempt = 0; attempt <= this.maxRetries; attempt += 1) {
       const ticket = await this.ticketUrl(sessionId, snapshot, recordsSha256);
+      downloadStartedAt = performance.now();
+      lastActivityAt = downloadStartedAt;
       let result: HttpResponse;
-      try { result = await request(ticket, { Accept: "application/x-ndjson", "User-Agent": "memeloop-token-center-delta-export/1" }, this.timeout(), this.tls); }
+      try {
+        result = await request(ticket, { Accept: "application/x-ndjson", "User-Agent": "memeloop-token-center-delta-export/1" }, this.timeout(), this.tls, this.deadline, () => {
+          lastActivityAt = performance.now();
+          this.archiveDownloadDiagnostic("progress", downloadStartedAt, lastActivityAt);
+        });
+      }
       catch (error) {
+        this.archiveDownloadDiagnostic("failure", downloadStartedAt, lastActivityAt, error instanceof DeltaError || isOverallDeadlineError(error) ? "overall_timeout" : classifyTransportFailure(error));
         if (error instanceof DeltaError) {
           if (this.collectorDirect && error.message === "source export exceeded the configured elapsed-time limit") throw new DeltaError("collector request failed (stage=archive-download,cause=overall_timeout)");
           throw error;
         }
-        if (this.collectorDirect) throw new DeltaError(collectorTransportDiagnostic("archive-download", error));
+        if (this.collectorDirect) throw new DeltaError(`collector request failed (stage=archive-download,cause=${isOverallDeadlineError(error) ? "overall_timeout" : classifyTransportFailure(error)})`);
         throw new DeltaError("source archive export failed");
       }
-      if (result.status === 200) { response = result.response; break; }
+      if (result.status === 200) { response = result.response; responseDeadlineExceeded = result.deadlineExceeded; break; }
       result.response.resume();
       if (this.collectorDirect && snapshot !== undefined && result.status === 404 && attempt < this.maxRetries) { await this.waitForRetry(attempt); continue; }
       if (this.collectorDirect && snapshot !== undefined && result.status === 404) throw new SnapshotExpired();
@@ -671,7 +732,7 @@ export class SourceClient {
     let buffered = Buffer.alloc(0);
     try {
       for await (const raw of response) {
-        this.timeout(); const chunk = Buffer.from(raw as Buffer); this.downloadedBytes += chunk.length;
+        this.timeout(); lastActivityAt = performance.now(); const chunk = Buffer.from(raw as Buffer); this.downloadedBytes += chunk.length;
         if (this.maxDownloadBytes !== undefined && this.downloadedBytes > this.maxDownloadBytes) throw new DeltaError("source archive downloads exceed the configured limit");
         buffered = Buffer.concat([buffered, chunk]);
         while (true) {
@@ -684,8 +745,10 @@ export class SourceClient {
       }
       if (buffered.length > 0 && buffered.toString("utf8").trim()) yield buffered;
     } catch (error) {
+      const cause = responseDeadlineExceeded() ? "overall_timeout" : error instanceof DeltaError ? "validation" : classifyTransportFailure(error);
+      this.archiveDownloadDiagnostic("failure", downloadStartedAt, lastActivityAt, cause);
       if (error instanceof DeltaError) throw error;
-      if (this.collectorDirect) throw new DeltaError(collectorTransportDiagnostic("archive-download", error));
+      if (this.collectorDirect) throw new DeltaError(`collector request failed (stage=archive-download,cause=${cause})`);
       throw new DeltaError("source archive export stream failed");
     }
   }
@@ -823,7 +886,8 @@ async function exportDelta(args: Arguments): Promise<JsonObject> {
     const certificate = lstatSync(args.clientCertFile); if (certificate.isSymbolicLink() || !certificate.isFile()) throw new DeltaError("mTLS certificate must be a regular non-symlink file");
     ensurePrivateRegular(args.clientKeyFile, "mTLS private key"); tls = { cert: readFileSync(args.clientCertFile), key: readFileSync(args.clientKeyFile) };
   }
-  const client = new SourceClient(args.baseUrl, args.downloadBaseUrl ?? args.baseUrl, token, args.timeoutSeconds, args.allowHttp, hosts, args.collectorDirect, args.maxRetries, args.retryBaseSeconds, args.deadline, tls, args.maxDownloadBytes, args.offlineFull);
+  const diagnostics = args.collectorDirect ? (message: string) => process.stderr.write(`${message}\n`) : undefined;
+  const client = new SourceClient(args.baseUrl, args.downloadBaseUrl ?? args.baseUrl, token, args.timeoutSeconds, args.allowHttp, hosts, args.collectorDirect, args.maxRetries, args.retryBaseSeconds, args.deadline, tls, args.maxDownloadBytes, args.offlineFull, diagnostics);
   const fingerprint = sourceFingerprint(client); const checkpoint = loadCheckpoint(args.checkpoint, fingerprint);
   const manifestPath = `${args.output}.manifest.json`; const pending = `${args.output}.pending`;
   if (args.resume) {
