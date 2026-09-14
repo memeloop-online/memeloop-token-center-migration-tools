@@ -1,0 +1,203 @@
+# Manual, offline-only migration templates.  This file is deliberately not a
+# kustomization resource: create a uniquely named reviewed copy, stage the
+# verified public release files through the existing evidence PVC, then unsuspend
+# one Job at a time.  It never mounts a CPA credential or a target credential.
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mtc-session-archive-v08-release-stager-20260914a
+  namespace: cliproxyapi
+  labels:
+    app.kubernetes.io/name: mtc-session-archive-v08-release-stager
+    app.kubernetes.io/component: archive-release-stager
+    memeloop.io/migration: mtc-session-archive-v08-final
+  annotations:
+    memeloop.io/stage: offline-release-materialization
+spec:
+  suspend: true
+  backoffLimit: 0
+  activeDeadlineSeconds: 1200
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mtc-session-archive-v08-release-stager
+        app.kubernetes.io/component: archive-release-stager
+        memeloop.io/migration: mtc-session-archive-v08-final
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      nodeSelector:
+        kubernetes.io/hostname: haixia
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: stage-verified-release
+          # This already-pulled digest supplies BusyBox/Node only; executable
+          # migration code comes exclusively from the verified release bundle.
+          image: ghcr.io/memeloop-online/memeloop-token-center-importer@sha256:75fef96d76af5fb39851514fd89ba8e12fee394e88c7d6f5fac91a5e8ca5a429
+          imagePullPolicy: IfNotPresent
+          command: [/bin/sh, -ec]
+          args:
+            - |
+              set -eu
+              umask 077
+              src=/evidence/release-input/9cecdc63f13f92f056216ccef22bb82fa3ceba15
+              dst=/evidence/release-bundles/9cecdc63f13f92f056216ccef22bb82fa3ceba15
+              archive=memeloop-token-center-migration-tools-9cecdc63f13f92f056216ccef22bb82fa3ceba15.tar.gz
+              manifest=memeloop-token-center-migration-tools-9cecdc63f13f92f056216ccef22bb82fa3ceba15.manifest.json
+              for _ in $(seq 1 450); do test -f "$src/READY" && break; sleep 2; done
+              test -f "$src/READY"
+              test "$(cat "$src/READY")" = "b504ea097248bbde0e420d8aea264b77ae9ad6ef8416574d04d058ef9f489b24"
+              test ! -e "$dst"
+              test -f "$src/$archive" && test -f "$src/$manifest" && test -f "$src/SHA256SUMS"
+              (cd "$src" && sha256sum -c SHA256SUMS)
+              tar -tzf "$src/$archive" | grep -Fx 'commands/export-cpa-session-archive-delta.mjs' >/dev/null
+              tmp="$dst.$$.tmp"
+              mkdir -p "$tmp"
+              cp "$src/$archive" "$src/$manifest" "$src/SHA256SUMS" "$tmp/"
+              chmod 0700 "$tmp"
+              chmod 0600 "$tmp"/*
+              mv "$tmp" "$dst"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          resources:
+            requests: { cpu: 10m, memory: 64Mi }
+            limits: { cpu: 100m, memory: 128Mi }
+          volumeMounts:
+            - { name: evidence, mountPath: /evidence }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: evidence
+          persistentVolumeClaim:
+            claimName: mtc-session-archive-v08-evidence-20260902c
+        - name: tmp
+          emptyDir: { medium: Memory, sizeLimit: 8Mi }
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mtc-session-archive-v08-final-baseline-20260914b
+  namespace: cliproxyapi
+  labels:
+    app.kubernetes.io/name: mtc-session-archive-v08-final-baseline
+    app.kubernetes.io/component: archive-exporter
+    memeloop.io/migration: mtc-session-archive-v08-final
+  annotations:
+    memeloop.io/stage: offline-baseline-verified-release
+spec:
+  suspend: true
+  backoffLimit: 0
+  activeDeadlineSeconds: 25200
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mtc-session-archive-v08-final-baseline
+        app.kubernetes.io/component: archive-exporter
+        memeloop.io/migration: mtc-session-archive-v08-final
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      nodeSelector:
+        kubernetes.io/hostname: haixia
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile: { type: RuntimeDefault }
+      initContainers:
+        - name: verify-release-and-empty-transition
+          image: ghcr.io/memeloop-online/memeloop-token-center-importer@sha256:75fef96d76af5fb39851514fd89ba8e12fee394e88c7d6f5fac91a5e8ca5a429
+          imagePullPolicy: IfNotPresent
+          command: [/bin/sh, -ec]
+          args:
+            - |
+              set -eu
+              umask 077
+              root=/evidence/release-bundles/9cecdc63f13f92f056216ccef22bb82fa3ceba15
+              archive=memeloop-token-center-migration-tools-9cecdc63f13f92f056216ccef22bb82fa3ceba15.tar.gz
+              manifest=memeloop-token-center-migration-tools-9cecdc63f13f92f056216ccef22bb82fa3ceba15.manifest.json
+              test "$(node --version)" = "v24.18.0"
+              test -f "$root/$archive" && test -f "$root/$manifest" && test -f "$root/SHA256SUMS"
+              (cd "$root" && sha256sum -c SHA256SUMS)
+              test "$(sha256sum "$root/$archive" | awk '{print $1}')" = "b504ea097248bbde0e420d8aea264b77ae9ad6ef8416574d04d058ef9f489b24"
+              test "$(sha256sum "$root/$manifest" | awk '{print $1}')" = "b9a0c71d1461597fb67df81a6630e2254cf8f13e5f02f408f488043e35c04e8a"
+              tar -xzf "$root/$archive" -C /runtime
+              test "$(sha256sum /runtime/commands/export-cpa-session-archive-delta.mjs | awk '{print $1}')" = "aeedbc0bee780d484fea80aa4c0153bad1febd645796be5c2d60804c22b48a0f"
+              test ! -e /evidence/source-checkpoint.json
+              test ! -e /evidence/baseline-000001.jsonl
+              test ! -e /evidence/baseline-000001.jsonl.pending
+              test ! -e /evidence/baseline-000001.jsonl.manifest.json
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { cpu: 250m, memory: 256Mi }
+          volumeMounts:
+            - { name: evidence, mountPath: /evidence, readOnly: true }
+            - { name: runtime, mountPath: /runtime }
+            - { name: tmp, mountPath: /tmp }
+      containers:
+        - name: exporter
+          image: ghcr.io/memeloop-online/memeloop-token-center-importer@sha256:75fef96d76af5fb39851514fd89ba8e12fee394e88c7d6f5fac91a5e8ca5a429
+          imagePullPolicy: IfNotPresent
+          command: [node, /runtime/commands/export-cpa-session-archive-delta.mjs]
+          args:
+            - --base-url
+            - http://mtc-session-archive-v08-source.cliproxyapi.svc.cluster.local:8080
+            - --collector-direct
+            - --offline-full
+            - --private-http-host
+            - mtc-session-archive-v08-source.cliproxyapi.svc.cluster.local
+            - --checkpoint
+            - /evidence/source-checkpoint.json
+            - --output
+            - /evidence/baseline-000001.jsonl
+            - --since
+            - 1970-01-01T00:00:00Z
+            - --overlap-seconds
+            - "86400"
+            - --max-download-bytes
+            - "68719476736"
+            - --max-output-bytes
+            - "68719476736"
+            - --timeout-seconds
+            - "120"
+            - --max-elapsed-seconds
+            - "21600"
+            - --readiness-timeout-seconds
+            - "900"
+            - --readiness-poll-milliseconds
+            - "5000"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          resources:
+            requests: { cpu: 250m, memory: 512Mi }
+            limits: { cpu: "2", memory: 2Gi }
+          volumeMounts:
+            - { name: evidence, mountPath: /evidence }
+            - { name: runtime, mountPath: /runtime, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: evidence
+          persistentVolumeClaim:
+            claimName: mtc-session-archive-v08-evidence-20260902c
+        - name: runtime
+          emptyDir: { sizeLimit: 32Mi }
+        - name: tmp
+          emptyDir: { sizeLimit: 64Mi }
