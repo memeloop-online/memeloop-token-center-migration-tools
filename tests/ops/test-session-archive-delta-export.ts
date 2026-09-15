@@ -53,6 +53,8 @@ type State = {
   readyRequests: number;
   statsRequests: number;
   sessionsRequests: number;
+  archiveRequests: Map<string, number>;
+  failedArchiveSessions: Set<string>;
   onReadyRequest?: () => void;
   readyGate?: Promise<void>;
 };
@@ -113,6 +115,8 @@ const server = createServer(async (request: IncomingMessage, response: ServerRes
     state.authorizationOnTicket ||= request.headers.authorization !== undefined;
     const capability = decodeURIComponent(url.pathname.slice("/archive-api/v1/exports/".length));
     const sessionId = /^[0-9a-f]{64}$/.test(capability) ? [...state.records.keys()][0]! : capability;
+    state.archiveRequests.set(sessionId, (state.archiveRequests.get(sessionId) ?? 0) + 1);
+    if (state.failedArchiveSessions.has(sessionId)) { sendJson(response, { error: "injected archive failure" }, 500); return; }
     const rows = state.records.get(sessionId);
     if (rows === undefined) { sendJson(response, { error: "not found" }, 404); return; }
     response.writeHead(200, { "Content-Type": "application/x-ndjson" });
@@ -166,7 +170,7 @@ before(async () => {
 });
 after(async () => { await new Promise<void>((resolveClose, reject) => server.close((error) => error === undefined ? resolveClose() : reject(error))); });
 beforeEach(() => {
-  state = { records: new Map(), stable: false, redirects: false, leakCalls: 0, authorizationOnTicket: false, directAuthorizationSeen: false, snapshot: "snapshot-one", fence: "7", snapshotSchemaVersion: 1, tombstoneFence: "0", tombstones: [], ready: true, readyRequests: 0, statsRequests: 0, sessionsRequests: 0 };
+  state = { records: new Map(), stable: false, redirects: false, leakCalls: 0, authorizationOnTicket: false, directAuthorizationSeen: false, snapshot: "snapshot-one", fence: "7", snapshotSchemaVersion: 1, tombstoneFence: "0", tombstones: [], ready: true, readyRequests: 0, statsRequests: 0, sessionsRequests: 0, archiveRequests: new Map(), failedArchiveSessions: new Set() };
 });
 
 test("collector 102 progress restarts the bounded archive-download idle timer", async () => {
@@ -293,8 +297,9 @@ test("archive spool stores each canonical payload in one indexed table", () => {
   const database = new DatabaseSync(":memory:");
   try {
     database.exec(ARCHIVE_SPOOL_SCHEMA);
+    database.exec(ARCHIVE_SPOOL_SCHEMA);
     const tables = database.prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name").all() as Array<{ name: string }>;
-    assert.deepEqual(tables.map((table) => table.name), ["records"]);
+    assert.deepEqual(tables.map((table) => table.name), ["completed_sessions", "records", "spool_metadata"]);
     const columns = database.prepare("PRAGMA table_info(records)").all() as Array<{ name: string }>;
     assert.equal(columns.filter((column) => column.name === "canonical").length, 1);
     assert.equal(columns.some((column) => column.name === "emit"), true);
@@ -600,8 +605,150 @@ test("resume seals a pending output without re-contacting the source", async () 
     const first = await run(baseArguments(paths)); assert.equal(first.code, 0, first.stderr);
     // Simulate the crash point after manifest fsync and before pending rename/checkpoint commit.
     const pending = `${paths.output}.pending`; const bytes = readFileSync(paths.output); writeFileSync(pending, bytes, { mode: 0o600 }); rmSync(paths.output); rmSync(paths.checkpoint);
+    writeFileSync(`${paths.output}.spool.sqlite-wal`, "interrupted cleanup", { mode: 0o600 });
+    writeFileSync(`${paths.output}.spool.sqlite-shm`, "interrupted cleanup", { mode: 0o600 });
     state.redirects = true;
     const resumed = await run([...baseArguments(paths), "--resume"]); assert.equal(resumed.code, 0, resumed.stderr); assert.equal(state.leakCalls, 0); assert.equal(readFileSync(paths.output, "utf8"), bytes.toString());
+    assert.equal(existsSync(`${paths.output}.spool.sqlite-wal`), false); assert.equal(existsSync(`${paths.output}.spool.sqlite-shm`), false);
+  } finally { rmSync(paths.directory, { recursive: true, force: true }); }
+});
+
+test("resume safely initializes an empty spool left before its descriptor commit", async () => {
+  const paths = fixture();
+  const spool = `${paths.output}.spool.sqlite`;
+  try {
+    state.stable = true;
+    state.records.set("session-a", [record("request-a", "session-a", "2025-01-02T01:00:00.000000Z", "2025-01-02T01:00:01.000000Z")]);
+    const database = new DatabaseSync(spool); database.exec(ARCHIVE_SPOOL_SCHEMA); database.close(); chmodSync(spool, 0o600);
+    const resumed = await run([...baseArguments(paths), "--resume"]);
+    assert.equal(resumed.code, 0, resumed.stderr); assert.equal(state.archiveRequests.get("session-a"), 1); assert.equal(existsSync(spool), false);
+  } finally { rmSync(paths.directory, { recursive: true, force: true }); }
+});
+
+test("stable spool resume skips previously verified sessions after a fresh snapshot", async () => {
+  const paths = fixture();
+  const spool = `${paths.output}.spool.sqlite`;
+  try {
+    state.stable = true;
+    state.records.set("session-a", [record("request-a", "session-a", "2025-01-02T01:00:00.000000Z", "2025-01-02T01:00:01.000000Z")]);
+    state.records.set("session-b", [record("request-b", "session-b", "2025-01-03T01:00:00.000000Z", "2025-01-03T01:00:01.000000Z")]);
+    state.failedArchiveSessions.add("session-b");
+    const failed = await run(baseArguments(paths));
+    assert.equal(failed.code, 2); assert.match(failed.stderr, /source archive export returned HTTP 500/);
+    assert.equal(existsSync(spool), true);
+    assert.equal(state.archiveRequests.get("session-a"), 1); assert.equal(state.archiveRequests.get("session-b"), 1);
+
+    state.failedArchiveSessions.clear(); state.snapshot = "snapshot-two";
+    const resumed = await run([...baseArguments(paths), "--resume"]);
+    assert.equal(resumed.code, 0, resumed.stderr);
+    assert.match(resumed.stderr, /archive spool resume completed_sessions=1 records=1/);
+    assert.equal(state.archiveRequests.get("session-a"), 1, "the verified session must not be downloaded again");
+    assert.equal(state.archiveRequests.get("session-b"), 2);
+    assert.equal(existsSync(spool), false);
+    const requestIds = readFileSync(paths.output, "utf8").trim().split("\n").map((line) => (JSON.parse(line) as RecordValue).request_id);
+    assert.deepEqual(requestIds, ["request-a", "request-b"]);
+  } finally { rmSync(paths.directory, { recursive: true, force: true }); }
+});
+
+test("stable spool resume rejects a changed source projection before another archive download", async () => {
+  const paths = fixture();
+  const spool = `${paths.output}.spool.sqlite`;
+  try {
+    state.stable = true;
+    state.records.set("session-a", [record("request-a", "session-a", "2025-01-02T01:00:00.000000Z", "2025-01-02T01:00:01.000000Z")]);
+    state.records.set("session-b", [record("request-b", "session-b", "2025-01-03T01:00:00.000000Z", "2025-01-03T01:00:01.000000Z")]);
+    state.failedArchiveSessions.add("session-b");
+    const failed = await run(baseArguments(paths)); assert.equal(failed.code, 2, failed.stderr); assert.equal(existsSync(spool), true);
+    const downloadsBeforeResume = [...state.archiveRequests.values()].reduce((sum, count) => sum + count, 0);
+
+    state.failedArchiveSessions.clear();
+    state.records.set("session-c", [record("request-c", "session-c", "2025-01-04T01:00:00.000000Z", "2025-01-04T01:00:01.000000Z")]);
+    const resumed = await run([...baseArguments(paths), "--resume"]);
+    assert.equal(resumed.code, 2); assert.match(resumed.stderr, /spool does not match the current source projection/);
+    assert.equal([...state.archiveRequests.values()].reduce((sum, count) => sum + count, 0), downloadsBeforeResume);
+    assert.equal(existsSync(spool), true);
+  } finally { rmSync(paths.directory, { recursive: true, force: true }); }
+});
+
+test("stable spool resume rejects changed download and output limits", async () => {
+  const paths = fixture();
+  try {
+    state.stable = true;
+    state.records.set("session-a", [record("request-a", "session-a", "2025-01-02T01:00:00.000000Z", "2025-01-02T01:00:01.000000Z")]);
+    state.records.set("session-b", [record("request-b", "session-b", "2025-01-03T01:00:00.000000Z", "2025-01-03T01:00:01.000000Z")]);
+    state.failedArchiveSessions.add("session-b");
+    const limits = ["--max-download-bytes", "20000000", "--max-output-bytes", "20000000"];
+    const failed = await run([...baseArguments(paths), ...limits]); assert.equal(failed.code, 2, failed.stderr);
+    const downloadsBeforeResume = [...state.archiveRequests.values()].reduce((sum, count) => sum + count, 0);
+    state.failedArchiveSessions.clear();
+    const resumed = await run([...baseArguments(paths), "--max-download-bytes", "21000000", "--max-output-bytes", "21000000", "--resume"]);
+    assert.equal(resumed.code, 2); assert.match(resumed.stderr, /spool does not match the current source projection/);
+    assert.equal([...state.archiveRequests.values()].reduce((sum, count) => sum + count, 0), downloadsBeforeResume);
+  } finally { rmSync(paths.directory, { recursive: true, force: true }); }
+});
+
+test("stable spool resume rejects changed projection columns even when canonical bytes still match", async () => {
+  const paths = fixture();
+  const spool = `${paths.output}.spool.sqlite`;
+  try {
+    state.stable = true;
+    state.records.set("session-a", [record("request-a", "session-a", "2025-01-02T01:00:00.000000Z", "2025-01-02T01:00:01.000000Z")]);
+    state.records.set("session-b", [record("request-b", "session-b", "2025-01-03T01:00:00.000000Z", "2025-01-03T01:00:01.000000Z")]);
+    state.failedArchiveSessions.add("session-b");
+    const failed = await run(baseArguments(paths)); assert.equal(failed.code, 2, failed.stderr);
+    const database = new DatabaseSync(spool);
+    database.prepare("UPDATE records SET emit=0 WHERE session_id='session-a'").run(); database.close();
+    const downloadsBeforeResume = [...state.archiveRequests.values()].reduce((sum, count) => sum + count, 0);
+
+    state.failedArchiveSessions.clear(); state.snapshot = "snapshot-two";
+    const resumed = await run([...baseArguments(paths), "--resume"]);
+    assert.equal(resumed.code, 2); assert.match(resumed.stderr, /spool session content failed verification/);
+    assert.equal([...state.archiveRequests.values()].reduce((sum, count) => sum + count, 0), downloadsBeforeResume);
+    assert.equal(existsSync(spool), true);
+  } finally { rmSync(paths.directory, { recursive: true, force: true }); }
+});
+
+test("legacy spool resume rebuilds unverifiable scratch instead of deadlocking retries", async () => {
+  const paths = fixture();
+  const spool = `${paths.output}.spool.sqlite`;
+  try {
+    const row = record("request-legacy", "session-legacy", "2025-01-02T01:00:00Z", "2025-01-02T01:00:01Z");
+    state.records.set("session-legacy", [row]);
+    const projection = sessions(state);
+    const base = `http://127.0.0.1:${port}`;
+    const fingerprint = sourceFingerprint(new SourceClient(base, base, TOKEN, 60, true, new Set()));
+    const descriptor = canonicalBytes({
+      version: 1,
+      source_fingerprint: fingerprint,
+      sequence: 1,
+      prior_watermark_completed_at: "2025-01-01T00:00:00.000000Z",
+      prior_source_ingest_fence: null,
+      lower_bound_completed_at: "2024-12-31T00:00:00.000000Z",
+      session_projection_protocol: "legacy-last-at-limit-v1",
+      source_projection_requests: 1,
+      session_count: 1,
+      session_set_sha256: selectionDigest(projection),
+      snapshot_schema_version: null,
+      deleted_session_count: 0,
+      offline_full_snapshot: false,
+      max_line_bytes: 16 * 1024 * 1024,
+      max_future_skew_seconds: 3600,
+      max_download_bytes: 64 * 1024 ** 3,
+      max_output_bytes: 64 * 1024 ** 3,
+      stable_source_required: false,
+    }).toString();
+    const database = new DatabaseSync(spool);
+    database.exec(ARCHIVE_SPOOL_SCHEMA);
+    database.prepare("INSERT INTO spool_metadata(id,descriptor_json) VALUES(1,?)").run(descriptor);
+    const encoded = canonicalLine(row);
+    database.prepare("INSERT INTO records VALUES(?,?,?,?,?,?,1)").run(row.request_id, row.session_id, row.started_at, row.completed_at, createHash("sha256").update(encoded).digest("hex"), encoded);
+    database.close(); chmodSync(spool, 0o600);
+
+    const resumed = await run([...baseArguments(paths), "--resume"]);
+    assert.equal(resumed.code, 0, resumed.stderr);
+    assert.match(resumed.stderr, /archive spool resume legacy_rebuild=true records_discarded=1/);
+    assert.equal(state.archiveRequests.get("session-legacy"), 1);
+    assert.equal(existsSync(spool), false);
   } finally { rmSync(paths.directory, { recursive: true, force: true }); }
 });
 

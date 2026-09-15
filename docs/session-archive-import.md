@@ -96,14 +96,23 @@ Use a new output name for every later run and omit `--since`. Preserve every
 JSONL and its adjacent `.manifest.json` as migration evidence. A completed
 manifest whose checkpoint write or final rename was interrupted is recovered
 without another source request by repeating the same command with `--resume`.
-Do not delete or edit an output, manifest, pending file or checkpoint to force a
-transition; retain it for investigation and retry from the last verified pair.
+If a stable snapshot download was interrupted earlier, repeat the same source,
+checkpoint, output path and validation contract with `--resume`. The exporter
+obtains a fresh snapshot, requires an identical versioned session projection,
+re-verifies completed session counts and digests, and downloads only unfinished
+sessions. Do not delete or edit an output, manifest, pending file, spool or
+checkpoint to force a transition; retain it for investigation and retry from
+the last verified state. A legacy projection has no source session digest, so a
+matching legacy spool is safely rebuilt as temporary scratch instead of
+claiming that its partial rows are resumable.
 
 The host needs private scratch space for the bounded SQLite de-duplication spool
 and the final JSONL. Downloads are streamed into that spool; there is no separate
-download file. The spool has one `records` table and stores each canonical record
-body exactly once. Its indexes carry request identity, session order and legacy
-output selection without a second payload-bearing `seen_records` table.
+download file. The spool has one payload-bearing `records` table and stores each
+canonical record body exactly once. Small metadata tables bind the resumable
+spool to its source projection and verified sessions. Its indexes carry request
+identity, session order and legacy output selection without a second
+payload-bearing `seen_records` table.
 
 Use this peak-space equation for the filesystem that contains `--output`:
 
@@ -114,7 +123,7 @@ stable-schema-v2: O = D + H, therefore peak = 2D + H + K + J + E
 
 `D` is the canonical record-line bytes in the single SQLite spool, `K` is its
 scalar columns and B-tree indexes, `O` is the pending/final JSONL (rename does not
-duplicate it), `J` is the transient SQLite DELETE-mode rollback journal, `H` is
+duplicate it), `J` is the SQLite per-session WAL working set, `H` is
 schema-v2 session-summary bytes, and `E` is the small manifest/checkpoint
 allowance. The previous two-table spool stored the same canonical bytes twice,
 making schema-v2 peak approximately `3D + H + K + J + E`; that estimate is no

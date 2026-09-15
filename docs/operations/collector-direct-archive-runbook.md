@@ -76,8 +76,9 @@ has been verified.
 Before retaining this baseline, rehearse the same command on the isolated clone
 and measure the evidence filesystem high-water mark. The exporter streams source
 bytes and keeps one canonical payload copy in its SQLite spool. With `D` record
-bytes, `H` summary bytes, `K` SQLite scalar/index bytes, `J` the transient
-rollback journal and `E` manifest/checkpoint allowance, stable-schema-v2 peak is
+bytes, `H` summary bytes, `K` SQLite scalar/index bytes, `J` the SQLite
+per-session WAL working set and `E` manifest/checkpoint allowance,
+stable-schema-v2 peak is
 `2D + H + K + J + E`: one spool payload plus the JSONL, not two spool payloads
 plus the JSONL. `K` and `J` must be measured for the real record-count and
 identifier distribution. Require the measured peak plus 20% free space; the
@@ -129,13 +130,19 @@ SESSION_ARCHIVE_APPLY=true node ops/import-cpa-session-archive.ts
 
 The third command must report `imported: 0`; overlap records may report as
 `replayed`. Preserve the JSONL, adjacent manifest, source checkpoint, three
-import summaries and target checkpoint as one audit set. `--resume` is only for
-recovering the exact same sealed output/manifest transition and performs no
-source request.
+import summaries and target checkpoint as one audit set. `--resume` requires the
+same source, checkpoint, output path and validation contract. A sealed
+output/manifest transition is recovered without a source request. An incomplete
+stable spool obtains a fresh source snapshot, requires the same versioned
+session projection, re-verifies every completed session count and digest, and
+downloads only unfinished sessions.
 
 ## Failure and rollback
 
 - Never edit a checkpoint, manifest or JSONL to bypass a refusal.
+- Keep an incomplete `*.spool.sqlite` private and retry the exact command with
+  `--resume`; changing the source projection or invocation contract fails
+  closed. The spool is removed only after the output and checkpoint commit.
 - The private checkpoint lock file serializes the complete load/export/resume/
   commit transaction. A second Job waits only within its elapsed-time bound.
 - On 401/403/invalid protocol, stop; those responses are not transient.
