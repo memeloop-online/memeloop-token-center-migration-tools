@@ -1010,7 +1010,18 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
       if (priorSession !== undefined) {
         if (priorSession.requests !== session.requests || priorSession.records_sha256 !== session.records_sha256) throw new DeltaError("incomplete archive spool session metadata changed");
         const resumedDigest = createHash("sha256"); let resumedCount = 0;
-        for (const row of database.prepare("SELECT canonical FROM records WHERE session_id=? ORDER BY request_id COLLATE BINARY").iterate(session.session_id) as Iterable<{ canonical: Uint8Array }>) { resumedDigest.update(row.canonical); resumedCount += 1; }
+        const rows = database.prepare("SELECT request_id,session_id,started_at,completed_at,digest,canonical,emit FROM records WHERE session_id=? ORDER BY request_id COLLATE BINARY");
+        for (const row of rows.iterate(session.session_id) as Iterable<{ request_id: string; session_id: string; started_at: string; completed_at: string; digest: string; canonical: Uint8Array; emit: number }>) {
+          const canonical = Buffer.from(row.canonical); let record: unknown;
+          try { record = parseStrictJson(canonical.toString("utf8")); } catch { throw new DeltaError("incomplete archive spool session content failed verification"); }
+          if (!isObject(record) || record.request_id !== row.request_id || record.session_id !== row.session_id || row.session_id !== session.session_id
+              || record.started_at !== row.started_at || record.completed_at !== row.completed_at || row.digest !== sha256Bytes(canonical) || row.emit !== 1) {
+            throw new DeltaError("incomplete archive spool session content failed verification");
+          }
+          parseCanonicalTime(row.started_at, "incomplete archive spool started_at");
+          parseCanonicalTime(row.completed_at, "incomplete archive spool completed_at");
+          resumedDigest.update(canonical); resumedCount += 1;
+        }
         if (resumedCount !== session.requests || resumedDigest.digest("hex") !== session.records_sha256) throw new DeltaError("incomplete archive spool session content failed verification");
         continue;
       }

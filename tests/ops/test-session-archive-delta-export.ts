@@ -655,6 +655,27 @@ test("stable spool resume rejects a changed source projection before another arc
   } finally { rmSync(paths.directory, { recursive: true, force: true }); }
 });
 
+test("stable spool resume rejects changed projection columns even when canonical bytes still match", async () => {
+  const paths = fixture();
+  const spool = `${paths.output}.spool.sqlite`;
+  try {
+    state.stable = true;
+    state.records.set("session-a", [record("request-a", "session-a", "2025-01-02T01:00:00.000000Z", "2025-01-02T01:00:01.000000Z")]);
+    state.records.set("session-b", [record("request-b", "session-b", "2025-01-03T01:00:00.000000Z", "2025-01-03T01:00:01.000000Z")]);
+    state.failedArchiveSessions.add("session-b");
+    const failed = await run(baseArguments(paths)); assert.equal(failed.code, 2, failed.stderr);
+    const database = new DatabaseSync(spool);
+    database.prepare("UPDATE records SET emit=0 WHERE session_id='session-a'").run(); database.close();
+    const downloadsBeforeResume = [...state.archiveRequests.values()].reduce((sum, count) => sum + count, 0);
+
+    state.failedArchiveSessions.clear(); state.snapshot = "snapshot-two";
+    const resumed = await run([...baseArguments(paths), "--resume"]);
+    assert.equal(resumed.code, 2); assert.match(resumed.stderr, /spool session content failed verification/);
+    assert.equal([...state.archiveRequests.values()].reduce((sum, count) => sum + count, 0), downloadsBeforeResume);
+    assert.equal(existsSync(spool), true);
+  } finally { rmSync(paths.directory, { recursive: true, force: true }); }
+});
+
 test("legacy spool resume rebuilds unverifiable scratch instead of deadlocking retries", async () => {
   const paths = fixture();
   const spool = `${paths.output}.spool.sqlite`;
