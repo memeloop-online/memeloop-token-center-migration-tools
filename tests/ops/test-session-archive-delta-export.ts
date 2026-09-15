@@ -605,8 +605,23 @@ test("resume seals a pending output without re-contacting the source", async () 
     const first = await run(baseArguments(paths)); assert.equal(first.code, 0, first.stderr);
     // Simulate the crash point after manifest fsync and before pending rename/checkpoint commit.
     const pending = `${paths.output}.pending`; const bytes = readFileSync(paths.output); writeFileSync(pending, bytes, { mode: 0o600 }); rmSync(paths.output); rmSync(paths.checkpoint);
+    writeFileSync(`${paths.output}.spool.sqlite-wal`, "interrupted cleanup", { mode: 0o600 });
+    writeFileSync(`${paths.output}.spool.sqlite-shm`, "interrupted cleanup", { mode: 0o600 });
     state.redirects = true;
     const resumed = await run([...baseArguments(paths), "--resume"]); assert.equal(resumed.code, 0, resumed.stderr); assert.equal(state.leakCalls, 0); assert.equal(readFileSync(paths.output, "utf8"), bytes.toString());
+    assert.equal(existsSync(`${paths.output}.spool.sqlite-wal`), false); assert.equal(existsSync(`${paths.output}.spool.sqlite-shm`), false);
+  } finally { rmSync(paths.directory, { recursive: true, force: true }); }
+});
+
+test("resume safely initializes an empty spool left before its descriptor commit", async () => {
+  const paths = fixture();
+  const spool = `${paths.output}.spool.sqlite`;
+  try {
+    state.stable = true;
+    state.records.set("session-a", [record("request-a", "session-a", "2025-01-02T01:00:00.000000Z", "2025-01-02T01:00:01.000000Z")]);
+    const database = new DatabaseSync(spool); database.exec(ARCHIVE_SPOOL_SCHEMA); database.close(); chmodSync(spool, 0o600);
+    const resumed = await run([...baseArguments(paths), "--resume"]);
+    assert.equal(resumed.code, 0, resumed.stderr); assert.equal(state.archiveRequests.get("session-a"), 1); assert.equal(existsSync(spool), false);
   } finally { rmSync(paths.directory, { recursive: true, force: true }); }
 });
 
@@ -652,6 +667,23 @@ test("stable spool resume rejects a changed source projection before another arc
     assert.equal(resumed.code, 2); assert.match(resumed.stderr, /spool does not match the current source projection/);
     assert.equal([...state.archiveRequests.values()].reduce((sum, count) => sum + count, 0), downloadsBeforeResume);
     assert.equal(existsSync(spool), true);
+  } finally { rmSync(paths.directory, { recursive: true, force: true }); }
+});
+
+test("stable spool resume rejects changed download and output limits", async () => {
+  const paths = fixture();
+  try {
+    state.stable = true;
+    state.records.set("session-a", [record("request-a", "session-a", "2025-01-02T01:00:00.000000Z", "2025-01-02T01:00:01.000000Z")]);
+    state.records.set("session-b", [record("request-b", "session-b", "2025-01-03T01:00:00.000000Z", "2025-01-03T01:00:01.000000Z")]);
+    state.failedArchiveSessions.add("session-b");
+    const limits = ["--max-download-bytes", "20000000", "--max-output-bytes", "20000000"];
+    const failed = await run([...baseArguments(paths), ...limits]); assert.equal(failed.code, 2, failed.stderr);
+    const downloadsBeforeResume = [...state.archiveRequests.values()].reduce((sum, count) => sum + count, 0);
+    state.failedArchiveSessions.clear();
+    const resumed = await run([...baseArguments(paths), "--max-download-bytes", "21000000", "--max-output-bytes", "21000000", "--resume"]);
+    assert.equal(resumed.code, 2); assert.match(resumed.stderr, /spool does not match the current source projection/);
+    assert.equal([...state.archiveRequests.values()].reduce((sum, count) => sum + count, 0), downloadsBeforeResume);
   } finally { rmSync(paths.directory, { recursive: true, force: true }); }
 });
 
@@ -701,6 +733,8 @@ test("legacy spool resume rebuilds unverifiable scratch instead of deadlocking r
       offline_full_snapshot: false,
       max_line_bytes: 16 * 1024 * 1024,
       max_future_skew_seconds: 3600,
+      max_download_bytes: 64 * 1024 ** 3,
+      max_output_bytes: 64 * 1024 ** 3,
       stable_source_required: false,
     }).toString();
     const database = new DatabaseSync(spool);

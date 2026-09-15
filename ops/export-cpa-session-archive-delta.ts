@@ -84,7 +84,8 @@ export const ARCHIVE_SPOOL_SCHEMA = `
   CREATE TABLE IF NOT EXISTS completed_sessions(
     session_id TEXT PRIMARY KEY COLLATE BINARY,
     requests INTEGER NOT NULL,
-    records_sha256 TEXT NOT NULL
+    records_sha256 TEXT NOT NULL,
+    downloaded_bytes INTEGER NOT NULL CHECK(downloaded_bytes >= 0)
   ) WITHOUT ROWID;
   CREATE TABLE IF NOT EXISTS spool_metadata(
     id INTEGER PRIMARY KEY CHECK(id=1),
@@ -93,6 +94,7 @@ export const ARCHIVE_SPOOL_SCHEMA = `
 `;
 
 function archiveSpoolSidecars(path: string): string[] { return [`${path}-wal`, `${path}-shm`]; }
+function archiveSpoolExists(path: string): boolean { return [path, ...archiveSpoolSidecars(path)].some(existsSync); }
 
 function ensurePrivateSpoolFile(path: string, label: string): void {
   ensurePrivateRegular(path, label);
@@ -128,7 +130,7 @@ function openArchiveSpool(path: string, resume: boolean): { database: DatabaseSy
 }
 
 function removeArchiveSpool(path: string): void {
-  const targets = [path, ...archiveSpoolSidecars(path)];
+  const targets = [...archiveSpoolSidecars(path), path];
   for (const target of targets) if (existsSync(target)) ensurePrivateSpoolFile(target, "archive spool cleanup target");
   for (const target of targets) rmSync(target, { force: true });
   fsyncDirectory(dirname(path));
@@ -944,7 +946,7 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
     if (existsSync(pending) && !existsSync(manifestPath) && !existsSync(args.output)) { ensurePrivateRegular(pending, "orphaned pending delta output"); unlinkSync(pending); fsyncDirectory(dirname(pending)); }
     else if (existsSync(args.output) || existsSync(pending) || existsSync(manifestPath)) {
       const manifest = await resumeOutput(args.output, pending, manifestPath, args.checkpoint, checkpoint, fingerprint);
-      if (existsSync(spoolPath)) removeArchiveSpool(spoolPath);
+      if (archiveSpoolExists(spoolPath)) removeArchiveSpool(spoolPath);
       return manifest;
     }
   }
@@ -974,9 +976,15 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
       source_projection_requests: first.requestCount, session_count: first.sessions.length, session_set_sha256: firstDigest,
       snapshot_schema_version: first.snapshotSchemaVersion ?? null, deleted_session_count: first.deletedSessionCount,
       offline_full_snapshot: args.offlineFull, max_line_bytes: args.maxLineBytes, max_future_skew_seconds: args.maxFutureSkewSeconds,
-      stable_source_required: args.requireStableSource });
-    const existingDescriptor = database.prepare("SELECT descriptor_json FROM spool_metadata WHERE id=1").get() as { descriptor_json: string } | undefined;
-    if (existingDescriptor === undefined && spool.resumed) throw new DeltaError("incomplete archive spool is missing its versioned descriptor");
+      max_download_bytes: args.maxDownloadBytes, max_output_bytes: args.maxOutputBytes, stable_source_required: args.requireStableSource });
+    let existingDescriptor = database.prepare("SELECT descriptor_json FROM spool_metadata WHERE id=1").get() as { descriptor_json: string } | undefined;
+    if (existingDescriptor === undefined && spool.resumed) {
+      const counts = database.prepare("SELECT (SELECT COUNT(*) FROM records) AS records,(SELECT COUNT(*) FROM completed_sessions) AS sessions").get() as { records: number; sessions: number };
+      if (counts.records !== 0 || counts.sessions !== 0) throw new DeltaError("incomplete archive spool is missing its versioned descriptor");
+      database.close(); database = undefined; removeArchiveSpool(spoolPath);
+      spool = openArchiveSpool(spoolPath, false); database = spool.database; database.exec(ARCHIVE_SPOOL_SCHEMA);
+      existingDescriptor = undefined;
+    }
     if (existingDescriptor === undefined) database.prepare("INSERT INTO spool_metadata(id,descriptor_json) VALUES(1,?)").run(spoolDescriptor);
     else if (existingDescriptor.descriptor_json !== spoolDescriptor) throw new DeltaError("incomplete archive spool does not match the current source projection");
     if (spool.resumed && first.protocol === LEGACY_PROJECTION_PROTOCOL) {
@@ -992,8 +1000,11 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
     const seen = database.prepare("SELECT session_id, digest FROM records WHERE request_id=?");
     const addRecord = database.prepare("INSERT INTO records VALUES(?,?,?,?,?,?,?)");
     const completedSession = database.prepare("SELECT requests,records_sha256 FROM completed_sessions WHERE session_id=?");
-    const markSessionCompleted = database.prepare("INSERT INTO completed_sessions(session_id,requests,records_sha256) VALUES(?,?,?)");
+    const markSessionCompleted = database.prepare("INSERT INTO completed_sessions(session_id,requests,records_sha256,downloaded_bytes) VALUES(?,?,?,?)");
     let selectedBytes = (database.prepare("SELECT COALESCE(SUM(length(canonical)),0) AS bytes FROM records WHERE emit=1").get() as { bytes: number }).bytes;
+    if (selectedBytes > args.maxOutputBytes) throw new DeltaError("delta output exceeds the configured size limit");
+    client.downloadedBytes = (database.prepare("SELECT COALESCE(SUM(downloaded_bytes),0) AS bytes FROM completed_sessions").get() as { bytes: number }).bytes;
+    if (client.downloadedBytes > args.maxDownloadBytes) throw new DeltaError("source archive downloads exceed the configured limit");
     const beginSpoolTransaction = (): void => { if (!spoolTransactionOpen) { database!.exec("BEGIN IMMEDIATE"); spoolTransactionOpen = true; } };
     const commitSpoolTransaction = (): void => { if (spoolTransactionOpen) { database!.exec("COMMIT"); spoolTransactionOpen = false; } };
     if (spool.resumed) {
@@ -1026,6 +1037,7 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
         continue;
       }
       let exported = 0;
+      const downloadedBeforeSession = client.downloadedBytes;
       beginSpoolTransaction();
       for await (const rawLine of client.exportLines(session.session_id, args.maxLineBytes, first.snapshot, session.records_sha256)) {
         let item: unknown; try { item = parseStrictJson(rawLine.toString("utf8")); } catch { throw new DeltaError("source archive stream contains invalid JSON"); }
@@ -1061,7 +1073,7 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
         if (digest.digest("hex") !== session.records_sha256) throw new DeltaError("source session export digest disagrees with its stable summary");
       }
       if (first.protocol === STABLE_CURSOR_PROTOCOL) {
-        markSessionCompleted.run(session.session_id, session.requests, session.records_sha256!);
+        markSessionCompleted.run(session.session_id, session.requests, session.records_sha256!, client.downloadedBytes - downloadedBeforeSession);
       }
       commitSpoolTransaction();
       database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
