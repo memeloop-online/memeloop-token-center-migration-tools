@@ -1040,7 +1040,7 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
         if (digest.digest("hex") !== session.records_sha256) throw new DeltaError("source session export digest disagrees with its stable summary");
       }
       if (first.protocol === STABLE_CURSOR_PROTOCOL) {
-        markSessionCompleted.run(session.session_id, session.requests, session.records_sha256);
+        markSessionCompleted.run(session.session_id, session.requests, session.records_sha256!);
       }
       commitSpoolTransaction();
       database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
