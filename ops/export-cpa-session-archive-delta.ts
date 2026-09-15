@@ -68,9 +68,9 @@ const COLLECTOR_READY_PATH = "/readyz";
  * overlap filter without staging selected records in a second table.
  */
 export const ARCHIVE_SPOOL_SCHEMA = `
-  PRAGMA journal_mode=DELETE;
-  PRAGMA synchronous=FULL;
-  CREATE TABLE records(
+  PRAGMA journal_mode=WAL;
+  PRAGMA synchronous=NORMAL;
+  CREATE TABLE IF NOT EXISTS records(
     request_id TEXT PRIMARY KEY COLLATE BINARY,
     session_id TEXT NOT NULL,
     started_at TEXT NOT NULL,
@@ -79,9 +79,58 @@ export const ARCHIVE_SPOOL_SCHEMA = `
     canonical BLOB NOT NULL,
     emit INTEGER NOT NULL CHECK(emit IN (0, 1))
   ) WITHOUT ROWID;
-  CREATE INDEX records_by_session ON records(session_id COLLATE BINARY, request_id COLLATE BINARY);
-  CREATE INDEX records_by_output ON records(started_at, request_id COLLATE BINARY) WHERE emit = 1;
+  CREATE INDEX IF NOT EXISTS records_by_session ON records(session_id COLLATE BINARY, request_id COLLATE BINARY);
+  CREATE INDEX IF NOT EXISTS records_by_output ON records(started_at, request_id COLLATE BINARY) WHERE emit = 1;
+  CREATE TABLE IF NOT EXISTS completed_sessions(
+    session_id TEXT PRIMARY KEY COLLATE BINARY,
+    requests INTEGER NOT NULL,
+    records_sha256 TEXT NOT NULL
+  ) WITHOUT ROWID;
+  CREATE TABLE IF NOT EXISTS spool_metadata(
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    descriptor_json TEXT NOT NULL
+  );
 `;
+
+function archiveSpoolSidecars(path: string): string[] { return [`${path}-wal`, `${path}-shm`]; }
+
+function ensurePrivateSpoolFile(path: string, label: string): void {
+  ensurePrivateRegular(path, label);
+  if (lstatSync(path).nlink !== 1) throw new DeltaError(`${label} must have one private filesystem link`);
+}
+
+function openArchiveSpool(path: string, resume: boolean): { database: DatabaseSync; resumed: boolean } {
+  if (existsSync(path)) {
+    if (!resume) throw new DeltaError("an incomplete archive spool exists; use --resume after reviewing the prior failure");
+    ensurePrivateSpoolFile(path, "incomplete archive spool");
+    for (const sidecar of archiveSpoolSidecars(path)) if (existsSync(sidecar)) ensurePrivateSpoolFile(sidecar, "incomplete archive spool sidecar");
+    const database = new DatabaseSync(path);
+    let integrity: Record<string, unknown> | undefined;
+    try { integrity = database.prepare("PRAGMA integrity_check").get() as Record<string, unknown> | undefined; }
+    catch { database.close(); throw new DeltaError("incomplete archive spool failed its integrity check"); }
+    if (integrity === undefined || Object.values(integrity)[0] !== "ok") { database.close(); throw new DeltaError("incomplete archive spool failed its integrity check"); }
+    return { database, resumed: true };
+  }
+  if (archiveSpoolSidecars(path).some(existsSync)) throw new DeltaError("archive spool sidecar exists without its database");
+  let descriptor = -1;
+  let created = false;
+  try {
+    descriptor = openSync(path, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
+    created = true;
+    const metadata = fstatSync(descriptor);
+    if (!metadata.isFile() || metadata.nlink !== 1 || (metadata.mode & 0o077) !== 0) throw new DeltaError("archive spool could not be created safely");
+  } catch (error) {
+    if (created) { try { unlinkSync(path); } catch { /* preserve the safe creation failure */ } }
+    if (error instanceof DeltaError) throw error;
+    throw new DeltaError("archive spool could not be created safely");
+  } finally { if (descriptor >= 0) closeSync(descriptor); }
+  return { database: new DatabaseSync(path), resumed: false };
+}
+
+function removeArchiveSpool(path: string): void {
+  for (const target of [path, ...archiveSpoolSidecars(path)]) rmSync(target, { force: true });
+  fsyncDirectory(dirname(path));
+}
 
 type JsonObject = Record<string, unknown>;
 type SourcePaths = typeof CPA_PATHS | typeof COLLECTOR_PATHS;
@@ -877,7 +926,7 @@ type Arguments = {
   maxFutureSkewSeconds: number; requireStableSource: boolean; allowHttp: boolean; resume: boolean; deadline: number;
 };
 
-async function exportDelta(args: Arguments): Promise<JsonObject> {
+async function exportDelta(args: Arguments, internalResume = false): Promise<JsonObject> {
   const token = args.collectorDirect ? undefined : args.tokenFile !== undefined ? loadToken(args.tokenFile) : loadTokenEnv(args.tokenEnv!);
   const hosts = new Set(args.privateHttpHosts.map(normalizeHost));
   let tls: TlsFiles | undefined;
@@ -888,10 +937,14 @@ async function exportDelta(args: Arguments): Promise<JsonObject> {
   const diagnostics = args.collectorDirect ? (message: string) => process.stderr.write(`${message}\n`) : undefined;
   const client = new SourceClient(args.baseUrl, args.downloadBaseUrl ?? args.baseUrl, token, args.timeoutSeconds, args.allowHttp, hosts, args.collectorDirect, args.maxRetries, args.retryBaseSeconds, args.deadline, tls, args.maxDownloadBytes, args.offlineFull, diagnostics);
   const fingerprint = sourceFingerprint(client); const checkpoint = loadCheckpoint(args.checkpoint, fingerprint);
-  const manifestPath = `${args.output}.manifest.json`; const pending = `${args.output}.pending`;
+  const manifestPath = `${args.output}.manifest.json`; const pending = `${args.output}.pending`; const spoolPath = `${args.output}.spool.sqlite`;
   if (args.resume) {
     if (existsSync(pending) && !existsSync(manifestPath) && !existsSync(args.output)) { ensurePrivateRegular(pending, "orphaned pending delta output"); unlinkSync(pending); fsyncDirectory(dirname(pending)); }
-    else return resumeOutput(args.output, pending, manifestPath, args.checkpoint, checkpoint, fingerprint);
+    else if (existsSync(args.output) || existsSync(pending) || existsSync(manifestPath)) {
+      const manifest = await resumeOutput(args.output, pending, manifestPath, args.checkpoint, checkpoint, fingerprint);
+      if (existsSync(spoolPath)) { ensurePrivateRegular(spoolPath, "completed archive spool"); removeArchiveSpool(spoolPath); }
+      return manifest;
+    }
   }
   if (existsSync(args.output) || existsSync(pending) || existsSync(manifestPath)) throw new DeltaError("delta output, pending file, or manifest already exists; use --resume or a new path");
   let prior: Time, priorFence: string | undefined, sequence: number;
@@ -909,20 +962,50 @@ async function exportDelta(args: Arguments): Promise<JsonObject> {
   if (checkpoint !== undefined && before < (checkpoint.last_source_records as number)) throw new DeltaError("source record count moved backwards since the checkpoint");
   const first = await loadProjection(client, lower, args.sessionLimit, before, undefined, priorFence); verifyClock(first.sessions, maximum); const firstDigest = selectionDigest(first.sessions);
   mkdirSync(dirname(args.output), { recursive: true, mode: 0o700 });
-  const spoolPath = join(dirname(args.output), `.mtc-archive-delta-spool.${process.pid}.${Date.now()}.sqlite`); let database: DatabaseSync | undefined; let outputTemporary: string | undefined;
+  let database: DatabaseSync | undefined; let outputTemporary: string | undefined; let completed = false; let spoolTransactionOpen = false;
+  const retainSpoolOnFailure = existsSync(spoolPath) || first.protocol === STABLE_CURSOR_PROTOCOL;
   let maximumCompleted = prior; let maximumStarted: Time | undefined;
   try {
-    database = new DatabaseSync(spoolPath); database.exec(ARCHIVE_SPOOL_SCHEMA);
+    const spool = openArchiveSpool(spoolPath, args.resume || internalResume); database = spool.database; database.exec(ARCHIVE_SPOOL_SCHEMA);
+    const spoolDescriptor = canonicalize({ version: 1, source_fingerprint: fingerprint, sequence, prior_watermark_completed_at: formatTime(prior),
+      prior_source_ingest_fence: priorFence ?? null, lower_bound_completed_at: formatTime(lower), session_projection_protocol: first.protocol,
+      source_projection_requests: first.requestCount, session_count: first.sessions.length, session_set_sha256: firstDigest,
+      snapshot_schema_version: first.snapshotSchemaVersion ?? null, deleted_session_count: first.deletedSessionCount,
+      offline_full_snapshot: args.offlineFull, max_line_bytes: args.maxLineBytes, max_future_skew_seconds: args.maxFutureSkewSeconds,
+      stable_source_required: args.requireStableSource });
+    const existingDescriptor = database.prepare("SELECT descriptor_json FROM spool_metadata WHERE id=1").get() as { descriptor_json: string } | undefined;
+    if (existingDescriptor === undefined && spool.resumed) throw new DeltaError("incomplete archive spool is missing its versioned descriptor");
+    if (existingDescriptor === undefined) database.prepare("INSERT INTO spool_metadata(id,descriptor_json) VALUES(1,?)").run(spoolDescriptor);
+    else if (existingDescriptor.descriptor_json !== spoolDescriptor) throw new DeltaError("incomplete archive spool does not match the current source projection");
+    const orphaned = (database.prepare("SELECT COUNT(*) AS records FROM records WHERE session_id NOT IN (SELECT session_id FROM completed_sessions)").get() as { records: number }).records;
+    if (orphaned !== 0) throw new DeltaError("incomplete archive spool contains an unverified session");
     const seen = database.prepare("SELECT session_id, digest FROM records WHERE request_id=?");
     const addRecord = database.prepare("INSERT INTO records VALUES(?,?,?,?,?,?,?)");
-    let selectedBytes = 0;
+    const completedSession = database.prepare("SELECT requests,records_sha256 FROM completed_sessions WHERE session_id=?");
+    const markSessionCompleted = database.prepare("INSERT INTO completed_sessions(session_id,requests,records_sha256) VALUES(?,?,?)");
+    let selectedBytes = (database.prepare("SELECT COALESCE(SUM(length(canonical)),0) AS bytes FROM records WHERE emit=1").get() as { bytes: number }).bytes;
+    const beginSpoolTransaction = (): void => { if (!spoolTransactionOpen) { database!.exec("BEGIN IMMEDIATE"); spoolTransactionOpen = true; } };
+    const commitSpoolTransaction = (): void => { if (spoolTransactionOpen) { database!.exec("COMMIT"); spoolTransactionOpen = false; } };
+    if (spool.resumed) {
+      const counts = database.prepare("SELECT (SELECT COUNT(*) FROM completed_sessions) AS sessions,(SELECT COUNT(*) FROM records) AS records").get() as { sessions: number; records: number };
+      process.stderr.write(`archive spool resume completed_sessions=${counts.sessions} records=${counts.records}\n`);
+    }
     for (const session of [...first.sessions].sort((left, right) => compareUtf8Bytewise(left.session_id, right.session_id))) {
       if (session.deleted === true) {
         const deletedAt = parseTime(session.deleted_at, "source session deleted_at");
         if (compareTime(deletedAt, maximumCompleted) > 0) maximumCompleted = deletedAt;
         continue;
       }
+      const priorSession = first.protocol === STABLE_CURSOR_PROTOCOL ? completedSession.get(session.session_id) as { requests: number; records_sha256: string } | undefined : undefined;
+      if (priorSession !== undefined) {
+        if (priorSession.requests !== session.requests || priorSession.records_sha256 !== session.records_sha256) throw new DeltaError("incomplete archive spool session metadata changed");
+        const resumedDigest = createHash("sha256"); let resumedCount = 0;
+        for (const row of database.prepare("SELECT canonical FROM records WHERE session_id=? ORDER BY request_id COLLATE BINARY").iterate(session.session_id) as Iterable<{ canonical: Uint8Array }>) { resumedDigest.update(row.canonical); resumedCount += 1; }
+        if (resumedCount !== session.requests || resumedDigest.digest("hex") !== session.records_sha256) throw new DeltaError("incomplete archive spool session content failed verification");
+        continue;
+      }
       let exported = 0;
+      beginSpoolTransaction();
       for await (const rawLine of client.exportLines(session.session_id, args.maxLineBytes, first.snapshot, session.records_sha256)) {
         let item: unknown; try { item = parseStrictJson(rawLine.toString("utf8")); } catch { throw new DeltaError("source archive stream contains invalid JSON"); }
         if (!isObject(item) || ![1, 2].includes(item.schema_version as number)) throw new DeltaError("source archive record schema is unsupported");
@@ -956,7 +1039,18 @@ async function exportDelta(args: Arguments): Promise<JsonObject> {
         for (const row of database.prepare("SELECT canonical FROM records WHERE session_id=? ORDER BY request_id COLLATE BINARY").iterate(session.session_id) as Iterable<{ canonical: Uint8Array }>) digest.update(row.canonical);
         if (digest.digest("hex") !== session.records_sha256) throw new DeltaError("source session export digest disagrees with its stable summary");
       }
+      if (first.protocol === STABLE_CURSOR_PROTOCOL) {
+        markSessionCompleted.run(session.session_id, session.requests, session.records_sha256);
+      }
+      commitSpoolTransaction();
+      database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
     }
+    const spoolWatermarks = database.prepare("SELECT MAX(completed_at) AS completed_at,MAX(started_at) AS started_at FROM records WHERE emit=1").get() as { completed_at: string | null; started_at: string | null };
+    if (spoolWatermarks.completed_at !== null) {
+      const value = parseCanonicalTime(spoolWatermarks.completed_at, "archive spool maximum completed_at");
+      if (compareTime(value, maximumCompleted) > 0) maximumCompleted = value;
+    }
+    if (spoolWatermarks.started_at !== null) maximumStarted = parseCanonicalTime(spoolWatermarks.started_at, "archive spool maximum started_at");
     const afterExport = await client.statsRecords(); if (args.requireStableSource && afterExport !== before) throw new DeltaError("source record count changed despite the requested write barrier");
     const second = await loadProjection(client, lower, args.sessionLimit, afterExport, first.snapshot, priorFence); verifyClock(second.sessions, maximum);
     if (second.protocol !== first.protocol || second.requestCount !== first.requestCount || selectionDigest(second.sessions) !== firstDigest) throw new DeltaError("source session projection changed during delta export; retry");
@@ -994,8 +1088,15 @@ async function exportDelta(args: Arguments): Promise<JsonObject> {
       snapshot_schema_version: first.snapshotSchemaVersion ?? null, tombstone_safe_after_ingest_fence: first.tombstoneSafeAfterIngestFence ?? null, deleted_session_count: first.deletedSessionCount,
       session_set_sha256: firstDigest, record_count: recordCount, source_records_before: before, source_records_after: after, stable_source_required: args.requireStableSource,
       output_file: basename(args.output), output_size_bytes: outputSize, output_sha256: outputDigest.digest("hex") };
-    writeAtomicJson(manifestPath, manifest); renameSync(pending, args.output); fsyncDirectory(dirname(args.output)); commitCheckpoint(args.checkpoint, fingerprint, manifest); return manifest;
-  } finally { database?.close(); rmSync(spoolPath, { force: true }); if (outputTemporary !== undefined) rmSync(outputTemporary, { force: true }); }
+    writeAtomicJson(manifestPath, manifest); renameSync(pending, args.output); fsyncDirectory(dirname(args.output)); commitCheckpoint(args.checkpoint, fingerprint, manifest); completed = true; return manifest;
+  } finally {
+    if (spoolTransactionOpen) { try { database?.exec("ROLLBACK"); } catch { /* closing the database still rolls back an interrupted transaction */ } }
+    try { database?.close(); }
+    finally {
+      if (completed || !retainSpoolOnFailure) removeArchiveSpool(spoolPath);
+      if (outputTemporary !== undefined) rmSync(outputTemporary, { force: true });
+    }
+  }
 }
 
 function numberOption(values: Record<string, unknown>, key: string, fallback: number): number {
@@ -1042,7 +1143,7 @@ function parseCli(argv: string[]): Arguments {
 
 async function runExport(args: Arguments): Promise<JsonObject> {
   for (let attempt = 0; attempt <= args.maxRetries; attempt += 1) {
-    try { return await exportDelta(args); }
+    try { return await exportDelta(args, attempt > 0); }
     catch (error) {
       if (!(error instanceof SnapshotExpired)) throw error;
       if (attempt >= args.maxRetries) throw new DeltaError("collector snapshot or export ticket repeatedly expired");
@@ -1065,7 +1166,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       "  --readiness-poll-milliseconds N poll /readyz without starting archive reads early\n" +
       "  --client-cert-file FILE        mTLS client certificate for collector-direct\n" +
       "  --client-key-file FILE         mTLS client key for collector-direct\n" +
-      "  --resume                       resume from the sealed checkpoint\n",
+      "  --resume                       resume a verified stable spool or sealed checkpoint\n",
     );
     return 0;
   }
