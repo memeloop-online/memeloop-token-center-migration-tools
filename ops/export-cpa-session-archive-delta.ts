@@ -128,7 +128,9 @@ function openArchiveSpool(path: string, resume: boolean): { database: DatabaseSy
 }
 
 function removeArchiveSpool(path: string): void {
-  for (const target of [path, ...archiveSpoolSidecars(path)]) rmSync(target, { force: true });
+  const targets = [path, ...archiveSpoolSidecars(path)];
+  for (const target of targets) if (existsSync(target)) ensurePrivateSpoolFile(target, "archive spool cleanup target");
+  for (const target of targets) rmSync(target, { force: true });
   fsyncDirectory(dirname(path));
 }
 
@@ -942,7 +944,7 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
     if (existsSync(pending) && !existsSync(manifestPath) && !existsSync(args.output)) { ensurePrivateRegular(pending, "orphaned pending delta output"); unlinkSync(pending); fsyncDirectory(dirname(pending)); }
     else if (existsSync(args.output) || existsSync(pending) || existsSync(manifestPath)) {
       const manifest = await resumeOutput(args.output, pending, manifestPath, args.checkpoint, checkpoint, fingerprint);
-      if (existsSync(spoolPath)) { ensurePrivateRegular(spoolPath, "completed archive spool"); removeArchiveSpool(spoolPath); }
+      if (existsSync(spoolPath)) removeArchiveSpool(spoolPath);
       return manifest;
     }
   }
@@ -963,10 +965,10 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
   const first = await loadProjection(client, lower, args.sessionLimit, before, undefined, priorFence); verifyClock(first.sessions, maximum); const firstDigest = selectionDigest(first.sessions);
   mkdirSync(dirname(args.output), { recursive: true, mode: 0o700 });
   let database: DatabaseSync | undefined; let outputTemporary: string | undefined; let completed = false; let spoolTransactionOpen = false;
-  const retainSpoolOnFailure = existsSync(spoolPath) || first.protocol === STABLE_CURSOR_PROTOCOL;
+  let retainSpoolOnFailure = existsSync(spoolPath) || first.protocol === STABLE_CURSOR_PROTOCOL;
   let maximumCompleted = prior; let maximumStarted: Time | undefined;
   try {
-    const spool = openArchiveSpool(spoolPath, args.resume || internalResume); database = spool.database; database.exec(ARCHIVE_SPOOL_SCHEMA);
+    let spool = openArchiveSpool(spoolPath, args.resume || internalResume); database = spool.database; database.exec(ARCHIVE_SPOOL_SCHEMA);
     const spoolDescriptor = canonicalize({ version: 1, source_fingerprint: fingerprint, sequence, prior_watermark_completed_at: formatTime(prior),
       prior_source_ingest_fence: priorFence ?? null, lower_bound_completed_at: formatTime(lower), session_projection_protocol: first.protocol,
       source_projection_requests: first.requestCount, session_count: first.sessions.length, session_set_sha256: firstDigest,
@@ -977,6 +979,14 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
     if (existingDescriptor === undefined && spool.resumed) throw new DeltaError("incomplete archive spool is missing its versioned descriptor");
     if (existingDescriptor === undefined) database.prepare("INSERT INTO spool_metadata(id,descriptor_json) VALUES(1,?)").run(spoolDescriptor);
     else if (existingDescriptor.descriptor_json !== spoolDescriptor) throw new DeltaError("incomplete archive spool does not match the current source projection");
+    if (spool.resumed && first.protocol === LEGACY_PROJECTION_PROTOCOL) {
+      const discarded = (database.prepare("SELECT COUNT(*) AS records FROM records").get() as { records: number }).records;
+      database.close(); database = undefined; removeArchiveSpool(spoolPath);
+      spool = openArchiveSpool(spoolPath, false); database = spool.database; database.exec(ARCHIVE_SPOOL_SCHEMA);
+      database.prepare("INSERT INTO spool_metadata(id,descriptor_json) VALUES(1,?)").run(spoolDescriptor);
+      retainSpoolOnFailure = false;
+      process.stderr.write(`archive spool resume legacy_rebuild=true records_discarded=${discarded}\n`);
+    }
     const orphaned = (database.prepare("SELECT COUNT(*) AS records FROM records WHERE session_id NOT IN (SELECT session_id FROM completed_sessions)").get() as { records: number }).records;
     if (orphaned !== 0) throw new DeltaError("incomplete archive spool contains an unverified session");
     const seen = database.prepare("SELECT session_id, digest FROM records WHERE request_id=?");

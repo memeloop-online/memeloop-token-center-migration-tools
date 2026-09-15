@@ -102,7 +102,9 @@ obtains a fresh snapshot, requires an identical versioned session projection,
 re-verifies completed session counts and digests, and downloads only unfinished
 sessions. Do not delete or edit an output, manifest, pending file, spool or
 checkpoint to force a transition; retain it for investigation and retry from
-the last verified state.
+the last verified state. A legacy projection has no source session digest, so a
+matching legacy spool is safely rebuilt as temporary scratch instead of
+claiming that its partial rows are resumable.
 
 The host needs private scratch space for the bounded SQLite de-duplication spool
 and the final JSONL. Downloads are streamed into that spool; there is no separate

@@ -296,7 +296,8 @@ test("canonical helpers preserve six-digit UTC timestamps and deterministic keys
 test("archive spool stores each canonical payload in one indexed table", () => {
   const database = new DatabaseSync(":memory:");
   try {
-    database.exec(ARCHIVE_SPOOL_SCHEMA); database.exec(ARCHIVE_SPOOL_SCHEMA);
+    database.exec(ARCHIVE_SPOOL_SCHEMA);
+    database.exec(ARCHIVE_SPOOL_SCHEMA);
     const tables = database.prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name").all() as Array<{ name: string }>;
     assert.deepEqual(tables.map((table) => table.name), ["completed_sessions", "records", "spool_metadata"]);
     const columns = database.prepare("PRAGMA table_info(records)").all() as Array<{ name: string }>;
@@ -651,6 +652,48 @@ test("stable spool resume rejects a changed source projection before another arc
     assert.equal(resumed.code, 2); assert.match(resumed.stderr, /spool does not match the current source projection/);
     assert.equal([...state.archiveRequests.values()].reduce((sum, count) => sum + count, 0), downloadsBeforeResume);
     assert.equal(existsSync(spool), true);
+  } finally { rmSync(paths.directory, { recursive: true, force: true }); }
+});
+
+test("legacy spool resume rebuilds unverifiable scratch instead of deadlocking retries", async () => {
+  const paths = fixture();
+  const spool = `${paths.output}.spool.sqlite`;
+  try {
+    const row = record("request-legacy", "session-legacy", "2025-01-02T01:00:00Z", "2025-01-02T01:00:01Z");
+    state.records.set("session-legacy", [row]);
+    const projection = sessions(state);
+    const base = `http://127.0.0.1:${port}`;
+    const fingerprint = sourceFingerprint(new SourceClient(base, base, TOKEN, 60, true, new Set()));
+    const descriptor = canonicalBytes({
+      version: 1,
+      source_fingerprint: fingerprint,
+      sequence: 1,
+      prior_watermark_completed_at: "2025-01-01T00:00:00.000000Z",
+      prior_source_ingest_fence: null,
+      lower_bound_completed_at: "2024-12-31T00:00:00.000000Z",
+      session_projection_protocol: "legacy-last-at-limit-v1",
+      source_projection_requests: 1,
+      session_count: 1,
+      session_set_sha256: selectionDigest(projection),
+      snapshot_schema_version: null,
+      deleted_session_count: 0,
+      offline_full_snapshot: false,
+      max_line_bytes: 16 * 1024 * 1024,
+      max_future_skew_seconds: 3600,
+      stable_source_required: false,
+    }).toString();
+    const database = new DatabaseSync(spool);
+    database.exec(ARCHIVE_SPOOL_SCHEMA);
+    database.prepare("INSERT INTO spool_metadata(id,descriptor_json) VALUES(1,?)").run(descriptor);
+    const encoded = canonicalLine(row);
+    database.prepare("INSERT INTO records VALUES(?,?,?,?,?,?,1)").run(row.request_id, row.session_id, row.started_at, row.completed_at, createHash("sha256").update(encoded).digest("hex"), encoded);
+    database.close(); chmodSync(spool, 0o600);
+
+    const resumed = await run([...baseArguments(paths), "--resume"]);
+    assert.equal(resumed.code, 0, resumed.stderr);
+    assert.match(resumed.stderr, /archive spool resume legacy_rebuild=true records_discarded=1/);
+    assert.equal(state.archiveRequests.get("session-legacy"), 1);
+    assert.equal(existsSync(spool), false);
   } finally { rmSync(paths.directory, { recursive: true, force: true }); }
 });
 
