@@ -106,6 +106,20 @@ the last verified state. A legacy projection has no source session digest, so a
 matching legacy spool is safely rebuilt as temporary scratch instead of
 claiming that its partial rows are resumable.
 
+The pre-PR8 `3612a75` collector baseline used a distinct random
+`.mtc-archive-delta-spool.PID.EPOCH.sqlite` records-only file. For that exact
+historical contract only, keep the old file in place and repeat the approved
+initial collector invocation with `--resume --legacy-spool ABSOLUTE_FILE`.
+The bridge opens the old file read-only, requires a fresh stable source
+projection, and copies only sessions whose local count and canonical digest
+match the source summary into a new adjacent PR8 spool. It then downloads only
+the remaining sessions. It emits aggregate-only
+`reused_sessions`, `reused_records`, `reused_canonical_bytes`,
+`remaining_sessions`, and `remaining_records`; these are the recovery
+accounting contract, not a new checkpoint. It refuses sidecars, unknown schema,
+unmatched source sessions, or an old spool without a verified completed session.
+Never rename the historical file to `OUTPUT.spool.sqlite` or add metadata to it.
+
 The host needs private scratch space for the bounded SQLite de-duplication spool
 and the final JSONL. Downloads are streamed into that spool; there is no separate
 download file. The spool has one payload-bearing `records` table and stores each
