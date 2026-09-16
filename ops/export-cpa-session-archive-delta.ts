@@ -31,7 +31,7 @@ import {
 import { request as httpRequest, type IncomingMessage } from "node:http";
 import { request as httpsRequest, type RequestOptions } from "node:https";
 import { isIP } from "node:net";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { invokedAsEntrypoint } from "./lib/invoked-as-entrypoint.ts";
@@ -48,6 +48,7 @@ const MAX_SESSION_COUNT = 1_000_000;
 const MAX_MANAGEMENT_RESPONSE_BYTES = 8 * 1024 * 1024;
 const TICKET_PATH_PREFIX = "/archive-api/v1/exports/";
 const TOKEN_ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+const LEGACY_SPOOL_BASENAME = /^\.mtc-archive-delta-spool\.[1-9][0-9]*\.[0-9]+\.sqlite$/;
 const CPA_PATHS = {
   mode: "cpa-plugin-input",
   sessions: "/v0/management/plugins/cpa-session-archive/sessions",
@@ -922,12 +923,117 @@ function verifyClock(sessions: SessionSummary[], maximum: Time): void {
   for (const item of sessions) if ((item.first_at !== undefined && compareTime(parseTime(item.first_at, "source session first_at"), maximum) > 0) || compareTime(parseTime(item.last_at, "source session last_at"), maximum) > 0) throw new DeltaError("source session timestamp exceeds the future-skew limit");
 }
 
+type RecoveredLegacySession = Readonly<{ sessionId: string; requests: number; recordsSha256: string; canonicalBytes: number }>;
+type LegacySpoolRecovery = Readonly<{
+  database: DatabaseSync;
+  sessions: readonly RecoveredLegacySession[];
+  reusedRecords: number;
+  reusedCanonicalBytes: number;
+  remainingSessions: number;
+  remainingRecords: number;
+}>;
+
+function legacySpoolSchema(database: DatabaseSync): void {
+  const tables = database.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all() as Array<{ name: string }>;
+  if (tables.length !== 1 || tables[0]?.name !== "records") throw new DeltaError("legacy archive spool does not match the 3612 records-only schema");
+  const columns = database.prepare("PRAGMA table_info(records)").all() as Array<{ name: string; type: string; notnull: number; pk: number }>;
+  const expected = [
+    ["request_id", "TEXT", 1, 1], ["session_id", "TEXT", 1, 0], ["started_at", "TEXT", 1, 0], ["completed_at", "TEXT", 1, 0],
+    ["digest", "TEXT", 1, 0], ["canonical", "BLOB", 1, 0], ["emit", "INTEGER", 1, 0],
+  ] as const;
+  if (columns.length !== expected.length || columns.some((column, index) => column.name !== expected[index]![0] || column.type !== expected[index]![1] || column.notnull !== expected[index]![2] || column.pk !== expected[index]![3])) {
+    throw new DeltaError("legacy archive spool does not match the 3612 records-only schema");
+  }
+}
+
+/**
+ * The 3612 exporter kept only a per-record spool. Its successful sessions are
+ * recoverable only when a fresh stable source projection supplies the exact
+ * per-session count and digest. This opens that historical file read-only and
+ * never adds PR8 metadata to it; the caller creates a separate PR8 spool after
+ * every candidate has been verified.
+ */
+function inspectLegacySpool(path: string, projection: Projection): LegacySpoolRecovery {
+  if (!isAbsolute(path) || path !== resolve(path) || !LEGACY_SPOOL_BASENAME.test(basename(path))) throw new DeltaError("legacy archive spool path does not match the 3612 random-spool contract");
+  ensurePrivateSpoolFile(path, "legacy archive spool");
+  for (const sidecar of archiveSpoolSidecars(path)) if (existsSync(sidecar)) throw new DeltaError("legacy archive spool has unsealed SQLite sidecars");
+  if (projection.protocol !== STABLE_CURSOR_PROTOCOL) throw new DeltaError("legacy archive spool recovery requires a stable source projection");
+  const source = new Map<string, SessionSummary>();
+  for (const session of projection.sessions) {
+    if (session.deleted === true || session.records_sha256 === undefined) continue;
+    if (source.has(session.session_id)) throw new DeltaError("stable source projection contains duplicate session identities");
+    source.set(session.session_id, session);
+  }
+  let database: DatabaseSync | undefined;
+  try {
+    database = new DatabaseSync(path, { readOnly: true });
+    const integrity = database.prepare("PRAGMA integrity_check").get() as Record<string, unknown> | undefined;
+    if (integrity === undefined || Object.values(integrity)[0] !== "ok") throw new DeltaError("legacy archive spool failed its integrity check");
+    legacySpoolSchema(database);
+    const sessions: RecoveredLegacySession[] = [];
+    let currentId: string | undefined, currentCount = 0, currentBytes = 0, currentDigest = createHash("sha256");
+    const complete = (): void => {
+      if (currentId === undefined) return;
+      const summary = source.get(currentId);
+      if (summary === undefined) throw new DeltaError("legacy archive spool contains a session absent from the stable source projection");
+      const digest = currentDigest.digest("hex");
+      if (currentCount === summary.requests && digest === summary.records_sha256) sessions.push({ sessionId: currentId, requests: currentCount, recordsSha256: digest, canonicalBytes: currentBytes });
+    };
+    const rows = database.prepare("SELECT request_id,session_id,started_at,completed_at,digest,canonical,emit FROM records ORDER BY session_id COLLATE BINARY,request_id COLLATE BINARY");
+    for (const row of rows.iterate() as Iterable<{ request_id: string; session_id: string; started_at: string; completed_at: string; digest: string; canonical: Uint8Array; emit: number }>) {
+      if (currentId !== undefined && currentId !== row.session_id) { complete(); currentCount = 0; currentBytes = 0; currentDigest = createHash("sha256"); }
+      currentId = row.session_id;
+      const canonical = Buffer.from(row.canonical); let record: unknown;
+      try { record = parseStrictJson(canonical.toString("utf8")); } catch { throw new DeltaError("legacy archive spool record content failed verification"); }
+      if (!isObject(record) || row.emit !== 1 || record.request_id !== row.request_id || record.session_id !== row.session_id || record.started_at !== row.started_at || record.completed_at !== row.completed_at || row.digest !== sha256Bytes(canonical)) {
+        throw new DeltaError("legacy archive spool record content failed verification");
+      }
+      parseCanonicalTime(row.started_at, "legacy archive spool started_at"); parseCanonicalTime(row.completed_at, "legacy archive spool completed_at");
+      currentDigest.update(canonical); currentCount += 1; currentBytes += canonical.length;
+    }
+    complete();
+    if (sessions.length === 0) throw new DeltaError("legacy archive spool contains no source-verified completed sessions");
+    const reusedRecords = sessions.reduce((sum, session) => sum + session.requests, 0);
+    const reusedCanonicalBytes = sessions.reduce((sum, session) => sum + session.canonicalBytes, 0);
+    const projectionSessions = [...source.values()];
+    return { database, sessions, reusedRecords, reusedCanonicalBytes,
+      remainingSessions: projectionSessions.length - sessions.length,
+      remainingRecords: projectionSessions.reduce((sum, session) => sum + session.requests, 0) - reusedRecords };
+  } catch (error) {
+    database?.close();
+    throw error;
+  }
+}
+
+function seedRecoveredLegacySessions(target: DatabaseSync, recovery: LegacySpoolRecovery): void {
+  const insertRecord = target.prepare("INSERT INTO records VALUES(?,?,?,?,?,?,?)");
+  const markSessionCompleted = target.prepare("INSERT INTO completed_sessions(session_id,requests,records_sha256,downloaded_bytes) VALUES(?,?,?,?)");
+  const legacyRows = recovery.database.prepare("SELECT request_id,session_id,started_at,completed_at,digest,canonical,emit FROM records WHERE session_id=? ORDER BY request_id COLLATE BINARY");
+  target.exec("BEGIN IMMEDIATE");
+  try {
+    for (const session of recovery.sessions) {
+      let copied = 0, copiedBytes = 0;
+      for (const row of legacyRows.iterate(session.sessionId) as Iterable<{ request_id: string; session_id: string; started_at: string; completed_at: string; digest: string; canonical: Uint8Array; emit: number }>) {
+        const canonical = Buffer.from(row.canonical);
+        insertRecord.run(row.request_id, row.session_id, row.started_at, row.completed_at, row.digest, canonical, row.emit);
+        copied += 1; copiedBytes += canonical.length;
+      }
+      if (copied !== session.requests || copiedBytes !== session.canonicalBytes) throw new DeltaError("legacy archive spool changed while it was being recovered");
+      markSessionCompleted.run(session.sessionId, session.requests, session.recordsSha256, session.canonicalBytes);
+    }
+    target.exec("COMMIT"); target.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  } catch (error) {
+    try { target.exec("ROLLBACK"); } catch { /* the caller will close the target spool */ }
+    throw error;
+  }
+}
+
 type Arguments = {
   baseUrl: string; downloadBaseUrl?: string; tokenFile?: string; tokenEnv?: string; checkpoint: string; output: string;
   collectorDirect: boolean; offlineFull: boolean; privateHttpHosts: string[]; clientCertFile?: string; clientKeyFile?: string; since?: string;
   overlapSeconds: number; sessionLimit: number; maxLineBytes: number; maxDownloadBytes: number; maxOutputBytes: number; timeoutSeconds: number;
   maxElapsedSeconds: number; readinessTimeoutSeconds: number; readinessPollMilliseconds: number; maxRetries: number; retryBaseSeconds: number;
-  maxFutureSkewSeconds: number; requireStableSource: boolean; allowHttp: boolean; resume: boolean; deadline: number;
+  maxFutureSkewSeconds: number; requireStableSource: boolean; allowHttp: boolean; resume: boolean; legacySpool?: string; deadline: number;
 };
 
 async function exportDelta(args: Arguments, internalResume = false): Promise<JsonObject> {
@@ -942,6 +1048,9 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
   const client = new SourceClient(args.baseUrl, args.downloadBaseUrl ?? args.baseUrl, token, args.timeoutSeconds, args.allowHttp, hosts, args.collectorDirect, args.maxRetries, args.retryBaseSeconds, args.deadline, tls, args.maxDownloadBytes, args.offlineFull, diagnostics);
   const fingerprint = sourceFingerprint(client); const checkpoint = loadCheckpoint(args.checkpoint, fingerprint);
   const manifestPath = `${args.output}.manifest.json`; const pending = `${args.output}.pending`; const spoolPath = `${args.output}.spool.sqlite`;
+  if (args.legacySpool !== undefined && (checkpoint !== undefined || !args.collectorDirect || !args.offlineFull || !args.resume || args.since === undefined)) {
+    throw new DeltaError("legacy archive spool recovery requires --resume, --collector-direct, --offline-full, --since, and no checkpoint");
+  }
   if (args.resume) {
     if (existsSync(pending) && !existsSync(manifestPath) && !existsSync(args.output)) { ensurePrivateRegular(pending, "orphaned pending delta output"); unlinkSync(pending); fsyncDirectory(dirname(pending)); }
     else if (existsSync(args.output) || existsSync(pending) || existsSync(manifestPath)) {
@@ -965,8 +1074,10 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
   const before = await client.statsRecords();
   if (checkpoint !== undefined && before < (checkpoint.last_source_records as number)) throw new DeltaError("source record count moved backwards since the checkpoint");
   const first = await loadProjection(client, lower, args.sessionLimit, before, undefined, priorFence); verifyClock(first.sessions, maximum); const firstDigest = selectionDigest(first.sessions);
+  const legacyRecovery = args.legacySpool === undefined ? undefined : inspectLegacySpool(args.legacySpool, first);
   mkdirSync(dirname(args.output), { recursive: true, mode: 0o700 });
   let database: DatabaseSync | undefined; let outputTemporary: string | undefined; let completed = false; let spoolTransactionOpen = false;
+  const seededLegacySessions = new Set<string>();
   let retainSpoolOnFailure = existsSync(spoolPath) || first.protocol === STABLE_CURSOR_PROTOCOL;
   let maximumCompleted = prior; let maximumStarted: Time | undefined;
   try {
@@ -987,6 +1098,12 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
     }
     if (existingDescriptor === undefined) database.prepare("INSERT INTO spool_metadata(id,descriptor_json) VALUES(1,?)").run(spoolDescriptor);
     else if (existingDescriptor.descriptor_json !== spoolDescriptor) throw new DeltaError("incomplete archive spool does not match the current source projection");
+    if (legacyRecovery !== undefined) {
+      if (!spool.resumed) {
+        seedRecoveredLegacySessions(database, legacyRecovery);
+        for (const session of legacyRecovery.sessions) seededLegacySessions.add(session.sessionId);
+      }
+    }
     if (spool.resumed && first.protocol === LEGACY_PROJECTION_PROTOCOL) {
       const discarded = (database.prepare("SELECT COUNT(*) AS records FROM records").get() as { records: number }).records;
       database.close(); database = undefined; removeArchiveSpool(spoolPath);
@@ -1007,6 +1124,9 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
     if (client.downloadedBytes > args.maxDownloadBytes) throw new DeltaError("source archive downloads exceed the configured limit");
     const beginSpoolTransaction = (): void => { if (!spoolTransactionOpen) { database!.exec("BEGIN IMMEDIATE"); spoolTransactionOpen = true; } };
     const commitSpoolTransaction = (): void => { if (spoolTransactionOpen) { database!.exec("COMMIT"); spoolTransactionOpen = false; } };
+    if (seededLegacySessions.size !== 0 && legacyRecovery !== undefined) {
+      process.stderr.write(`archive legacy spool recovery reused_sessions=${legacyRecovery.sessions.length} reused_records=${legacyRecovery.reusedRecords} reused_canonical_bytes=${legacyRecovery.reusedCanonicalBytes} remaining_sessions=${legacyRecovery.remainingSessions} remaining_records=${legacyRecovery.remainingRecords}\n`);
+    }
     if (spool.resumed) {
       const counts = database.prepare("SELECT (SELECT COUNT(*) FROM completed_sessions) AS sessions,(SELECT COUNT(*) FROM records) AS records").get() as { sessions: number; records: number };
       process.stderr.write(`archive spool resume completed_sessions=${counts.sessions} records=${counts.records}\n`);
@@ -1020,6 +1140,10 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
       const priorSession = first.protocol === STABLE_CURSOR_PROTOCOL ? completedSession.get(session.session_id) as { requests: number; records_sha256: string } | undefined : undefined;
       if (priorSession !== undefined) {
         if (priorSession.requests !== session.requests || priorSession.records_sha256 !== session.records_sha256) throw new DeltaError("incomplete archive spool session metadata changed");
+        // The recovery bridge just verified the source spool's canonical rows,
+        // then copied them in one transaction. Avoid another full local blob
+        // pass here; a later invocation uses the ordinary PR8 re-verification.
+        if (seededLegacySessions.has(session.session_id)) continue;
         const resumedDigest = createHash("sha256"); let resumedCount = 0;
         const rows = database.prepare("SELECT request_id,session_id,started_at,completed_at,digest,canonical,emit FROM records WHERE session_id=? ORDER BY request_id COLLATE BINARY");
         for (const row of rows.iterate(session.session_id) as Iterable<{ request_id: string; session_id: string; started_at: string; completed_at: string; digest: string; canonical: Uint8Array; emit: number }>) {
@@ -1124,7 +1248,7 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
     writeAtomicJson(manifestPath, manifest); renameSync(pending, args.output); fsyncDirectory(dirname(args.output)); commitCheckpoint(args.checkpoint, fingerprint, manifest); completed = true; return manifest;
   } finally {
     if (spoolTransactionOpen) { try { database?.exec("ROLLBACK"); } catch { /* closing the database still rolls back an interrupted transaction */ } }
-    try { database?.close(); }
+    try { database?.close(); legacyRecovery?.database.close(); }
     finally {
       if (completed || !retainSpoolOnFailure) removeArchiveSpool(spoolPath);
       if (outputTemporary !== undefined) rmSync(outputTemporary, { force: true });
@@ -1137,14 +1261,14 @@ function numberOption(values: Record<string, unknown>, key: string, fallback: nu
 }
 function parseCli(argv: string[]): Arguments {
   const { values } = parseArgs({ args: argv, strict: true, allowPositionals: false, options: {
-    "base-url": { type: "string" }, "download-base-url": { type: "string" }, "token-file": { type: "string" }, "token-env": { type: "string" }, checkpoint: { type: "string" }, output: { type: "string" },
+    "base-url": { type: "string" }, "download-base-url": { type: "string" }, "token-file": { type: "string" }, "token-env": { type: "string" }, checkpoint: { type: "string" }, output: { type: "string" }, "legacy-spool": { type: "string" },
     "collector-direct": { type: "boolean", default: false }, "offline-full": { type: "boolean", default: false }, "private-http-host": { type: "string", multiple: true, default: [] }, "client-cert-file": { type: "string" }, "client-key-file": { type: "string" }, since: { type: "string" },
     "overlap-seconds": { type: "string" }, "session-limit": { type: "string" }, "max-line-bytes": { type: "string" }, "max-download-bytes": { type: "string" }, "max-output-bytes": { type: "string" }, "timeout-seconds": { type: "string" }, "max-elapsed-seconds": { type: "string" },
     "readiness-timeout-seconds": { type: "string" }, "readiness-poll-milliseconds": { type: "string" }, "max-retries": { type: "string" }, "retry-base-seconds": { type: "string" }, "max-future-skew-seconds": { type: "string" },
     "require-stable-source": { type: "boolean", default: false }, "allow-http": { type: "boolean", default: false }, resume: { type: "boolean", default: false },
   } });
   if (typeof values["base-url"] !== "string" || typeof values.checkpoint !== "string" || typeof values.output !== "string") throw new DeltaError("--base-url, --checkpoint, and --output are required");
-  const args: Arguments = { baseUrl: values["base-url"], downloadBaseUrl: values["download-base-url"], tokenFile: values["token-file"], tokenEnv: values["token-env"], checkpoint: values.checkpoint, output: values.output,
+  const args: Arguments = { baseUrl: values["base-url"], downloadBaseUrl: values["download-base-url"], tokenFile: values["token-file"], tokenEnv: values["token-env"], checkpoint: values.checkpoint, output: values.output, legacySpool: values["legacy-spool"],
     collectorDirect: values["collector-direct"]!, offlineFull: values["offline-full"]!, privateHttpHosts: values["private-http-host"]!, clientCertFile: values["client-cert-file"], clientKeyFile: values["client-key-file"], since: values.since,
     overlapSeconds: numberOption(values, "overlap-seconds", 86_400), sessionLimit: numberOption(values, "session-limit", 1000), maxLineBytes: numberOption(values, "max-line-bytes", 16 * 1024 * 1024), maxDownloadBytes: numberOption(values, "max-download-bytes", 64 * 1024 ** 3), maxOutputBytes: numberOption(values, "max-output-bytes", 64 * 1024 ** 3), timeoutSeconds: numberOption(values, "timeout-seconds", 60), maxElapsedSeconds: numberOption(values, "max-elapsed-seconds", 6 * 3600),
     readinessTimeoutSeconds: numberOption(values, "readiness-timeout-seconds", 900), readinessPollMilliseconds: numberOption(values, "readiness-poll-milliseconds", 1000), maxRetries: numberOption(values, "max-retries", 5), retryBaseSeconds: numberOption(values, "retry-base-seconds", 0.5), maxFutureSkewSeconds: numberOption(values, "max-future-skew-seconds", 3600), requireStableSource: values["require-stable-source"]!, allowHttp: values["allow-http"]!, resume: values.resume!, deadline: 0 };
@@ -1169,6 +1293,7 @@ function parseCli(argv: string[]): Arguments {
   if (args.allowHttp && args.privateHttpHosts.length > 0) throw new DeltaError("--allow-http and --private-http-host cannot be combined");
   if ((args.clientCertFile === undefined) !== (args.clientKeyFile === undefined)) throw new DeltaError("mTLS requires both --client-cert-file and --client-key-file");
   if (args.clientCertFile !== undefined && !args.collectorDirect) throw new DeltaError("mTLS client files are only valid with --collector-direct");
+  if (args.legacySpool !== undefined && (!isAbsolute(args.legacySpool) || args.legacySpool !== resolve(args.legacySpool) || !LEGACY_SPOOL_BASENAME.test(basename(args.legacySpool)))) throw new DeltaError("legacy archive spool path does not match the 3612 random-spool contract");
   const normalized = args.privateHttpHosts.map(normalizeHost); if (normalized.some((item, index) => item.length === 0 || item !== args.privateHttpHosts[index])) throw new DeltaError("private HTTP host allowlist contains an invalid host");
   if (new Set(normalized).size !== normalized.length) throw new DeltaError("private HTTP host allowlist contains duplicates");
   args.deadline = performance.now() + args.maxElapsedSeconds * 1000; return args;
@@ -1199,6 +1324,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       "  --readiness-poll-milliseconds N poll /readyz without starting archive reads early\n" +
       "  --client-cert-file FILE        mTLS client certificate for collector-direct\n" +
       "  --client-key-file FILE         mTLS client key for collector-direct\n" +
+      "  --legacy-spool FILE            read-only recovery of a verified 3612 random spool\n" +
       "  --resume                       resume a verified stable spool or sealed checkpoint\n",
     );
     return 0;

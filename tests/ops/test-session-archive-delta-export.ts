@@ -264,6 +264,31 @@ function fixture(): { directory: string; token: string; checkpoint: string; outp
 function baseArguments(paths: ReturnType<typeof fixture>): string[] {
   return ["--base-url", `http://127.0.0.1:${port}`, "--allow-http", "--token-file", paths.token, "--checkpoint", paths.checkpoint, "--output", paths.output, "--since", "2025-01-01T00:00:00Z", "--retry-base-seconds", "0.001"];
 }
+function collectorBaselineArguments(paths: ReturnType<typeof fixture>): string[] {
+  return ["--collector-direct", "--offline-full", "--base-url", `http://127.0.0.1:${port}`, "--private-http-host", "127.0.0.1", "--checkpoint", paths.checkpoint, "--output", paths.output, "--since", "1970-01-01T00:00:00Z", "--retry-base-seconds", "0.001"];
+}
+const LEGACY_3612_SPOOL_SCHEMA = `
+  CREATE TABLE records(
+    request_id TEXT PRIMARY KEY COLLATE BINARY,
+    session_id TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    completed_at TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    canonical BLOB NOT NULL,
+    emit INTEGER NOT NULL CHECK(emit IN (0, 1))
+  ) WITHOUT ROWID;
+  CREATE INDEX records_by_session ON records(session_id COLLATE BINARY, request_id COLLATE BINARY);
+  CREATE INDEX records_by_output ON records(started_at, request_id COLLATE BINARY) WHERE emit = 1;
+`;
+function writeLegacy3612RecordSpool(path: string, rows: RecordValue[]): void {
+  const database = new DatabaseSync(path); database.exec(LEGACY_3612_SPOOL_SCHEMA);
+  const insert = database.prepare("INSERT INTO records VALUES(?,?,?,?,?,?,?)");
+  for (const row of rows) {
+    const canonical = canonicalLine(row);
+    insert.run(row.request_id, row.session_id, row.started_at, row.completed_at, createHash("sha256").update(canonical).digest("hex"), canonical, 1);
+  }
+  database.close(); chmodSync(path, 0o600);
+}
 
 function scriptedReadinessDriver(steps: Array<number | Error>, fallbackStatus = 503): {
   clock: { now: number };
@@ -647,6 +672,48 @@ test("stable spool resume skips previously verified sessions after a fresh snaps
     assert.equal(existsSync(spool), false);
     const requestIds = readFileSync(paths.output, "utf8").trim().split("\n").map((line) => (JSON.parse(line) as RecordValue).request_id);
     assert.deepEqual(requestIds, ["request-a", "request-b"]);
+  } finally { rmSync(paths.directory, { recursive: true, force: true }); }
+});
+
+test("read-only legacy 3612 recovery seeds only source-verified sessions", async () => {
+  const paths = fixture();
+  const legacy = join(paths.directory, ".mtc-archive-delta-spool.1.1789479841474.sqlite");
+  try {
+    state.stable = true;
+    const later = record("request-later", "session-later", "2025-01-03T01:00:00.000000Z", "2025-01-03T01:00:01.000000Z");
+    const recovered = record("request-recovered", "session-recovered", "2025-01-02T01:00:00.000000Z", "2025-01-02T01:00:01.000000Z");
+    // The direct fixture deliberately resolves hashed tickets to the first map
+    // entry, so leave the unseeded session first and verify it is the only ticket
+    // fetched by the recovery run.
+    state.records.set("session-later", [later]); state.records.set("session-recovered", [recovered]);
+    writeLegacy3612RecordSpool(legacy, [recovered]);
+    const legacyBytes = readFileSync(legacy);
+
+    const result = await run([...collectorBaselineArguments(paths), "--resume", "--legacy-spool", legacy]);
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stderr, /archive legacy spool recovery reused_sessions=1 reused_records=1 reused_canonical_bytes=\d+ remaining_sessions=1 remaining_records=1/);
+    assert.equal(state.archiveRequests.get("session-recovered") ?? 0, 0, "a source-verified session must not be downloaded again");
+    assert.equal(state.archiveRequests.get("session-later"), 1);
+    assert.equal(existsSync(legacy), true); assert.deepEqual(readFileSync(legacy), legacyBytes, "the legacy source spool is read-only evidence");
+    assert.equal(existsSync(`${paths.output}.spool.sqlite`), false, "only the completed new spool is cleaned up");
+  } finally { rmSync(paths.directory, { recursive: true, force: true }); }
+});
+
+test("legacy 3612 recovery refuses unverified rows before creating a canonical spool", async () => {
+  const paths = fixture();
+  const legacy = join(paths.directory, ".mtc-archive-delta-spool.2.1789479841475.sqlite");
+  try {
+    state.stable = true;
+    const source = record("request-source", "session-source", "2025-01-02T01:00:00.000000Z", "2025-01-02T01:00:01.000000Z");
+    const mismatched = { ...source, request_id: "request-mismatched" };
+    state.records.set("session-source", [source]); writeLegacy3612RecordSpool(legacy, [mismatched]);
+    const legacyBytes = readFileSync(legacy);
+
+    const result = await run([...collectorBaselineArguments(paths), "--resume", "--legacy-spool", legacy]);
+    assert.equal(result.code, 2); assert.match(result.stderr, /legacy archive spool contains no source-verified completed sessions/);
+    assert.equal(state.archiveRequests.size, 0);
+    assert.equal(existsSync(`${paths.output}.spool.sqlite`), false);
+    assert.deepEqual(readFileSync(legacy), legacyBytes);
   } finally { rmSync(paths.directory, { recursive: true, force: true }); }
 });
 
