@@ -749,7 +749,7 @@ export class SourceClient {
     }
     return ticket;
   }
-  async *exportLines(sessionId: string, maximum: number, snapshot?: string, recordsSha256?: string): AsyncGenerator<Buffer> {
+  async *exportLines(sessionId: string, maximum: number, snapshot?: string, recordsSha256?: string): AsyncGenerator<string> {
     let response: IncomingMessage | undefined;
     let responseDeadlineExceeded = () => false;
     let downloadStartedAt = performance.now();
@@ -782,21 +782,38 @@ export class SourceClient {
       throw new DeltaError(`source archive export returned HTTP ${result.status}`);
     }
     if (response === undefined) throw new DeltaError("source archive export failed");
-    let buffered = Buffer.alloc(0);
+    let fragments: Buffer[] = [];
+    let bufferedBytes = 0;
+    const append = (fragment: Buffer): void => {
+      if (fragment.length === 0) return;
+      bufferedBytes += fragment.length;
+      if (bufferedBytes > maximum) throw new DeltaError("source archive record exceeds the configured line limit");
+      fragments.push(fragment);
+    };
+    const decode = (): string => {
+      const bytes = fragments.length === 1 ? fragments[0]! : Buffer.concat(fragments, bufferedBytes);
+      fragments = []; bufferedBytes = 0;
+      return bytes.toString("utf8");
+    };
     try {
       for await (const raw of response) {
-        this.timeout(); lastActivityAt = performance.now(); const chunk = Buffer.from(raw as Buffer); this.downloadedBytes += chunk.length;
+        this.timeout(); lastActivityAt = performance.now(); const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as Uint8Array); this.downloadedBytes += chunk.length;
         if (this.maxDownloadBytes !== undefined && this.downloadedBytes > this.maxDownloadBytes) throw new DeltaError("source archive downloads exceed the configured limit");
-        buffered = Buffer.concat([buffered, chunk]);
-        while (true) {
-          const newline = buffered.indexOf(0x0a); if (newline < 0) break;
-          const line = buffered.subarray(0, newline + 1); buffered = buffered.subarray(newline + 1);
-          if (line.length > maximum) throw new DeltaError("source archive record exceeds the configured line limit");
-          if (line.toString("utf8").trim()) yield line;
+        let offset = 0;
+        while (offset < chunk.length) {
+          const newline = chunk.indexOf(0x0a, offset);
+          const end = newline < 0 ? chunk.length : newline + 1;
+          append(chunk.subarray(offset, end));
+          if (newline < 0) break;
+          const line = decode();
+          if (line.trim()) yield line;
+          offset = end;
         }
-        if (buffered.length > maximum) throw new DeltaError("source archive record exceeds the configured line limit");
       }
-      if (buffered.length > 0 && buffered.toString("utf8").trim()) yield buffered;
+      if (bufferedBytes > 0) {
+        const line = decode();
+        if (line.trim()) yield line;
+      }
     } catch (error) {
       const cause = responseDeadlineExceeded() ? "overall_timeout" : error instanceof DeltaError ? "validation" : classifyTransportFailure(error);
       this.archiveDownloadDiagnostic("failure", downloadStartedAt, lastActivityAt, cause);
@@ -1164,7 +1181,7 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
       const downloadedBeforeSession = client.downloadedBytes;
       beginSpoolTransaction();
       for await (const rawLine of client.exportLines(session.session_id, args.maxLineBytes, first.snapshot, session.records_sha256)) {
-        let item: unknown; try { item = parseStrictJson(rawLine.toString("utf8")); } catch { throw new DeltaError("source archive stream contains invalid JSON"); }
+        let item: unknown; try { item = parseStrictJson(rawLine); } catch { throw new DeltaError("source archive stream contains invalid JSON"); }
         if (!isObject(item) || ![1, 2].includes(item.schema_version as number)) throw new DeltaError("source archive record schema is unsupported");
         if (typeof item.request_id !== "string" || item.request_id.length === 0) throw new DeltaError("source archive request identity is invalid");
         const requestId = item.request_id;
