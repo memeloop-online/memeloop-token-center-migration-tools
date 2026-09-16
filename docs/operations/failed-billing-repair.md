@@ -75,6 +75,18 @@ FAILED_BILLING_ALLOW_WRITE=I_UNDERSTAND_SETTLEMENT_ADJUSTMENT_API \
 The real receipt, token, request IDs, and batch receipts must remain outside
 this repository and any public CI log.
 
+Before any `--apply` write, the runner performs a read-only, paginated
+`settlement-correction-previews` sweep for each candidate account. It uses
+inclusive millisecond windows no wider than 93 days, follows the returned
+`after_created_at`/`after_request_id` cursor, and requires the exact plan
+selection: terminal failed, `contract_ceiling`, response archive `gap`, no
+response, `ready_for_evidence`, and a matched settlement feed. The preview
+must reproduce the immutable 1590-row / 28868679418-micros safe set and the
+five bound rows are reported but excluded. A `--preflight` invocation can run
+the same API preview when both API environment variables are supplied; the
+preview is read-only and a non-200 response stops the operation before any
+write.
+
 `statistics_sources` compares request facts, the settlement feed, daily
 aggregates, and hourly request buckets. Day/hour rows are reported as
 overlapping buckets; a correction implementation must rebuild or compensate

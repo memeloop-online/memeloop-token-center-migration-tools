@@ -154,6 +154,12 @@ function microsToDecimal(micros: string): string {
   return fraction ? `${units}.${fraction}` : units.toString();
 }
 
+function decimalToMicros(value: unknown, name: string): string {
+  const parsed = nonnegativeMoney(value, name);
+  const [whole, fraction = ""] = parsed.split(".");
+  return (BigInt(whole) * 1_000_000n + BigInt(fraction.padEnd(6, "0"))).toString();
+}
+
 type Candidate = {
   requestId: string;
   createdAt: string;
@@ -178,6 +184,23 @@ type Plan = {
   dayBuckets: string[];
   hourBuckets: string[];
   scope: JsonRecord;
+  expectedPreviewRows: string;
+  expectedSafeRows: string;
+  expectedSafeMicros: string;
+  expectedBoundRows: string;
+  expectedProviderRows: string;
+  expectedNullableBasisRows: string;
+};
+
+type PreviewSummary = {
+  pages: string;
+  preview_rows: string;
+  safe_rows: string;
+  safe_micros: string;
+  bound_rows: string;
+  invariant_mismatch_rows: string;
+  excluded_provider_reported_rows: string;
+  excluded_nullable_basis_rows: string;
 };
 
 function planCandidate(raw: unknown): Candidate {
@@ -262,6 +285,10 @@ function planCandidate(raw: unknown): Candidate {
   };
 }
 
+function receiptCount(value: JsonRecord, key: string, name: string): string {
+  return nonnegativeInteger(value[key], name);
+}
+
 function readPlan(): Plan {
   const file = protectedPlanFile();
   let parsed: unknown;
@@ -276,6 +303,23 @@ function readPlan(): Plan {
   }
   const receipt = record(root.receipt, "plan receipt");
   const scope = record(receipt.scope, "plan scope");
+  const manualReview = record(receipt.manual_review, "plan manual_review");
+  const archiveStates = manualReview.contract_ceiling_archive_states;
+  if (!Array.isArray(archiveStates)) fail("plan manual_review has no contract_ceiling_archive_states", 1);
+  const archiveCounts = new Map<string, { rows: string; micros: string }>();
+  for (const rawState of archiveStates) {
+    const state = record(rawState, "plan archive state");
+    const name = stringValue(state.response_archive_state, "plan response_archive_state");
+    if (archiveCounts.has(name)) fail("plan has duplicate response archive state", 1);
+    archiveCounts.set(name, {
+      rows: receiptCount(state, "request_count", `${name}.request_count`),
+      micros: receiptCount(state, "cost_micros", `${name}.cost_micros`),
+    });
+  }
+  const safeArchive = archiveCounts.get("gap");
+  const boundArchive = archiveCounts.get("bound") ?? { rows: "0", micros: "0" };
+  const expectedProviderRows = receiptCount(manualReview, "evidence_preserved_rows_in_interval", "manual_review.evidence_preserved_rows_in_interval");
+  const expectedNullableBasisRows = receiptCount(manualReview, "nullable_basis_failed_nonzero_in_interval", "manual_review.nullable_basis_failed_nonzero_in_interval");
   const rawCandidates = receipt.repair_candidates;
   if (!Array.isArray(rawCandidates)) fail("plan has no repair_candidates", 1);
   const candidates = rawCandidates.map(planCandidate).sort((a, b) => {
@@ -294,7 +338,26 @@ function readPlan(): Plan {
   const totalMicros = candidates.reduce((total, candidate) => total + BigInt(candidate.costMicros), 0n).toString();
   const dayBuckets = [...new Set(candidates.map((candidate) => (BigInt(candidate.createdAt) / 86_400_000n).toString()))].sort((a, b) => Number(BigInt(a) - BigInt(b)));
   const hourBuckets = [...new Set(candidates.map((candidate) => (BigInt(candidate.createdAt) / 3_600_000n).toString()))].sort((a, b) => Number(BigInt(a) - BigInt(b)));
-  return { candidates, planSha256, totalMicros, source: `${DEFAULT_SOURCE_PREFIX}${planSha256}`, dayBuckets, hourBuckets, scope };
+  const expectedSafeRows = safeArchive?.rows ?? String(candidates.length);
+  const expectedSafeMicros = safeArchive?.micros ?? totalMicros;
+  if (BigInt(expectedSafeRows) !== BigInt(candidates.length) || expectedSafeMicros !== totalMicros) {
+    fail("plan candidate set does not match its gap archive summary", 1);
+  }
+  return {
+    candidates,
+    planSha256,
+    totalMicros,
+    source: `${DEFAULT_SOURCE_PREFIX}${planSha256}`,
+    dayBuckets,
+    hourBuckets,
+    scope,
+    expectedPreviewRows: (BigInt(expectedSafeRows) + BigInt(boundArchive.rows)).toString(),
+    expectedSafeRows,
+    expectedSafeMicros,
+    expectedBoundRows: boundArchive.rows,
+    expectedProviderRows,
+    expectedNullableBasisRows,
+  };
 }
 
 function expectedPlan(plan: Plan, requireApproval = false): void {
@@ -602,6 +665,225 @@ function assertPreflightRows(rows: unknown, candidates: Candidate[], source: str
   }
 }
 
+type ApiPreviewCursor = {
+  afterCreatedAt: string;
+  afterRequestId: string;
+};
+
+type ApiPreviewPage = {
+  items: JsonRecord[];
+  nextCursor: ApiPreviewCursor | null;
+};
+
+type ApiPreviewRow = {
+  requestId: string;
+  accountId: string;
+  settlementId: string | null;
+  currency: string;
+  statusCode: string;
+  createdAt: string;
+  usageBasis: string | null;
+  costMicros: string;
+  archiveState: string;
+  responseAvailable: boolean;
+  feedState: string;
+  reviewState: string;
+};
+
+const PREVIEW_PAGE_SIZE = 500;
+const MAX_PREVIEW_RANGE_MILLIS = 93n * 86_400_000n;
+
+function integerValue(value: unknown, name: string): string {
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value)) fail(`invalid ${name}`, 1);
+    return String(value);
+  }
+  return integerString(value, name);
+}
+
+function apiConfig(): { base: string; token: string } {
+  const base = required("FAILED_BILLING_API_BASE_URL").replace(/\/+$/u, "");
+  const apiUrl = new URL(`${base}/`);
+  if (apiUrl.protocol !== "https:") fail("FAILED_BILLING_API_BASE_URL must use HTTPS");
+  const token = required("FAILED_BILLING_SERVICE_TOKEN");
+  if (token.length < 16) fail("FAILED_BILLING_SERVICE_TOKEN is too short");
+  return { base, token };
+}
+
+async function getPreviewPage(
+  base: string,
+  token: string,
+  accountId: string,
+  fromCreatedAt: string,
+  toCreatedAt: string,
+  cursor: ApiPreviewCursor | null,
+  timeout: number,
+): Promise<ApiPreviewPage> {
+  const url = new URL(`/internal/v1/accounts/${accountId}/settlement-correction-previews`, `${base}/`);
+  url.searchParams.set("from_created_at", fromCreatedAt);
+  url.searchParams.set("to_created_at", toCreatedAt);
+  url.searchParams.set("limit", String(PREVIEW_PAGE_SIZE));
+  if (cursor) {
+    url.searchParams.set("after_created_at", cursor.afterCreatedAt);
+    url.searchParams.set("after_request_id", cursor.afterRequestId);
+  }
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: "GET",
+      headers: { Accept: "application/json", Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(timeout),
+    });
+  } catch {
+    fail("settlement-correction preview API transport failure; execution stopped", 1);
+  }
+  const responseText = await response.text();
+  if (response.status !== 200) fail(`settlement-correction preview API returned HTTP ${response.status}; execution stopped`, 1);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(responseText);
+  } catch {
+    fail("settlement-correction preview API returned invalid JSON; execution stopped", 1);
+  }
+  const root = record(parsed, "settlement-correction preview page");
+  if (!Array.isArray(root.items)) fail("settlement-correction preview API returned no items array", 1);
+  const items = root.items.map((item, index) => record(item, `settlement-correction preview item ${index}`));
+  let nextCursor: ApiPreviewCursor | null = null;
+  if (root.next_cursor !== null && root.next_cursor !== undefined) {
+    const rawCursor = record(root.next_cursor, "settlement-correction preview cursor");
+    nextCursor = {
+      afterCreatedAt: integerValue(rawCursor.after_created_at, "preview cursor after_created_at"),
+      afterRequestId: uuid(rawCursor.after_request_id, "preview cursor after_request_id"),
+    };
+  }
+  return { items, nextCursor };
+}
+
+function apiPreviewRow(raw: JsonRecord): ApiPreviewRow {
+  const requestId = uuid(raw.request_id, "preview request_id");
+  const accountId = uuid(raw.account_id, "preview account_id");
+  const settlementId = raw.settlement_id === undefined || raw.settlement_id === null
+    ? null
+    : uuid(raw.settlement_id, "preview settlement_id");
+  const original = record(raw.original, `${requestId}.original`);
+  const evidence = record(raw.evidence, `${requestId}.evidence`);
+  const invariants = record(raw.invariants, `${requestId}.invariants`);
+  const usageBasis = original.usage_basis === null || original.usage_basis === undefined
+    ? null
+    : stringValue(original.usage_basis, `${requestId}.original.usage_basis`);
+  const costMicros = original.cost_micros === undefined
+    ? decimalToMicros(original.cost, `${requestId}.original.cost`)
+    : nonnegativeInteger(original.cost_micros, `${requestId}.original.cost_micros`);
+  if (typeof evidence.response_available !== "boolean") fail(`invalid ${requestId}.evidence.response_available`, 1);
+  return {
+    requestId,
+    accountId,
+    settlementId,
+    currency: stringValue(raw.currency, `${requestId}.currency`).toUpperCase(),
+    statusCode: integerValue(raw.status_code, `${requestId}.status_code`),
+    createdAt: integerValue(raw.created_at, `${requestId}.created_at`),
+    usageBasis,
+    costMicros,
+    archiveState: stringValue(evidence.archive_state, `${requestId}.evidence.archive_state`),
+    responseAvailable: evidence.response_available,
+    feedState: stringValue(invariants.settlement_feed, `${requestId}.invariants.settlement_feed`),
+    reviewState: stringValue(raw.review_state, `${requestId}.review_state`),
+  };
+}
+
+function previewWindows(candidates: Candidate[]): Array<{ fromCreatedAt: string; toCreatedAt: string }> {
+  if (candidates.length === 0) fail("plan has no candidates", 1);
+  const times = candidates.map((candidate) => BigInt(candidate.createdAt));
+  let from = times.reduce((minimum, value) => value < minimum ? value : minimum, times[0]!);
+  const maximum = times.reduce((maximumValue, value) => value > maximumValue ? value : maximumValue, times[0]!);
+  const windows: Array<{ fromCreatedAt: string; toCreatedAt: string }> = [];
+  while (from <= maximum) {
+    const to = from + MAX_PREVIEW_RANGE_MILLIS < maximum ? from + MAX_PREVIEW_RANGE_MILLIS : maximum;
+    windows.push({ fromCreatedAt: from.toString(), toCreatedAt: to.toString() });
+    if (to === maximum) break;
+    from = to + 1n;
+  }
+  return windows;
+}
+
+function previewWindowsByAccount(candidates: Candidate[]): Array<{ accountId: string; windows: Array<{ fromCreatedAt: string; toCreatedAt: string }> }> {
+  const byAccount = new Map<string, Candidate[]>();
+  for (const candidate of candidates) byAccount.set(candidate.accountId, [...(byAccount.get(candidate.accountId) ?? []), candidate]);
+  return [...byAccount.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([accountId, accountCandidates]) => ({ accountId, windows: previewWindows(accountCandidates) }));
+}
+
+function assertApiPreviewCandidate(row: ApiPreviewRow, candidate: Candidate): void {
+  if (row.accountId !== candidate.accountId || row.currency !== candidate.currency || row.costMicros !== candidate.costMicros || row.statusCode !== candidate.statusCode || (row.settlementId !== null && row.settlementId !== candidate.settlementId)) {
+    fail("settlement-correction preview does not match the immutable plan", 1);
+  }
+}
+
+async function previewPlan(plan: Plan, base: string, token: string, timeout: number): Promise<PreviewSummary> {
+  const candidates = new Map(plan.candidates.map((candidate) => [candidate.requestId, candidate]));
+  const seen = new Set<string>();
+  let pages = 0n;
+  let previewRows = 0n;
+  let safeRows = 0n;
+  let safeMicros = 0n;
+  let boundRows = 0n;
+  let invariantMismatchRows = 0n;
+  for (const { accountId, windows } of previewWindowsByAccount(plan.candidates)) {
+    for (const window of windows) {
+      let cursor: ApiPreviewCursor | null = null;
+      do {
+        const page = await getPreviewPage(base, token, accountId, window.fromCreatedAt, window.toCreatedAt, cursor, timeout);
+        pages += 1n;
+        if (page.items.length > PREVIEW_PAGE_SIZE) fail("settlement-correction preview page exceeds the API limit", 1);
+        for (const raw of page.items) {
+          const row = apiPreviewRow(raw);
+          if (!seen.add(row.requestId)) fail("settlement-correction preview returned a duplicate row", 1);
+          previewRows += 1n;
+          if (row.archiveState === "bound") boundRows += 1n;
+          if (row.reviewState !== "ready_for_evidence" || row.feedState !== "matched") invariantMismatchRows += 1n;
+          const safe = BigInt(row.statusCode) >= 400n
+            && row.usageBasis === "contract_ceiling"
+            && row.archiveState === "gap"
+            && row.responseAvailable === false
+            && row.reviewState === "ready_for_evidence"
+            && row.feedState === "matched";
+          if (!safe) continue;
+          const candidate = candidates.get(row.requestId);
+          if (!candidate) fail("settlement-correction preview contains an unplanned safe row", 1);
+          assertApiPreviewCandidate(row, candidate);
+          safeRows += 1n;
+          safeMicros += BigInt(row.costMicros);
+        }
+        if (page.items.length === PREVIEW_PAGE_SIZE && page.nextCursor === null) fail("settlement-correction preview pagination ended without a cursor", 1);
+        if (page.items.length === 0 && page.nextCursor !== null) fail("settlement-correction preview returned an empty page with a cursor", 1);
+        if (cursor && page.nextCursor && cursor.afterCreatedAt === page.nextCursor.afterCreatedAt && cursor.afterRequestId === page.nextCursor.afterRequestId) {
+          fail("settlement-correction preview cursor did not advance", 1);
+        }
+        cursor = page.nextCursor;
+      } while (cursor !== null);
+    }
+  }
+  if (previewRows !== BigInt(plan.expectedPreviewRows)
+    || safeRows !== BigInt(plan.expectedSafeRows)
+    || safeMicros !== BigInt(plan.expectedSafeMicros)
+    || boundRows !== BigInt(plan.expectedBoundRows)) {
+    fail("settlement-correction preview totals do not match the immutable plan", 1);
+  }
+  if (safeRows !== BigInt(plan.candidates.length)) fail("settlement-correction preview did not select exactly the planned safe rows", 1);
+  for (const candidate of plan.candidates) if (!seen.has(candidate.requestId)) fail("settlement-correction preview omitted a planned row", 1);
+  return {
+    pages: pages.toString(),
+    preview_rows: previewRows.toString(),
+    safe_rows: safeRows.toString(),
+    safe_micros: safeMicros.toString(),
+    bound_rows: boundRows.toString(),
+    invariant_mismatch_rows: invariantMismatchRows.toString(),
+    excluded_provider_reported_rows: plan.expectedProviderRows,
+    excluded_nullable_basis_rows: plan.expectedNullableBasisRows,
+  };
+}
+
 async function putAdjustment(base: string, token: string, candidate: Candidate, source: string, timeout: number): Promise<JsonRecord> {
   const url = new URL(`/internal/v1/accounts/${candidate.accountId}/settlements/${candidate.settlementId}/adjustments`, `${base}/`);
   const body = JSON.stringify({
@@ -649,7 +931,7 @@ async function main(): Promise<void> {
   const arguments_ = process.argv.slice(2);
   if (arguments_.length > 1 || (arguments_.length === 1 && arguments_[0] !== "--dry-run" && arguments_[0] !== "--preflight" && arguments_[0] !== "--apply" && arguments_[0] !== "--help")) fail("usage: node ops/apply-failed-billing-rebates.ts [--dry-run|--preflight|--apply]");
   if (arguments_[0] === "--help") {
-    process.stdout.write("Usage: node ops/apply-failed-billing-rebates.ts [--dry-run|--preflight|--apply]\nRequired env: FAILED_BILLING_PLAN_FILE, FAILED_BILLING_EXPECTED_ROWS, FAILED_BILLING_EXPECTED_MICROS, FAILED_BILLING_APPROVED_PLAN_SHA256 (apply), FAILED_BILLING_API_BASE_URL (apply), FAILED_BILLING_SERVICE_TOKEN (apply), PostgreSQL env (preflight/apply)\n");
+    process.stdout.write("Usage: node ops/apply-failed-billing-rebates.ts [--dry-run|--preflight|--apply]\nRequired env: FAILED_BILLING_PLAN_FILE, FAILED_BILLING_EXPECTED_ROWS, FAILED_BILLING_EXPECTED_MICROS, FAILED_BILLING_APPROVED_PLAN_SHA256 (apply), FAILED_BILLING_API_BASE_URL (apply), FAILED_BILLING_SERVICE_TOKEN (apply), PostgreSQL env (preflight/apply)\n--preflight may also perform a read-only paginated API preview when both API env vars are supplied.\n");
     return;
   }
   const apply = arguments_[0] === "--apply";
@@ -682,18 +964,25 @@ async function main(): Promise<void> {
       statement_timeout: `${statementTimeout}ms`,
     });
     assertPreflightRows(preflightRows, plan.candidates, plan.source);
-    process.stdout.write(`${JSON.stringify({ ...summary, aggregate_baseline: aggregateBaseline, preflight: "all_immutable_rows_consistent", production_write_performed: false })}\n`);
+    const configuredBase = optional("FAILED_BILLING_API_BASE_URL");
+    const configuredToken = optional("FAILED_BILLING_SERVICE_TOKEN");
+    let apiPreview: PreviewSummary | undefined;
+    if (configuredBase || configuredToken) {
+      if (!configuredBase || !configuredToken) fail("FAILED_BILLING_API_BASE_URL and FAILED_BILLING_SERVICE_TOKEN must be supplied together");
+      const api = apiConfig();
+      apiPreview = await previewPlan(plan, api.base, api.token, positiveInteger("FAILED_BILLING_API_TIMEOUT_MS", "30000", 300_000));
+    }
+    process.stdout.write(`${JSON.stringify({ ...summary, aggregate_baseline: aggregateBaseline, preflight: "all_immutable_rows_consistent", ...(apiPreview ? { api_preview: apiPreview } : {}), production_write_performed: false })}\n`);
     return;
   }
   if (optional("FAILED_BILLING_ALLOW_WRITE") !== "I_UNDERSTAND_SETTLEMENT_ADJUSTMENT_API") fail("FAILED_BILLING_ALLOW_WRITE must explicitly authorize settlement-adjustment API writes");
-  const base = required("FAILED_BILLING_API_BASE_URL").replace(/\/+$/u, "");
-  const apiUrl = new URL(`${base}/`);
-  if (apiUrl.protocol !== "https:") fail("FAILED_BILLING_API_BASE_URL must use HTTPS");
-  const token = required("FAILED_BILLING_SERVICE_TOKEN");
-  if (token.length < 16) fail("FAILED_BILLING_SERVICE_TOKEN is too short");
+  const api = apiConfig();
+  const base = api.base;
+  const token = api.token;
   const statementTimeout = positiveInteger("FAILED_BILLING_STATEMENT_TIMEOUT_MS", "30000", 300_000);
   const apiTimeout = positiveInteger("FAILED_BILLING_API_TIMEOUT_MS", "30000", 300_000);
   const batchSize = positiveInteger("FAILED_BILLING_BATCH_SIZE", "50", 100);
+  const apiPreview = await previewPlan(plan, base, token, apiTimeout);
   const before = baseline(plan, statementTimeout);
   const initialRows = psqlJson(verifySql, {
     request_ids: plan.candidates.map((candidate) => candidate.requestId).join(","),
@@ -729,7 +1018,7 @@ async function main(): Promise<void> {
     batchSummaries.push(batchSummary);
     process.stderr.write(`verified failed-billing batch ${batchSummary.batch}/${summary.batches}: ${batchSummary.rows} rows, ${batchSummary.applied} applied, ${batchSummary.replayed} replayed\n`);
   }
-  process.stdout.write(`${JSON.stringify({ ...summary, production_write_performed: true, applied: String(applied), replayed: String(replayed), verification: "all_batches_ledger_reservation_fact_feed_aggregate_consistent", batch_summaries: batchSummaries })}\n`);
+  process.stdout.write(`${JSON.stringify({ ...summary, api_preview: apiPreview, production_write_performed: true, applied: String(applied), replayed: String(replayed), verification: "all_batches_ledger_reservation_fact_feed_aggregate_consistent", batch_summaries: batchSummaries })}\n`);
 }
 
 if (invokedAsEntrypoint("apply-failed-billing-rebates", import.meta.url)) {
