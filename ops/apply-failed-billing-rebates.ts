@@ -112,6 +112,12 @@ function nonnegativeInteger(value: unknown, name: string): string {
   return parsed;
 }
 
+function nonnegativeMoney(value: unknown, name: string): string {
+  const parsed = stringValue(value, name);
+  if (!/^\d+(?:\.\d{1,6})?$/u.test(parsed)) fail(`invalid ${name}`, 1);
+  return parsed;
+}
+
 function nullableNonnegativeInteger(value: unknown, name: string): string | null {
   return value === null ? null : nonnegativeInteger(value, name);
 }
@@ -635,7 +641,7 @@ async function putAdjustment(base: string, token: string, candidate: Candidate, 
   assertText(result.desired_rebate, microsToDecimal(candidate.costMicros), "response desired_rebate", candidate.requestId);
   assertText(result.version, 1, "response version", candidate.requestId);
   if (typeof result.replayed !== "boolean") fail(`${candidate.requestId} API response replay flag is invalid`, 1);
-  nonnegativeInteger(result.applied_delta, `${candidate.requestId}.response.applied_delta`);
+  nonnegativeMoney(result.applied_delta, `${candidate.requestId}.response.applied_delta`);
   return result;
 }
 
