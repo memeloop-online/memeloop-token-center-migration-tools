@@ -193,9 +193,9 @@ test("collector 102 progress restarts the bounded archive-download idle timer", 
     const diagnostics: string[] = [];
     const client = new SourceClient(base, base, undefined, 0.03, true, new Set(["127.0.0.1"]), true, 5, 0.5, undefined, undefined, undefined, false, (message) => diagnostics.push(message));
     (client as unknown as { ticketUrl: () => Promise<URL> }).ticketUrl = async () => new URL(`/archive-api/v1/exports/${"a".repeat(64)}`, base);
-    const lines: Buffer[] = [];
+    const lines: string[] = [];
     for await (const line of client.exportLines("session", 1024, "snapshot", "0".repeat(64))) lines.push(line);
-    assert.deepEqual(lines.map((line) => line.toString("utf8")), ['{"schema_version":2}\n']);
+    assert.deepEqual(lines, ['{"schema_version":2}\n']);
     assert(diagnostics.some((message) => /^archive download progress status=102 elapsed_seconds=\d+ idle_seconds=\d+ idle_timer_reset=true$/.test(message)));
   } finally {
     await new Promise<void>((resolveClose, rejectClose) => progressServer.close((error) => error === undefined ? resolveClose() : rejectClose(error)));
@@ -247,6 +247,66 @@ test("overall archive-download deadline also covers a final response body", asyn
     }, /stage=archive-download,cause=overall_timeout/);
   } finally {
     await new Promise<void>((resolveClose, rejectClose) => bodyServer.close((error) => error === undefined ? resolveClose() : rejectClose(error)));
+  }
+});
+
+test("archive framing preserves split UTF-8, separator boundaries, and an unterminated final line", async () => {
+  const terminated = Buffer.from('{"text":"汉字"}\n');
+  const final = Buffer.from('{"tail":true}');
+  const character = terminated.indexOf(Buffer.from("汉"));
+  assert(character >= 0);
+  const chunks = [
+    terminated.subarray(0, character + 1),
+    terminated.subarray(character + 1, terminated.length - 1),
+    terminated.subarray(terminated.length - 1),
+    Buffer.from(" \t"),
+    Buffer.from("\r"),
+    Buffer.from("\n"),
+    final.subarray(0, 4),
+    final.subarray(4),
+  ];
+  const fragmentServer = createServer(async (_request, response) => {
+    response.writeHead(200, { "Content-Type": "application/x-ndjson" });
+    for (const chunk of chunks) {
+      response.write(chunk);
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    response.end();
+  });
+  await new Promise<void>((resolveListen, rejectListen) => { fragmentServer.once("error", rejectListen); fragmentServer.listen(0, "127.0.0.1", resolveListen); });
+  const address = fragmentServer.address(); assert(address !== null && typeof address === "object");
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    const client = new SourceClient(base, base, undefined, 5, true, new Set(["127.0.0.1"]), true);
+    (client as unknown as { ticketUrl: () => Promise<URL> }).ticketUrl = async () => new URL(`/archive-api/v1/exports/${"d".repeat(64)}`, base);
+    const lines: string[] = [];
+    for await (const line of client.exportLines("session", Math.max(terminated.length, final.length), "snapshot", "0".repeat(64))) lines.push(line);
+    assert.deepEqual(lines, [terminated.toString("utf8"), final.toString("utf8")]);
+  } finally {
+    await new Promise<void>((resolveClose, rejectClose) => fragmentServer.close((error) => error === undefined ? resolveClose() : rejectClose(error)));
+  }
+});
+
+test("archive framing rejects an overlong line assembled across chunks before its separator", async () => {
+  const fragmentServer = createServer(async (_request, response) => {
+    response.writeHead(200, { "Content-Type": "application/x-ndjson" });
+    response.write(Buffer.alloc(12, 0x61));
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    response.write(Buffer.alloc(12, 0x62));
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    response.end("\n");
+  });
+  await new Promise<void>((resolveListen, rejectListen) => { fragmentServer.once("error", rejectListen); fragmentServer.listen(0, "127.0.0.1", resolveListen); });
+  const address = fragmentServer.address(); assert(address !== null && typeof address === "object");
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    const client = new SourceClient(base, base, undefined, 5, true, new Set(["127.0.0.1"]), true);
+    (client as unknown as { ticketUrl: () => Promise<URL> }).ticketUrl = async () => new URL(`/archive-api/v1/exports/${"e".repeat(64)}`, base);
+    await assert.rejects(async () => {
+      for await (const _line of client.exportLines("session", 20, "snapshot", "0".repeat(64))) { /* rejected before a line can be yielded */ }
+    }, /source archive record exceeds the configured line limit/);
+  } finally {
+    await new Promise<void>((resolveClose, rejectClose) => fragmentServer.close((error) => error === undefined ? resolveClose() : rejectClose(error)));
   }
 });
 
