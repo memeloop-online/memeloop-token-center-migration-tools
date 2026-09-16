@@ -27,6 +27,7 @@ export const releaseEntrypoints = Object.freeze({
   "migrate-cpamp": "ops/migrate-cpamp.ts",
   "reconcile-final-price-cache": "ops/reconcile-final-price-cache.ts",
   "reconcile-failed-billing": "ops/reconcile-failed-billing.ts",
+  "apply-failed-billing-rebates": "ops/apply-failed-billing-rebates.ts",
   "reconcile-existing-transport": "ops/cpa-upstreams/reconcile-existing-transport.ts",
   "resolve-cpa-managed-codex-provenance": "ops/legacy-routes/resolve-cpa-managed-codex-provenance.ts",
   "stage-protected-inputs": "ops/ci/stage-protected-inputs.ts",

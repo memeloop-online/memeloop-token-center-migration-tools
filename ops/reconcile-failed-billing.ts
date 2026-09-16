@@ -270,7 +270,7 @@ WITH params AS MATERIALIZED (
 ), history_contract_archive AS MATERIALIZED (
   SELECT COALESCE(e.response_archive_state, 'unknown') AS response_archive_state,
          count(*) AS request_count,
-         COALESCE(sum(e.cost_micros), 0) AS cost_micros
+         COALESCE(sum(r.cost_micros), 0) AS cost_micros
     FROM request_records r
     JOIN usage_reservations u ON u.id = r.reservation_id
     LEFT JOIN response_archive_spools spool
@@ -377,21 +377,35 @@ SELECT jsonb_build_object(
     'evidence_preserved_cost_micros', measured.evidence_preserved_cost_micros::text,
     'by_usage_basis', COALESCE((
       SELECT jsonb_agg(jsonb_build_object(
-        'usage_basis', COALESCE(NULLIF(e.usage_basis, ''), '<null>'),
-        'request_count', count(*)::text,
-        'cost_micros', COALESCE(sum(e.cost_micros), 0)::text
-      ) ORDER BY COALESCE(NULLIF(e.usage_basis, ''), '<null>')
-      FROM evaluated e GROUP BY COALESCE(NULLIF(e.usage_basis, ''), '<null>')
+        'usage_basis', grouped.usage_basis,
+        'request_count', grouped.request_count::text,
+        'cost_micros', grouped.cost_micros::text
+      ) ORDER BY grouped.usage_basis)
+      FROM (
+        SELECT COALESCE(NULLIF(e.usage_basis, ''), '<null>') AS usage_basis,
+               count(*) AS request_count,
+               COALESCE(sum(e.cost_micros), 0) AS cost_micros
+          FROM evaluated e
+         GROUP BY COALESCE(NULLIF(e.usage_basis, ''), '<null>')
+      ) grouped
     ), '[]'::jsonb),
     'by_status_error', COALESCE((
       SELECT jsonb_agg(jsonb_build_object(
-        'status_code', e.status_code::text,
-        'error_code', e.error_code,
-        'usage_basis', COALESCE(e.usage_basis, '<null>'),
-        'request_count', count(*)::text,
-        'cost_micros', COALESCE(sum(e.cost_micros), 0)::text
-      ) ORDER BY e.status_code, e.error_code, COALESCE(e.usage_basis, '<null>')
-      FROM evaluated e GROUP BY e.status_code, e.error_code, COALESCE(e.usage_basis, '<null>')
+        'status_code', grouped.status_code::text,
+        'error_code', grouped.error_code,
+        'usage_basis', grouped.usage_basis,
+        'request_count', grouped.request_count::text,
+        'cost_micros', grouped.cost_micros::text
+      ) ORDER BY grouped.status_code, grouped.error_code, grouped.usage_basis)
+      FROM (
+        SELECT e.status_code,
+               e.error_code,
+               COALESCE(e.usage_basis, '<null>') AS usage_basis,
+               count(*) AS request_count,
+               COALESCE(sum(e.cost_micros), 0) AS cost_micros
+          FROM evaluated e
+         GROUP BY e.status_code, e.error_code, COALESCE(e.usage_basis, '<null>')
+      ) grouped
     ), '[]'::jsonb)
   ),
   'repair_candidates', COALESCE((

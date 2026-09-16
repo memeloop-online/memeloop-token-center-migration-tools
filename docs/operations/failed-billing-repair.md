@@ -40,14 +40,40 @@ matching usage ledger entry, one matching settlement-feed row, and a matching
 invariants, and the proposed `(cost_micros=0, usage_basis=not_observed)` state.
 
 The repair plan is intentionally not a SQL `UPDATE`. After human approval of
-the receipt digest and each evidence set, the product's settlement-adjustment
-endpoint should apply a forward-only rebate using the emitted settlement ID,
-request ID, and idempotency key. That endpoint keeps the immutable gross feed,
-reservation, and original ledger entry as the rollback/audit baseline while
-returning the attributed credit through the supported entitlement/account
-path. Replaying the same idempotency key is safe; changing its payload must be
-rejected. A future batch runner may call that endpoint, but this migration
-tool remains fail-closed and read-only.
+the receipt digest and each evidence set, `ops/apply-failed-billing-rebates.ts`
+can apply a forward-only rebate through the product's settlement-adjustment
+endpoint. It is dry-run by default; `--apply` requires the expected row and
+micros totals, an exact approved plan SHA-256, an HTTPS API URL, an explicit
+`FAILED_BILLING_ALLOW_WRITE=I_UNDERSTAND_SETTLEMENT_ADJUSTMENT_API` opt-in, and
+a service token supplied only through the environment. It uses the emitted
+settlement ID, request ID, and idempotency key, then stops on the first API,
+ledger/reservation/fact/feed, or aggregate mismatch. The endpoint keeps the
+immutable gross feed, reservation, and original ledger entry as the
+rollback/audit baseline while returning the attributed credit through the
+supported entitlement/account path. Replaying the same idempotency key is
+safe; changing its payload must be rejected.
+
+For an approved all-history plan, stage the audit receipt outside this public
+repository with mode `0600`, then use an invocation equivalent to:
+
+```text
+FAILED_BILLING_PLAN_FILE=/protected-evidence/failed-billing-all-history.json
+FAILED_BILLING_EXPECTED_ROWS=1590
+FAILED_BILLING_EXPECTED_MICROS=28868679418
+FAILED_BILLING_APPROVED_PLAN_SHA256=<reviewed-digest>
+FAILED_BILLING_API_BASE_URL=https://token-operator.k3s.onetwo.website
+FAILED_BILLING_SERVICE_TOKEN=<in-memory-secret>
+FAILED_BILLING_PGHOST=...
+FAILED_BILLING_PGPORT=5432
+FAILED_BILLING_PGUSER=...
+FAILED_BILLING_PGDATABASE=...
+FAILED_BILLING_PGPASSFILE=/protected-evidence/pgpass
+FAILED_BILLING_ALLOW_WRITE=I_UNDERSTAND_SETTLEMENT_ADJUSTMENT_API \
+  node ./commands/apply-failed-billing-rebates.mjs --apply
+```
+
+The real receipt, token, request IDs, and batch receipts must remain outside
+this repository and any public CI log.
 
 `statistics_sources` compares request facts, the settlement feed, daily
 aggregates, and hourly request buckets. Day/hour rows are reported as
