@@ -1341,7 +1341,7 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
     }
     if (spool.resumed) {
       const counts = database.prepare("SELECT (SELECT COUNT(*) FROM completed_sessions) AS sessions,(SELECT COUNT(*) FROM session_progress) AS partial_sessions,(SELECT COUNT(*) FROM records) AS records").get() as { sessions: number; partial_sessions: number; records: number };
-      process.stderr.write(`archive spool resume completed_sessions=${counts.sessions} partial_sessions=${counts.partial_sessions} records=${counts.records}\n`);
+      process.stderr.write(`archive spool resume completed_sessions=${counts.sessions} records=${counts.records} partial_sessions=${counts.partial_sessions}\n`);
     }
     let invocationChunks = 0;
     for (const session of [...first.sessions].sort((left, right) => compareUtf8Bytewise(left.session_id, right.session_id))) {
