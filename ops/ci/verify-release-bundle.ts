@@ -79,6 +79,7 @@ try {
   execute(command("reconcile-existing-transport"), ["--help"]);
   execute(command("credential-recovery-preflight"), ["--help"]);
   execute(command("source-credential-recovery-apply"), ["--help"]);
+  execute(command("purge-retired-api2-trial"), ["--help"]);
 
   const captureRoot = join(root, "source-capture");
   mkdirSync(captureRoot, { mode: 0o700 }); chmodSync(captureRoot, 0o700);
