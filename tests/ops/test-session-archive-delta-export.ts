@@ -359,6 +359,8 @@ function writeLargeArchiveSQLite(path: string, recordCount = 257): RecordValue[]
       original_ref TEXT,response_ref TEXT,original_request_gz BLOB,response_gz BLOB);
     CREATE INDEX idx_records_session_request ON records(session_id,request_id COLLATE BINARY);
     CREATE TABLE blobs(hash TEXT PRIMARY KEY,codec TEXT NOT NULL,data BLOB NOT NULL);
+    CREATE TABLE credential_principals(credential_hash TEXT PRIMARY KEY COLLATE NOCASE,principal_id TEXT NOT NULL,alias TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'active',updated_at TEXT NOT NULL);
+    CREATE INDEX idx_credential_principals_principal ON credential_principals(principal_id);
     CREATE TABLE session_summaries(session_id TEXT PRIMARY KEY,requests INTEGER NOT NULL,first_at TEXT NOT NULL,last_at TEXT NOT NULL);
     CREATE TABLE archive_ingest_clock(id INTEGER PRIMARY KEY,sequence INTEGER NOT NULL);
     CREATE TABLE archive_ingest_events(sequence INTEGER PRIMARY KEY,session_id TEXT NOT NULL,previous_session_id TEXT NOT NULL DEFAULT '');
@@ -369,10 +371,14 @@ function writeLargeArchiveSQLite(path: string, recordCount = 257): RecordValue[]
   const insertRecord = database.prepare(`INSERT INTO records(request_id,session_id,key_id,principal_id,credential_hash,requested_model,model,outcome,status_code,started_at,completed_at,
     metadata_json,facets_json,original_ref,response_ref,original_request_gz,response_gz) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
   const insertEvent = database.prepare("INSERT INTO archive_ingest_events(sequence,session_id,previous_session_id) VALUES(?,'large-session','')");
+  database.prepare("INSERT INTO credential_principals VALUES(?,?,?,?,?)").run("credential-old", "principal", "Historical Alias", "active", "2025-01-01T00:00:00.000000Z");
+  database.prepare("INSERT INTO credential_principals VALUES(?,?,?,?,?)").run("credential-current", "principal", "Current Alias", "active", "2025-01-02T00:00:00.000000Z");
+  database.prepare("INSERT INTO credential_principals VALUES(?,?,?,?,?)").run("credential-empty", "principal", "", "active", "2025-01-03T00:00:00.000000Z");
   const rows: RecordValue[] = [];
   for (let index = 0; index < recordCount; index += 1) {
     const requestId = `request-${String(index).padStart(6, "0")}`;
     const item = record(requestId, "large-session", `2025-01-02T01:${String(Math.floor(index / 60)).padStart(2, "0")}:${String(index % 60).padStart(2, "0")}.000000Z`, `2025-01-02T01:${String(Math.floor(index / 60)).padStart(2, "0")}:${String(index % 60).padStart(2, "0")}.500000Z`);
+    item.principal_alias = "Current Alias";
     item.request = { prompt: `${requestId}:${"x".repeat(2048)}` };
     rows.push(item);
     insertRecord.run(item.request_id, item.session_id, String(item.key_id), String(item.principal_id), "", String(item.requested_model), String(item.model), String(item.outcome), Number(item.status_code),
@@ -696,6 +702,7 @@ test("readiness CLI bounds and legacy-only rejection fail before any network req
       ["--readiness-timeout-seconds", "86401", /readiness timeout seconds/],
       ["--readiness-poll-milliseconds", "9", /readiness poll milliseconds/],
       ["--readiness-poll-milliseconds", "60001", /readiness poll milliseconds/],
+      ["--chunk-seconds", "0", /chunk seconds must be greater than 0 and at most 3600/],
     ] as const) {
       const result = await run([...direct, flag, value]); assert.equal(result.code, 2); assert.match(result.stderr, message);
     }
@@ -799,12 +806,54 @@ test("read-only SQLite large session checkpoints a request cursor and resumes wi
     assert.equal(state.archiveRequests.size, 0); assert.equal(existsSync(spool), false);
     const output = readFileSync(paths.output, "utf8").trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
     assert.equal(output.length, rows.length + 1); assert.equal(output[0]!.requests, rows.length);
+    assert.equal(output[0]!.records_sha256, digestRecords(rows), "the direct SQLite records must exactly match the source stable digest");
     assert.deepEqual(output.slice(1).map((item) => item.request_id), rows.map((item) => item.request_id));
+    assert.equal(output[1]!.principal_alias, "Current Alias", "the newest non-empty alias for the principal must be reconstructed");
     const manifest = JSON.parse(readFileSync(`${paths.output}.manifest.json`, "utf8")) as Record<string, unknown>;
     assert.equal(manifest.source_read_mode, "sqlite-snapshot"); assert.equal(manifest.record_count, rows.length); assert.equal(manifest.session_count, 1);
     rmSync(source);
     const sealedReplay = await run([...common, "--resume"]);
     assert.equal(sealedReplay.code, 0, sealedReplay.stderr);
+  } finally { rmSync(paths.directory, { recursive: true, force: true }); }
+});
+
+test("read-only SQLite rejects snapshots that cannot reconstruct principal aliases", async () => {
+  const paths = fixture();
+  const source = join(paths.directory, "archive.sqlite");
+  try {
+    writeLargeArchiveSQLite(source, 1); chmodSync(source, 0o600);
+    const database = new DatabaseSync(source); database.exec("DROP TABLE credential_principals"); database.close(); chmodSync(source, 0o400);
+    const result = await run([
+      "--collector-direct", "--offline-full", "--base-url", `http://127.0.0.1:${port}`, "--private-http-host", "127.0.0.1",
+      "--source-sqlite", source, "--checkpoint", paths.checkpoint, "--output", paths.output, "--since", "1970-01-01T00:00:00Z",
+    ]);
+    assert.equal(result.code, 2); assert.match(result.stderr, /source SQLite snapshot schema is unsupported/);
+    assert.equal(state.readyRequests, 0); assert.equal(state.archiveRequests.size, 0);
+  } finally { rmSync(paths.directory, { recursive: true, force: true }); }
+});
+
+test("max-chunks counts a small session tail commit and resumes from the completed session", async () => {
+  const paths = fixture();
+  const source = join(paths.directory, "archive.sqlite");
+  const spool = `${paths.output}.spool.sqlite`;
+  try {
+    const rows = writeLargeArchiveSQLite(source, 3);
+    const common = [
+      "--collector-direct", "--offline-full", "--base-url", `http://127.0.0.1:${port}`, "--private-http-host", "127.0.0.1",
+      "--source-sqlite", source, "--checkpoint", paths.checkpoint, "--output", paths.output, "--since", "1970-01-01T00:00:00Z",
+      "--chunk-records", "100000", "--chunk-bytes", "1073741824", "--chunk-seconds", "3600",
+    ];
+    const interrupted = await run([...common, "--max-chunks", "1"]);
+    assert.equal(interrupted.code, 2); assert.match(interrupted.stderr, /chunk budget reached/);
+    const checkpointed = new DatabaseSync(spool, { readOnly: true });
+    const counts = checkpointed.prepare("SELECT (SELECT COUNT(*) FROM completed_sessions) AS completed,(SELECT COUNT(*) FROM session_progress) AS partial,(SELECT COUNT(*) FROM records) AS records").get() as { completed: number; partial: number; records: number };
+    checkpointed.close();
+    assert.equal(counts.completed, 1); assert.equal(counts.partial, 0); assert.equal(counts.records, rows.length);
+
+    const resumed = await run([...common, "--resume"]);
+    assert.equal(resumed.code, 0, resumed.stderr); assert.equal(state.archiveRequests.size, 0);
+    const output = readFileSync(paths.output, "utf8").trim().split("\n");
+    assert.equal(output.length, rows.length + 1);
   } finally { rmSync(paths.directory, { recursive: true, force: true }); }
 });
 
@@ -887,7 +936,7 @@ test("stable spool resume rejects changed download and output limits", async () 
   } finally { rmSync(paths.directory, { recursive: true, force: true }); }
 });
 
-test("stable spool resume rejects changed projection columns even when canonical bytes still match", async () => {
+test("stable spool resume rejects changed time projections even when counts and emit flags still match", async () => {
   const paths = fixture();
   const spool = `${paths.output}.spool.sqlite`;
   try {
@@ -897,7 +946,31 @@ test("stable spool resume rejects changed projection columns even when canonical
     state.failedArchiveSessions.add("session-b");
     const failed = await run(baseArguments(paths)); assert.equal(failed.code, 2, failed.stderr);
     const database = new DatabaseSync(spool);
-    database.prepare("UPDATE records SET emit=0 WHERE session_id='session-a'").run(); database.close();
+    database.prepare("UPDATE records SET started_at='2025-01-02T00:59:59.000000Z' WHERE session_id='session-a'").run(); database.close();
+    const downloadsBeforeResume = [...state.archiveRequests.values()].reduce((sum, count) => sum + count, 0);
+
+    state.failedArchiveSessions.clear(); state.snapshot = "snapshot-two";
+    const resumed = await run([...baseArguments(paths), "--resume"]);
+    assert.equal(resumed.code, 2); assert.match(resumed.stderr, /spool session content failed verification/);
+    assert.equal([...state.archiveRequests.values()].reduce((sum, count) => sum + count, 0), downloadsBeforeResume);
+    assert.equal(existsSync(spool), true);
+  } finally { rmSync(paths.directory, { recursive: true, force: true }); }
+});
+
+test("stable spool resume recomputes the completed session digest after internally consistent row tampering", async () => {
+  const paths = fixture();
+  const spool = `${paths.output}.spool.sqlite`;
+  try {
+    state.stable = true;
+    const original = record("request-a", "session-a", "2025-01-02T01:00:00.000000Z", "2025-01-02T01:00:01.000000Z");
+    state.records.set("session-a", [original]);
+    state.records.set("session-b", [record("request-b", "session-b", "2025-01-03T01:00:00.000000Z", "2025-01-03T01:00:01.000000Z")]);
+    state.failedArchiveSessions.add("session-b");
+    const failed = await run(baseArguments(paths)); assert.equal(failed.code, 2, failed.stderr);
+    const tampered = canonicalLine({ ...original, model: "tampered-model" });
+    const database = new DatabaseSync(spool);
+    database.prepare("UPDATE records SET canonical=?,digest=? WHERE session_id='session-a'").run(tampered, createHash("sha256").update(tampered).digest("hex"));
+    database.close();
     const downloadsBeforeResume = [...state.archiveRequests.values()].reduce((sum, count) => sum + count, 0);
 
     state.failedArchiveSessions.clear(); state.snapshot = "snapshot-two";

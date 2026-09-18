@@ -172,7 +172,7 @@ type Projection = {
 };
 type TlsFiles = { cert: Buffer; key: Buffer };
 type SQLiteSourceRow = {
-  request_id: string; session_id: string; key_id: string; principal_id: string; credential_hash: string;
+  request_id: string; session_id: string; key_id: string; principal_id: string; credential_hash: string; principal_alias: string;
   requested_model: string; model: string; outcome: string; status_code: number; started_at: string; completed_at: string;
   metadata_json: string; facets_json: string; original_ref: string; response_ref: string;
   original_request_gz: Uint8Array | null; response_gz: Uint8Array | null;
@@ -879,6 +879,7 @@ export class SQLiteArchiveSource {
   private verifySchema(): void {
     const required: Record<string, string[]> = {
       records: ["request_id", "session_id", "key_id", "principal_id", "credential_hash", "requested_model", "model", "outcome", "status_code", "started_at", "completed_at", "metadata_json", "facets_json", "original_ref", "response_ref", "original_request_gz", "response_gz"],
+      credential_principals: ["credential_hash", "principal_id", "alias", "status", "updated_at"],
       blobs: ["hash", "codec", "data"],
       session_summaries: ["session_id", "requests"],
       archive_ingest_clock: ["id", "sequence"],
@@ -984,14 +985,16 @@ export class SQLiteArchiveSource {
 
   async *exportLines(sessionId: string, maximum: number, afterRequestId?: string): AsyncGenerator<string> {
     const statement = this.database.prepare(`SELECT request_id,session_id,COALESCE(key_id,'') AS key_id,COALESCE(principal_id,'') AS principal_id,
-      COALESCE(credential_hash,'') AS credential_hash,COALESCE(requested_model,'') AS requested_model,COALESCE(model,'') AS model,
+      COALESCE(credential_hash,'') AS credential_hash,
+      COALESCE((SELECT alias FROM credential_principals p WHERE p.principal_id=records.principal_id AND alias<>'' ORDER BY updated_at DESC LIMIT 1),'') AS principal_alias,
+      COALESCE(requested_model,'') AS requested_model,COALESCE(model,'') AS model,
       COALESCE(outcome,'') AS outcome,COALESCE(status_code,0) AS status_code,started_at,completed_at,COALESCE(metadata_json,'') AS metadata_json,
       COALESCE(facets_json,'') AS facets_json,COALESCE(original_ref,'') AS original_ref,COALESCE(response_ref,'') AS response_ref,
       original_request_gz,response_gz FROM records WHERE session_id=? AND request_id>? ORDER BY request_id COLLATE BINARY ASC`);
     for (const row of statement.iterate(sessionId, afterRequestId ?? "") as Iterable<SQLiteSourceRow>) {
       const started = parseTime(row.started_at, "source SQLite record started_at"), completed = parseTime(row.completed_at, "source SQLite record completed_at");
       const record: JsonObject = { schema_version: 2, session_id: row.session_id, request_id: row.request_id, started_at: formatTime(started), completed_at: formatTime(completed) };
-      for (const [key, value] of Object.entries({ key_id: row.key_id, principal_id: row.principal_id, credential_hash: row.credential_hash, requested_model: row.requested_model, model: row.model, outcome: row.outcome })) if (value.trim() !== "") record[key] = value;
+      for (const [key, value] of Object.entries({ key_id: row.key_id, principal_id: row.principal_id, credential_hash: row.credential_hash, principal_alias: row.principal_alias, requested_model: row.requested_model, model: row.model, outcome: row.outcome })) if (value.trim() !== "") record[key] = value;
       if (row.status_code !== 0) record.status_code = row.status_code;
       const metadata = this.optionalJson(row.metadata_json, "metadata"), facets = this.optionalJson(row.facets_json, "facets");
       if (metadata !== undefined) record.metadata = metadata;
@@ -1346,6 +1349,7 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
     }
     let invocationChunks = 0;
     for (const session of [...first.sessions].sort((left, right) => compareUtf8Bytewise(left.session_id, right.session_id))) {
+      if (performance.now() >= args.deadline) throw new DeltaError("source export exceeded the configured elapsed-time limit; rerun the same command with --resume");
       if (session.deleted === true) {
         const deletedAt = parseTime(session.deleted_at, "source session deleted_at");
         if (compareTime(deletedAt, maximumCompleted) > 0) maximumCompleted = deletedAt;
@@ -1354,12 +1358,20 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
       const priorSession = first.protocol === STABLE_CURSOR_PROTOCOL ? completedSession.get(session.session_id) as { requests: number; records_sha256: string } | undefined : undefined;
       if (priorSession !== undefined) {
         if (priorSession.requests !== session.requests || priorSession.records_sha256 !== session.records_sha256) throw new DeltaError("incomplete archive spool session metadata changed");
-        // The recovery bridge just verified the source spool's canonical rows,
-        // then copied them in one transaction. Avoid another full local blob
-        // pass here; a later invocation uses the ordinary PR8 re-verification.
-        if (seededLegacySessions.has(session.session_id)) continue;
-        const verified = database.prepare("SELECT COUNT(*) AS records,COALESCE(MIN(emit),0) AS all_emit FROM records WHERE session_id=?").get(session.session_id) as { records: number; all_emit: number };
-        if (verified.records !== session.requests || verified.all_emit !== 1) throw new DeltaError("incomplete archive spool session content failed verification");
+        const resumedDigest = createHash("sha256"); let resumedCount = 0;
+        const rows = database.prepare("SELECT request_id,session_id,started_at,completed_at,digest,canonical,emit FROM records WHERE session_id=? ORDER BY request_id COLLATE BINARY");
+        for (const row of rows.iterate(session.session_id) as Iterable<{ request_id: string; session_id: string; started_at: string; completed_at: string; digest: string; canonical: Uint8Array; emit: number }>) {
+          const canonical = Buffer.from(row.canonical); let record: unknown;
+          try { record = parseStrictJson(canonical.toString("utf8")); } catch { throw new DeltaError("incomplete archive spool session content failed verification"); }
+          if (!isObject(record) || record.request_id !== row.request_id || record.session_id !== row.session_id || row.session_id !== session.session_id
+              || record.started_at !== row.started_at || record.completed_at !== row.completed_at || row.digest !== sha256Bytes(canonical) || row.emit !== 1) {
+            throw new DeltaError("incomplete archive spool session content failed verification");
+          }
+          parseCanonicalTime(row.started_at, "incomplete archive spool started_at");
+          parseCanonicalTime(row.completed_at, "incomplete archive spool completed_at");
+          resumedDigest.update(canonical); resumedCount += 1;
+        }
+        if (resumedCount !== session.requests || resumedDigest.digest("hex") !== session.records_sha256) throw new DeltaError("incomplete archive spool session content failed verification");
         continue;
       }
       const progress = first.protocol === STABLE_CURSOR_PROTOCOL ? sessionProgress.get(session.session_id) as {
@@ -1383,6 +1395,18 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
       let skippedForHttpResume = 0;
       let foundHttpCursor = resumeCursor === undefined;
       let chunkRecords = 0, chunkBytes = 0, chunkStartedAt = performance.now();
+      const checkpointPartialSession = (): void => {
+        if (cursor === undefined || chunkRecords === 0) throw new DeltaError("cannot checkpoint an empty archive session chunk");
+        chunks += 1;
+        saveSessionProgress.run(session.session_id, session.requests, session.records_sha256!, cursor, exported, stagedBytes,
+          priorDownloaded + client.downloadedBytes - downloadedBeforeAttempt, chunks);
+        commitSpoolTransaction(); database!.exec("PRAGMA wal_checkpoint(TRUNCATE)"); invocationChunks += 1;
+        chunkRecords = 0; chunkBytes = 0; chunkStartedAt = performance.now();
+      };
+      const enforceRunLimitsAfterChunk = (): void => {
+        if (args.maxChunks !== 0 && invocationChunks >= args.maxChunks) throw new DeltaError("archive session chunk budget reached; rerun the same command with --resume");
+        if (performance.now() >= args.deadline) throw new DeltaError("source export exceeded the configured elapsed-time limit; rerun the same command with --resume");
+      };
       beginSpoolTransaction();
       const lines = localSource === undefined
         ? client.exportLines(session.session_id, args.maxLineBytes, first.snapshot, session.records_sha256)
@@ -1425,29 +1449,35 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
         if (!emit) continue;
         if (compareTime(completed, maximumCompleted) > 0) maximumCompleted = completed;
         if (maximumStarted === undefined || compareTime(started, maximumStarted) > 0) maximumStarted = started;
-        if (first.protocol === STABLE_CURSOR_PROTOCOL && (chunkRecords >= args.chunkRecords || chunkBytes >= args.chunkBytes || performance.now() - chunkStartedAt >= args.chunkSeconds * 1000)) {
-          chunks += 1;
-          saveSessionProgress.run(session.session_id, session.requests, session.records_sha256!, cursor, exported, stagedBytes,
-            priorDownloaded + client.downloadedBytes - downloadedBeforeAttempt, chunks);
-          commitSpoolTransaction(); database.exec("PRAGMA wal_checkpoint(TRUNCATE)"); invocationChunks += 1;
-          if (args.maxChunks !== 0 && invocationChunks >= args.maxChunks) throw new DeltaError("archive session chunk budget reached; rerun the same command with --resume");
-          if (performance.now() >= args.deadline) throw new DeltaError("source export exceeded the configured elapsed-time limit; rerun the same command with --resume");
-          beginSpoolTransaction(); chunkRecords = 0; chunkBytes = 0; chunkStartedAt = performance.now();
+        if (first.protocol === STABLE_CURSOR_PROTOCOL && (chunkRecords >= args.chunkRecords || chunkBytes >= args.chunkBytes
+            || performance.now() - chunkStartedAt >= args.chunkSeconds * 1000 || performance.now() >= args.deadline)) {
+          checkpointPartialSession(); enforceRunLimitsAfterChunk(); beginSpoolTransaction();
         }
       }
       if (resumeCursor !== undefined && localSource === undefined && (!foundHttpCursor || skippedForHttpResume !== resumedRecords)) throw new DeltaError("source stable session resume cursor could not be replayed");
+      if (first.protocol === STABLE_CURSOR_PROTOCOL && performance.now() >= args.deadline) {
+        if (chunkRecords > 0) { checkpointPartialSession(); enforceRunLimitsAfterChunk(); }
+        throw new DeltaError("source export exceeded the configured elapsed-time limit; rerun the same command with --resume");
+      }
       if (exported !== session.requests) throw new DeltaError("source session export count disagrees with its session summary");
       if (first.protocol === STABLE_CURSOR_PROTOCOL) {
         const digest = createHash("sha256");
         for (const row of database.prepare("SELECT canonical FROM records WHERE session_id=? ORDER BY request_id COLLATE BINARY").iterate(session.session_id) as Iterable<{ canonical: Uint8Array }>) digest.update(row.canonical);
         if (digest.digest("hex") !== session.records_sha256) throw new DeltaError("source session export digest disagrees with its stable summary");
+        if (performance.now() >= args.deadline) {
+          if (chunkRecords > 0) { checkpointPartialSession(); enforceRunLimitsAfterChunk(); }
+          throw new DeltaError("source export exceeded the configured elapsed-time limit; rerun the same command with --resume");
+        }
       }
+      const commitsTailChunk = first.protocol === STABLE_CURSOR_PROTOCOL && chunkRecords > 0;
       if (first.protocol === STABLE_CURSOR_PROTOCOL) {
         clearSessionProgress.run(session.session_id);
         markSessionCompleted.run(session.session_id, session.requests, session.records_sha256!, priorDownloaded + client.downloadedBytes - downloadedBeforeAttempt);
       }
       commitSpoolTransaction();
       database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+      if (commitsTailChunk) { invocationChunks += 1; enforceRunLimitsAfterChunk(); }
+      if (performance.now() >= args.deadline) throw new DeltaError("source export exceeded the configured elapsed-time limit; rerun the same command with --resume");
     }
     const spoolWatermarks = database.prepare("SELECT MAX(completed_at) AS completed_at,MAX(started_at) AS started_at FROM records WHERE emit=1").get() as { completed_at: string | null; started_at: string | null };
     if (spoolWatermarks.completed_at !== null) {
@@ -1536,7 +1566,7 @@ function parseCli(argv: string[]): Arguments {
   if (!Number.isInteger(args.maxFutureSkewSeconds) || args.maxFutureSkewSeconds < 0 || args.maxFutureSkewSeconds > 86_400) throw new DeltaError("max future skew seconds must be between 0 and 86400");
   if (!Number.isInteger(args.chunkRecords) || args.chunkRecords < 1 || args.chunkRecords > 100_000) throw new DeltaError("chunk records must be between 1 and 100000");
   if (!Number.isInteger(args.chunkBytes) || args.chunkBytes < 1024 || args.chunkBytes > 1024 ** 3) throw new DeltaError("chunk bytes must be between 1 KiB and 1 GiB");
-  if (args.chunkSeconds <= 0 || args.chunkSeconds > 3600) throw new DeltaError("chunk seconds must be between 0 and 3600");
+  if (args.chunkSeconds <= 0 || args.chunkSeconds > 3600) throw new DeltaError("chunk seconds must be greater than 0 and at most 3600");
   if (!Number.isInteger(args.maxChunks) || args.maxChunks < 0 || args.maxChunks > 1_000_000) throw new DeltaError("max chunks must be between 0 and 1000000");
   if (args.offlineFull && !args.collectorDirect) throw new DeltaError("--offline-full requires --collector-direct");
   if (args.collectorDirect && (args.tokenFile !== undefined || args.tokenEnv !== undefined)) throw new DeltaError("collector-direct does not accept a CPA token");
