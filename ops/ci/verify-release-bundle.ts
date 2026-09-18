@@ -69,6 +69,10 @@ try {
   const archiveHelp = spawnSync(archiveBinary, ["--help"], { encoding: "utf8", timeout: 10_000 });
   assert.equal(archiveHelp.status, 0, "isolated archive runtime must execute without product checkout");
   assert.match(archiveHelp.stdout, /--max-plan-bytes/u);
+  const backupBinary = join(bundle, "commands/runtime/cpa-session-archive-backup");
+  const backupHelp = spawnSync(backupBinary, ["--help"], { encoding: "utf8", timeout: 10_000 });
+  assert.equal(backupHelp.status, 0, "isolated SQLite backup runtime must execute without product checkout");
+  assert.match(backupHelp.stdout, /--pages-per-step/u);
 
   execute(command("export-cpa-managed-codex-model-snapshot"), ["--help"]);
   execute(command("resolve-cpa-managed-codex-provenance"), ["--help"]);

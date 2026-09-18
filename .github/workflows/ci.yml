@@ -19,7 +19,7 @@ concurrency:
 jobs:
   verify:
     name: Verify migration tools
-    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/master'
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/master'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -34,6 +34,12 @@ jobs:
           node-version: "24.18.0"
           registry-url: https://registry.npmjs.org/
 
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.24.7"
+          cache: true
+
       - name: Install dependencies
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
@@ -41,6 +47,11 @@ jobs:
 
       - name: Verify repository policy, types, and tests
         run: npm run verify
+
+      - name: Verify SQLite backup command
+        run: |
+          test -z "$(gofmt -l cmd/cpa-session-archive-backup)"
+          go test ./cmd/cpa-session-archive-backup
 
   publish-release:
     name: Publish immutable migration-tools release and pinned archive runtime
@@ -80,6 +91,12 @@ jobs:
           node-version: "24.18.0"
           registry-url: https://registry.npmjs.org/
 
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.24.7"
+          cache: true
+
       - name: Install locked build dependencies
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
@@ -87,6 +104,26 @@ jobs:
 
       - name: Build dependency-bundled release commands
         run: npm run build
+
+      - name: Build and exercise static SQLite backup runtime
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends musl-tools
+          go test ./cmd/cpa-session-archive-backup
+          mkdir -p dist/release/commands/runtime
+          CGO_ENABLED=1 CC=musl-gcc go build -trimpath -buildvcs=true -tags 'osusergo netgo static_build' \
+            -ldflags '-linkmode external -extldflags -static -s -w' \
+            -o dist/release/commands/runtime/cpa-session-archive-backup ./cmd/cpa-session-archive-backup
+          if ldd dist/release/commands/runtime/cpa-session-archive-backup > "$RUNNER_TEMP/backup-ldd.txt" 2>&1; then
+            echo 'backup runtime unexpectedly has dynamic dependencies' >&2
+            exit 1
+          fi
+          grep -Eq 'not a dynamic executable|statically linked' "$RUNNER_TEMP/backup-ldd.txt"
+          dist/release/commands/runtime/cpa-session-archive-backup --help | grep -- '--pages-per-step'
+          mkdir -p dist/release/commands/runtime/licenses
+          install -m 0444 LICENSE dist/release/commands/runtime/licenses/LICENSE
+          install -m 0444 THIRD_PARTY_NOTICES.md dist/release/commands/runtime/licenses/THIRD_PARTY_NOTICES.md
 
       - name: Check out approved immutable archive engine source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v6.0.0
@@ -246,3 +283,71 @@ jobs:
             gh release create "$tag" --target "$GITHUB_SHA" --title "Migration tools $GITHUB_SHA" --notes "Dependency-bundled Node.js 24.18.0 migration command release for $GITHUB_SHA." \
               "$RELEASE_ASSETS/$archive" "$RELEASE_ASSETS/$manifest" "$RELEASE_ASSETS/SHA256SUMS"
           fi
+
+
+  publish-session-archive-backup:
+    name: Publish immutable SQLite backup runtime
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/master')
+    needs: [verify]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out the verified revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v6.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.24.7"
+          cache: true
+
+      - name: Build and exercise static SQLite backup runtime
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends musl-tools
+          go test ./cmd/cpa-session-archive-backup
+          mkdir -p dist/release/commands/runtime
+          CGO_ENABLED=1 CC=musl-gcc go build -trimpath -buildvcs=true -tags 'osusergo netgo static_build' \
+            -ldflags '-linkmode external -extldflags -static -s -w' \
+            -o dist/release/commands/runtime/cpa-session-archive-backup ./cmd/cpa-session-archive-backup
+          if ldd dist/release/commands/runtime/cpa-session-archive-backup > "$RUNNER_TEMP/backup-ldd.txt" 2>&1; then
+            echo 'backup runtime unexpectedly has dynamic dependencies' >&2
+            exit 1
+          fi
+          grep -Eq 'not a dynamic executable|statically linked' "$RUNNER_TEMP/backup-ldd.txt"
+          dist/release/commands/runtime/cpa-session-archive-backup --help | grep -- '--pages-per-step'
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Publish digest-addressable SQLite backup image
+        id: publish-backup
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.18.0
+        with:
+          context: .
+          file: ops/ci/Dockerfile.session-archive-backup
+          build-args: RELEASE_REVISION=${{ github.sha }}
+          tags: ghcr.io/${{ github.repository }}:session-archive-backup-${{ github.sha }}
+          push: true
+          provenance: mode=max
+          sbom: true
+
+      - name: Record immutable SQLite backup image identity
+        run: |
+          set -euo pipefail
+          [[ "${{ steps.publish-backup.outputs.digest }}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf 'SQLite backup OCI image: `ghcr.io/%s@%s`\n' "$GITHUB_REPOSITORY" "${{ steps.publish-backup.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"

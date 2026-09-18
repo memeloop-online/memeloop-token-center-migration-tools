@@ -50,9 +50,17 @@ const commandFiles = releaseEntrypointNames.map((name) => {
   return { name, source: releaseEntrypoints[name], path: releasePath(path), sha256: digest(path) };
 });
 const expected = new Set(commandFiles.map((entry) => entry.path));
-const runtimeFiles = ["import-cpa-session-archive", "compatibility.json", "source.tar"]
+const runtimeFiles = [
+  "import-cpa-session-archive",
+  "compatibility.json",
+  "source.tar",
+  "cpa-session-archive-backup",
+  "licenses/LICENSE",
+  "licenses/THIRD_PARTY_NOTICES.md",
+]
   .map((name) => resolve(commandsDirectory, "runtime", name));
 verifiedArchiveRuntime(runtimeFiles[0]!);
+regularFile(runtimeFiles[3]!);
 const runtimePaths = new Set(runtimeFiles.map(releasePath));
 for (const path of files(commandsDirectory)) {
   const packaged = releasePath(path);

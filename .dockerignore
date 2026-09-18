@@ -2,11 +2,14 @@
 # Dockerfile. Keep tests, fixtures, source manifests, and operator notes out
 # of the build context as an additional accidental-copy boundary.
 *
+!LICENSE
+!THIRD_PARTY_NOTICES.md
 !Dockerfile.importer
 !package.json
 !package-lock.json
 !ops/
 !ops/ci/
+!ops/ci/Dockerfile.session-archive-backup
 !ops/ci/run-typescript-entrypoint.ts
 !ops/ci/stage-protected-inputs.ts
 !ops/legacy-routes/
@@ -23,3 +26,8 @@
 !ops/reconcile-final-price-cache.ts
 !ops/lib/
 !ops/lib/strict-json.ts
+!dist/
+!dist/release/
+!dist/release/commands/
+!dist/release/commands/runtime/
+!dist/release/commands/runtime/cpa-session-archive-backup
