@@ -1248,14 +1248,14 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
   }
   const diagnostics = args.collectorDirect ? (message: string) => process.stderr.write(`${message}\n`) : undefined;
   const client = new SourceClient(args.baseUrl, args.downloadBaseUrl ?? args.baseUrl, token, args.timeoutSeconds, args.allowHttp, hosts, args.collectorDirect, args.maxRetries, args.retryBaseSeconds, args.deadline, tls, args.maxDownloadBytes, args.offlineFull, diagnostics);
-  const localSource = args.sourceSqlite === undefined ? undefined : new SQLiteArchiveSource(args.sourceSqlite);
+  let localSource: SQLiteArchiveSource | undefined;
   const fingerprint = sourceFingerprint(client); const checkpoint = loadCheckpoint(args.checkpoint, fingerprint);
   const manifestPath = `${args.output}.manifest.json`; const pending = `${args.output}.pending`; const spoolPath = `${args.output}.spool.sqlite`;
+  const resumesSealedOutput = args.resume && (existsSync(args.output) || existsSync(pending) || existsSync(manifestPath));
   if (args.legacySpool !== undefined && (checkpoint !== undefined || !args.collectorDirect || !args.offlineFull || !args.resume || args.since === undefined)) {
     throw new DeltaError("legacy archive spool recovery requires --resume, --collector-direct, --offline-full, --since, and no checkpoint");
   }
-  if (localSource !== undefined && (checkpoint !== undefined || !args.collectorDirect || !args.offlineFull || args.since === undefined)) {
-    localSource.close();
+  if (args.sourceSqlite !== undefined && ((checkpoint !== undefined && !resumesSealedOutput) || !args.collectorDirect || !args.offlineFull || args.since === undefined)) {
     throw new DeltaError("source SQLite snapshots are only valid for the first collector-direct offline-full export");
   }
   if (args.resume) {
@@ -1273,6 +1273,7 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
   const initialCollectorSnapshot = args.collectorDirect && priorFence === undefined;
   if (initialCollectorSnapshot) { if (!args.offlineFull) throw new DeltaError("the first collector-direct snapshot requires --offline-full"); }
   else if (args.offlineFull) throw new DeltaError("--offline-full is only valid for the first collector-direct snapshot");
+  if (args.sourceSqlite !== undefined) localSource = new SQLiteArchiveSource(args.sourceSqlite);
   const lower = addSeconds(prior, -args.overlapSeconds); const observed: Time = { nanos: BigInt(Date.now()) * 1_000_000n }; const maximum = addSeconds(observed, args.maxFutureSkewSeconds);
   if (compareTime(prior, maximum) > 0) throw new DeltaError("source checkpoint timestamp exceeds the future-skew limit");
   if (localSource === undefined && !args.allowHttp) for (const host of hosts) if (!await verifyPrivateHost(host, hosts)) throw new DeltaError("private HTTP host allowlist did not resolve exclusively to private addresses");

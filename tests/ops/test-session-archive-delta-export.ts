@@ -802,6 +802,9 @@ test("read-only SQLite large session checkpoints a request cursor and resumes wi
     assert.deepEqual(output.slice(1).map((item) => item.request_id), rows.map((item) => item.request_id));
     const manifest = JSON.parse(readFileSync(`${paths.output}.manifest.json`, "utf8")) as Record<string, unknown>;
     assert.equal(manifest.source_read_mode, "sqlite-snapshot"); assert.equal(manifest.record_count, rows.length); assert.equal(manifest.session_count, 1);
+    rmSync(source);
+    const sealedReplay = await run([...common, "--resume"]);
+    assert.equal(sealedReplay.code, 0, sealedReplay.stderr);
   } finally { rmSync(paths.directory, { recursive: true, force: true }); }
 });
 
