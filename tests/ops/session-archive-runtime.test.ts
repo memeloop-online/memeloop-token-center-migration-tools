@@ -4,7 +4,12 @@ import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { archiveRuntimePin, fileDigest, verifiedArchiveRuntime } from "../../ops/lib/session-archive-runtime.ts";
+import {
+  archiveRuntimePin,
+  fileDigest,
+  verifiedArchiveRuntime,
+  verifiedSessionArchiveBackupRuntime,
+} from "../../ops/lib/session-archive-runtime.ts";
 
 test("archive runtime rejects missing, drifted, substituted and symlinked artifacts before execution", () => {
   const directory = mkdtempSync(join(tmpdir(), "archive-runtime-fixture-"));
@@ -63,12 +68,35 @@ test("archive runtime rejects missing, drifted, substituted and symlinked artifa
   }
 });
 
+test("SQLite backup runtime must be a regular executable file", () => {
+  const directory = mkdtempSync(join(tmpdir(), "session-archive-backup-runtime-fixture-"));
+  const binary = join(directory, "cpa-session-archive-backup");
+  try {
+    writeFileSync(binary, "fixture", { mode: 0o555 });
+    assert.equal(verifiedSessionArchiveBackupRuntime(binary), binary);
+    chmodSync(binary, 0o444);
+    assert.throws(() => verifiedSessionArchiveBackupRuntime(binary), /verification failed/);
+    chmodSync(binary, 0o555);
+    const alternate = join(directory, "alternate");
+    writeFileSync(alternate, "fixture", { mode: 0o555 });
+    rmSync(binary);
+    symlinkSync(alternate, binary);
+    assert.throws(() => verifiedSessionArchiveBackupRuntime(binary), /verification failed/);
+    assert.throws(() => verifiedSessionArchiveBackupRuntime("cpa-session-archive-backup"), /verification failed/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("release CI pins engine provenance and packages source without runtime builds", () => {
   const workflow = readFileSync(new URL("../../.github/workflows/ci.yml", import.meta.url), "utf8");
   assert.ok(workflow.includes(archiveRuntimePin.revision));
   assert.ok(workflow.includes(archiveRuntimePin.cargo_lock_sha256));
   assert.match(workflow, /cargo build --locked --release --bin import-cpa-session-archive/);
   assert.match(workflow, /cargo test --locked --test session_archive_import --test session_archive_quarantine --test session_archive_unlinked/);
+  assert.equal((workflow.match(/CGO_ENABLED=1 CC=musl-gcc go build/gu) ?? []).length, 1);
+  assert.match(workflow, /name: session-archive-backup-runtime-\$\{\{ github\.sha \}\}/u);
+  assert.equal((workflow.match(/needs\.build-session-archive-backup\.outputs\.binary_sha256/gu) ?? []).length, 3);
   const wrapper = readFileSync(new URL("../../ops/import-cpa-session-archive.ts", import.meta.url), "utf8");
   assert.match(wrapper, /const binary = verifiedArchiveRuntime\(requestedBinary\)/);
   assert.match(wrapper, /spawn\(binary, args/);

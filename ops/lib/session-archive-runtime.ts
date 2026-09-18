@@ -46,3 +46,23 @@ export function verifiedArchiveRuntime(binary: string): string {
     throw new Error("session archive runtime verification failed");
   }
 }
+
+/** Resolve only the packaged, executable SQLite backup runtime. */
+export function verifiedSessionArchiveBackupRuntime(binary: string): string {
+  try {
+    if (!isAbsolute(binary)) throw new Error("runtime path must be absolute");
+    const stat = lstatSync(binary);
+    if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o111) === 0) {
+      throw new Error("runtime must be a regular executable file");
+    }
+    binary = realpathSync(binary);
+    if (basename(binary) !== "cpa-session-archive-backup") throw new Error("runtime name invalid");
+    const resolved = lstatSync(binary);
+    if (!resolved.isFile() || resolved.isSymbolicLink() || (resolved.mode & 0o111) === 0) {
+      throw new Error("resolved runtime must be a regular executable file");
+    }
+    return binary;
+  } catch {
+    throw new Error("session archive backup runtime verification failed");
+  }
+}

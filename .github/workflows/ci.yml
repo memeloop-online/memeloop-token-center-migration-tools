@@ -19,7 +19,7 @@ concurrency:
 jobs:
   verify:
     name: Verify migration tools
-    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/master'
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/master'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -34,6 +34,12 @@ jobs:
           node-version: "24.18.0"
           registry-url: https://registry.npmjs.org/
 
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.24.7"
+          cache: true
+
       - name: Install dependencies
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
@@ -42,10 +48,79 @@ jobs:
       - name: Verify repository policy, types, and tests
         run: npm run verify
 
+      - name: Verify SQLite backup command
+        run: |
+          test -z "$(gofmt -l cmd/cpa-session-archive-backup)"
+          go test ./cmd/cpa-session-archive-backup
+
+  build-session-archive-backup:
+    name: Build verified SQLite backup runtime once
+    needs: [verify]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      binary_sha256: ${{ steps.seal.outputs.binary_sha256 }}
+    steps:
+      - name: Check out the verified revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v6.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.24.7"
+          cache: true
+
+      - name: Build, exercise, and seal static SQLite backup runtime
+        id: seal
+        env:
+          ARTIFACT_DIRECTORY: ${{ runner.temp }}/session-archive-backup-runtime
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends musl-tools
+          mkdir -p "$ARTIFACT_DIRECTORY/payload"
+          CGO_ENABLED=1 CC=musl-gcc go build -trimpath -buildvcs=true -tags 'osusergo netgo static_build' \
+            -ldflags '-linkmode external -extldflags -static -s -w' \
+            -o "$ARTIFACT_DIRECTORY/payload/cpa-session-archive-backup" ./cmd/cpa-session-archive-backup
+          chmod 0555 "$ARTIFACT_DIRECTORY/payload/cpa-session-archive-backup"
+          binary="$ARTIFACT_DIRECTORY/payload/cpa-session-archive-backup"
+          test -f "$binary"
+          test ! -L "$binary"
+          test -x "$binary"
+          file "$binary" | grep -- 'statically linked'
+          ! readelf -l "$binary" | grep -q 'Requesting program interpreter'
+          "$binary" --help | grep -- 'pages-per-step'
+          binary_sha256="$(sha256sum "$binary" | cut -d ' ' -f 1)"
+          printf 'binary_sha256=%s\n' "$binary_sha256" >> "$GITHUB_OUTPUT"
+          tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+            -C "$ARTIFACT_DIRECTORY/payload" -cf - cpa-session-archive-backup \
+            | gzip -n > "$ARTIFACT_DIRECTORY/session-archive-backup-runtime.tar.gz"
+          rm -rf -- "$ARTIFACT_DIRECTORY/payload"
+          (
+            cd "$ARTIFACT_DIRECTORY"
+            sha256sum session-archive-backup-runtime.tar.gz > SHA256SUMS
+            sha256sum -c SHA256SUMS
+          )
+
+      - name: Upload verified SQLite backup runtime
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.6.2
+        with:
+          name: session-archive-backup-runtime-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/session-archive-backup-runtime/session-archive-backup-runtime.tar.gz
+            ${{ runner.temp }}/session-archive-backup-runtime/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 90
+
   publish-release:
     name: Publish immutable migration-tools release and pinned archive runtime
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-    needs: [verify]
+    needs: [verify, build-session-archive-backup]
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
@@ -87,6 +162,48 @@ jobs:
 
       - name: Build dependency-bundled release commands
         run: npm run build
+
+      - name: Download verified SQLite backup runtime
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: session-archive-backup-runtime-${{ github.sha }}
+          path: ${{ runner.temp }}/session-archive-backup-runtime
+
+      - name: Install the shared SQLite backup runtime
+        env:
+          ARTIFACT_DIRECTORY: ${{ runner.temp }}/session-archive-backup-runtime
+          EXPECTED_BINARY_SHA256: ${{ needs.build-session-archive-backup.outputs.binary_sha256 }}
+        run: |
+          set -euo pipefail
+          test "$(find "$ARTIFACT_DIRECTORY" -mindepth 1 -maxdepth 1 -type f | wc -l)" = 2
+          test -f "$ARTIFACT_DIRECTORY/session-archive-backup-runtime.tar.gz"
+          test ! -L "$ARTIFACT_DIRECTORY/session-archive-backup-runtime.tar.gz"
+          test -f "$ARTIFACT_DIRECTORY/SHA256SUMS"
+          test ! -L "$ARTIFACT_DIRECTORY/SHA256SUMS"
+          (cd "$ARTIFACT_DIRECTORY" && sha256sum -c SHA256SUMS)
+          test "$(tar -tzf "$ARTIFACT_DIRECTORY/session-archive-backup-runtime.tar.gz")" = "cpa-session-archive-backup"
+          extracted="$(mktemp -d "$RUNNER_TEMP/session-archive-backup-release.XXXXXX")"
+          trap 'rm -rf -- "$extracted"' EXIT
+          tar -xzf "$ARTIFACT_DIRECTORY/session-archive-backup-runtime.tar.gz" -C "$extracted" --no-same-owner
+          binary="$extracted/cpa-session-archive-backup"
+          test -f "$binary"
+          test ! -L "$binary"
+          test -x "$binary"
+          test "$(sha256sum "$binary" | cut -d ' ' -f 1)" = "$EXPECTED_BINARY_SHA256"
+          file "$binary" | grep -- 'statically linked'
+          ! readelf -l "$binary" | grep -q 'Requesting program interpreter'
+          "$binary" --help | grep -- 'pages-per-step'
+          mkdir -p dist/release/commands/runtime
+          install -m 0555 "$binary" dist/release/commands/runtime/cpa-session-archive-backup
+          packaged="dist/release/commands/runtime/cpa-session-archive-backup"
+          test -f "$packaged"
+          test ! -L "$packaged"
+          test -x "$packaged"
+          test "$(sha256sum "$packaged" | cut -d ' ' -f 1)" = "$EXPECTED_BINARY_SHA256"
+          "$packaged" --help | grep -- 'pages-per-step'
+          mkdir -p dist/release/commands/runtime/licenses
+          install -m 0444 LICENSE dist/release/commands/runtime/licenses/LICENSE
+          install -m 0444 THIRD_PARTY_NOTICES.md dist/release/commands/runtime/licenses/THIRD_PARTY_NOTICES.md
 
       - name: Check out approved immutable archive engine source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v6.0.0
@@ -199,6 +316,7 @@ jobs:
 
       - name: Create deterministic release archive and checksums
         env:
+          EXPECTED_BACKUP_SHA256: ${{ needs.build-session-archive-backup.outputs.binary_sha256 }}
           RELEASE_ASSETS: ${{ runner.temp }}/migration-tools-release-assets
         run: |
           set -euo pipefail
@@ -207,6 +325,15 @@ jobs:
           manifest="memeloop-token-center-migration-tools-${GITHUB_SHA}.manifest.json"
           cp dist/release/release-manifest.json "$RELEASE_ASSETS/$manifest"
           tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner -C dist/release -cf - commands release-manifest.json | gzip -n > "$RELEASE_ASSETS/$archive"
+          extracted="$(mktemp -d "$RUNNER_TEMP/migration-tools-release-check.XXXXXX")"
+          trap 'rm -rf -- "$extracted"' EXIT
+          tar -xzf "$RELEASE_ASSETS/$archive" -C "$extracted" --no-same-owner
+          backup="$extracted/commands/runtime/cpa-session-archive-backup"
+          test -f "$backup"
+          test ! -L "$backup"
+          test -x "$backup"
+          test "$(sha256sum "$backup" | cut -d ' ' -f 1)" = "$EXPECTED_BACKUP_SHA256"
+          "$backup" --help | grep -- 'pages-per-step'
           (
             cd "$RELEASE_ASSETS"
             sha256sum "$archive" "$manifest" > SHA256SUMS
@@ -246,3 +373,87 @@ jobs:
             gh release create "$tag" --target "$GITHUB_SHA" --title "Migration tools $GITHUB_SHA" --notes "Dependency-bundled Node.js 24.18.0 migration command release for $GITHUB_SHA." \
               "$RELEASE_ASSETS/$archive" "$RELEASE_ASSETS/$manifest" "$RELEASE_ASSETS/SHA256SUMS"
           fi
+
+
+  publish-session-archive-backup:
+    name: Publish immutable SQLite backup runtime
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/master')
+    needs: [verify, build-session-archive-backup]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out the verified revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v6.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Download verified SQLite backup runtime
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: session-archive-backup-runtime-${{ github.sha }}
+          path: ${{ runner.temp }}/session-archive-backup-runtime
+
+      - name: Install the shared SQLite backup runtime
+        env:
+          ARTIFACT_DIRECTORY: ${{ runner.temp }}/session-archive-backup-runtime
+          EXPECTED_BINARY_SHA256: ${{ needs.build-session-archive-backup.outputs.binary_sha256 }}
+        run: |
+          set -euo pipefail
+          test "$(find "$ARTIFACT_DIRECTORY" -mindepth 1 -maxdepth 1 -type f | wc -l)" = 2
+          test -f "$ARTIFACT_DIRECTORY/session-archive-backup-runtime.tar.gz"
+          test ! -L "$ARTIFACT_DIRECTORY/session-archive-backup-runtime.tar.gz"
+          test -f "$ARTIFACT_DIRECTORY/SHA256SUMS"
+          test ! -L "$ARTIFACT_DIRECTORY/SHA256SUMS"
+          (cd "$ARTIFACT_DIRECTORY" && sha256sum -c SHA256SUMS)
+          test "$(tar -tzf "$ARTIFACT_DIRECTORY/session-archive-backup-runtime.tar.gz")" = "cpa-session-archive-backup"
+          extracted="$(mktemp -d "$RUNNER_TEMP/session-archive-backup-image.XXXXXX")"
+          trap 'rm -rf -- "$extracted"' EXIT
+          tar -xzf "$ARTIFACT_DIRECTORY/session-archive-backup-runtime.tar.gz" -C "$extracted" --no-same-owner
+          binary="$extracted/cpa-session-archive-backup"
+          test -f "$binary"
+          test ! -L "$binary"
+          test -x "$binary"
+          test "$(sha256sum "$binary" | cut -d ' ' -f 1)" = "$EXPECTED_BINARY_SHA256"
+          file "$binary" | grep -- 'statically linked'
+          ! readelf -l "$binary" | grep -q 'Requesting program interpreter'
+          "$binary" --help | grep -- 'pages-per-step'
+          mkdir -p dist/release/commands/runtime
+          install -m 0555 "$binary" dist/release/commands/runtime/cpa-session-archive-backup
+          packaged="dist/release/commands/runtime/cpa-session-archive-backup"
+          test -f "$packaged"
+          test ! -L "$packaged"
+          test -x "$packaged"
+          test "$(sha256sum "$packaged" | cut -d ' ' -f 1)" = "$EXPECTED_BINARY_SHA256"
+          "$packaged" --help | grep -- 'pages-per-step'
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Publish digest-addressable SQLite backup image
+        id: publish-backup
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.18.0
+        with:
+          context: .
+          file: ops/ci/Dockerfile.session-archive-backup
+          build-args: RELEASE_REVISION=${{ github.sha }}
+          tags: ghcr.io/${{ github.repository }}:session-archive-backup-${{ github.sha }}
+          push: true
+          provenance: mode=max
+          sbom: true
+
+      - name: Record immutable SQLite backup image identity
+        run: |
+          set -euo pipefail
+          [[ "${{ steps.publish-backup.outputs.digest }}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf 'SQLite backup OCI image: `ghcr.io/%s@%s`\n' "$GITHUB_REPOSITORY" "${{ steps.publish-backup.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"

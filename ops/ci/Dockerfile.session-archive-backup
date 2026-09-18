@@ -1,0 +1,12 @@
+FROM scratch
+
+ARG RELEASE_REVISION
+LABEL org.opencontainers.image.source="https://github.com/memeloop-online/memeloop-token-center-migration-tools" \
+      org.opencontainers.image.revision="${RELEASE_REVISION}" \
+      org.opencontainers.image.title="MTC session archive backup"
+
+COPY --chmod=0555 dist/release/commands/runtime/cpa-session-archive-backup /usr/local/bin/cpa-session-archive-backup
+COPY --chmod=0444 LICENSE THIRD_PARTY_NOTICES.md /licenses/
+
+USER 10001:10001
+ENTRYPOINT ["/usr/local/bin/cpa-session-archive-backup"]
