@@ -37,6 +37,7 @@ import { fileURLToPath } from "node:url";
 import { invokedAsEntrypoint } from "./lib/invoked-as-entrypoint.ts";
 import { parseArgs } from "node:util";
 import { parseStrictJson } from "./lib/strict-json.ts";
+import { gunzipSync } from "node:zlib";
 
 export const SOURCE_FINGERPRINT_VERSION = 1;
 export const COLLECTOR_FINGERPRINT_VERSION = 2;
@@ -87,6 +88,16 @@ export const ARCHIVE_SPOOL_SCHEMA = `
     requests INTEGER NOT NULL,
     records_sha256 TEXT NOT NULL,
     downloaded_bytes INTEGER NOT NULL CHECK(downloaded_bytes >= 0)
+  ) WITHOUT ROWID;
+  CREATE TABLE IF NOT EXISTS session_progress(
+    session_id TEXT PRIMARY KEY COLLATE BINARY,
+    requests INTEGER NOT NULL CHECK(requests >= 0),
+    records_sha256 TEXT NOT NULL,
+    record_cursor TEXT NOT NULL COLLATE BINARY,
+    staged_records INTEGER NOT NULL CHECK(staged_records >= 0),
+    staged_bytes INTEGER NOT NULL CHECK(staged_bytes >= 0),
+    downloaded_bytes INTEGER NOT NULL CHECK(downloaded_bytes >= 0),
+    chunks INTEGER NOT NULL CHECK(chunks >= 1)
   ) WITHOUT ROWID;
   CREATE TABLE IF NOT EXISTS spool_metadata(
     id INTEGER PRIMARY KEY CHECK(id=1),
@@ -160,6 +171,12 @@ type Projection = {
   deletedSessionCount: number;
 };
 type TlsFiles = { cert: Buffer; key: Buffer };
+type SQLiteSourceRow = {
+  request_id: string; session_id: string; key_id: string; principal_id: string; credential_hash: string;
+  requested_model: string; model: string; outcome: string; status_code: number; started_at: string; completed_at: string;
+  metadata_json: string; facets_json: string; original_ref: string; response_ref: string;
+  original_request_gz: Uint8Array | null; response_gz: Uint8Array | null;
+};
 
 export class DeltaError extends Error {}
 export class StableCursorUnsupported extends DeltaError {}
@@ -824,6 +841,173 @@ export class SourceClient {
   }
 }
 
+/**
+ * Read a sealed cpa-session-archive SQLite online-backup directly. The file is
+ * required to be immutable and sidecar-free so request-id seek cursors remain
+ * valid across process restarts without holding a long-lived source snapshot.
+ */
+export class SQLiteArchiveSource {
+  readonly path: string;
+  readonly database: DatabaseSync;
+  readonly projection: Projection;
+  readonly recordCount: number;
+
+  constructor(path: string) {
+    if (!isAbsolute(path) || path !== resolve(path)) throw new DeltaError("source SQLite snapshot path must be absolute");
+    ensurePrivateSpoolFile(path, "source SQLite snapshot");
+    const metadata = lstatSync(path);
+    if ((metadata.mode & 0o222) !== 0) throw new DeltaError("source SQLite snapshot must be filesystem read-only");
+    if (archiveSpoolSidecars(path).some(existsSync)) throw new DeltaError("source SQLite snapshot must not have WAL or SHM sidecars");
+    this.path = path;
+    this.database = new DatabaseSync(path, { readOnly: true });
+    try {
+      this.database.exec("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF");
+      this.verifySchema();
+      const counts = this.database.prepare("SELECT COUNT(*) AS records,COUNT(DISTINCT session_id) AS sessions FROM records").get() as { records: number; sessions: number };
+      const indexed = this.database.prepare("SELECT COALESCE(SUM(requests),0) AS records,COUNT(*) AS sessions FROM session_summaries").get() as { records: number; sessions: number };
+      if (!Number.isSafeInteger(counts.records) || counts.records < 0 || counts.records !== indexed.records || counts.sessions !== indexed.sessions) {
+        throw new DeltaError("source SQLite snapshot session index is incomplete");
+      }
+      this.recordCount = counts.records;
+      this.projection = this.loadProjection(counts.sessions);
+    } catch (error) {
+      this.database.close();
+      throw error;
+    }
+  }
+
+  private verifySchema(): void {
+    const required: Record<string, string[]> = {
+      records: ["request_id", "session_id", "key_id", "principal_id", "credential_hash", "requested_model", "model", "outcome", "status_code", "started_at", "completed_at", "metadata_json", "facets_json", "original_ref", "response_ref", "original_request_gz", "response_gz"],
+      blobs: ["hash", "codec", "data"],
+      session_summaries: ["session_id", "requests"],
+      archive_ingest_clock: ["id", "sequence"],
+      archive_ingest_events: ["sequence", "session_id", "previous_session_id"],
+      session_export_digests: ["session_id", "requests", "first_at", "last_at", "records_sha256", "max_ingest_sequence"],
+      archive_snapshot_contract: ["id", "schema_version", "tombstone_safe_after_sequence"],
+    };
+    for (const [table, columns] of Object.entries(required)) {
+      const found = new Set((this.database.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((item) => item.name));
+      if (columns.some((column) => !found.has(column))) throw new DeltaError("source SQLite snapshot schema is unsupported");
+    }
+  }
+
+  private loadProjection(expectedSessions: number): Projection {
+    const clock = this.database.prepare("SELECT sequence FROM archive_ingest_clock WHERE id=1").get() as { sequence: number } | undefined;
+    const contract = this.database.prepare("SELECT schema_version,tombstone_safe_after_sequence FROM archive_snapshot_contract WHERE id=1").get() as { schema_version: number; tombstone_safe_after_sequence: number } | undefined;
+    if (clock === undefined || !Number.isSafeInteger(clock.sequence) || clock.sequence < 0 || contract === undefined || contract.schema_version !== 2
+        || !Number.isSafeInteger(contract.tombstone_safe_after_sequence) || contract.tombstone_safe_after_sequence < 0 || contract.tombstone_safe_after_sequence > clock.sequence) {
+      throw new DeltaError("source SQLite snapshot stable contract is invalid");
+    }
+    const rows = this.database.prepare(`SELECT d.session_id,d.requests,d.first_at,d.last_at,d.records_sha256,d.max_ingest_sequence,
+      COALESCE((SELECT MAX(e.sequence) FROM archive_ingest_events e WHERE e.session_id=d.session_id OR e.previous_session_id=d.session_id),0) AS current_sequence
+      FROM session_export_digests d
+      WHERE EXISTS(SELECT 1 FROM records r WHERE r.session_id=d.session_id)
+      ORDER BY d.last_at DESC,d.session_id COLLATE BINARY ASC`).all() as Array<{
+        session_id: string; requests: number; first_at: string; last_at: string; records_sha256: string; max_ingest_sequence: number; current_sequence: number;
+      }>;
+    if (rows.length !== expectedSessions) throw new DeltaError("source SQLite snapshot export digests are incomplete");
+    const sessions: SessionSummary[] = [];
+    let requests = 0;
+    for (const row of rows) {
+      if (typeof row.session_id !== "string" || row.session_id.length === 0 || row.session_id.length > 512
+          || [...row.session_id].some((character) => character.charCodeAt(0) < 0x20 || character.charCodeAt(0) > 0x7e)
+          || !Number.isSafeInteger(row.requests) || row.requests < 1 || !isSha256(row.records_sha256)
+          || row.max_ingest_sequence !== row.current_sequence) throw new DeltaError("source SQLite snapshot export digest is stale or invalid");
+      const first = parseTime(row.first_at, "source SQLite session first_at"), last = parseTime(row.last_at, "source SQLite session last_at");
+      const item: SessionSummary = { session_id: row.session_id, requests: row.requests, first_at: formatTime(first), last_at: formatTime(last), records_sha256: row.records_sha256 };
+      sessions.push(item); requests += row.requests;
+    }
+    if (requests !== this.recordCount) throw new DeltaError("source SQLite snapshot request count disagrees");
+    const setDigest = selectionDigest(sessions);
+    return {
+      sessions,
+      protocol: STABLE_CURSOR_PROTOCOL,
+      requestCount: requests,
+      snapshot: `sqlite-${sha256Bytes(canonicalBytes({ fence: String(clock.sequence), sessions: setDigest }))}`,
+      ingestFence: String(clock.sequence),
+      snapshotSchemaVersion: 2,
+      tombstoneSafeAfterIngestFence: String(contract.tombstone_safe_after_sequence),
+      deletedSessionCount: 0,
+    };
+  }
+
+  statsRecords(): number { return this.recordCount; }
+  stableProjection(): Projection { return this.projection; }
+
+  private blob(hash: string): Buffer {
+    const row = this.database.prepare("SELECT codec,data FROM blobs WHERE hash=?").get(hash) as { codec: string; data: Uint8Array } | undefined;
+    if (row === undefined) throw new DeltaError("source SQLite snapshot payload blob is missing");
+    const value = Buffer.from(row.data);
+    try { return row.codec === "gzip" ? gunzipSync(value) : value; }
+    catch { throw new DeltaError("source SQLite snapshot payload blob is invalid"); }
+  }
+
+  private expand(value: unknown): unknown {
+    if (Array.isArray(value)) return value.map((item) => this.expand(item));
+    if (!isObject(value)) return value;
+    if (typeof value.$cpa_blob === "string") {
+      const raw = this.blob(value.$cpa_blob); const encoding = value.encoding;
+      if (encoding === "raw") return raw;
+      if (encoding === "utf8") return raw.toString("utf8");
+      if (encoding === "data-url") return `data:${typeof value.media_type === "string" ? value.media_type : ""};base64,${raw.toString("base64")}`;
+      if (encoding === "json") {
+        let nested: unknown;
+        try { nested = parseStrictJson(raw.toString("utf8")); } catch { throw new DeltaError("source SQLite snapshot JSON payload blob is invalid"); }
+        return this.expand(nested);
+      }
+      throw new DeltaError("source SQLite snapshot payload encoding is unsupported");
+    }
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, this.expand(item)]));
+  }
+
+  private decodedPayload(reference: string, legacy: Uint8Array | null): unknown {
+    let expanded: unknown;
+    if (reference !== "") {
+      let manifest: unknown;
+      try { manifest = parseStrictJson(this.blob(reference).toString("utf8")); } catch { throw new DeltaError("source SQLite snapshot payload manifest is invalid"); }
+      expanded = this.expand(manifest);
+      if (!Buffer.isBuffer(expanded)) return expanded;
+    } else {
+      if (legacy === null || legacy.byteLength === 0) return undefined;
+      try { expanded = gunzipSync(Buffer.from(legacy)); } catch { throw new DeltaError("source SQLite snapshot legacy payload is invalid"); }
+    }
+    const raw = Buffer.from(expanded as Uint8Array);
+    try { return parseStrictJson(raw.toString("utf8")); } catch { return raw.toString("utf8"); }
+  }
+
+  private optionalJson(raw: string, label: string): unknown {
+    if (raw === "") return undefined;
+    try { const value = parseStrictJson(raw); return value === null ? undefined : value; }
+    catch { throw new DeltaError(`source SQLite snapshot ${label} is invalid`); }
+  }
+
+  async *exportLines(sessionId: string, maximum: number, afterRequestId?: string): AsyncGenerator<string> {
+    const statement = this.database.prepare(`SELECT request_id,session_id,COALESCE(key_id,'') AS key_id,COALESCE(principal_id,'') AS principal_id,
+      COALESCE(credential_hash,'') AS credential_hash,COALESCE(requested_model,'') AS requested_model,COALESCE(model,'') AS model,
+      COALESCE(outcome,'') AS outcome,COALESCE(status_code,0) AS status_code,started_at,completed_at,COALESCE(metadata_json,'') AS metadata_json,
+      COALESCE(facets_json,'') AS facets_json,COALESCE(original_ref,'') AS original_ref,COALESCE(response_ref,'') AS response_ref,
+      original_request_gz,response_gz FROM records WHERE session_id=? AND request_id>? ORDER BY request_id COLLATE BINARY ASC`);
+    for (const row of statement.iterate(sessionId, afterRequestId ?? "") as Iterable<SQLiteSourceRow>) {
+      const started = parseTime(row.started_at, "source SQLite record started_at"), completed = parseTime(row.completed_at, "source SQLite record completed_at");
+      const record: JsonObject = { schema_version: 2, session_id: row.session_id, request_id: row.request_id, started_at: formatTime(started), completed_at: formatTime(completed) };
+      for (const [key, value] of Object.entries({ key_id: row.key_id, principal_id: row.principal_id, credential_hash: row.credential_hash, requested_model: row.requested_model, model: row.model, outcome: row.outcome })) if (value.trim() !== "") record[key] = value;
+      if (row.status_code !== 0) record.status_code = row.status_code;
+      const metadata = this.optionalJson(row.metadata_json, "metadata"), facets = this.optionalJson(row.facets_json, "facets");
+      if (metadata !== undefined) record.metadata = metadata;
+      if (facets !== undefined) record.facets = facets;
+      const requestPayload = this.decodedPayload(row.original_ref, row.original_request_gz), responsePayload = this.decodedPayload(row.response_ref, row.response_gz);
+      if (requestPayload !== undefined) record.request = requestPayload;
+      if (responsePayload !== undefined) record.response = responsePayload;
+      const line = `${canonicalize(record)}\n`;
+      if (Buffer.byteLength(line) > maximum) throw new DeltaError("source archive record exceeds the configured line limit");
+      yield line;
+    }
+  }
+
+  close(): void { this.database.close(); }
+}
+
 export function sourceFingerprint(client: SourceClient): string {
   const descriptor: JsonObject = {
     origin: client.origin, base: client.base, download_origin: client.downloadOrigin, download_base: client.downloadBase,
@@ -1050,7 +1234,8 @@ type Arguments = {
   collectorDirect: boolean; offlineFull: boolean; privateHttpHosts: string[]; clientCertFile?: string; clientKeyFile?: string; since?: string;
   overlapSeconds: number; sessionLimit: number; maxLineBytes: number; maxDownloadBytes: number; maxOutputBytes: number; timeoutSeconds: number;
   maxElapsedSeconds: number; readinessTimeoutSeconds: number; readinessPollMilliseconds: number; maxRetries: number; retryBaseSeconds: number;
-  maxFutureSkewSeconds: number; requireStableSource: boolean; allowHttp: boolean; resume: boolean; legacySpool?: string; deadline: number;
+  maxFutureSkewSeconds: number; requireStableSource: boolean; allowHttp: boolean; resume: boolean; legacySpool?: string; sourceSqlite?: string;
+  chunkRecords: number; chunkBytes: number; chunkSeconds: number; maxChunks: number; deadline: number;
 };
 
 async function exportDelta(args: Arguments, internalResume = false): Promise<JsonObject> {
@@ -1063,10 +1248,15 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
   }
   const diagnostics = args.collectorDirect ? (message: string) => process.stderr.write(`${message}\n`) : undefined;
   const client = new SourceClient(args.baseUrl, args.downloadBaseUrl ?? args.baseUrl, token, args.timeoutSeconds, args.allowHttp, hosts, args.collectorDirect, args.maxRetries, args.retryBaseSeconds, args.deadline, tls, args.maxDownloadBytes, args.offlineFull, diagnostics);
+  const localSource = args.sourceSqlite === undefined ? undefined : new SQLiteArchiveSource(args.sourceSqlite);
   const fingerprint = sourceFingerprint(client); const checkpoint = loadCheckpoint(args.checkpoint, fingerprint);
   const manifestPath = `${args.output}.manifest.json`; const pending = `${args.output}.pending`; const spoolPath = `${args.output}.spool.sqlite`;
   if (args.legacySpool !== undefined && (checkpoint !== undefined || !args.collectorDirect || !args.offlineFull || !args.resume || args.since === undefined)) {
     throw new DeltaError("legacy archive spool recovery requires --resume, --collector-direct, --offline-full, --since, and no checkpoint");
+  }
+  if (localSource !== undefined && (checkpoint !== undefined || !args.collectorDirect || !args.offlineFull || args.since === undefined)) {
+    localSource.close();
+    throw new DeltaError("source SQLite snapshots are only valid for the first collector-direct offline-full export");
   }
   if (args.resume) {
     if (existsSync(pending) && !existsSync(manifestPath) && !existsSync(args.output)) { ensurePrivateRegular(pending, "orphaned pending delta output"); unlinkSync(pending); fsyncDirectory(dirname(pending)); }
@@ -1085,12 +1275,12 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
   else if (args.offlineFull) throw new DeltaError("--offline-full is only valid for the first collector-direct snapshot");
   const lower = addSeconds(prior, -args.overlapSeconds); const observed: Time = { nanos: BigInt(Date.now()) * 1_000_000n }; const maximum = addSeconds(observed, args.maxFutureSkewSeconds);
   if (compareTime(prior, maximum) > 0) throw new DeltaError("source checkpoint timestamp exceeds the future-skew limit");
-  if (!args.allowHttp) for (const host of hosts) if (!await verifyPrivateHost(host, hosts)) throw new DeltaError("private HTTP host allowlist did not resolve exclusively to private addresses");
-  if (args.collectorDirect) await client.waitUntilReady(args.readinessTimeoutSeconds, args.readinessPollMilliseconds);
-  if (initialCollectorSnapshot) await client.verifyOfflineFull();
-  const before = await client.statsRecords();
+  if (localSource === undefined && !args.allowHttp) for (const host of hosts) if (!await verifyPrivateHost(host, hosts)) throw new DeltaError("private HTTP host allowlist did not resolve exclusively to private addresses");
+  if (args.collectorDirect && localSource === undefined) await client.waitUntilReady(args.readinessTimeoutSeconds, args.readinessPollMilliseconds);
+  if (initialCollectorSnapshot && localSource === undefined) await client.verifyOfflineFull();
+  const before = localSource?.statsRecords() ?? await client.statsRecords();
   if (checkpoint !== undefined && before < (checkpoint.last_source_records as number)) throw new DeltaError("source record count moved backwards since the checkpoint");
-  const first = await loadProjection(client, lower, args.sessionLimit, before, undefined, priorFence); verifyClock(first.sessions, maximum); const firstDigest = selectionDigest(first.sessions);
+  const first = localSource?.stableProjection() ?? await loadProjection(client, lower, args.sessionLimit, before, undefined, priorFence); verifyClock(first.sessions, maximum); const firstDigest = selectionDigest(first.sessions);
   const legacyRecovery = args.legacySpool === undefined ? undefined : inspectLegacySpool(args.legacySpool, first);
   mkdirSync(dirname(args.output), { recursive: true, mode: 0o700 });
   let database: DatabaseSync | undefined; let outputTemporary: string | undefined; let completed = false; let spoolTransactionOpen = false;
@@ -1129,15 +1319,20 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
       retainSpoolOnFailure = false;
       process.stderr.write(`archive spool resume legacy_rebuild=true records_discarded=${discarded}\n`);
     }
-    const orphaned = (database.prepare("SELECT COUNT(*) AS records FROM records WHERE session_id NOT IN (SELECT session_id FROM completed_sessions)").get() as { records: number }).records;
+    const orphaned = (database.prepare("SELECT COUNT(*) AS records FROM records WHERE session_id NOT IN (SELECT session_id FROM completed_sessions UNION SELECT session_id FROM session_progress)").get() as { records: number }).records;
     if (orphaned !== 0) throw new DeltaError("incomplete archive spool contains an unverified session");
     const seen = database.prepare("SELECT session_id, digest FROM records WHERE request_id=?");
     const addRecord = database.prepare("INSERT INTO records VALUES(?,?,?,?,?,?,?)");
     const completedSession = database.prepare("SELECT requests,records_sha256 FROM completed_sessions WHERE session_id=?");
     const markSessionCompleted = database.prepare("INSERT INTO completed_sessions(session_id,requests,records_sha256,downloaded_bytes) VALUES(?,?,?,?)");
+    const sessionProgress = database.prepare("SELECT requests,records_sha256,record_cursor,staged_records,staged_bytes,downloaded_bytes,chunks FROM session_progress WHERE session_id=?");
+    const saveSessionProgress = database.prepare(`INSERT INTO session_progress(session_id,requests,records_sha256,record_cursor,staged_records,staged_bytes,downloaded_bytes,chunks)
+      VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET record_cursor=excluded.record_cursor,staged_records=excluded.staged_records,
+      staged_bytes=excluded.staged_bytes,downloaded_bytes=excluded.downloaded_bytes,chunks=excluded.chunks`);
+    const clearSessionProgress = database.prepare("DELETE FROM session_progress WHERE session_id=?");
     let selectedBytes = (database.prepare("SELECT COALESCE(SUM(length(canonical)),0) AS bytes FROM records WHERE emit=1").get() as { bytes: number }).bytes;
     if (selectedBytes > args.maxOutputBytes) throw new DeltaError("delta output exceeds the configured size limit");
-    client.downloadedBytes = (database.prepare("SELECT COALESCE(SUM(downloaded_bytes),0) AS bytes FROM completed_sessions").get() as { bytes: number }).bytes;
+    client.downloadedBytes = (database.prepare("SELECT COALESCE((SELECT SUM(downloaded_bytes) FROM completed_sessions),0)+COALESCE((SELECT SUM(downloaded_bytes) FROM session_progress),0) AS bytes").get() as { bytes: number }).bytes;
     if (client.downloadedBytes > args.maxDownloadBytes) throw new DeltaError("source archive downloads exceed the configured limit");
     const beginSpoolTransaction = (): void => { if (!spoolTransactionOpen) { database!.exec("BEGIN IMMEDIATE"); spoolTransactionOpen = true; } };
     const commitSpoolTransaction = (): void => { if (spoolTransactionOpen) { database!.exec("COMMIT"); spoolTransactionOpen = false; } };
@@ -1145,9 +1340,10 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
       process.stderr.write(`archive legacy spool recovery reused_sessions=${legacyRecovery.sessions.length} reused_records=${legacyRecovery.reusedRecords} reused_canonical_bytes=${legacyRecovery.reusedCanonicalBytes} remaining_sessions=${legacyRecovery.remainingSessions} remaining_records=${legacyRecovery.remainingRecords}\n`);
     }
     if (spool.resumed) {
-      const counts = database.prepare("SELECT (SELECT COUNT(*) FROM completed_sessions) AS sessions,(SELECT COUNT(*) FROM records) AS records").get() as { sessions: number; records: number };
-      process.stderr.write(`archive spool resume completed_sessions=${counts.sessions} records=${counts.records}\n`);
+      const counts = database.prepare("SELECT (SELECT COUNT(*) FROM completed_sessions) AS sessions,(SELECT COUNT(*) FROM session_progress) AS partial_sessions,(SELECT COUNT(*) FROM records) AS records").get() as { sessions: number; partial_sessions: number; records: number };
+      process.stderr.write(`archive spool resume completed_sessions=${counts.sessions} partial_sessions=${counts.partial_sessions} records=${counts.records}\n`);
     }
+    let invocationChunks = 0;
     for (const session of [...first.sessions].sort((left, right) => compareUtf8Bytewise(left.session_id, right.session_id))) {
       if (session.deleted === true) {
         const deletedAt = parseTime(session.deleted_at, "source session deleted_at");
@@ -1161,31 +1357,52 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
         // then copied them in one transaction. Avoid another full local blob
         // pass here; a later invocation uses the ordinary PR8 re-verification.
         if (seededLegacySessions.has(session.session_id)) continue;
-        const resumedDigest = createHash("sha256"); let resumedCount = 0;
-        const rows = database.prepare("SELECT request_id,session_id,started_at,completed_at,digest,canonical,emit FROM records WHERE session_id=? ORDER BY request_id COLLATE BINARY");
-        for (const row of rows.iterate(session.session_id) as Iterable<{ request_id: string; session_id: string; started_at: string; completed_at: string; digest: string; canonical: Uint8Array; emit: number }>) {
-          const canonical = Buffer.from(row.canonical); let record: unknown;
-          try { record = parseStrictJson(canonical.toString("utf8")); } catch { throw new DeltaError("incomplete archive spool session content failed verification"); }
-          if (!isObject(record) || record.request_id !== row.request_id || record.session_id !== row.session_id || row.session_id !== session.session_id
-              || record.started_at !== row.started_at || record.completed_at !== row.completed_at || row.digest !== sha256Bytes(canonical) || row.emit !== 1) {
-            throw new DeltaError("incomplete archive spool session content failed verification");
-          }
-          parseCanonicalTime(row.started_at, "incomplete archive spool started_at");
-          parseCanonicalTime(row.completed_at, "incomplete archive spool completed_at");
-          resumedDigest.update(canonical); resumedCount += 1;
-        }
-        if (resumedCount !== session.requests || resumedDigest.digest("hex") !== session.records_sha256) throw new DeltaError("incomplete archive spool session content failed verification");
+        const verified = database.prepare("SELECT COUNT(*) AS records,COALESCE(MIN(emit),0) AS all_emit FROM records WHERE session_id=?").get(session.session_id) as { records: number; all_emit: number };
+        if (verified.records !== session.requests || verified.all_emit !== 1) throw new DeltaError("incomplete archive spool session content failed verification");
         continue;
       }
-      let exported = 0;
-      const downloadedBeforeSession = client.downloadedBytes;
+      const progress = first.protocol === STABLE_CURSOR_PROTOCOL ? sessionProgress.get(session.session_id) as {
+        requests: number; records_sha256: string; record_cursor: string; staged_records: number; staged_bytes: number; downloaded_bytes: number; chunks: number;
+      } | undefined : undefined;
+      if (progress !== undefined && (progress.requests !== session.requests || progress.records_sha256 !== session.records_sha256)) throw new DeltaError("incomplete archive spool partial session metadata changed");
+      if (progress !== undefined) {
+        const staged = database.prepare("SELECT COUNT(*) AS records,COALESCE(MAX(request_id),'') AS cursor,COALESCE(SUM(length(canonical)),0) AS bytes FROM records WHERE session_id=?").get(session.session_id) as { records: number; cursor: string; bytes: number };
+        if (staged.records !== progress.staged_records || staged.cursor !== progress.record_cursor || staged.bytes !== progress.staged_bytes || staged.records > session.requests) {
+          throw new DeltaError("incomplete archive spool partial session checkpoint is invalid");
+        }
+      }
+      let exported = progress?.staged_records ?? 0;
+      let stagedBytes = progress?.staged_bytes ?? 0;
+      let cursor = progress?.record_cursor;
+      let chunks = progress?.chunks ?? 0;
+      const resumeCursor = cursor;
+      const resumedRecords = exported;
+      const downloadedBeforeAttempt = client.downloadedBytes;
+      const priorDownloaded = progress?.downloaded_bytes ?? 0;
+      let skippedForHttpResume = 0;
+      let foundHttpCursor = resumeCursor === undefined;
+      let chunkRecords = 0, chunkBytes = 0, chunkStartedAt = performance.now();
       beginSpoolTransaction();
-      for await (const rawLine of client.exportLines(session.session_id, args.maxLineBytes, first.snapshot, session.records_sha256)) {
+      const lines = localSource === undefined
+        ? client.exportLines(session.session_id, args.maxLineBytes, first.snapshot, session.records_sha256)
+        : localSource.exportLines(session.session_id, args.maxLineBytes, resumeCursor);
+      for await (const rawLine of lines) {
+        if (localSource !== undefined) {
+          client.downloadedBytes += Buffer.byteLength(rawLine);
+          if (client.downloadedBytes > args.maxDownloadBytes) throw new DeltaError("source archive downloads exceed the configured limit");
+        }
         let item: unknown; try { item = parseStrictJson(rawLine); } catch { throw new DeltaError("source archive stream contains invalid JSON"); }
         if (!isObject(item) || ![1, 2].includes(item.schema_version as number)) throw new DeltaError("source archive record schema is unsupported");
         if (typeof item.request_id !== "string" || item.request_id.length === 0) throw new DeltaError("source archive request identity is invalid");
         const requestId = item.request_id;
         if (item.session_id !== session.session_id) throw new DeltaError("source session export returned a foreign session record");
+        if (first.protocol === STABLE_CURSOR_PROTOCOL && resumeCursor !== undefined && localSource === undefined && compareUtf8Bytewise(requestId, resumeCursor) <= 0) {
+          skippedForHttpResume += 1;
+          if (requestId === resumeCursor) foundHttpCursor = true;
+          continue;
+        }
+        if (first.protocol === STABLE_CURSOR_PROTOCOL && cursor !== undefined && compareUtf8Bytewise(requestId, cursor) <= 0) throw new DeltaError("source stable session records are not in request-id cursor order");
+        if (resumeCursor !== undefined && localSource === undefined && (!foundHttpCursor || skippedForHttpResume !== resumedRecords)) throw new DeltaError("source stable session resume cursor could not be replayed");
         let record = item;
         const started = parseTime(item.started_at, "archive started_at"), completed = parseTime(item.completed_at, "archive completed_at");
         if (compareTime(completed, started) < 0) throw new DeltaError("source archive record time range is invalid");
@@ -1202,11 +1419,22 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
           selectedBytes += encoded.length;
           if (selectedBytes > args.maxOutputBytes) throw new DeltaError("delta output exceeds the configured size limit");
         }
-        addRecord.run(requestId, session.session_id, formatTime(started), formatTime(completed), digest, encoded, emit ? 1 : 0); exported += 1;
+        addRecord.run(requestId, session.session_id, formatTime(started), formatTime(completed), digest, encoded, emit ? 1 : 0); exported += 1; stagedBytes += encoded.length; cursor = requestId;
+        chunkRecords += 1; chunkBytes += encoded.length;
         if (!emit) continue;
         if (compareTime(completed, maximumCompleted) > 0) maximumCompleted = completed;
         if (maximumStarted === undefined || compareTime(started, maximumStarted) > 0) maximumStarted = started;
+        if (first.protocol === STABLE_CURSOR_PROTOCOL && (chunkRecords >= args.chunkRecords || chunkBytes >= args.chunkBytes || performance.now() - chunkStartedAt >= args.chunkSeconds * 1000)) {
+          chunks += 1;
+          saveSessionProgress.run(session.session_id, session.requests, session.records_sha256!, cursor, exported, stagedBytes,
+            priorDownloaded + client.downloadedBytes - downloadedBeforeAttempt, chunks);
+          commitSpoolTransaction(); database.exec("PRAGMA wal_checkpoint(TRUNCATE)"); invocationChunks += 1;
+          if (args.maxChunks !== 0 && invocationChunks >= args.maxChunks) throw new DeltaError("archive session chunk budget reached; rerun the same command with --resume");
+          if (performance.now() >= args.deadline) throw new DeltaError("source export exceeded the configured elapsed-time limit; rerun the same command with --resume");
+          beginSpoolTransaction(); chunkRecords = 0; chunkBytes = 0; chunkStartedAt = performance.now();
+        }
       }
+      if (resumeCursor !== undefined && localSource === undefined && (!foundHttpCursor || skippedForHttpResume !== resumedRecords)) throw new DeltaError("source stable session resume cursor could not be replayed");
       if (exported !== session.requests) throw new DeltaError("source session export count disagrees with its session summary");
       if (first.protocol === STABLE_CURSOR_PROTOCOL) {
         const digest = createHash("sha256");
@@ -1214,7 +1442,8 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
         if (digest.digest("hex") !== session.records_sha256) throw new DeltaError("source session export digest disagrees with its stable summary");
       }
       if (first.protocol === STABLE_CURSOR_PROTOCOL) {
-        markSessionCompleted.run(session.session_id, session.requests, session.records_sha256!, client.downloadedBytes - downloadedBeforeSession);
+        clearSessionProgress.run(session.session_id);
+        markSessionCompleted.run(session.session_id, session.requests, session.records_sha256!, priorDownloaded + client.downloadedBytes - downloadedBeforeAttempt);
       }
       commitSpoolTransaction();
       database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
@@ -1225,10 +1454,10 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
       if (compareTime(value, maximumCompleted) > 0) maximumCompleted = value;
     }
     if (spoolWatermarks.started_at !== null) maximumStarted = parseCanonicalTime(spoolWatermarks.started_at, "archive spool maximum started_at");
-    const afterExport = await client.statsRecords(); if (args.requireStableSource && afterExport !== before) throw new DeltaError("source record count changed despite the requested write barrier");
-    const second = await loadProjection(client, lower, args.sessionLimit, afterExport, first.snapshot, priorFence); verifyClock(second.sessions, maximum);
+    const afterExport = localSource?.statsRecords() ?? await client.statsRecords(); if (args.requireStableSource && afterExport !== before) throw new DeltaError("source record count changed despite the requested write barrier");
+    const second = localSource?.stableProjection() ?? await loadProjection(client, lower, args.sessionLimit, afterExport, first.snapshot, priorFence); verifyClock(second.sessions, maximum);
     if (second.protocol !== first.protocol || second.requestCount !== first.requestCount || selectionDigest(second.sessions) !== firstDigest) throw new DeltaError("source session projection changed during delta export; retry");
-    const after = await client.statsRecords(); if (args.requireStableSource && after !== before) throw new DeltaError("source record count changed despite the requested write barrier"); if (after < before) throw new DeltaError("source record count decreased during delta export");
+    const after = localSource?.statsRecords() ?? await client.statsRecords(); if (args.requireStableSource && after !== before) throw new DeltaError("source record count changed despite the requested write barrier"); if (after < before) throw new DeltaError("source record count decreased during delta export");
     outputTemporary = join(dirname(args.output), `.${basename(args.output)}.${process.pid}.${Date.now()}`); const descriptor = openSync(outputTemporary, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
     const outputDigest = createHash("sha256"); let outputSize = 0, recordCount = 0;
     try {
@@ -1257,7 +1486,8 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
     const manifest: JsonObject = { version: MANIFEST_VERSION, source_fingerprint: fingerprint, observed_at: formatTime(observed), max_future_skew_seconds: args.maxFutureSkewSeconds,
       sequence, prior_watermark_completed_at: formatTime(prior), prior_output_sha256: checkpoint?.last_output_sha256 ?? null, lower_bound_completed_at: formatTime(lower), overlap_seconds: args.overlapSeconds,
       watermark_completed_at: formatTime(maximumCompleted), max_started_at: maximumStarted === undefined ? null : formatTime(maximumStarted), session_limit: args.sessionLimit, session_count: first.sessions.length,
-      session_projection_protocol: first.protocol, source_mode: client.paths.mode, offline_full_snapshot: args.offlineFull, source_projection_requests: first.requestCount,
+      session_projection_protocol: first.protocol, source_mode: client.paths.mode, source_read_mode: localSource === undefined ? "http-ticket" : "sqlite-snapshot", offline_full_snapshot: args.offlineFull, source_projection_requests: first.requestCount,
+      session_chunk_records: args.chunkRecords, session_chunk_bytes: args.chunkBytes, session_chunk_seconds: args.chunkSeconds,
       source_snapshot_sha256: first.snapshot === undefined ? null : sha256Bytes(first.snapshot), prior_source_ingest_fence: priorFence ?? null, source_ingest_fence: first.ingestFence ?? null,
       snapshot_schema_version: first.snapshotSchemaVersion ?? null, tombstone_safe_after_ingest_fence: first.tombstoneSafeAfterIngestFence ?? null, deleted_session_count: first.deletedSessionCount,
       session_set_sha256: firstDigest, record_count: recordCount, source_records_before: before, source_records_after: after, stable_source_required: args.requireStableSource,
@@ -1265,7 +1495,7 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
     writeAtomicJson(manifestPath, manifest); renameSync(pending, args.output); fsyncDirectory(dirname(args.output)); commitCheckpoint(args.checkpoint, fingerprint, manifest); completed = true; return manifest;
   } finally {
     if (spoolTransactionOpen) { try { database?.exec("ROLLBACK"); } catch { /* closing the database still rolls back an interrupted transaction */ } }
-    try { database?.close(); legacyRecovery?.database.close(); }
+    try { database?.close(); legacyRecovery?.database.close(); localSource?.close(); }
     finally {
       if (completed || !retainSpoolOnFailure) removeArchiveSpool(spoolPath);
       if (outputTemporary !== undefined) rmSync(outputTemporary, { force: true });
@@ -1278,17 +1508,19 @@ function numberOption(values: Record<string, unknown>, key: string, fallback: nu
 }
 function parseCli(argv: string[]): Arguments {
   const { values } = parseArgs({ args: argv, strict: true, allowPositionals: false, options: {
-    "base-url": { type: "string" }, "download-base-url": { type: "string" }, "token-file": { type: "string" }, "token-env": { type: "string" }, checkpoint: { type: "string" }, output: { type: "string" }, "legacy-spool": { type: "string" },
+    "base-url": { type: "string" }, "download-base-url": { type: "string" }, "token-file": { type: "string" }, "token-env": { type: "string" }, checkpoint: { type: "string" }, output: { type: "string" }, "legacy-spool": { type: "string" }, "source-sqlite": { type: "string" },
     "collector-direct": { type: "boolean", default: false }, "offline-full": { type: "boolean", default: false }, "private-http-host": { type: "string", multiple: true, default: [] }, "client-cert-file": { type: "string" }, "client-key-file": { type: "string" }, since: { type: "string" },
     "overlap-seconds": { type: "string" }, "session-limit": { type: "string" }, "max-line-bytes": { type: "string" }, "max-download-bytes": { type: "string" }, "max-output-bytes": { type: "string" }, "timeout-seconds": { type: "string" }, "max-elapsed-seconds": { type: "string" },
     "readiness-timeout-seconds": { type: "string" }, "readiness-poll-milliseconds": { type: "string" }, "max-retries": { type: "string" }, "retry-base-seconds": { type: "string" }, "max-future-skew-seconds": { type: "string" },
+    "chunk-records": { type: "string" }, "chunk-bytes": { type: "string" }, "chunk-seconds": { type: "string" }, "max-chunks": { type: "string" },
     "require-stable-source": { type: "boolean", default: false }, "allow-http": { type: "boolean", default: false }, resume: { type: "boolean", default: false },
   } });
   if (typeof values["base-url"] !== "string" || typeof values.checkpoint !== "string" || typeof values.output !== "string") throw new DeltaError("--base-url, --checkpoint, and --output are required");
-  const args: Arguments = { baseUrl: values["base-url"], downloadBaseUrl: values["download-base-url"], tokenFile: values["token-file"], tokenEnv: values["token-env"], checkpoint: values.checkpoint, output: values.output, legacySpool: values["legacy-spool"],
+  const args: Arguments = { baseUrl: values["base-url"], downloadBaseUrl: values["download-base-url"], tokenFile: values["token-file"], tokenEnv: values["token-env"], checkpoint: values.checkpoint, output: values.output, legacySpool: values["legacy-spool"], sourceSqlite: values["source-sqlite"],
     collectorDirect: values["collector-direct"]!, offlineFull: values["offline-full"]!, privateHttpHosts: values["private-http-host"]!, clientCertFile: values["client-cert-file"], clientKeyFile: values["client-key-file"], since: values.since,
     overlapSeconds: numberOption(values, "overlap-seconds", 86_400), sessionLimit: numberOption(values, "session-limit", 1000), maxLineBytes: numberOption(values, "max-line-bytes", 16 * 1024 * 1024), maxDownloadBytes: numberOption(values, "max-download-bytes", 64 * 1024 ** 3), maxOutputBytes: numberOption(values, "max-output-bytes", 64 * 1024 ** 3), timeoutSeconds: numberOption(values, "timeout-seconds", 60), maxElapsedSeconds: numberOption(values, "max-elapsed-seconds", 6 * 3600),
-    readinessTimeoutSeconds: numberOption(values, "readiness-timeout-seconds", 900), readinessPollMilliseconds: numberOption(values, "readiness-poll-milliseconds", 1000), maxRetries: numberOption(values, "max-retries", 5), retryBaseSeconds: numberOption(values, "retry-base-seconds", 0.5), maxFutureSkewSeconds: numberOption(values, "max-future-skew-seconds", 3600), requireStableSource: values["require-stable-source"]!, allowHttp: values["allow-http"]!, resume: values.resume!, deadline: 0 };
+    readinessTimeoutSeconds: numberOption(values, "readiness-timeout-seconds", 900), readinessPollMilliseconds: numberOption(values, "readiness-poll-milliseconds", 1000), maxRetries: numberOption(values, "max-retries", 5), retryBaseSeconds: numberOption(values, "retry-base-seconds", 0.5), maxFutureSkewSeconds: numberOption(values, "max-future-skew-seconds", 3600), requireStableSource: values["require-stable-source"]!, allowHttp: values["allow-http"]!, resume: values.resume!,
+    chunkRecords: numberOption(values, "chunk-records", 128), chunkBytes: numberOption(values, "chunk-bytes", 16 * 1024 * 1024), chunkSeconds: numberOption(values, "chunk-seconds", 30), maxChunks: numberOption(values, "max-chunks", 0), deadline: 0 };
   if (!Number.isInteger(args.overlapSeconds) || args.overlapSeconds < 1 || args.overlapSeconds > 31 * 86_400) throw new DeltaError("overlap seconds must be between one second and 31 days");
   if (!Number.isInteger(args.sessionLimit) || args.sessionLimit < 1 || args.sessionLimit > 1000) throw new DeltaError("session limit must be between 1 and 1000");
   if (!Number.isInteger(args.maxLineBytes) || args.maxLineBytes < 1024 || args.maxLineBytes > 16 * 1024 * 1024) throw new DeltaError("max line bytes must be between 1 KiB and 16 MiB");
@@ -1301,6 +1533,10 @@ function parseCli(argv: string[]): Arguments {
   if (!Number.isInteger(args.maxRetries) || args.maxRetries < 0 || args.maxRetries > 20) throw new DeltaError("max retries must be between 0 and 20");
   if (args.retryBaseSeconds <= 0 || args.retryBaseSeconds > 30) throw new DeltaError("retry base seconds must be between 0 and 30");
   if (!Number.isInteger(args.maxFutureSkewSeconds) || args.maxFutureSkewSeconds < 0 || args.maxFutureSkewSeconds > 86_400) throw new DeltaError("max future skew seconds must be between 0 and 86400");
+  if (!Number.isInteger(args.chunkRecords) || args.chunkRecords < 1 || args.chunkRecords > 100_000) throw new DeltaError("chunk records must be between 1 and 100000");
+  if (!Number.isInteger(args.chunkBytes) || args.chunkBytes < 1024 || args.chunkBytes > 1024 ** 3) throw new DeltaError("chunk bytes must be between 1 KiB and 1 GiB");
+  if (args.chunkSeconds <= 0 || args.chunkSeconds > 3600) throw new DeltaError("chunk seconds must be between 0 and 3600");
+  if (!Number.isInteger(args.maxChunks) || args.maxChunks < 0 || args.maxChunks > 1_000_000) throw new DeltaError("max chunks must be between 0 and 1000000");
   if (args.offlineFull && !args.collectorDirect) throw new DeltaError("--offline-full requires --collector-direct");
   if (args.collectorDirect && (args.tokenFile !== undefined || args.tokenEnv !== undefined)) throw new DeltaError("collector-direct does not accept a CPA token");
   if (!args.collectorDirect && args.tokenFile === undefined && args.tokenEnv === undefined) throw new DeltaError("the legacy CPA plugin input requires --token-file or --token-env");
@@ -1311,6 +1547,7 @@ function parseCli(argv: string[]): Arguments {
   if ((args.clientCertFile === undefined) !== (args.clientKeyFile === undefined)) throw new DeltaError("mTLS requires both --client-cert-file and --client-key-file");
   if (args.clientCertFile !== undefined && !args.collectorDirect) throw new DeltaError("mTLS client files are only valid with --collector-direct");
   if (args.legacySpool !== undefined && (!isAbsolute(args.legacySpool) || args.legacySpool !== resolve(args.legacySpool) || !LEGACY_SPOOL_BASENAME.test(basename(args.legacySpool)))) throw new DeltaError("legacy archive spool path does not match the 3612 random-spool contract");
+  if (args.sourceSqlite !== undefined && (!args.collectorDirect || !args.offlineFull)) throw new DeltaError("--source-sqlite requires --collector-direct and --offline-full");
   const normalized = args.privateHttpHosts.map(normalizeHost); if (normalized.some((item, index) => item.length === 0 || item !== args.privateHttpHosts[index])) throw new DeltaError("private HTTP host allowlist contains an invalid host");
   if (new Set(normalized).size !== normalized.length) throw new DeltaError("private HTTP host allowlist contains duplicates");
   args.deadline = performance.now() + args.maxElapsedSeconds * 1000; return args;
@@ -1342,6 +1579,11 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       "  --client-cert-file FILE        mTLS client certificate for collector-direct\n" +
       "  --client-key-file FILE         mTLS client key for collector-direct\n" +
       "  --legacy-spool FILE            read-only recovery of a verified 3612 random spool\n" +
+      "  --source-sqlite FILE           read a sealed, read-only archive.sqlite backup directly\n" +
+      "  --chunk-records N              checkpoint a stable session after at most N records\n" +
+      "  --chunk-bytes N                checkpoint a stable session after at most N canonical bytes\n" +
+      "  --chunk-seconds N              checkpoint a stable session after at most N elapsed seconds\n" +
+      "  --max-chunks N                 stop after N committed chunks (zero is unlimited)\n" +
       "  --resume                       resume a verified stable spool or sealed checkpoint\n",
     );
     return 0;
