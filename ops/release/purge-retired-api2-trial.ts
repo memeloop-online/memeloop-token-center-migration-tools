@@ -20,7 +20,9 @@ const LEGACY_TEXT = /(?:api2|legacy-cpa-bridge|cpa-|bridge)/iu;
 const SNAPSHOT_NAME = /^(?:legacy-cpa-bridge-|cpa-).+/u;
 const EXPECTED_SNAPSHOT_COUNT = 17;
 const EXPECTED_KEY_COUNT = 7;
-const EXPECTED_ROUTING_RELATION_COUNT = 16;
+const EXPECTED_ROUTING_GRANT_COUNT = 16;
+const EXPECTED_ROUTING_REVISION_COUNT = 7;
+const EXPECTED_CONVERSATION_OBSERVATION_COUNT = 170;
 const MAX_MANIFEST_BYTES = 1024 * 1024;
 
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
@@ -83,16 +85,6 @@ export interface ReviewedRevision {
   revision: number;
 }
 
-export interface ReviewedLegacyCredential {
-  id: string;
-  generation: number;
-  fingerprint: string;
-  source_hash: string;
-  created_at: number;
-  revoked_at: number;
-  secret_hash_present: boolean;
-}
-
 export interface ReviewedRotationReplay {
   idempotency_key: string;
   request_hash: string;
@@ -124,7 +116,6 @@ export interface ReviewedKey {
   credentials: ReviewedCredential[];
   recovery_secrets: ReviewedRecoverySecret[];
   source_proofs: ReviewedSourceProof[];
-  legacy_credentials: ReviewedLegacyCredential[];
   rotation_replays: ReviewedRotationReplay[];
   credential_group_memberships: ReviewedMembership[];
   routing_grants: ReviewedGrant[];
@@ -159,13 +150,15 @@ export interface ReviewedConversationProjection {
 }
 
 export interface ReviewedManifest {
-  schema_version: 3;
+  schema_version: 4;
   idempotency_key: string;
   tenant_external_id: string;
   expected: {
     deleted_upstream_account_snapshots: 17;
     key_records: 7;
-    routing_relations: 16;
+    routing_grants: 16;
+    routing_revisions: 7;
+    conversation_observations: 170;
   };
   snapshots: ReviewedSnapshot[];
   keys: ReviewedKey[];
@@ -306,20 +299,6 @@ function parseGrant(value: Json, label: string): ReviewedGrant {
   return { model_route_id: modelRoute, route_group_id: routeGroup, created_at: integer(item.created_at, `${label}.created_at`) };
 }
 
-function parseLegacyCredential(value: Json, label: string): ReviewedLegacyCredential {
-  const item = object(value, label);
-  exactKeys(item, ["id", "generation", "fingerprint", "source_hash", "created_at", "revoked_at", "secret_hash_present"], label);
-  return {
-    id: uuid(item.id, `${label}.id`),
-    generation: integer(item.generation, `${label}.generation`),
-    fingerprint: text(item.fingerprint, `${label}.fingerprint`, 128),
-    source_hash: text(item.source_hash, `${label}.source_hash`, 256),
-    created_at: integer(item.created_at, `${label}.created_at`),
-    revoked_at: integer(item.revoked_at, `${label}.revoked_at`),
-    secret_hash_present: bool(item.secret_hash_present, `${label}.secret_hash_present`),
-  };
-}
-
 function parseRotationReplay(value: Json, label: string): ReviewedRotationReplay {
   const item = object(value, label);
   exactKeys(item, ["idempotency_key", "request_hash", "expires_at", "created_at", "response_ciphertext_present"], label);
@@ -379,13 +358,12 @@ function array(value: Json | undefined, label: string, max = 500): Json[] {
 function parseKey(value: Json, index: number): ReviewedKey {
   const label = `keys[${index}]`;
   const item = object(value, label);
-  exactKeys(item, ["key_id", "principal_id", "account_id", "alias", "currency", "credential_generation", "archived_at", "created_at", "updated_at", "issued_ciphertext_present", "credentials", "recovery_secrets", "source_proofs", "legacy_credentials", "rotation_replays", "credential_group_memberships", "routing_grants", "routing_revision"], label);
+  exactKeys(item, ["key_id", "principal_id", "account_id", "alias", "currency", "credential_generation", "archived_at", "created_at", "updated_at", "issued_ciphertext_present", "credentials", "recovery_secrets", "source_proofs", "rotation_replays", "credential_group_memberships", "routing_grants", "routing_revision"], label);
   const alias = text(item.alias, `${label}.alias`, 200);
   if (!LEGACY_TEXT.test(alias)) fail("manifest_invalid", `${label}.alias does not identify retired API2/bridge material`);
   const credentials = array(item.credentials, `${label}.credentials`).map((entry, child) => parseCredential(entry, `${label}.credentials[${child}]`));
   const recovery = array(item.recovery_secrets, `${label}.recovery_secrets`).map((entry, child) => parseRecovery(entry, `${label}.recovery_secrets[${child}]`));
   const proofs = array(item.source_proofs, `${label}.source_proofs`).map((entry, child) => parseProof(entry, `${label}.source_proofs[${child}]`));
-  const legacyCredentials = array(item.legacy_credentials, `${label}.legacy_credentials`).map((entry, child) => parseLegacyCredential(entry, `${label}.legacy_credentials[${child}]`));
   const rotationReplays = array(item.rotation_replays, `${label}.rotation_replays`).map((entry, child) => parseRotationReplay(entry, `${label}.rotation_replays[${child}]`));
   const memberships = array(item.credential_group_memberships, `${label}.credential_group_memberships`).map((entry, child) => parseMembership(entry, `${label}.credential_group_memberships[${child}]`));
   const grants = array(item.routing_grants, `${label}.routing_grants`).map((entry, child) => parseGrant(entry, `${label}.routing_grants[${child}]`));
@@ -405,7 +383,6 @@ function parseKey(value: Json, index: number): ReviewedKey {
     credentials: sortedUnique(credentials, entry => entry.credential_id, `${label}.credentials`),
     recovery_secrets: sortedUnique(recovery, entry => entry.credential_id, `${label}.recovery_secrets`),
     source_proofs: sortedUnique(proofs, entry => `${entry.credential_id}:${entry.proof_kind}`, `${label}.source_proofs`),
-    legacy_credentials: sortedUnique(legacyCredentials, entry => entry.id, `${label}.legacy_credentials`),
     rotation_replays: sortedUnique(rotationReplays, entry => entry.idempotency_key, `${label}.rotation_replays`),
     credential_group_memberships: sortedUnique(memberships, entry => entry.credential_group_id, `${label}.credential_group_memberships`),
     routing_grants: sortedUnique(grants, entry => `${entry.model_route_id ?? ""}:${entry.route_group_id ?? ""}`, `${label}.routing_grants`),
@@ -446,12 +423,12 @@ function parseRewrite(value: Json, index: number): ConversationRewrite {
 export function parseManifest(value: Json): ReviewedManifest {
   const root = object(value, "manifest");
   exactKeys(root, ["schema_version", "idempotency_key", "tenant_external_id", "expected", "snapshots", "keys", "credential_groups", "route_groups", "conversation_projection_outbox", "conversation_rewrites"], "manifest");
-  if (root.schema_version !== 3) fail("manifest_invalid", "unsupported manifest schema_version");
+  if (root.schema_version !== 4) fail("manifest_invalid", "unsupported manifest schema_version");
   const idempotencyKey = text(root.idempotency_key, "idempotency_key", 128);
   if (!IDEMPOTENCY_KEY.test(idempotencyKey)) fail("manifest_invalid", "idempotency_key has an unsupported format");
   const expected = object(root.expected, "expected");
-  exactKeys(expected, ["deleted_upstream_account_snapshots", "key_records", "routing_relations"], "expected");
-  if (expected.deleted_upstream_account_snapshots !== EXPECTED_SNAPSHOT_COUNT || expected.key_records !== EXPECTED_KEY_COUNT || expected.routing_relations !== EXPECTED_ROUTING_RELATION_COUNT) fail("manifest_invalid", "manifest exact counts are not the approved 17/7/16 cohort");
+  exactKeys(expected, ["deleted_upstream_account_snapshots", "key_records", "routing_grants", "routing_revisions", "conversation_observations"], "expected");
+  if (expected.deleted_upstream_account_snapshots !== EXPECTED_SNAPSHOT_COUNT || expected.key_records !== EXPECTED_KEY_COUNT || expected.routing_grants !== EXPECTED_ROUTING_GRANT_COUNT || expected.routing_revisions !== EXPECTED_ROUTING_REVISION_COUNT || expected.conversation_observations !== EXPECTED_CONVERSATION_OBSERVATION_COUNT) fail("manifest_invalid", "manifest exact counts are not the approved 17 snapshots / 7 keys / 16 grants / 7 revisions / 170 observations cohort");
   const snapshots = array(root.snapshots, "snapshots", EXPECTED_SNAPSHOT_COUNT).map((entry, index) => {
     const label = `snapshots[${index}]`;
     const item = object(entry, label);
@@ -473,7 +450,7 @@ export function parseManifest(value: Json): ReviewedManifest {
   const routeGroups = array(root.route_groups, "route_groups", 500).map((entry, index) => parseGroup(entry, `route_groups[${index}]`));
   const conversationProjections = array(root.conversation_projection_outbox, "conversation_projection_outbox", 500).map(parseConversationProjection);
   const rewrites = array(root.conversation_rewrites, "conversation_rewrites", 500).map(parseRewrite);
-  if (snapshots.length !== EXPECTED_SNAPSHOT_COUNT || keys.length !== EXPECTED_KEY_COUNT) fail("manifest_invalid", "manifest object counts do not match the approved cohort");
+  if (snapshots.length !== EXPECTED_SNAPSHOT_COUNT || keys.length !== EXPECTED_KEY_COUNT || rewrites.length !== EXPECTED_CONVERSATION_OBSERVATION_COUNT) fail("manifest_invalid", "manifest object counts do not match the approved cohort");
   sortedUnique(snapshots, entry => entry.upstream_account_id, "snapshots");
   sortedUnique(keys, entry => entry.key_id, "keys");
   sortedUnique(credentialGroups, entry => entry.id, "credential_groups");
@@ -485,13 +462,14 @@ export function parseManifest(value: Json): ReviewedManifest {
   if (conversationProjections.some(entry => !keyIds.has(entry.key_id))) fail("manifest_invalid", "conversation projection rows must belong to reviewed keys");
   if (credentialGroups.some(group => !keys.some(key => key.credential_group_memberships.some(member => member.credential_group_id === group.id)))) fail("manifest_invalid", "credential groups must be referenced by the reviewed cohort");
   if (routeGroups.some(group => !keys.some(key => key.routing_grants.some(grant => grant.route_group_id === group.id)))) fail("manifest_invalid", "route groups must be referenced by the reviewed cohort");
-  const relationCount = keys.reduce((count, key) => count + key.routing_grants.length + 1, 0);
-  if (relationCount !== EXPECTED_ROUTING_RELATION_COUNT) fail("manifest_invalid", "routing grant/revision relation count is not exactly 16");
+  const grantCount = keys.reduce((count, key) => count + key.routing_grants.length, 0);
+  if (grantCount !== EXPECTED_ROUTING_GRANT_COUNT) fail("manifest_invalid", "routing grant count is not exactly 16");
+  if (keys.length !== EXPECTED_ROUTING_REVISION_COUNT) fail("manifest_invalid", "routing revision count is not exactly 7");
   return {
-    schema_version: 3,
+    schema_version: 4,
     idempotency_key: idempotencyKey,
     tenant_external_id: text(root.tenant_external_id, "tenant_external_id", 200),
-    expected: { deleted_upstream_account_snapshots: 17, key_records: 7, routing_relations: 16 },
+    expected: { deleted_upstream_account_snapshots: 17, key_records: 7, routing_grants: 16, routing_revisions: 7, conversation_observations: 170 },
     snapshots,
     keys,
     credential_groups: credentialGroups,
@@ -530,6 +508,13 @@ const protectedTables = [
   "synchronous_image_idempotency",
 ] as const;
 
+function protectedCount(table: typeof protectedTables[number]): string {
+  if (table === "session_archive_import_records") {
+    return `(SELECT COUNT(*) FROM session_archive_import_records row JOIN request_records request_row ON request_row.id=row.target_request_id WHERE request_row.key_id IN (SELECT key_id FROM target_keys))`;
+  }
+  return `(SELECT COUNT(*) FROM ${table} row WHERE row.key_id IN (SELECT key_id FROM target_keys))`;
+}
+
 function assertion(predicate: string): string {
   return `INSERT INTO purge_guard(value) SELECT 1 WHERE ${predicate};`;
 }
@@ -540,7 +525,6 @@ export function buildSql(manifest: ReviewedManifest, digest: string, apply: bool
   const credentialRows = manifest.keys.flatMap(key => key.credentials.map(credential => [sqlText(key.key_id), sqlText(credential.credential_id), String(credential.generation), sqlText(credential.fingerprint), String(credential.created_at), String(credential.revoked_at), sqlBool(credential.plaintext_present)]));
   const recoveryRows = manifest.keys.flatMap(key => key.recovery_secrets.map(recovery => [sqlText(key.key_id), sqlText(recovery.credential_id), String(recovery.credential_generation), String(recovery.created_at), String(recovery.updated_at)]));
   const proofRows = manifest.keys.flatMap(key => key.source_proofs.map(proof => [sqlText(key.key_id), sqlText(proof.credential_id), sqlText(proof.proof_kind), sqlText(proof.source_digest), String(proof.created_at)]));
-  const legacyCredentialRows = manifest.keys.flatMap(key => key.legacy_credentials.map(credential => [sqlText(key.key_id), sqlText(credential.id), String(credential.generation), sqlText(credential.fingerprint), sqlText(credential.source_hash), String(credential.created_at), String(credential.revoked_at), sqlBool(credential.secret_hash_present)]));
   const rotationReplayRows = manifest.keys.flatMap(key => key.rotation_replays.map(replay => [sqlText(key.key_id), sqlText(replay.idempotency_key), sqlText(replay.request_hash), String(replay.expires_at), String(replay.created_at), sqlBool(replay.response_ciphertext_present)]));
   const membershipRows = manifest.keys.flatMap(key => key.credential_group_memberships.map(membership => [sqlText(key.key_id), sqlText(membership.credential_group_id), String(membership.created_at)]));
   const grantRows = manifest.keys.flatMap(key => key.routing_grants.map(grant => [sqlText(key.key_id), sqlNullable(grant.model_route_id), sqlNullable(grant.route_group_id), String(grant.created_at)]));
@@ -551,19 +535,18 @@ export function buildSql(manifest: ReviewedManifest, digest: string, apply: bool
   const routeGroupRows = manifest.route_groups.map(group => [sqlText(group.id), sqlText(group.tenant_id), sqlText(group.name), sqlText(group.normalized_name), String(group.created_at), String(group.updated_at)]);
   const values = (rows: string[][], fallback: string[]) => rows.length === 0 ? `SELECT ${fallback.join(",")} WHERE 0` : `VALUES ${tuples(rows)}`;
   const begin = backend === "sqlite" ? "BEGIN IMMEDIATE;" : "BEGIN;\nSET TRANSACTION ISOLATION LEVEL SERIALIZABLE;";
-  const lock = backend === "postgres" ? "LOCK TABLE deleted_upstream_account_snapshots, key_records, key_credentials, legacy_key_credentials, credential_rotation_replays, key_credential_recovery_secrets, key_credential_source_proofs, credential_groups, credential_group_memberships, route_groups, model_route_group_memberships, routing_grants, routing_grant_relation_revisions, principals, credit_accounts, request_records, usage_reservations, generation_jobs, conversation_clusters, session_archive_correlations, session_archive_unlinked_requests, memeloop_cloud_subscription_events, conversation_observations, conversation_projection_outbox IN SHARE ROW EXCLUSIVE MODE;" : "";
+  const lock = backend === "postgres" ? "LOCK TABLE deleted_upstream_account_snapshots, key_records, key_credentials, credential_rotation_replays, key_credential_recovery_secrets, key_credential_source_proofs, credential_groups, credential_group_memberships, route_groups, model_route_group_memberships, routing_grants, routing_grant_relation_revisions, principals, credit_accounts, request_records, usage_reservations, generation_jobs, conversation_clusters, session_archive_correlations, session_archive_unlinked_requests, memeloop_cloud_subscription_events, conversation_observations, conversation_projection_outbox, conversation_unresolved_explicit_parents, session_routing_terminals IN SHARE ROW EXCLUSIVE MODE;" : "";
   const octetLength = (expression: string): string => backend === "postgres" ? `OCTET_LENGTH(${expression})` : `LENGTH(CAST(${expression} AS BLOB))`;
   const projectionPayloadCas = backend === "postgres"
     ? "LOWER(ENCODE(SHA256(CONVERT_TO(actual.request_json,'UTF8')),'hex'))<>expected.request_json_sha256 OR LOWER(ENCODE(SHA256(CONVERT_TO(actual.hints_json,'UTF8')),'hex'))<>expected.hints_json_sha256"
     : "SHA256_TEXT(actual.request_json)<>expected.request_json_sha256 OR SHA256_TEXT(actual.hints_json)<>expected.hints_json_sha256";
   const replay = `EXISTS (SELECT 1 FROM migration_tool_operation_receipts WHERE idempotency_key=${sqlText(manifest.idempotency_key)})`;
   const fresh = "(SELECT initial_replay FROM operation_state)=0";
-  const protectedBefore = protectedTables.map(table => `INSERT INTO protected_counts(table_name,before_count) SELECT ${sqlText(table)},COUNT(*) FROM ${table} row WHERE row.key_id IN (SELECT key_id FROM target_keys);`).join("\n");
-  const protectedAfter = protectedTables.map(table => assertion(`(SELECT before_count FROM protected_counts WHERE table_name=${sqlText(table)})<>(SELECT COUNT(*) FROM ${table} row WHERE row.key_id IN (SELECT key_id FROM target_keys))`)).join("\n");
-  const relationExpected = EXPECTED_ROUTING_RELATION_COUNT;
+  const protectedBefore = protectedTables.map(table => `INSERT INTO protected_counts(table_name,before_count) VALUES (${sqlText(table)},${protectedCount(table)});`).join("\n");
+  const protectedAfter = protectedTables.map(table => assertion(`(SELECT before_count FROM protected_counts WHERE table_name=${sqlText(table)})<>${protectedCount(table)}`)).join("\n");
   const outcome = "CASE WHEN (SELECT initial_replay FROM operation_state)=1 THEN 'replay' ELSE 'planned' END";
-  const eligiblePrincipals = "(SELECT COUNT(DISTINCT principal_id) FROM target_keys WHERE NOT EXISTS (SELECT 1 FROM key_records remaining WHERE remaining.principal_id=target_keys.principal_id) AND NOT EXISTS (SELECT 1 FROM credit_accounts remaining WHERE remaining.principal_id=target_keys.principal_id) AND NOT EXISTS (SELECT 1 FROM conversation_clusters remaining WHERE remaining.principal_id=target_keys.principal_id) AND NOT EXISTS (SELECT 1 FROM session_archive_correlations remaining WHERE remaining.principal_id=target_keys.principal_id) AND NOT EXISTS (SELECT 1 FROM session_archive_unlinked_requests remaining WHERE remaining.principal_id=target_keys.principal_id) AND NOT EXISTS (SELECT 1 FROM memeloop_cloud_subscription_events remaining WHERE remaining.principal_id=target_keys.principal_id))";
-  const summaryValues = `${outcome},${EXPECTED_SNAPSHOT_COUNT},${EXPECTED_KEY_COUNT},${relationExpected},${legacyCredentialRows.length},${rotationReplayRows.length},${credentialGroupRows.length},${routeGroupRows.length},${conversationProjectionRows.length},${manifest.conversation_rewrites.length},${eligiblePrincipals}`;
+  const eligiblePrincipals = "(SELECT COUNT(DISTINCT principal_id) FROM target_keys WHERE NOT EXISTS (SELECT 1 FROM key_records remaining WHERE remaining.principal_id=target_keys.principal_id) AND NOT EXISTS (SELECT 1 FROM credit_accounts remaining WHERE remaining.principal_id=target_keys.principal_id) AND NOT EXISTS (SELECT 1 FROM conversation_clusters remaining WHERE remaining.principal_id=target_keys.principal_id) AND NOT EXISTS (SELECT 1 FROM session_archive_correlations remaining WHERE remaining.principal_id=target_keys.principal_id) AND NOT EXISTS (SELECT 1 FROM session_archive_unlinked_requests remaining WHERE remaining.principal_id=target_keys.principal_id) AND NOT EXISTS (SELECT 1 FROM memeloop_cloud_subscription_events remaining WHERE remaining.principal_id=target_keys.principal_id) AND NOT EXISTS (SELECT 1 FROM conversation_unresolved_explicit_parents remaining WHERE remaining.principal_id=target_keys.principal_id) AND NOT EXISTS (SELECT 1 FROM session_routing_terminals remaining WHERE remaining.principal_id=target_keys.principal_id))";
+  const summaryValues = `${outcome},${EXPECTED_SNAPSHOT_COUNT},${EXPECTED_KEY_COUNT},${EXPECTED_ROUTING_GRANT_COUNT},${EXPECTED_ROUTING_REVISION_COUNT},${rotationReplayRows.length},${credentialGroupRows.length},${routeGroupRows.length},${conversationProjectionRows.length},${manifest.conversation_rewrites.length},${eligiblePrincipals}`;
   const summaryStatement = backend === "sqlite" ? `SELECT CAPTURE_PURGE_SUMMARY(${summaryValues});` : `SELECT ${summaryValues};`;
   return `${begin}
 ${lock}
@@ -587,8 +570,6 @@ CREATE TEMP TABLE target_recovery(key_id TEXT NOT NULL,credential_id TEXT PRIMAR
 INSERT INTO target_recovery ${values(recoveryRows, ["''", "''", "0", "0", "0"])};
 CREATE TEMP TABLE target_proofs(key_id TEXT NOT NULL,credential_id TEXT NOT NULL,proof_kind TEXT NOT NULL,source_digest TEXT NOT NULL,created_at BIGINT NOT NULL,PRIMARY KEY(credential_id,proof_kind));
 INSERT INTO target_proofs ${values(proofRows, ["''", "''", "''", "''", "0"])};
-CREATE TEMP TABLE target_legacy_credentials(key_id TEXT NOT NULL,id TEXT PRIMARY KEY,generation BIGINT NOT NULL,fingerprint TEXT NOT NULL,source_hash TEXT NOT NULL,created_at BIGINT NOT NULL,revoked_at BIGINT NOT NULL,secret_hash_present BIGINT NOT NULL);
-INSERT INTO target_legacy_credentials ${values(legacyCredentialRows, ["''", "''", "0", "''", "''", "0", "0", "0"])};
 CREATE TEMP TABLE target_rotation_replays(resource_id TEXT NOT NULL,idempotency_key TEXT PRIMARY KEY,request_hash TEXT NOT NULL,expires_at BIGINT NOT NULL,created_at BIGINT NOT NULL,response_ciphertext_present BIGINT NOT NULL);
 INSERT INTO target_rotation_replays ${values(rotationReplayRows, ["''", "''", "''", "0", "0", "0"])};
 CREATE TEMP TABLE target_memberships(key_id TEXT NOT NULL,credential_group_id TEXT NOT NULL,created_at BIGINT NOT NULL,PRIMARY KEY(key_id,credential_group_id));
@@ -605,10 +586,11 @@ CREATE TEMP TABLE target_credential_groups(id TEXT PRIMARY KEY,tenant_id TEXT NO
 INSERT INTO target_credential_groups ${values(credentialGroupRows, ["''", "''", "''", "''", "0", "0"])};
 CREATE TEMP TABLE target_route_groups(id TEXT PRIMARY KEY,tenant_id TEXT NOT NULL,name TEXT NOT NULL,normalized_name TEXT NOT NULL,created_at BIGINT NOT NULL,updated_at BIGINT NOT NULL);
 INSERT INTO target_route_groups ${values(routeGroupRows, ["''", "''", "''", "''", "0", "0"])};
-${assertion(`EXISTS (SELECT 1 FROM migration_tool_operation_receipts WHERE idempotency_key=${sqlText(manifest.idempotency_key)} AND (operation_kind<>'retired-api2-trial-purge-v3' OR manifest_sha256<>${sqlText(digest)}))`)}
+${assertion(`EXISTS (SELECT 1 FROM migration_tool_operation_receipts WHERE idempotency_key=${sqlText(manifest.idempotency_key)} AND (operation_kind<>'retired-api2-trial-purge-v4' OR manifest_sha256<>${sqlText(digest)}))`)}
 ${assertion(`${fresh} AND (SELECT COUNT(*) FROM target_snapshots)<>${EXPECTED_SNAPSHOT_COUNT}`)}
 ${assertion(`${fresh} AND (SELECT COUNT(*) FROM target_keys)<>${EXPECTED_KEY_COUNT}`)}
-${assertion(`${fresh} AND ((SELECT COUNT(*) FROM target_grants)+(SELECT COUNT(*) FROM target_revisions))<>${relationExpected}`)}
+${assertion(`${fresh} AND (SELECT COUNT(*) FROM target_grants)<>${EXPECTED_ROUTING_GRANT_COUNT}`)}
+${assertion(`${fresh} AND (SELECT COUNT(*) FROM target_revisions)<>${EXPECTED_ROUTING_REVISION_COUNT}`)}
 ${assertion(`${fresh} AND (SELECT COUNT(*) FROM tenants WHERE external_id=${sqlText(manifest.tenant_external_id)})<>1`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM target_snapshots expected LEFT JOIN deleted_upstream_account_snapshots actual ON actual.upstream_account_id=expected.upstream_account_id WHERE actual.upstream_account_id IS NULL OR actual.tenant_id<>(SELECT id FROM tenants WHERE external_id=${sqlText(manifest.tenant_external_id)}) OR actual.name<>expected.name OR actual.driver<>expected.driver OR actual.auth_kind<>expected.auth_kind OR actual.credential_generation<>expected.credential_generation OR actual.created_at<>expected.created_at OR actual.deleted_at<>expected.deleted_at)`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM deleted_upstream_account_snapshots actual JOIN tenants tenant ON tenant.id=actual.tenant_id WHERE tenant.external_id=${sqlText(manifest.tenant_external_id)} AND (actual.name LIKE 'legacy-cpa-bridge-%' OR actual.name LIKE 'cpa-%') AND NOT EXISTS (SELECT 1 FROM target_snapshots expected WHERE expected.upstream_account_id=actual.upstream_account_id))`)}
@@ -620,8 +602,6 @@ ${assertion(`${fresh} AND (SELECT COUNT(*) FROM key_credential_recovery_secrets 
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM target_recovery expected LEFT JOIN key_credential_recovery_secrets actual ON actual.credential_id=expected.credential_id WHERE actual.credential_id IS NULL OR actual.key_id<>expected.key_id OR actual.credential_generation<>expected.credential_generation OR actual.created_at<>expected.created_at OR actual.updated_at<>expected.updated_at OR actual.ciphertext='')`)}
 ${assertion(`${fresh} AND (SELECT COUNT(*) FROM key_credential_source_proofs actual JOIN key_credentials credential ON credential.id=actual.credential_id WHERE credential.key_id IN (SELECT key_id FROM target_keys))<>(SELECT COUNT(*) FROM target_proofs)`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM target_proofs expected LEFT JOIN key_credential_source_proofs actual ON actual.credential_id=expected.credential_id AND actual.proof_kind=expected.proof_kind WHERE actual.credential_id IS NULL OR actual.source_digest<>expected.source_digest OR actual.created_at<>expected.created_at)`)}
-${assertion(`${fresh} AND (SELECT COUNT(*) FROM legacy_key_credentials actual WHERE actual.key_id IN (SELECT key_id FROM target_keys))<>(SELECT COUNT(*) FROM target_legacy_credentials)`)}
-${assertion(`${fresh} AND EXISTS (SELECT 1 FROM target_legacy_credentials expected LEFT JOIN legacy_key_credentials actual ON actual.id=expected.id WHERE actual.id IS NULL OR actual.key_id<>expected.key_id OR actual.generation<>expected.generation OR actual.fingerprint<>expected.fingerprint OR actual.source_hash<>expected.source_hash OR actual.created_at<>expected.created_at OR actual.revoked_at IS NULL OR actual.revoked_at<>expected.revoked_at OR CASE WHEN actual.secret_hash IS NULL THEN 0 ELSE 1 END<>expected.secret_hash_present)`)}
 ${assertion(`${fresh} AND (SELECT COUNT(*) FROM credential_rotation_replays actual WHERE actual.resource_kind='key' AND actual.resource_id IN (SELECT key_id FROM target_keys))<>(SELECT COUNT(*) FROM target_rotation_replays)`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM target_rotation_replays expected LEFT JOIN credential_rotation_replays actual ON actual.idempotency_key=expected.idempotency_key WHERE actual.idempotency_key IS NULL OR actual.resource_kind<>'key' OR actual.resource_id<>expected.resource_id OR actual.request_hash<>expected.request_hash OR actual.expires_at<>expected.expires_at OR actual.created_at<>expected.created_at OR CASE WHEN actual.response_ciphertext IS NULL THEN 0 ELSE 1 END<>expected.response_ciphertext_present)`)}
 ${assertion(`${fresh} AND (SELECT COUNT(*) FROM credential_group_memberships actual WHERE actual.key_id IN (SELECT key_id FROM target_keys))<>(SELECT COUNT(*) FROM target_memberships)`)}
@@ -659,7 +639,6 @@ DELETE FROM credential_group_memberships WHERE key_id IN (SELECT key_id FROM tar
 DELETE FROM routing_grants WHERE key_id IN (SELECT key_id FROM target_keys) AND ${fresh};
 DELETE FROM routing_grant_relation_revisions WHERE subject_kind='credential' AND key_id IN (SELECT key_id FROM target_keys) AND ${fresh};
 DELETE FROM credential_rotation_replays WHERE idempotency_key IN (SELECT idempotency_key FROM target_rotation_replays) AND ${fresh};
-DELETE FROM legacy_key_credentials WHERE id IN (SELECT id FROM target_legacy_credentials) AND ${fresh};
 DELETE FROM key_credentials WHERE id IN (SELECT credential_id FROM target_credentials) AND ${fresh};
 DELETE FROM key_records WHERE id IN (SELECT key_id FROM target_keys) AND ${fresh};
 DELETE FROM credential_groups WHERE id IN (SELECT id FROM target_credential_groups) AND NOT EXISTS (SELECT 1 FROM credential_group_memberships remaining WHERE remaining.credential_group_id=credential_groups.id) AND ${fresh};
@@ -671,11 +650,12 @@ DELETE FROM principals WHERE id IN (SELECT DISTINCT principal_id FROM target_key
   AND NOT EXISTS (SELECT 1 FROM session_archive_correlations remaining WHERE remaining.principal_id=principals.id)
   AND NOT EXISTS (SELECT 1 FROM session_archive_unlinked_requests remaining WHERE remaining.principal_id=principals.id)
   AND NOT EXISTS (SELECT 1 FROM memeloop_cloud_subscription_events remaining WHERE remaining.principal_id=principals.id)
+  AND NOT EXISTS (SELECT 1 FROM conversation_unresolved_explicit_parents remaining WHERE remaining.principal_id=principals.id)
+  AND NOT EXISTS (SELECT 1 FROM session_routing_terminals remaining WHERE remaining.principal_id=principals.id)
   AND ${fresh};
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM deleted_upstream_account_snapshots WHERE upstream_account_id IN (SELECT upstream_account_id FROM target_snapshots))`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM key_records WHERE id IN (SELECT key_id FROM target_keys))`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM key_credentials WHERE id IN (SELECT credential_id FROM target_credentials))`)}
-${assertion(`${fresh} AND EXISTS (SELECT 1 FROM legacy_key_credentials WHERE id IN (SELECT id FROM target_legacy_credentials))`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM credential_rotation_replays WHERE idempotency_key IN (SELECT idempotency_key FROM target_rotation_replays))`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM credential_groups WHERE id IN (SELECT id FROM target_credential_groups) AND NOT EXISTS (SELECT 1 FROM credential_group_memberships remaining WHERE remaining.credential_group_id=credential_groups.id))`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM route_groups WHERE id IN (SELECT id FROM target_route_groups) AND NOT EXISTS (SELECT 1 FROM routing_grants remaining WHERE remaining.route_group_id=route_groups.id) AND NOT EXISTS (SELECT 1 FROM model_route_group_memberships remaining WHERE remaining.route_group_id=route_groups.id))`)}
@@ -683,9 +663,9 @@ ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM conversation_observations actual
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM conversation_observations actual WHERE actual.key_id IN (SELECT key_id FROM target_keys) AND (LOWER(COALESCE(actual.session_name,'')) LIKE '%api2%' OR LOWER(COALESCE(actual.session_name,'')) LIKE '%legacy-cpa-bridge%' OR LOWER(COALESCE(actual.session_name,'')) LIKE '%cpa-%' OR LOWER(COALESCE(actual.session_name,'')) LIKE '%bridge%' OR LOWER(actual.labels_json) LIKE '%api2%' OR LOWER(actual.labels_json) LIKE '%legacy-cpa-bridge%' OR LOWER(actual.labels_json) LIKE '%cpa-%' OR LOWER(actual.labels_json) LIKE '%bridge%'))`)}
 ${protectedAfter}
 INSERT INTO migration_tool_operation_receipts(idempotency_key,operation_kind,manifest_sha256,applied_at,summary_json)
-SELECT ${sqlText(manifest.idempotency_key)},'retired-api2-trial-purge-v3',${sqlText(digest)},${now},${sqlText(JSON.stringify({ deleted_upstream_account_snapshots: 17, key_records: 7, routing_relations: 16, legacy_key_credentials: legacyCredentialRows.length, credential_rotation_replays: rotationReplayRows.length, credential_groups: credentialGroupRows.length, route_groups: routeGroupRows.length, conversation_projection_outbox: conversationProjectionRows.length, conversation_rewrites: manifest.conversation_rewrites.length }))}
+SELECT ${sqlText(manifest.idempotency_key)},'retired-api2-trial-purge-v4',${sqlText(digest)},${now},${sqlText(JSON.stringify({ deleted_upstream_account_snapshots: 17, key_records: 7, routing_grants: 16, routing_revisions: 7, credential_rotation_replays: rotationReplayRows.length, credential_groups: credentialGroupRows.length, route_groups: routeGroupRows.length, conversation_projection_outbox: conversationProjectionRows.length, conversation_rewrites: manifest.conversation_rewrites.length }))}
 WHERE ${fresh};
-${assertion(`(SELECT COUNT(*) FROM migration_tool_operation_receipts WHERE idempotency_key=${sqlText(manifest.idempotency_key)} AND operation_kind='retired-api2-trial-purge-v3' AND manifest_sha256=${sqlText(digest)})<>1`)}
+${assertion(`(SELECT COUNT(*) FROM migration_tool_operation_receipts WHERE idempotency_key=${sqlText(manifest.idempotency_key)} AND operation_kind='retired-api2-trial-purge-v4' AND manifest_sha256=${sqlText(digest)})<>1`)}
 ${summaryStatement}
 ${apply ? "COMMIT;" : "ROLLBACK;"}
 `;
@@ -761,15 +741,15 @@ function runDatabase(options: Options, sql: string): string {
       database?.close();
     }
   }
-  if (!summary || !/^(?:planned|replay)\|17\|7\|16(?:\|\d+){7}$/u.test(summary)) fail("database_receipt_invalid", "database did not return the bounded cleanup summary");
+  if (!summary || !/^(?:planned|replay)\|17\|7\|16\|7(?:\|\d+){6}$/u.test(summary)) fail("database_receipt_invalid", "database did not return the bounded cleanup summary");
   return summary;
 }
 
 export function receipt(manifest: ReviewedManifest, digest: string, mode: "dry-run" | "apply", summary: string): Obj {
-  const [outcome, snapshots, keys, relations, legacyCredentials, rotationReplays, credentialGroups, routeGroups, conversationProjections, rewrites, principals] = summary.split("|");
+  const [outcome, snapshots, keys, routingGrants, routingRevisions, rotationReplays, credentialGroups, routeGroups, conversationProjections, rewrites, principals] = summary.split("|");
   return {
-    schema_version: 3,
-    operation: "retired-api2-trial-purge-v3",
+    schema_version: 4,
+    operation: "retired-api2-trial-purge-v4",
     mode,
     outcome: outcome!,
     idempotency_key: manifest.idempotency_key,
@@ -777,8 +757,8 @@ export function receipt(manifest: ReviewedManifest, digest: string, mode: "dry-r
     tenant_external_id_sha256: createHash("sha256").update(manifest.tenant_external_id).digest("hex"),
     deleted_upstream_account_snapshots: Number(snapshots),
     key_records: Number(keys),
-    routing_relations: Number(relations),
-    legacy_key_credentials: Number(legacyCredentials),
+    routing_grants: Number(routingGrants),
+    routing_revisions: Number(routingRevisions),
     credential_rotation_replays: Number(rotationReplays),
     credential_groups: Number(credentialGroups),
     route_groups: Number(routeGroups),
