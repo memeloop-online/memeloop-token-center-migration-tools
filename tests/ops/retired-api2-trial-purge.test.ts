@@ -43,6 +43,8 @@ function fixtureManifest(): ReviewedManifest {
       credentials: [{ credential_id: credentialId, generation: 1, fingerprint: `fixture-${index}`, created_at: 1000 + index, revoked_at: 2900 + index, plaintext_present: index < 3 }],
       recovery_secrets: index < 2 ? [{ credential_id: credentialId, credential_generation: 1, created_at: 1500 + index, updated_at: 2500 + index }] : [],
       source_proofs: [{ credential_id: credentialId, proof_kind: "fixture-source-v1", source_digest: `fixture-only-source-${index}`, created_at: 1000 + index }],
+      legacy_credentials: [{ id: uuid(1000 + index), generation: 1, fingerprint: `legacy-${index}`, source_hash: `legacy-source-${index}`, created_at: 1000 + index, revoked_at: 3000 + index, secret_hash_present: true }],
+      rotation_replays: [{ idempotency_key: `rotate-${index}`, request_hash: `request-${index}`, expires_at: 999999, created_at: 1000 + index, response_ciphertext_present: true }],
       credential_group_memberships: index < 3 ? [{ credential_group_id: uuid(600 + index), created_at: 1800 + index }] : [],
       routing_grants: Array.from({ length: index < 2 ? 2 : 1 }, (_, grant) => ({
         model_route_id: index === 6 ? null : uuid(700 + index * 2 + grant),
@@ -60,13 +62,20 @@ function fixtureManifest(): ReviewedManifest {
     replacement_session_name: `retired-session-${key.key_id}`,
     replacement_labels_json: JSON.stringify({ credential: `retired-credential-${key.key_id}`, state: "retired" }),
   }));
+  const credential_groups = keys.flatMap(key => key.credential_group_memberships.map(membership => {
+    const suffix = Number(membership.credential_group_id.slice(-12)) - 600;
+    return { id: membership.credential_group_id, tenant_id: uuid(1), name: `legacy-group-${suffix}`, normalized_name: `legacy-group-${suffix}`, created_at: 1700 + suffix, updated_at: 1800 + suffix };
+  }));
+  const route_groups = [{ id: uuid(900), tenant_id: uuid(1), name: "legacy-route-group", normalized_name: "legacy-route-group", created_at: 1700, updated_at: 1800 }];
   return parseManifest({
-    schema_version: 1,
+    schema_version: 2,
     idempotency_key: "retired-api2-trial-fixture-v1",
     tenant_external_id: "fixture-tenant",
     expected: { deleted_upstream_account_snapshots: 17, key_records: 7, routing_relations: 16 },
     snapshots,
     keys,
+    credential_groups,
+    route_groups,
     conversation_rewrites,
   } as never);
 }
@@ -74,14 +83,14 @@ function fixtureManifest(): ReviewedManifest {
 function baseSchema(postgres: boolean): string {
   const auto = postgres ? "BYTEA" : "BLOB";
   const protectedTables = [
-    "request_records", "request_events", "request_record_locators", "request_event_locators",
+    "request_events", "request_record_locators", "request_event_locators",
     "request_stats_facts", "request_daily_aggregates", "usage_daily_aggregates",
     "usage_analysis_hourly", "usage_analysis_daily", "session_usage_totals",
     "session_usage_hourly", "session_usage_daily", "session_archive_totals",
     "session_archive_import_records", "session_archive_quarantine_resolutions",
-    "generation_jobs", "generation_stats_facts", "generation_daily_aggregates",
+    "generation_stats_facts", "generation_daily_aggregates",
     "generation_usage_dimensions_hourly", "generation_usage_dimensions_daily",
-    "ledger_entries", "usage_reservations", "account_settlement_feed", "key_budget_state",
+    "ledger_entries", "account_settlement_feed", "key_budget_state",
     "key_budget_daily_rollups", "key_budget_usage_events", "rate_limit_windows",
     "key_runtime_state", "metered_usage_projection_outbox",
     "key_credential_recovery_audit", "key_credential_recovery_access_audit",
@@ -98,9 +107,9 @@ CREATE TABLE legacy_key_credentials(id TEXT PRIMARY KEY,key_id TEXT NOT NULL,gen
 CREATE TABLE credential_rotation_replays(idempotency_key TEXT PRIMARY KEY,resource_kind TEXT NOT NULL,resource_id TEXT NOT NULL,request_hash TEXT NOT NULL,response_ciphertext TEXT,expires_at BIGINT NOT NULL,created_at BIGINT NOT NULL);
 CREATE TABLE key_credential_recovery_secrets(credential_id TEXT PRIMARY KEY,key_id TEXT NOT NULL REFERENCES key_records(id) ON DELETE CASCADE,credential_generation BIGINT NOT NULL,ciphertext TEXT NOT NULL,created_at BIGINT NOT NULL,updated_at BIGINT NOT NULL);
 CREATE TABLE key_credential_source_proofs(credential_id TEXT NOT NULL REFERENCES key_credentials(id) ON DELETE CASCADE,proof_kind TEXT NOT NULL,source_digest TEXT NOT NULL,created_at BIGINT NOT NULL,PRIMARY KEY(credential_id,proof_kind));
-CREATE TABLE credential_groups(id TEXT PRIMARY KEY,tenant_id TEXT NOT NULL,name TEXT NOT NULL);
+CREATE TABLE credential_groups(id TEXT PRIMARY KEY,tenant_id TEXT NOT NULL,name TEXT NOT NULL,normalized_name TEXT NOT NULL,created_at BIGINT NOT NULL,updated_at BIGINT NOT NULL);
 CREATE TABLE credential_group_memberships(tenant_id TEXT NOT NULL,credential_group_id TEXT NOT NULL,key_id TEXT NOT NULL REFERENCES key_records(id) ON DELETE CASCADE,created_at BIGINT NOT NULL,PRIMARY KEY(credential_group_id,key_id));
-CREATE TABLE route_groups(id TEXT PRIMARY KEY,tenant_id TEXT NOT NULL,name TEXT NOT NULL);
+CREATE TABLE route_groups(id TEXT PRIMARY KEY,tenant_id TEXT NOT NULL,name TEXT NOT NULL,normalized_name TEXT NOT NULL,created_at BIGINT NOT NULL,updated_at BIGINT NOT NULL);
 CREATE TABLE model_route_group_memberships(tenant_id TEXT NOT NULL,route_group_id TEXT NOT NULL,model_route_id TEXT NOT NULL);
 CREATE TABLE routing_grants(tenant_id TEXT NOT NULL,key_id TEXT NOT NULL REFERENCES key_records(id) ON DELETE CASCADE,model_route_id TEXT,route_group_id TEXT,created_at BIGINT NOT NULL);
 CREATE TABLE routing_grant_relation_revisions(tenant_id TEXT NOT NULL,subject_kind TEXT NOT NULL,subject_id TEXT NOT NULL,key_id TEXT REFERENCES key_records(id) ON DELETE CASCADE,model_route_id TEXT,revision BIGINT NOT NULL,PRIMARY KEY(tenant_id,subject_kind,subject_id));
@@ -111,6 +120,9 @@ CREATE TABLE session_archive_correlations(id TEXT PRIMARY KEY,key_id TEXT NOT NU
 CREATE TABLE session_archive_unlinked_requests(id TEXT PRIMARY KEY,key_id TEXT NOT NULL,principal_id TEXT NOT NULL);
 CREATE TABLE memeloop_cloud_subscription_events(id TEXT PRIMARY KEY,key_id TEXT NOT NULL,principal_id TEXT NOT NULL);
 CREATE TABLE synchronous_image_idempotency(key_id TEXT NOT NULL REFERENCES key_records(id) ON DELETE CASCADE,idempotency_key TEXT NOT NULL,PRIMARY KEY(key_id,idempotency_key));
+CREATE TABLE request_records(id TEXT PRIMARY KEY,key_id TEXT NOT NULL,completed_at BIGINT);
+CREATE TABLE usage_reservations(id TEXT PRIMARY KEY,key_id TEXT NOT NULL,status TEXT NOT NULL);
+CREATE TABLE generation_jobs(id TEXT PRIMARY KEY,key_id TEXT NOT NULL,status TEXT NOT NULL,stats_aggregated_at BIGINT);
 ${protectedTables.map(name => `CREATE TABLE ${name}(id TEXT PRIMARY KEY,key_id TEXT NOT NULL);`).join("\n")}
 `;
 }
@@ -130,15 +142,18 @@ function fixtureSql(manifest: ReviewedManifest, postgres: boolean): string {
     for (const recovery of key.recovery_secrets) statements.push(`INSERT INTO key_credential_recovery_secrets VALUES (${q(recovery.credential_id)},${q(key.key_id)},${recovery.credential_generation},'fixture-only-recovery-ciphertext',${recovery.created_at},${recovery.updated_at});`);
     for (const proof of key.source_proofs) statements.push(`INSERT INTO key_credential_source_proofs VALUES (${q(proof.credential_id)},${q(proof.proof_kind)},${q(proof.source_digest)},${proof.created_at});`);
     for (const membership of key.credential_group_memberships) {
-      statements.push(`INSERT INTO credential_groups VALUES (${q(membership.credential_group_id)},${q(tenantId)},${q(`legacy-group-${index}`)});`);
+      statements.push(`INSERT INTO credential_groups VALUES (${q(membership.credential_group_id)},${q(tenantId)},${q(`legacy-group-${index}`)},${q(`legacy-group-${index}`)},${1700 + index},${1800 + index});`);
       statements.push(`INSERT INTO credential_group_memberships VALUES (${q(tenantId)},${q(membership.credential_group_id)},${q(key.key_id)},${membership.created_at});`);
     }
     for (const grant of key.routing_grants) {
-      if (grant.route_group_id) statements.push(`INSERT INTO route_groups VALUES (${q(grant.route_group_id)},${q(tenantId)},'legacy-route-group');`);
+      if (grant.route_group_id) statements.push(`INSERT INTO route_groups VALUES (${q(grant.route_group_id)},${q(tenantId)},'legacy-route-group','legacy-route-group',1700,1800);`);
       statements.push(`INSERT INTO routing_grants VALUES (${q(tenantId)},${q(key.key_id)},${grant.model_route_id ? q(grant.model_route_id) : "NULL"},${grant.route_group_id ? q(grant.route_group_id) : "NULL"},${grant.created_at});`);
     }
     statements.push(`INSERT INTO routing_grant_relation_revisions VALUES (${q(tenantId)},'credential',${q(key.key_id)},${q(key.key_id)},NULL,${key.routing_revision.revision});`);
-    for (const table of ["request_records", "request_events", "request_record_locators", "request_event_locators", "request_stats_facts", "request_daily_aggregates", "usage_daily_aggregates", "usage_analysis_hourly", "usage_analysis_daily", "session_usage_totals", "session_usage_hourly", "session_usage_daily", "session_archive_totals", "session_archive_import_records", "session_archive_quarantine_resolutions", "generation_jobs", "generation_stats_facts", "generation_daily_aggregates", "generation_usage_dimensions_hourly", "generation_usage_dimensions_daily", "ledger_entries", "usage_reservations", "account_settlement_feed", "key_budget_state", "key_budget_daily_rollups", "key_budget_usage_events", "rate_limit_windows", "key_runtime_state", "metered_usage_projection_outbox", "key_credential_recovery_audit", "key_credential_recovery_access_audit", "conversation_key_clusters", "conversation_projection_outbox", "conversation_unresolved_explicit_parents", "session_routing_terminals"]) statements.push(`INSERT INTO ${table} VALUES (${q(`${table}-${index}`)},${q(key.key_id)});`);
+    statements.push(`INSERT INTO request_records VALUES (${q(`request_records-${index}`)},${q(key.key_id)},${key.archived_at});`);
+    statements.push(`INSERT INTO usage_reservations VALUES (${q(`usage_reservations-${index}`)},${q(key.key_id)},'settled');`);
+    statements.push(`INSERT INTO generation_jobs VALUES (${q(`generation_jobs-${index}`)},${q(key.key_id)},'succeeded',${key.archived_at});`);
+    for (const table of ["request_events", "request_record_locators", "request_event_locators", "request_stats_facts", "request_daily_aggregates", "usage_daily_aggregates", "usage_analysis_hourly", "usage_analysis_daily", "session_usage_totals", "session_usage_hourly", "session_usage_daily", "session_archive_totals", "session_archive_import_records", "session_archive_quarantine_resolutions", "generation_stats_facts", "generation_daily_aggregates", "generation_usage_dimensions_hourly", "generation_usage_dimensions_daily", "ledger_entries", "account_settlement_feed", "key_budget_state", "key_budget_daily_rollups", "key_budget_usage_events", "rate_limit_windows", "key_runtime_state", "metered_usage_projection_outbox", "key_credential_recovery_audit", "key_credential_recovery_access_audit", "conversation_key_clusters", "conversation_projection_outbox", "conversation_unresolved_explicit_parents", "session_routing_terminals"]) statements.push(`INSERT INTO ${table} VALUES (${q(`${table}-${index}`)},${q(key.key_id)});`);
     statements.push(`INSERT INTO session_archive_correlations VALUES (${q(`correlation-${index}`)},${q(key.key_id)},${q(key.principal_id)});`);
     statements.push(`INSERT INTO session_archive_unlinked_requests VALUES (${q(`unlinked-${index}`)},${q(key.key_id)},${q(key.principal_id)});`);
     statements.push(`INSERT INTO memeloop_cloud_subscription_events VALUES (${q(`cloud-${index}`)},${q(key.key_id)},${q(key.principal_id)});`);
@@ -181,6 +196,9 @@ test("reviewed manifest is fixed to 17 snapshots, 7 revoked keys and 16 routing 
   const unsafe = JSON.parse(JSON.stringify(manifest));
   unsafe.conversation_rewrites[0].replacement_session_name = "api2-retired";
   assert.throws(() => parseManifest(unsafe), (error: unknown) => error instanceof PurgeFailure && error.code === "manifest_invalid");
+  const oldSchema = JSON.parse(JSON.stringify(manifest));
+  oldSchema.schema_version = 1;
+  assert.throws(() => parseManifest(oldSchema), (error: unknown) => error instanceof PurgeFailure && error.code === "manifest_invalid");
 });
 
 test("generated SQL clears recoverable secrets before exact deletes and rolls back by default", () => {
@@ -191,10 +209,75 @@ test("generated SQL clears recoverable secrets before exact deletes and rolls ba
   assert.ok(sql.indexOf("UPDATE key_credential_recovery_secrets SET ciphertext=''") < sql.indexOf("DELETE FROM key_credential_recovery_secrets"));
   assert.ok(sql.indexOf("UPDATE credential_rotation_replays SET response_ciphertext=NULL") < sql.indexOf("DELETE FROM credential_rotation_replays"));
   assert.match(sql, /DELETE FROM legacy_key_credentials WHERE id IN \(SELECT id FROM target_legacy_credentials\)/u);
+  assert.match(sql, /request_records WHERE key_id IN \(SELECT key_id FROM target_keys\) AND completed_at IS NULL/u);
+  assert.match(sql, /usage_reservations WHERE key_id IN \(SELECT key_id FROM target_keys\) AND \(status IS NULL OR status<>'settled'\)/u);
+  assert.match(sql, /generation_jobs WHERE key_id IN \(SELECT key_id FROM target_keys\) AND \(status IS NULL OR status NOT IN \('succeeded','failed','cancelled'\) OR stats_aggregated_at IS NULL\)/u);
+  assert.match(sql, /target_legacy_credentials expected LEFT JOIN legacy_key_credentials/u);
+  assert.match(sql, /target_rotation_replays expected LEFT JOIN credential_rotation_replays/u);
+  assert.match(sql, /target_credential_groups expected LEFT JOIN credential_groups/u);
+  assert.match(sql, /target_route_groups expected LEFT JOIN route_groups/u);
   assert.match(sql, /NOT EXISTS \(SELECT 1 FROM key_records remaining WHERE remaining\.principal_id=principals\.id\)/u);
   assert.doesNotMatch(sql, /remaining\.status='active'/u);
   assert.match(sql, /ROLLBACK;\s*$/u);
   assert.doesNotMatch(sql, /DELETE FROM (?:request_records|ledger_entries|usage_reservations|generation_jobs|conversation_observations)/u);
+});
+
+test("PostgreSQL plan locks mutable dependencies and applies the same fail-closed contract", () => {
+  const manifest = fixtureManifest();
+  const sql = buildSql(manifest, manifestSha256(manifest), false, "postgres", 1234);
+  assert.match(sql, /^BEGIN;\nSET TRANSACTION ISOLATION LEVEL SERIALIZABLE;/u);
+  assert.match(sql, /LOCK TABLE .*request_records, usage_reservations, generation_jobs.* IN SHARE ROW EXCLUSIVE MODE;/u);
+  assert.match(sql, /target_legacy_credentials expected LEFT JOIN legacy_key_credentials/u);
+  assert.match(sql, /target_rotation_replays expected LEFT JOIN credential_rotation_replays/u);
+  assert.match(sql, /completed_at IS NULL/u);
+  assert.match(sql, /stats_aggregated_at IS NULL/u);
+  assert.match(sql, /ROLLBACK;\s*$/u);
+});
+
+test("SQLite dry-run fails closed on unfinished requests, reservations and generations", () => {
+  const workspace = mkdtempSync(join(tmpdir(), "mtc-api2-purge-guards-"));
+  const database = join(workspace, "fixture.sqlite");
+  const manifest = fixtureManifest();
+  const manifestPath = join(workspace, "manifest.json");
+  writePrivate(manifestPath, `${JSON.stringify(manifest)}\n`);
+  success(run("sqlite3", [database], fixtureSql(manifest, false)), "initialize guard fixture");
+  chmodSync(database, 0o600);
+  const databaseArgs = ["--backend", "sqlite", "--sqlite-database", database];
+  const blockers = [
+    ["UPDATE request_records SET completed_at=NULL WHERE id='request_records-0';", "UPDATE request_records SET completed_at=3000 WHERE id='request_records-0';"],
+    ["UPDATE usage_reservations SET status='reserved' WHERE id='usage_reservations-0';", "UPDATE usage_reservations SET status='settled' WHERE id='usage_reservations-0';"],
+    ["UPDATE generation_jobs SET status='running' WHERE id='generation_jobs-0';", "UPDATE generation_jobs SET status='succeeded' WHERE id='generation_jobs-0';"],
+    ["UPDATE generation_jobs SET stats_aggregated_at=NULL WHERE id='generation_jobs-0';", "UPDATE generation_jobs SET stats_aggregated_at=3000 WHERE id='generation_jobs-0';"],
+  ];
+  for (const [index, [introduce, restore]] of blockers.entries()) {
+    success(run("sqlite3", [database], introduce), `introduce blocker ${index}`);
+    const result = run(process.execPath, toolArgs(workspace, manifestPath, join(workspace, `blocked-${index}.json`), databaseArgs));
+    assert.notEqual(result.status, 0, `blocker ${index} must reject the purge`);
+    success(run("sqlite3", [database], restore), `restore blocker ${index}`);
+  }
+});
+
+test("SQLite dry-run fails closed on reviewed child and group CAS drift", () => {
+  const workspace = mkdtempSync(join(tmpdir(), "mtc-api2-purge-cas-"));
+  const database = join(workspace, "fixture.sqlite");
+  const manifest = fixtureManifest();
+  const manifestPath = join(workspace, "manifest.json");
+  writePrivate(manifestPath, `${JSON.stringify(manifest)}\n`);
+  success(run("sqlite3", [database], fixtureSql(manifest, false)), "initialize CAS fixture");
+  chmodSync(database, 0o600);
+  const databaseArgs = ["--backend", "sqlite", "--sqlite-database", database];
+  const drifts = [
+    ["UPDATE legacy_key_credentials SET fingerprint='drift' WHERE id='00000000-0000-4000-8000-000000001000';", "UPDATE legacy_key_credentials SET fingerprint='legacy-0' WHERE id='00000000-0000-4000-8000-000000001000';"],
+    ["UPDATE credential_rotation_replays SET request_hash='drift' WHERE idempotency_key='rotate-0';", "UPDATE credential_rotation_replays SET request_hash='request-0' WHERE idempotency_key='rotate-0';"],
+    ["UPDATE credential_groups SET name='drift' WHERE id='00000000-0000-4000-8000-000000000600';", "UPDATE credential_groups SET name='legacy-group-0' WHERE id='00000000-0000-4000-8000-000000000600';"],
+    ["UPDATE route_groups SET name='drift' WHERE id='00000000-0000-4000-8000-000000000900';", "UPDATE route_groups SET name='legacy-route-group' WHERE id='00000000-0000-4000-8000-000000000900';"],
+  ];
+  for (const [index, [introduce, restore]] of drifts.entries()) {
+    success(run("sqlite3", [database], introduce), `introduce drift ${index}`);
+    const result = run(process.execPath, toolArgs(workspace, manifestPath, join(workspace, `drift-${index}.json`), databaseArgs));
+    assert.notEqual(result.status, 0, `drift ${index} must reject the purge`);
+    success(run("sqlite3", [database], restore), `restore drift ${index}`);
+  }
 });
 
 test("SQLite dry-run, approved apply and replay preserve historical facts", () => {

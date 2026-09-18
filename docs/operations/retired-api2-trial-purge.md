@@ -19,18 +19,25 @@ The command rejects any manifest that is not exactly:
 - 7 `key_records`, each still `revoked` and archived at its reviewed CAS
   timestamp;
 - 16 total credential routing grants plus credential relation revisions;
-- a complete, sorted description of every credential, recovery envelope,
-  source proof and credential-group membership belonging to those keys.
+- a complete, sorted description of every credential, legacy credential,
+  rotation replay, recovery envelope, source proof, membership, and touched
+  credential/route group belonging to those keys.
 
 Each snapshot and key is bound to its tenant and all reviewed lifecycle fields.
 Every child relation is compared in both directions: a missing, extra or changed
 row aborts the transaction. The command also rejects unreviewed legacy-pattern
 snapshot names or credential aliases in the selected tenant.
 
+The reviewed legacy credentials, rotation replays, and touched groups are part
+of the canonical manifest SHA. Under the database lock, the command compares
+their stable IDs and non-secret CAS fields in both directions. Missing, extra,
+or changed rows abort both dry-run and apply. Secrets and ciphertext never
+appear in the receipt.
+
 Before deletion it sets `key_records.issued_key_ciphertext` and
 `key_credentials.secret_plaintext` to `NULL`, overwrites every reviewed recovery
-`ciphertext`, and clears cached rotation responses. It inventories and removes
-matching `legacy_key_credentials` and key-scoped rotation replay rows before
+`ciphertext`, and clears cached rotation responses. It removes the reviewed
+`legacy_key_credentials` and key-scoped rotation replay rows before
 deleting the reviewed recovery/source-proof/membership/routing rows and
 credentials. Credential and route groups touched by the cohort are removed only
 when no membership, grant, or model-route membership remains.
@@ -52,6 +59,10 @@ or cascading count change aborts the transaction. In particular, a selected
 key with a retained synchronous-generation idempotency row cannot be deleted
 silently.
 
+Deletion also fails closed while any selected key has an incomplete request, a
+reservation whose status is not `settled`, a non-terminal generation job, or a
+terminal generation job whose statistics have not been aggregated.
+
 ## Reviewed manifest
 
 The JSON document has this shape. Arrays must be sorted by stable ID. Values
@@ -60,7 +71,7 @@ this intentionally invalid as an executable manifest.
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "idempotency_key": "owner-approved-operation-key",
   "tenant_external_id": "reviewed-tenant",
   "expected": {
@@ -103,11 +114,33 @@ this intentionally invalid as an executable manifest.
       ],
       "recovery_secrets": [],
       "source_proofs": [],
+      "legacy_credentials": [
+        {
+          "id": "00000000-0000-4000-8000-000000000402",
+          "generation": 1,
+          "fingerprint": "reviewed-legacy-fingerprint",
+          "source_hash": "reviewed-source-hash",
+          "created_at": 1,
+          "revoked_at": 2,
+          "secret_hash_present": true
+        }
+      ],
+      "rotation_replays": [
+        {
+          "idempotency_key": "reviewed-rotation-replay",
+          "request_hash": "reviewed-request-hash",
+          "expires_at": 3,
+          "created_at": 1,
+          "response_ciphertext_present": true
+        }
+      ],
       "credential_group_memberships": [],
       "routing_grants": [],
       "routing_revision": { "revision": 1 }
     }
   ],
+  "credential_groups": [],
+  "route_groups": [],
   "conversation_rewrites": [
     {
       "observation_id": "00000000-0000-4000-8000-000000000501",
