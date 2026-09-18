@@ -1,11 +1,12 @@
 /** Produce a checked release manifest for the dependency-bundled commands. */
 
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { lstatSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { releaseEntrypointNames, releaseEntrypoints } from "./release-entrypoints.ts";
-import { verifiedArchiveRuntime } from "../lib/session-archive-runtime.ts";
+import { verifiedArchiveRuntime, verifiedSessionArchiveBackupRuntime } from "../lib/session-archive-runtime.ts";
 
 const repository = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const releaseDirectory = resolve(repository, "dist/release");
@@ -60,7 +61,11 @@ const runtimeFiles = [
 ]
   .map((name) => resolve(commandsDirectory, "runtime", name));
 verifiedArchiveRuntime(runtimeFiles[0]!);
-regularFile(runtimeFiles[3]!);
+const backupRuntime = verifiedSessionArchiveBackupRuntime(runtimeFiles[3]!);
+const backupHelp = spawnSync(backupRuntime, ["--help"], { encoding: "utf8", timeout: 10_000 });
+if (backupHelp.status !== 0 || !/pages-per-step/u.test(backupHelp.stdout)) {
+  throw new Error("SQLite backup runtime is not executable");
+}
 const runtimePaths = new Set(runtimeFiles.map(releasePath));
 for (const path of files(commandsDirectory)) {
   const packaged = releasePath(path);

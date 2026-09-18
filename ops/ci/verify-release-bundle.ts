@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { releaseEntrypointNames } from "./release-entrypoints.ts";
-import { verifiedArchiveRuntime } from "../lib/session-archive-runtime.ts";
+import { verifiedArchiveRuntime, verifiedSessionArchiveBackupRuntime } from "../lib/session-archive-runtime.ts";
 
 const repository = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const bundleArgument = process.argv[2] ?? resolve(repository, "dist/release");
@@ -69,7 +69,7 @@ try {
   const archiveHelp = spawnSync(archiveBinary, ["--help"], { encoding: "utf8", timeout: 10_000 });
   assert.equal(archiveHelp.status, 0, "isolated archive runtime must execute without product checkout");
   assert.match(archiveHelp.stdout, /--max-plan-bytes/u);
-  const backupBinary = join(bundle, "commands/runtime/cpa-session-archive-backup");
+  const backupBinary = verifiedSessionArchiveBackupRuntime(join(bundle, "commands/runtime/cpa-session-archive-backup"));
   const backupHelp = spawnSync(backupBinary, ["--help"], { encoding: "utf8", timeout: 10_000 });
   assert.equal(backupHelp.status, 0, "isolated SQLite backup runtime must execute without product checkout");
   assert.match(backupHelp.stdout, /pages-per-step/u);
