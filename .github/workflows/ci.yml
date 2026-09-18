@@ -115,11 +115,8 @@ jobs:
           CGO_ENABLED=1 CC=musl-gcc go build -trimpath -buildvcs=true -tags 'osusergo netgo static_build' \
             -ldflags '-linkmode external -extldflags -static -s -w' \
             -o dist/release/commands/runtime/cpa-session-archive-backup ./cmd/cpa-session-archive-backup
-          if ldd dist/release/commands/runtime/cpa-session-archive-backup > "$RUNNER_TEMP/backup-ldd.txt" 2>&1; then
-            echo 'backup runtime unexpectedly has dynamic dependencies' >&2
-            exit 1
-          fi
-          grep -Eq 'not a dynamic executable|statically linked' "$RUNNER_TEMP/backup-ldd.txt"
+          file dist/release/commands/runtime/cpa-session-archive-backup | grep -- 'statically linked'
+          ! readelf -l dist/release/commands/runtime/cpa-session-archive-backup | grep -q 'Requesting program interpreter'
           dist/release/commands/runtime/cpa-session-archive-backup --help | grep -- '--pages-per-step'
           mkdir -p dist/release/commands/runtime/licenses
           install -m 0444 LICENSE dist/release/commands/runtime/licenses/LICENSE
@@ -317,11 +314,8 @@ jobs:
           CGO_ENABLED=1 CC=musl-gcc go build -trimpath -buildvcs=true -tags 'osusergo netgo static_build' \
             -ldflags '-linkmode external -extldflags -static -s -w' \
             -o dist/release/commands/runtime/cpa-session-archive-backup ./cmd/cpa-session-archive-backup
-          if ldd dist/release/commands/runtime/cpa-session-archive-backup > "$RUNNER_TEMP/backup-ldd.txt" 2>&1; then
-            echo 'backup runtime unexpectedly has dynamic dependencies' >&2
-            exit 1
-          fi
-          grep -Eq 'not a dynamic executable|statically linked' "$RUNNER_TEMP/backup-ldd.txt"
+          file dist/release/commands/runtime/cpa-session-archive-backup | grep -- 'statically linked'
+          ! readelf -l dist/release/commands/runtime/cpa-session-archive-backup | grep -q 'Requesting program interpreter'
           dist/release/commands/runtime/cpa-session-archive-backup --help | grep -- '--pages-per-step'
 
       - name: Set up Docker Buildx
