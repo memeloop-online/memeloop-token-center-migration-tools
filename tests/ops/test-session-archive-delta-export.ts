@@ -3,10 +3,10 @@
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmodSync, closeSync, constants as fsConstants, existsSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, constants as fsConstants, existsSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import test, { after, before, beforeEach } from "node:test";
@@ -351,7 +351,7 @@ function writeLegacy3612RecordSpool(path: string, rows: RecordValue[]): void {
   database.close(); chmodSync(path, 0o600);
 }
 
-function writeLargeArchiveSQLite(path: string, recordCount = 257): RecordValue[] {
+function writeLargeArchiveSQLite(path: string, recordCount = 257, payloadBytes = 2048): RecordValue[] {
   const database = new DatabaseSync(path);
   database.exec(`
     CREATE TABLE records(id INTEGER PRIMARY KEY,request_id TEXT NOT NULL UNIQUE,session_id TEXT NOT NULL,key_id TEXT,principal_id TEXT,credential_hash TEXT,
@@ -377,9 +377,11 @@ function writeLargeArchiveSQLite(path: string, recordCount = 257): RecordValue[]
   const rows: RecordValue[] = [];
   for (let index = 0; index < recordCount; index += 1) {
     const requestId = `request-${String(index).padStart(6, "0")}`;
-    const item = record(requestId, "large-session", `2025-01-02T01:${String(Math.floor(index / 60)).padStart(2, "0")}:${String(index % 60).padStart(2, "0")}.000000Z`, `2025-01-02T01:${String(Math.floor(index / 60)).padStart(2, "0")}:${String(index % 60).padStart(2, "0")}.500000Z`);
+    const startedAt = new Date(Date.UTC(2025, 0, 2, 1, 0, index)).toISOString().replace(".000Z", ".000000Z");
+    const completedAt = new Date(Date.UTC(2025, 0, 2, 1, 0, index, 500)).toISOString().replace(".500Z", ".500000Z");
+    const item = record(requestId, "large-session", startedAt, completedAt);
     item.principal_alias = "Current Alias";
-    item.request = { prompt: `${requestId}:${"x".repeat(2048)}` };
+    item.request = { prompt: `${requestId}:${"x".repeat(payloadBytes)}` };
     rows.push(item);
     insertRecord.run(item.request_id, item.session_id, String(item.key_id), String(item.principal_id), "", String(item.requested_model), String(item.model), String(item.outcome), Number(item.status_code),
       item.started_at, item.completed_at, "", "", "", "", gzipSync(Buffer.from(JSON.stringify(item.request))), gzipSync(Buffer.from(JSON.stringify(item.response))));
@@ -854,6 +856,31 @@ test("max-chunks counts a small session tail commit and resumes from the complet
     assert.equal(resumed.code, 0, resumed.stderr); assert.equal(state.archiveRequests.size, 0);
     const output = readFileSync(paths.output, "utf8").trim().split("\n");
     assert.equal(output.length, rows.length + 1);
+  } finally { rmSync(paths.directory, { recursive: true, force: true }); }
+});
+
+test("completed large-session resume obeys the elapsed deadline and retains only its spool", async () => {
+  const paths = fixture();
+  const source = join(paths.directory, "archive.sqlite");
+  const spool = `${paths.output}.spool.sqlite`;
+  try {
+    writeLargeArchiveSQLite(source, 10_000, 8192);
+    const common = [
+      "--collector-direct", "--offline-full", "--base-url", `http://127.0.0.1:${port}`, "--private-http-host", "127.0.0.1",
+      "--source-sqlite", source, "--checkpoint", paths.checkpoint, "--output", paths.output, "--since", "1970-01-01T00:00:00Z",
+      "--chunk-records", "100000", "--chunk-bytes", "1073741824", "--chunk-seconds", "3600",
+    ];
+    const completed = await run([...common, "--max-chunks", "1"]);
+    assert.equal(completed.code, 2); assert.match(completed.stderr, /chunk budget reached/); assert.equal(existsSync(spool), true);
+    const checkpointed = new DatabaseSync(spool, { readOnly: true });
+    const completedSessions = checkpointed.prepare("SELECT COUNT(*) AS count FROM completed_sessions").get() as { count: number };
+    checkpointed.close(); assert.equal(completedSessions.count, 1);
+
+    const timedOut = await run([...common, "--resume", "--max-elapsed-seconds", "0.25"]);
+    assert.equal(timedOut.code, 2); assert.match(timedOut.stderr, /elapsed-time limit during completed session verification/);
+    assert.equal(existsSync(spool), true, "the verified spool remains resumable after the deadline");
+    assert.equal(existsSync(paths.output), false); assert.equal(existsSync(`${paths.output}.pending`), false);
+    assert.equal(readdirSync(paths.directory).some((name) => name.startsWith(`.${basename(paths.output)}.`)), false, "temporary JSONL output must be removed");
   } finally { rmSync(paths.directory, { recursive: true, force: true }); }
 });
 

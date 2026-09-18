@@ -1340,6 +1340,9 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
     if (client.downloadedBytes > args.maxDownloadBytes) throw new DeltaError("source archive downloads exceed the configured limit");
     const beginSpoolTransaction = (): void => { if (!spoolTransactionOpen) { database!.exec("BEGIN IMMEDIATE"); spoolTransactionOpen = true; } };
     const commitSpoolTransaction = (): void => { if (spoolTransactionOpen) { database!.exec("COMMIT"); spoolTransactionOpen = false; } };
+    const enforceElapsedDeadline = (stage: string): void => {
+      if (performance.now() >= args.deadline) throw new DeltaError(`source export exceeded the configured elapsed-time limit during ${stage}; rerun the same command with --resume`);
+    };
     if (seededLegacySessions.size !== 0 && legacyRecovery !== undefined) {
       process.stderr.write(`archive legacy spool recovery reused_sessions=${legacyRecovery.sessions.length} reused_records=${legacyRecovery.reusedRecords} reused_canonical_bytes=${legacyRecovery.reusedCanonicalBytes} remaining_sessions=${legacyRecovery.remainingSessions} remaining_records=${legacyRecovery.remainingRecords}\n`);
     }
@@ -1349,7 +1352,7 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
     }
     let invocationChunks = 0;
     for (const session of [...first.sessions].sort((left, right) => compareUtf8Bytewise(left.session_id, right.session_id))) {
-      if (performance.now() >= args.deadline) throw new DeltaError("source export exceeded the configured elapsed-time limit; rerun the same command with --resume");
+      enforceElapsedDeadline("session processing");
       if (session.deleted === true) {
         const deletedAt = parseTime(session.deleted_at, "source session deleted_at");
         if (compareTime(deletedAt, maximumCompleted) > 0) maximumCompleted = deletedAt;
@@ -1361,6 +1364,7 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
         const resumedDigest = createHash("sha256"); let resumedCount = 0;
         const rows = database.prepare("SELECT request_id,session_id,started_at,completed_at,digest,canonical,emit FROM records WHERE session_id=? ORDER BY request_id COLLATE BINARY");
         for (const row of rows.iterate(session.session_id) as Iterable<{ request_id: string; session_id: string; started_at: string; completed_at: string; digest: string; canonical: Uint8Array; emit: number }>) {
+          enforceElapsedDeadline("completed session verification");
           const canonical = Buffer.from(row.canonical); let record: unknown;
           try { record = parseStrictJson(canonical.toString("utf8")); } catch { throw new DeltaError("incomplete archive spool session content failed verification"); }
           if (!isObject(record) || record.request_id !== row.request_id || record.session_id !== row.session_id || row.session_id !== session.session_id
@@ -1371,6 +1375,7 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
           parseCanonicalTime(row.completed_at, "incomplete archive spool completed_at");
           resumedDigest.update(canonical); resumedCount += 1;
         }
+        enforceElapsedDeadline("completed session verification");
         if (resumedCount !== session.requests || resumedDigest.digest("hex") !== session.records_sha256) throw new DeltaError("incomplete archive spool session content failed verification");
         continue;
       }
@@ -1405,7 +1410,7 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
       };
       const enforceRunLimitsAfterChunk = (): void => {
         if (args.maxChunks !== 0 && invocationChunks >= args.maxChunks) throw new DeltaError("archive session chunk budget reached; rerun the same command with --resume");
-        if (performance.now() >= args.deadline) throw new DeltaError("source export exceeded the configured elapsed-time limit; rerun the same command with --resume");
+        enforceElapsedDeadline("session chunk checkpoint");
       };
       beginSpoolTransaction();
       const lines = localSource === undefined
@@ -1457,7 +1462,7 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
       if (resumeCursor !== undefined && localSource === undefined && (!foundHttpCursor || skippedForHttpResume !== resumedRecords)) throw new DeltaError("source stable session resume cursor could not be replayed");
       if (first.protocol === STABLE_CURSOR_PROTOCOL && performance.now() >= args.deadline) {
         if (chunkRecords > 0) { checkpointPartialSession(); enforceRunLimitsAfterChunk(); }
-        throw new DeltaError("source export exceeded the configured elapsed-time limit; rerun the same command with --resume");
+        enforceElapsedDeadline("session tail checkpoint");
       }
       if (exported !== session.requests) throw new DeltaError("source session export count disagrees with its session summary");
       if (first.protocol === STABLE_CURSOR_PROTOCOL) {
@@ -1466,7 +1471,7 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
         if (digest.digest("hex") !== session.records_sha256) throw new DeltaError("source session export digest disagrees with its stable summary");
         if (performance.now() >= args.deadline) {
           if (chunkRecords > 0) { checkpointPartialSession(); enforceRunLimitsAfterChunk(); }
-          throw new DeltaError("source export exceeded the configured elapsed-time limit; rerun the same command with --resume");
+          enforceElapsedDeadline("session digest verification");
         }
       }
       const commitsTailChunk = first.protocol === STABLE_CURSOR_PROTOCOL && chunkRecords > 0;
@@ -1477,23 +1482,29 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
       commitSpoolTransaction();
       database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
       if (commitsTailChunk) { invocationChunks += 1; enforceRunLimitsAfterChunk(); }
-      if (performance.now() >= args.deadline) throw new DeltaError("source export exceeded the configured elapsed-time limit; rerun the same command with --resume");
+      enforceElapsedDeadline("session completion checkpoint");
     }
+    enforceElapsedDeadline("spool watermark verification");
     const spoolWatermarks = database.prepare("SELECT MAX(completed_at) AS completed_at,MAX(started_at) AS started_at FROM records WHERE emit=1").get() as { completed_at: string | null; started_at: string | null };
     if (spoolWatermarks.completed_at !== null) {
       const value = parseCanonicalTime(spoolWatermarks.completed_at, "archive spool maximum completed_at");
       if (compareTime(value, maximumCompleted) > 0) maximumCompleted = value;
     }
     if (spoolWatermarks.started_at !== null) maximumStarted = parseCanonicalTime(spoolWatermarks.started_at, "archive spool maximum started_at");
+    enforceElapsedDeadline("source projection revalidation");
     const afterExport = localSource?.statsRecords() ?? await client.statsRecords(); if (args.requireStableSource && afterExport !== before) throw new DeltaError("source record count changed despite the requested write barrier");
+    enforceElapsedDeadline("source projection revalidation");
     const second = localSource?.stableProjection() ?? await loadProjection(client, lower, args.sessionLimit, afterExport, first.snapshot, priorFence); verifyClock(second.sessions, maximum);
     if (second.protocol !== first.protocol || second.requestCount !== first.requestCount || selectionDigest(second.sessions) !== firstDigest) throw new DeltaError("source session projection changed during delta export; retry");
+    enforceElapsedDeadline("source projection revalidation");
     const after = localSource?.statsRecords() ?? await client.statsRecords(); if (args.requireStableSource && after !== before) throw new DeltaError("source record count changed despite the requested write barrier"); if (after < before) throw new DeltaError("source record count decreased during delta export");
+    enforceElapsedDeadline("final JSONL preparation");
     outputTemporary = join(dirname(args.output), `.${basename(args.output)}.${process.pid}.${Date.now()}`); const descriptor = openSync(outputTemporary, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
     const outputDigest = createHash("sha256"); let outputSize = 0, recordCount = 0;
     try {
       if (first.snapshotSchemaVersion === 2) {
         for (const session of [...first.sessions].sort((left, right) => compareUtf8Bytewise(left.session_id, right.session_id))) {
+          enforceElapsedDeadline("final JSONL output");
           const summary = session.deleted === true
             ? { _mtc_delta_type: "session_summary", schema_version: 2, session_id: session.session_id, requests: 0, last_at: session.last_at, deleted: true, deleted_at: session.deleted_at }
             : { _mtc_delta_type: "session_summary", schema_version: 2, session_id: session.session_id, requests: session.requests, first_at: session.first_at, last_at: session.last_at, records_sha256: session.records_sha256 };
@@ -1502,6 +1513,7 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
           writeFileSync(descriptor, summaryBytes); outputDigest.update(summaryBytes); outputSize += summaryBytes.length;
           if (session.deleted !== true) {
             for (const row of database.prepare("SELECT canonical FROM records WHERE session_id=? ORDER BY request_id COLLATE BINARY").iterate(session.session_id) as Iterable<{ canonical: Uint8Array }>) {
+              enforceElapsedDeadline("final JSONL output");
               const bytes = Buffer.from(row.canonical);
               if (outputSize + bytes.length > args.maxOutputBytes) throw new DeltaError("delta output exceeds the configured size limit");
               writeFileSync(descriptor, bytes); outputDigest.update(bytes); outputSize += bytes.length; recordCount += 1;
@@ -1509,9 +1521,14 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
           }
         }
       } else {
-        for (const row of database.prepare("SELECT canonical FROM records WHERE emit=1 ORDER BY started_at, request_id COLLATE BINARY").iterate() as Iterable<{ canonical: Uint8Array }>) { const bytes = Buffer.from(row.canonical); writeFileSync(descriptor, bytes); outputDigest.update(bytes); outputSize += bytes.length; recordCount += 1; }
+        for (const row of database.prepare("SELECT canonical FROM records WHERE emit=1 ORDER BY started_at, request_id COLLATE BINARY").iterate() as Iterable<{ canonical: Uint8Array }>) {
+          enforceElapsedDeadline("final JSONL output");
+          const bytes = Buffer.from(row.canonical); writeFileSync(descriptor, bytes); outputDigest.update(bytes); outputSize += bytes.length; recordCount += 1;
+        }
       }
+      enforceElapsedDeadline("final JSONL fsync");
       fsyncSync(descriptor);
+      enforceElapsedDeadline("final JSONL fsync");
     } finally { closeSync(descriptor); }
     renameSync(outputTemporary, pending); outputTemporary = undefined; fsyncDirectory(dirname(args.output));
     const manifest: JsonObject = { version: MANIFEST_VERSION, source_fingerprint: fingerprint, observed_at: formatTime(observed), max_future_skew_seconds: args.maxFutureSkewSeconds,
