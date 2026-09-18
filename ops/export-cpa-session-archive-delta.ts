@@ -1352,8 +1352,8 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
     }
     let invocationChunks = 0;
     for (const session of [...first.sessions].sort((left, right) => compareUtf8Bytewise(left.session_id, right.session_id))) {
-      enforceElapsedDeadline("session processing");
       if (session.deleted === true) {
+        enforceElapsedDeadline("session processing");
         const deletedAt = parseTime(session.deleted_at, "source session deleted_at");
         if (compareTime(deletedAt, maximumCompleted) > 0) maximumCompleted = deletedAt;
         continue;
@@ -1379,6 +1379,7 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
         if (resumedCount !== session.requests || resumedDigest.digest("hex") !== session.records_sha256) throw new DeltaError("incomplete archive spool session content failed verification");
         continue;
       }
+      enforceElapsedDeadline("session processing");
       const progress = first.protocol === STABLE_CURSOR_PROTOCOL ? sessionProgress.get(session.session_id) as {
         requests: number; records_sha256: string; record_cursor: string; staged_records: number; staged_bytes: number; downloaded_bytes: number; chunks: number;
       } | undefined : undefined;
