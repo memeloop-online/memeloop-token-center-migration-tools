@@ -48,9 +48,11 @@ identity, or cloud subscription event. Revoked and archived shared keys retain
 their principal exactly like active keys.
 
 Conversation rewrites use exact old `session_name` and `labels_json` values as
-CAS inputs. Replacements must use a `retired-*` session name and may not contain
-`api2`, `legacy-cpa-bridge`, `cpa-` or `bridge`. After rewriting, the transaction
-scans all selected-key observations and fails if any of those markers remain.
+CAS inputs. The replacement title must be empty or `null`, and replacement
+labels contain only `{ "state": "retired" }`. This leaves the user-facing
+tombstone title to the localized product UI and avoids exposing UUID-based
+technical names. After rewriting, the transaction scans all selected-key
+observations and fails if any legacy markers remain.
 
 The command snapshots row counts for requests, events, request/generation
 stats, session rollups/archive rows, ledger entries, reservations, generation
@@ -61,7 +63,12 @@ silently.
 
 Deletion also fails closed while any selected key has an incomplete request, a
 reservation whose status is not `settled`, a non-terminal generation job, or a
-terminal generation job whose statistics have not been aggregated.
+terminal generation job whose statistics have not been aggregated. Every
+conversation projection outbox row is reviewed by stable ID, identity,
+lifecycle fields, payload byte counts and SHA-256 digests. Payload content is
+not copied into the manifest or receipt. A row with
+`projected_at: null` blocks the purge so the projection worker never loses the
+key identity it still needs.
 
 ## Reviewed manifest
 
@@ -71,7 +78,7 @@ this intentionally invalid as an executable manifest.
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "idempotency_key": "owner-approved-operation-key",
   "tenant_external_id": "reviewed-tenant",
   "expected": {
@@ -141,14 +148,33 @@ this intentionally invalid as an executable manifest.
   ],
   "credential_groups": [],
   "route_groups": [],
+  "conversation_projection_outbox": [
+    {
+      "request_id": "00000000-0000-4000-8000-000000000601",
+      "tenant_id": "00000000-0000-4000-8000-000000000701",
+      "key_id": "00000000-0000-4000-8000-000000000101",
+      "principal_id": "00000000-0000-4000-8000-000000000201",
+      "request_json_bytes": 2,
+      "hints_json_bytes": 2,
+      "request_json_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "hints_json_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "client_name": null,
+      "upstream_response_id": null,
+      "observed_at": 2,
+      "lease_owner": null,
+      "lease_expires_at": null,
+      "attempts": 1,
+      "projected_at": 3
+    }
+  ],
   "conversation_rewrites": [
     {
       "observation_id": "00000000-0000-4000-8000-000000000501",
       "key_id": "00000000-0000-4000-8000-000000000101",
       "session_name": "reviewed old API2 session name",
       "labels_json": "{\"alias\":\"reviewed-old-value\"}",
-      "replacement_session_name": "retired-session-00000000-0000-4000-8000-000000000501",
-      "replacement_labels_json": "{\"credential\":\"retired-credential-00000000-0000-4000-8000-000000000101\"}"
+      "replacement_session_name": null,
+      "replacement_labels_json": "{\"state\":\"retired\"}"
     }
   ]
 }

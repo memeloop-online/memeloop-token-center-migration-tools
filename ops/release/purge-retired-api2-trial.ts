@@ -9,6 +9,7 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstatSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { invokedAsEntrypoint } from "../lib/invoked-as-entrypoint.ts";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
@@ -135,12 +136,30 @@ export interface ConversationRewrite {
   key_id: string;
   session_name: string;
   labels_json: string;
-  replacement_session_name: string;
+  replacement_session_name: string | null;
   replacement_labels_json: string;
 }
 
+export interface ReviewedConversationProjection {
+  request_id: string;
+  tenant_id: string;
+  key_id: string;
+  principal_id: string;
+  request_json_bytes: number;
+  hints_json_bytes: number;
+  request_json_sha256: string;
+  hints_json_sha256: string;
+  client_name: string | null;
+  upstream_response_id: string | null;
+  observed_at: number;
+  lease_owner: string | null;
+  lease_expires_at: number | null;
+  attempts: number;
+  projected_at: number | null;
+}
+
 export interface ReviewedManifest {
-  schema_version: 2;
+  schema_version: 3;
   idempotency_key: string;
   tenant_external_id: string;
   expected: {
@@ -152,6 +171,7 @@ export interface ReviewedManifest {
   keys: ReviewedKey[];
   credential_groups: ReviewedGroup[];
   route_groups: ReviewedGroup[];
+  conversation_projection_outbox: ReviewedConversationProjection[];
   conversation_rewrites: ConversationRewrite[];
 }
 
@@ -163,7 +183,6 @@ interface Options {
   pgService?: string;
   psqlBinary: string;
   sqliteDatabase?: string;
-  sqliteBinary: string;
   approvedManifestSha256?: string;
   apply: boolean;
 }
@@ -206,6 +225,20 @@ function uuid(value: Json | undefined, label: string): string {
 
 function nullableUuid(value: Json | undefined, label: string): string | null {
   return value === null ? null : uuid(value, label);
+}
+
+function nullableInteger(value: Json | undefined, label: string): number | null {
+  return value === null ? null : integer(value, label);
+}
+
+function nullableText(value: Json | undefined, label: string, max = 500): string | null {
+  return value === null ? null : text(value, label, max);
+}
+
+function nullableTitle(value: Json | undefined, label: string): string | null {
+  if (value === null) return null;
+  if (typeof value !== "string" || value.length > 1024 || /[\u0000-\u001f\u007f]/u.test(value)) fail("manifest_invalid", `${label} must be null or bounded text`);
+  return value;
 }
 
 function canonical(value: Json): string {
@@ -312,6 +345,32 @@ function parseGroup(value: Json, label: string): ReviewedGroup {
   };
 }
 
+function parseConversationProjection(value: Json, index: number): ReviewedConversationProjection {
+  const label = `conversation_projection_outbox[${index}]`;
+  const item = object(value, label);
+  exactKeys(item, ["request_id", "tenant_id", "key_id", "principal_id", "request_json_bytes", "hints_json_bytes", "request_json_sha256", "hints_json_sha256", "client_name", "upstream_response_id", "observed_at", "lease_owner", "lease_expires_at", "attempts", "projected_at"], label);
+  const requestDigest = text(item.request_json_sha256, `${label}.request_json_sha256`, 64);
+  const hintsDigest = text(item.hints_json_sha256, `${label}.hints_json_sha256`, 64);
+  if (!SHA256.test(requestDigest) || !SHA256.test(hintsDigest)) fail("manifest_invalid", `${label} payload digests must be lowercase SHA-256`);
+  return {
+    request_id: uuid(item.request_id, `${label}.request_id`),
+    tenant_id: uuid(item.tenant_id, `${label}.tenant_id`),
+    key_id: uuid(item.key_id, `${label}.key_id`),
+    principal_id: uuid(item.principal_id, `${label}.principal_id`),
+    request_json_bytes: integer(item.request_json_bytes, `${label}.request_json_bytes`),
+    hints_json_bytes: integer(item.hints_json_bytes, `${label}.hints_json_bytes`),
+    request_json_sha256: requestDigest,
+    hints_json_sha256: hintsDigest,
+    client_name: nullableText(item.client_name, `${label}.client_name`, 512),
+    upstream_response_id: nullableText(item.upstream_response_id, `${label}.upstream_response_id`, 512),
+    observed_at: integer(item.observed_at, `${label}.observed_at`),
+    lease_owner: nullableText(item.lease_owner, `${label}.lease_owner`, 512),
+    lease_expires_at: nullableInteger(item.lease_expires_at, `${label}.lease_expires_at`),
+    attempts: integer(item.attempts, `${label}.attempts`),
+    projected_at: nullableInteger(item.projected_at, `${label}.projected_at`),
+  };
+}
+
 function array(value: Json | undefined, label: string, max = 500): Json[] {
   if (!Array.isArray(value) || value.length > max) fail("manifest_invalid", `${label} must be a bounded array`);
   return value;
@@ -365,11 +424,15 @@ function parseRewrite(value: Json, index: number): ConversationRewrite {
   exactKeys(item, ["observation_id", "key_id", "session_name", "labels_json", "replacement_session_name", "replacement_labels_json"], label);
   const sessionName = text(item.session_name, `${label}.session_name`, 1024);
   const labelsJson = text(item.labels_json, `${label}.labels_json`, 64 * 1024);
-  const replacementSessionName = text(item.replacement_session_name, `${label}.replacement_session_name`, 1024);
+  const replacementSessionName = nullableTitle(item.replacement_session_name, `${label}.replacement_session_name`);
   const replacementLabelsJson = text(item.replacement_labels_json, `${label}.replacement_labels_json`, 64 * 1024);
-  try { JSON.parse(labelsJson); JSON.parse(replacementLabelsJson); } catch { fail("manifest_invalid", `${label} labels must be valid JSON`); }
+  let replacementLabels: Json;
+  try { JSON.parse(labelsJson); replacementLabels = JSON.parse(replacementLabelsJson) as Json; } catch { fail("manifest_invalid", `${label} labels must be valid JSON`); }
   if (!LEGACY_TEXT.test(`${sessionName}\n${labelsJson}`)) fail("manifest_invalid", `${label} does not contain retired API2/bridge text`);
-  if (!replacementSessionName.startsWith("retired-") || (replacementLabelsJson !== "{}" && !replacementLabelsJson.includes("retired-")) || LEGACY_TEXT.test(`${replacementSessionName}\n${replacementLabelsJson}`)) fail("manifest_invalid", `${label} replacement must be neutral retired-* metadata`);
+  if (replacementSessionName !== null && replacementSessionName !== "") fail("manifest_invalid", `${label}.replacement_session_name must be empty or null for localized presentation`);
+  const replacementObject = object(replacementLabels, `${label}.replacement_labels_json`);
+  exactKeys(replacementObject, ["state"], `${label}.replacement_labels_json`);
+  if (replacementObject.state !== "retired" || LEGACY_TEXT.test(replacementLabelsJson)) fail("manifest_invalid", `${label} replacement must carry neutral retired state`);
   return {
     observation_id: uuid(item.observation_id, `${label}.observation_id`),
     key_id: uuid(item.key_id, `${label}.key_id`),
@@ -382,8 +445,8 @@ function parseRewrite(value: Json, index: number): ConversationRewrite {
 
 export function parseManifest(value: Json): ReviewedManifest {
   const root = object(value, "manifest");
-  exactKeys(root, ["schema_version", "idempotency_key", "tenant_external_id", "expected", "snapshots", "keys", "credential_groups", "route_groups", "conversation_rewrites"], "manifest");
-  if (root.schema_version !== 2) fail("manifest_invalid", "unsupported manifest schema_version");
+  exactKeys(root, ["schema_version", "idempotency_key", "tenant_external_id", "expected", "snapshots", "keys", "credential_groups", "route_groups", "conversation_projection_outbox", "conversation_rewrites"], "manifest");
+  if (root.schema_version !== 3) fail("manifest_invalid", "unsupported manifest schema_version");
   const idempotencyKey = text(root.idempotency_key, "idempotency_key", 128);
   if (!IDEMPOTENCY_KEY.test(idempotencyKey)) fail("manifest_invalid", "idempotency_key has an unsupported format");
   const expected = object(root.expected, "expected");
@@ -408,21 +471,24 @@ export function parseManifest(value: Json): ReviewedManifest {
   const keys = array(root.keys, "keys", EXPECTED_KEY_COUNT).map(parseKey);
   const credentialGroups = array(root.credential_groups, "credential_groups", 500).map((entry, index) => parseGroup(entry, `credential_groups[${index}]`));
   const routeGroups = array(root.route_groups, "route_groups", 500).map((entry, index) => parseGroup(entry, `route_groups[${index}]`));
+  const conversationProjections = array(root.conversation_projection_outbox, "conversation_projection_outbox", 500).map(parseConversationProjection);
   const rewrites = array(root.conversation_rewrites, "conversation_rewrites", 500).map(parseRewrite);
   if (snapshots.length !== EXPECTED_SNAPSHOT_COUNT || keys.length !== EXPECTED_KEY_COUNT) fail("manifest_invalid", "manifest object counts do not match the approved cohort");
   sortedUnique(snapshots, entry => entry.upstream_account_id, "snapshots");
   sortedUnique(keys, entry => entry.key_id, "keys");
   sortedUnique(credentialGroups, entry => entry.id, "credential_groups");
   sortedUnique(routeGroups, entry => entry.id, "route_groups");
+  sortedUnique(conversationProjections, entry => entry.request_id, "conversation_projection_outbox");
   sortedUnique(rewrites, entry => entry.observation_id, "conversation_rewrites");
   const keyIds = new Set(keys.map(entry => entry.key_id));
   if (rewrites.some(entry => !keyIds.has(entry.key_id))) fail("manifest_invalid", "conversation rewrites must belong to reviewed keys");
+  if (conversationProjections.some(entry => !keyIds.has(entry.key_id))) fail("manifest_invalid", "conversation projection rows must belong to reviewed keys");
   if (credentialGroups.some(group => !keys.some(key => key.credential_group_memberships.some(member => member.credential_group_id === group.id)))) fail("manifest_invalid", "credential groups must be referenced by the reviewed cohort");
   if (routeGroups.some(group => !keys.some(key => key.routing_grants.some(grant => grant.route_group_id === group.id)))) fail("manifest_invalid", "route groups must be referenced by the reviewed cohort");
   const relationCount = keys.reduce((count, key) => count + key.routing_grants.length + 1, 0);
   if (relationCount !== EXPECTED_ROUTING_RELATION_COUNT) fail("manifest_invalid", "routing grant/revision relation count is not exactly 16");
   return {
-    schema_version: 2,
+    schema_version: 3,
     idempotency_key: idempotencyKey,
     tenant_external_id: text(root.tenant_external_id, "tenant_external_id", 200),
     expected: { deleted_upstream_account_snapshots: 17, key_records: 7, routing_relations: 16 },
@@ -430,6 +496,7 @@ export function parseManifest(value: Json): ReviewedManifest {
     keys,
     credential_groups: credentialGroups,
     route_groups: routeGroups,
+    conversation_projection_outbox: conversationProjections,
     conversation_rewrites: rewrites,
   };
 }
@@ -440,6 +507,7 @@ export function manifestSha256(manifest: ReviewedManifest): string {
 
 function sqlText(value: string): string { return `'${value.replaceAll("'", "''")}'`; }
 function sqlNullable(value: string | null): string { return value === null ? "NULL" : sqlText(value); }
+function sqlNullableInteger(value: number | null): string { return value === null ? "NULL" : String(value); }
 function sqlBool(value: boolean): string { return value ? "1" : "0"; }
 function tuples(rows: string[][]): string { return rows.map(row => `(${row.join(",")})`).join(",\n"); }
 
@@ -477,17 +545,26 @@ export function buildSql(manifest: ReviewedManifest, digest: string, apply: bool
   const membershipRows = manifest.keys.flatMap(key => key.credential_group_memberships.map(membership => [sqlText(key.key_id), sqlText(membership.credential_group_id), String(membership.created_at)]));
   const grantRows = manifest.keys.flatMap(key => key.routing_grants.map(grant => [sqlText(key.key_id), sqlNullable(grant.model_route_id), sqlNullable(grant.route_group_id), String(grant.created_at)]));
   const revisionRows = manifest.keys.map(key => [sqlText(key.key_id), String(key.routing_revision.revision)]);
-  const rewriteRows = manifest.conversation_rewrites.map(rewrite => [sqlText(rewrite.observation_id), sqlText(rewrite.key_id), sqlText(rewrite.session_name), sqlText(rewrite.labels_json), sqlText(rewrite.replacement_session_name), sqlText(rewrite.replacement_labels_json)]);
+  const rewriteRows = manifest.conversation_rewrites.map(rewrite => [sqlText(rewrite.observation_id), sqlText(rewrite.key_id), sqlText(rewrite.session_name), sqlText(rewrite.labels_json), sqlNullable(rewrite.replacement_session_name), sqlText(rewrite.replacement_labels_json)]);
+  const conversationProjectionRows = manifest.conversation_projection_outbox.map(row => [sqlText(row.request_id), sqlText(row.tenant_id), sqlText(row.key_id), sqlText(row.principal_id), String(row.request_json_bytes), String(row.hints_json_bytes), sqlText(row.request_json_sha256), sqlText(row.hints_json_sha256), sqlNullable(row.client_name), sqlNullable(row.upstream_response_id), String(row.observed_at), sqlNullable(row.lease_owner), sqlNullableInteger(row.lease_expires_at), String(row.attempts), sqlNullableInteger(row.projected_at)]);
   const credentialGroupRows = manifest.credential_groups.map(group => [sqlText(group.id), sqlText(group.tenant_id), sqlText(group.name), sqlText(group.normalized_name), String(group.created_at), String(group.updated_at)]);
   const routeGroupRows = manifest.route_groups.map(group => [sqlText(group.id), sqlText(group.tenant_id), sqlText(group.name), sqlText(group.normalized_name), String(group.created_at), String(group.updated_at)]);
   const values = (rows: string[][], fallback: string[]) => rows.length === 0 ? `SELECT ${fallback.join(",")} WHERE 0` : `VALUES ${tuples(rows)}`;
   const begin = backend === "sqlite" ? "BEGIN IMMEDIATE;" : "BEGIN;\nSET TRANSACTION ISOLATION LEVEL SERIALIZABLE;";
-  const lock = backend === "postgres" ? "LOCK TABLE deleted_upstream_account_snapshots, key_records, key_credentials, legacy_key_credentials, credential_rotation_replays, key_credential_recovery_secrets, key_credential_source_proofs, credential_groups, credential_group_memberships, route_groups, model_route_group_memberships, routing_grants, routing_grant_relation_revisions, principals, credit_accounts, request_records, usage_reservations, generation_jobs, conversation_clusters, session_archive_correlations, session_archive_unlinked_requests, memeloop_cloud_subscription_events, conversation_observations IN SHARE ROW EXCLUSIVE MODE;" : "";
+  const lock = backend === "postgres" ? "LOCK TABLE deleted_upstream_account_snapshots, key_records, key_credentials, legacy_key_credentials, credential_rotation_replays, key_credential_recovery_secrets, key_credential_source_proofs, credential_groups, credential_group_memberships, route_groups, model_route_group_memberships, routing_grants, routing_grant_relation_revisions, principals, credit_accounts, request_records, usage_reservations, generation_jobs, conversation_clusters, session_archive_correlations, session_archive_unlinked_requests, memeloop_cloud_subscription_events, conversation_observations, conversation_projection_outbox IN SHARE ROW EXCLUSIVE MODE;" : "";
+  const octetLength = (expression: string): string => backend === "postgres" ? `OCTET_LENGTH(${expression})` : `LENGTH(CAST(${expression} AS BLOB))`;
+  const projectionPayloadCas = backend === "postgres"
+    ? "LOWER(ENCODE(SHA256(CONVERT_TO(actual.request_json,'UTF8')),'hex'))<>expected.request_json_sha256 OR LOWER(ENCODE(SHA256(CONVERT_TO(actual.hints_json,'UTF8')),'hex'))<>expected.hints_json_sha256"
+    : "SHA256_TEXT(actual.request_json)<>expected.request_json_sha256 OR SHA256_TEXT(actual.hints_json)<>expected.hints_json_sha256";
   const replay = `EXISTS (SELECT 1 FROM migration_tool_operation_receipts WHERE idempotency_key=${sqlText(manifest.idempotency_key)})`;
   const fresh = "(SELECT initial_replay FROM operation_state)=0";
   const protectedBefore = protectedTables.map(table => `INSERT INTO protected_counts(table_name,before_count) SELECT ${sqlText(table)},COUNT(*) FROM ${table} row WHERE row.key_id IN (SELECT key_id FROM target_keys);`).join("\n");
   const protectedAfter = protectedTables.map(table => assertion(`(SELECT before_count FROM protected_counts WHERE table_name=${sqlText(table)})<>(SELECT COUNT(*) FROM ${table} row WHERE row.key_id IN (SELECT key_id FROM target_keys))`)).join("\n");
   const relationExpected = EXPECTED_ROUTING_RELATION_COUNT;
+  const outcome = "CASE WHEN (SELECT initial_replay FROM operation_state)=1 THEN 'replay' ELSE 'planned' END";
+  const eligiblePrincipals = "(SELECT COUNT(DISTINCT principal_id) FROM target_keys WHERE NOT EXISTS (SELECT 1 FROM key_records remaining WHERE remaining.principal_id=target_keys.principal_id) AND NOT EXISTS (SELECT 1 FROM credit_accounts remaining WHERE remaining.principal_id=target_keys.principal_id) AND NOT EXISTS (SELECT 1 FROM conversation_clusters remaining WHERE remaining.principal_id=target_keys.principal_id) AND NOT EXISTS (SELECT 1 FROM session_archive_correlations remaining WHERE remaining.principal_id=target_keys.principal_id) AND NOT EXISTS (SELECT 1 FROM session_archive_unlinked_requests remaining WHERE remaining.principal_id=target_keys.principal_id) AND NOT EXISTS (SELECT 1 FROM memeloop_cloud_subscription_events remaining WHERE remaining.principal_id=target_keys.principal_id))";
+  const summaryValues = `${outcome},${EXPECTED_SNAPSHOT_COUNT},${EXPECTED_KEY_COUNT},${relationExpected},${legacyCredentialRows.length},${rotationReplayRows.length},${credentialGroupRows.length},${routeGroupRows.length},${conversationProjectionRows.length},${manifest.conversation_rewrites.length},${eligiblePrincipals}`;
+  const summaryStatement = backend === "sqlite" ? `SELECT CAPTURE_PURGE_SUMMARY(${summaryValues});` : `SELECT ${summaryValues};`;
   return `${begin}
 ${lock}
 CREATE TABLE IF NOT EXISTS migration_tool_operation_receipts (
@@ -520,13 +597,15 @@ CREATE TEMP TABLE target_grants(key_id TEXT NOT NULL,model_route_id TEXT,route_g
 INSERT INTO target_grants ${values(grantRows, ["''", "NULL", "NULL", "0"])};
 CREATE TEMP TABLE target_revisions(key_id TEXT PRIMARY KEY,revision BIGINT NOT NULL);
 INSERT INTO target_revisions ${values(revisionRows, ["''", "0"])};
-CREATE TEMP TABLE target_rewrites(observation_id TEXT PRIMARY KEY,key_id TEXT NOT NULL,session_name TEXT NOT NULL,labels_json TEXT NOT NULL,replacement_session_name TEXT NOT NULL,replacement_labels_json TEXT NOT NULL);
-INSERT INTO target_rewrites ${values(rewriteRows, ["''", "''", "''", "''", "''", "''"])};
+CREATE TEMP TABLE target_rewrites(observation_id TEXT PRIMARY KEY,key_id TEXT NOT NULL,session_name TEXT NOT NULL,labels_json TEXT NOT NULL,replacement_session_name TEXT,replacement_labels_json TEXT NOT NULL);
+INSERT INTO target_rewrites ${values(rewriteRows, ["''", "''", "''", "''", "NULL", "''"])};
+CREATE TEMP TABLE target_conversation_projections(request_id TEXT PRIMARY KEY,tenant_id TEXT NOT NULL,key_id TEXT NOT NULL,principal_id TEXT NOT NULL,request_json_bytes BIGINT NOT NULL,hints_json_bytes BIGINT NOT NULL,request_json_sha256 TEXT NOT NULL,hints_json_sha256 TEXT NOT NULL,client_name TEXT,upstream_response_id TEXT,observed_at BIGINT NOT NULL,lease_owner TEXT,lease_expires_at BIGINT,attempts BIGINT NOT NULL,projected_at BIGINT);
+INSERT INTO target_conversation_projections ${values(conversationProjectionRows, ["''", "''", "''", "''", "0", "0", "''", "''", "NULL", "NULL", "0", "NULL", "NULL", "0", "NULL"])};
 CREATE TEMP TABLE target_credential_groups(id TEXT PRIMARY KEY,tenant_id TEXT NOT NULL,name TEXT NOT NULL,normalized_name TEXT NOT NULL,created_at BIGINT NOT NULL,updated_at BIGINT NOT NULL);
 INSERT INTO target_credential_groups ${values(credentialGroupRows, ["''", "''", "''", "''", "0", "0"])};
 CREATE TEMP TABLE target_route_groups(id TEXT PRIMARY KEY,tenant_id TEXT NOT NULL,name TEXT NOT NULL,normalized_name TEXT NOT NULL,created_at BIGINT NOT NULL,updated_at BIGINT NOT NULL);
 INSERT INTO target_route_groups ${values(routeGroupRows, ["''", "''", "''", "''", "0", "0"])};
-${assertion(`EXISTS (SELECT 1 FROM migration_tool_operation_receipts WHERE idempotency_key=${sqlText(manifest.idempotency_key)} AND (operation_kind<>'retired-api2-trial-purge-v2' OR manifest_sha256<>${sqlText(digest)}))`)}
+${assertion(`EXISTS (SELECT 1 FROM migration_tool_operation_receipts WHERE idempotency_key=${sqlText(manifest.idempotency_key)} AND (operation_kind<>'retired-api2-trial-purge-v3' OR manifest_sha256<>${sqlText(digest)}))`)}
 ${assertion(`${fresh} AND (SELECT COUNT(*) FROM target_snapshots)<>${EXPECTED_SNAPSHOT_COUNT}`)}
 ${assertion(`${fresh} AND (SELECT COUNT(*) FROM target_keys)<>${EXPECTED_KEY_COUNT}`)}
 ${assertion(`${fresh} AND ((SELECT COUNT(*) FROM target_grants)+(SELECT COUNT(*) FROM target_revisions))<>${relationExpected}`)}
@@ -560,6 +639,9 @@ ${assertion(`${fresh} AND (SELECT COUNT(*) FROM routing_grant_relation_revisions
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM target_revisions expected LEFT JOIN routing_grant_relation_revisions actual ON actual.subject_kind='credential' AND actual.subject_id=expected.key_id AND actual.key_id=expected.key_id WHERE actual.key_id IS NULL OR actual.tenant_id<>(SELECT id FROM tenants WHERE external_id=${sqlText(manifest.tenant_external_id)}) OR actual.model_route_id IS NOT NULL OR actual.revision<>expected.revision)`)}
 ${assertion(`${fresh} AND (SELECT COUNT(*) FROM conversation_observations actual WHERE actual.id IN (SELECT observation_id FROM target_rewrites))<>(SELECT COUNT(*) FROM target_rewrites)`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM target_rewrites expected LEFT JOIN conversation_observations actual ON actual.id=expected.observation_id WHERE actual.id IS NULL OR actual.key_id<>expected.key_id OR actual.session_name<>expected.session_name OR actual.labels_json<>expected.labels_json)`)}
+${assertion(`${fresh} AND (SELECT COUNT(*) FROM conversation_projection_outbox actual WHERE actual.key_id IN (SELECT key_id FROM target_keys))<>(SELECT COUNT(*) FROM target_conversation_projections)`)}
+${assertion(`${fresh} AND EXISTS (SELECT 1 FROM target_conversation_projections expected LEFT JOIN conversation_projection_outbox actual ON actual.request_id=expected.request_id WHERE actual.request_id IS NULL OR actual.tenant_id<>expected.tenant_id OR actual.key_id<>expected.key_id OR actual.principal_id<>expected.principal_id OR ${octetLength("actual.request_json")}<>expected.request_json_bytes OR ${octetLength("actual.hints_json")}<>expected.hints_json_bytes OR ${projectionPayloadCas} OR COALESCE(actual.client_name,'')<>COALESCE(expected.client_name,'') OR COALESCE(actual.upstream_response_id,'')<>COALESCE(expected.upstream_response_id,'') OR actual.observed_at<>expected.observed_at OR COALESCE(actual.lease_owner,'')<>COALESCE(expected.lease_owner,'') OR COALESCE(actual.lease_expires_at,-1)<>COALESCE(expected.lease_expires_at,-1) OR actual.attempts<>expected.attempts OR COALESCE(actual.projected_at,-1)<>COALESCE(expected.projected_at,-1))`)}
+${assertion(`${fresh} AND EXISTS (SELECT 1 FROM conversation_projection_outbox WHERE key_id IN (SELECT key_id FROM target_keys) AND projected_at IS NULL)`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM request_records WHERE key_id IN (SELECT key_id FROM target_keys) AND completed_at IS NULL)`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM usage_reservations WHERE key_id IN (SELECT key_id FROM target_keys) AND (status IS NULL OR status<>'settled'))`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM generation_jobs WHERE key_id IN (SELECT key_id FROM target_keys) AND (status IS NULL OR status NOT IN ('succeeded','failed','cancelled') OR stats_aggregated_at IS NULL))`)}
@@ -597,14 +679,14 @@ ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM legacy_key_credentials WHERE id 
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM credential_rotation_replays WHERE idempotency_key IN (SELECT idempotency_key FROM target_rotation_replays))`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM credential_groups WHERE id IN (SELECT id FROM target_credential_groups) AND NOT EXISTS (SELECT 1 FROM credential_group_memberships remaining WHERE remaining.credential_group_id=credential_groups.id))`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM route_groups WHERE id IN (SELECT id FROM target_route_groups) AND NOT EXISTS (SELECT 1 FROM routing_grants remaining WHERE remaining.route_group_id=route_groups.id) AND NOT EXISTS (SELECT 1 FROM model_route_group_memberships remaining WHERE remaining.route_group_id=route_groups.id))`)}
-${assertion(`${fresh} AND EXISTS (SELECT 1 FROM conversation_observations actual JOIN target_rewrites expected ON expected.observation_id=actual.id WHERE actual.session_name<>expected.replacement_session_name OR actual.labels_json<>expected.replacement_labels_json)`)}
+${assertion(`${fresh} AND EXISTS (SELECT 1 FROM conversation_observations actual JOIN target_rewrites expected ON expected.observation_id=actual.id WHERE COALESCE(actual.session_name,'')<>COALESCE(expected.replacement_session_name,'') OR actual.labels_json<>expected.replacement_labels_json)`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM conversation_observations actual WHERE actual.key_id IN (SELECT key_id FROM target_keys) AND (LOWER(COALESCE(actual.session_name,'')) LIKE '%api2%' OR LOWER(COALESCE(actual.session_name,'')) LIKE '%legacy-cpa-bridge%' OR LOWER(COALESCE(actual.session_name,'')) LIKE '%cpa-%' OR LOWER(COALESCE(actual.session_name,'')) LIKE '%bridge%' OR LOWER(actual.labels_json) LIKE '%api2%' OR LOWER(actual.labels_json) LIKE '%legacy-cpa-bridge%' OR LOWER(actual.labels_json) LIKE '%cpa-%' OR LOWER(actual.labels_json) LIKE '%bridge%'))`)}
 ${protectedAfter}
 INSERT INTO migration_tool_operation_receipts(idempotency_key,operation_kind,manifest_sha256,applied_at,summary_json)
-SELECT ${sqlText(manifest.idempotency_key)},'retired-api2-trial-purge-v2',${sqlText(digest)},${now},${sqlText(JSON.stringify({ deleted_upstream_account_snapshots: 17, key_records: 7, routing_relations: 16, legacy_key_credentials: legacyCredentialRows.length, credential_rotation_replays: rotationReplayRows.length, credential_groups: credentialGroupRows.length, route_groups: routeGroupRows.length, conversation_rewrites: manifest.conversation_rewrites.length }))}
+SELECT ${sqlText(manifest.idempotency_key)},'retired-api2-trial-purge-v3',${sqlText(digest)},${now},${sqlText(JSON.stringify({ deleted_upstream_account_snapshots: 17, key_records: 7, routing_relations: 16, legacy_key_credentials: legacyCredentialRows.length, credential_rotation_replays: rotationReplayRows.length, credential_groups: credentialGroupRows.length, route_groups: routeGroupRows.length, conversation_projection_outbox: conversationProjectionRows.length, conversation_rewrites: manifest.conversation_rewrites.length }))}
 WHERE ${fresh};
-${assertion(`(SELECT COUNT(*) FROM migration_tool_operation_receipts WHERE idempotency_key=${sqlText(manifest.idempotency_key)} AND operation_kind='retired-api2-trial-purge-v2' AND manifest_sha256=${sqlText(digest)})<>1`)}
-SELECT CASE WHEN (SELECT initial_replay FROM operation_state)=1 THEN 'replay' ELSE 'planned' END,${EXPECTED_SNAPSHOT_COUNT},${EXPECTED_KEY_COUNT},${relationExpected},${legacyCredentialRows.length},${rotationReplayRows.length},${credentialGroupRows.length},${routeGroupRows.length},${manifest.conversation_rewrites.length},(SELECT COUNT(DISTINCT principal_id) FROM target_keys WHERE NOT EXISTS (SELECT 1 FROM key_records remaining WHERE remaining.principal_id=target_keys.principal_id) AND NOT EXISTS (SELECT 1 FROM credit_accounts remaining WHERE remaining.principal_id=target_keys.principal_id) AND NOT EXISTS (SELECT 1 FROM conversation_clusters remaining WHERE remaining.principal_id=target_keys.principal_id) AND NOT EXISTS (SELECT 1 FROM session_archive_correlations remaining WHERE remaining.principal_id=target_keys.principal_id) AND NOT EXISTS (SELECT 1 FROM session_archive_unlinked_requests remaining WHERE remaining.principal_id=target_keys.principal_id) AND NOT EXISTS (SELECT 1 FROM memeloop_cloud_subscription_events remaining WHERE remaining.principal_id=target_keys.principal_id));
+${assertion(`(SELECT COUNT(*) FROM migration_tool_operation_receipts WHERE idempotency_key=${sqlText(manifest.idempotency_key)} AND operation_kind='retired-api2-trial-purge-v3' AND manifest_sha256=${sqlText(digest)})<>1`)}
+${summaryStatement}
 ${apply ? "COMMIT;" : "ROLLBACK;"}
 `;
 }
@@ -626,14 +708,14 @@ function outputPath(path: string): string {
 
 function parseArgs(argv: string[]): Options {
   if (argv.includes("--help") || argv.includes("-h")) {
-    process.stdout.write("usage: purge-retired-api2-trial --manifest FILE --receipt-output FILE --backend postgres|sqlite [database options] [--apply --approved-manifest-sha256 SHA256]\n\nPostgreSQL: --pg-service-file FILE --pg-service NAME [--psql-binary PATH]\nSQLite: --sqlite-database FILE [--sqlite-binary PATH]\nDefault mode is a complete transactional dry-run followed by ROLLBACK.\n");
+    process.stdout.write("usage: purge-retired-api2-trial --manifest FILE --receipt-output FILE --backend postgres|sqlite [database options] [--apply --approved-manifest-sha256 SHA256]\n\nPostgreSQL: --pg-service-file FILE --pg-service NAME [--psql-binary PATH]\nSQLite: --sqlite-database FILE\nDefault mode is a complete transactional dry-run followed by ROLLBACK.\n");
     process.exit(0);
   }
-  const result: Options = { psqlBinary: "psql", sqliteBinary: "sqlite3", apply: false };
+  const result: Options = { psqlBinary: "psql", apply: false };
   const valued: Record<string, keyof Options> = {
     "--manifest": "manifest", "--receipt-output": "receipt", "--backend": "backend",
     "--pg-service-file": "pgServiceFile", "--pg-service": "pgService", "--psql-binary": "psqlBinary",
-    "--sqlite-database": "sqliteDatabase", "--sqlite-binary": "sqliteBinary",
+    "--sqlite-database": "sqliteDatabase",
     "--approved-manifest-sha256": "approvedManifestSha256",
   };
   for (let index = 0; index < argv.length; index += 1) {
@@ -654,22 +736,40 @@ function parseArgs(argv: string[]): Options {
 }
 
 function runDatabase(options: Options, sql: string): string {
-  const common = { input: sql, encoding: "utf8" as const, shell: false, maxBuffer: 1024 * 1024, stdio: ["pipe", "pipe", "pipe"] as ["pipe", "pipe", "pipe"] };
-  const result = options.backend === "postgres"
-    ? spawnSync(options.psqlBinary, ["-X", "--no-psqlrc", "--no-password", "-qAt", "-F", "|", "--set=ON_ERROR_STOP=1", `service=${options.pgService}`], { ...common, env: { ...process.env, PGSERVICEFILE: regularProtectedFile(options.pgServiceFile!, "PostgreSQL service file", 64 * 1024), PGAPPNAME: "mtc-retired-api2-trial-purge", PGCONNECT_TIMEOUT: process.env.PGCONNECT_TIMEOUT ?? "10" } })
-    : spawnSync(options.sqliteBinary, ["-batch", "-noheader", "-separator", "|", regularProtectedFile(options.sqliteDatabase!, "SQLite database", Number.MAX_SAFE_INTEGER)], common);
-  if (result.error || result.status !== 0) fail("database_rejected_plan", result.error ? "database client could not be started" : "database rejected the reviewed cleanup plan");
-  const lines = result.stdout.trim().split("\n").filter(Boolean);
-  const summary = lines.at(-1);
-  if (!summary || !/^(?:planned|replay)\|17\|7\|16(?:\|\d+){6}$/u.test(summary)) fail("database_receipt_invalid", "database did not return the bounded cleanup summary");
+  let summary: string | undefined;
+  if (options.backend === "postgres") {
+    const common = { input: sql, encoding: "utf8" as const, shell: false, maxBuffer: 1024 * 1024, stdio: ["pipe", "pipe", "pipe"] as ["pipe", "pipe", "pipe"] };
+    const result = spawnSync(options.psqlBinary, ["-X", "--no-psqlrc", "--no-password", "-qAt", "-F", "|", "--set=ON_ERROR_STOP=1", `service=${options.pgService}`], { ...common, env: { ...process.env, PGSERVICEFILE: regularProtectedFile(options.pgServiceFile!, "PostgreSQL service file", 64 * 1024), PGAPPNAME: "mtc-retired-api2-trial-purge", PGCONNECT_TIMEOUT: process.env.PGCONNECT_TIMEOUT ?? "10" } });
+    if (result.error || result.status !== 0) fail("database_rejected_plan", result.error ? "database client could not be started" : "database rejected the reviewed cleanup plan");
+    summary = result.stdout.trim().split("\n").filter(Boolean).at(-1);
+  } else {
+    let database: DatabaseSync | undefined;
+    try {
+      database = new DatabaseSync(regularProtectedFile(options.sqliteDatabase!, "SQLite database", Number.MAX_SAFE_INTEGER));
+      database.function("sha256_text", { deterministic: true }, (value: unknown) => {
+        if (typeof value !== "string") throw new TypeError("SHA256_TEXT requires text");
+        return createHash("sha256").update(value).digest("hex");
+      });
+      database.function("capture_purge_summary", (...values: unknown[]) => {
+        summary = values.map(value => String(value)).join("|");
+        return 0;
+      });
+      database.exec(sql);
+    } catch {
+      fail("database_rejected_plan", "database rejected the reviewed cleanup plan");
+    } finally {
+      database?.close();
+    }
+  }
+  if (!summary || !/^(?:planned|replay)\|17\|7\|16(?:\|\d+){7}$/u.test(summary)) fail("database_receipt_invalid", "database did not return the bounded cleanup summary");
   return summary;
 }
 
 export function receipt(manifest: ReviewedManifest, digest: string, mode: "dry-run" | "apply", summary: string): Obj {
-  const [outcome, snapshots, keys, relations, legacyCredentials, rotationReplays, credentialGroups, routeGroups, rewrites, principals] = summary.split("|");
+  const [outcome, snapshots, keys, relations, legacyCredentials, rotationReplays, credentialGroups, routeGroups, conversationProjections, rewrites, principals] = summary.split("|");
   return {
-    schema_version: 2,
-    operation: "retired-api2-trial-purge-v2",
+    schema_version: 3,
+    operation: "retired-api2-trial-purge-v3",
     mode,
     outcome: outcome!,
     idempotency_key: manifest.idempotency_key,
@@ -682,6 +782,7 @@ export function receipt(manifest: ReviewedManifest, digest: string, mode: "dry-r
     credential_rotation_replays: Number(rotationReplays),
     credential_groups: Number(credentialGroups),
     route_groups: Number(routeGroups),
+    conversation_projection_outbox: Number(conversationProjections),
     conversation_rewrites: Number(rewrites),
     eligible_principals: Number(principals),
   };

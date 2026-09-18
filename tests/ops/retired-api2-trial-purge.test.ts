@@ -3,6 +3,7 @@ import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import {
   PurgeFailure,
@@ -59,16 +60,37 @@ function fixtureManifest(): ReviewedManifest {
     key_id: key.key_id,
     session_name: `api2 trial session ${index}`,
     labels_json: JSON.stringify({ alias: `cpa-fixture-${index}`, cohort: "bridge" }),
-    replacement_session_name: `retired-session-${key.key_id}`,
-    replacement_labels_json: JSON.stringify({ credential: `retired-credential-${key.key_id}`, state: "retired" }),
+    replacement_session_name: index % 2 === 0 ? null : "",
+    replacement_labels_json: JSON.stringify({ state: "retired" }),
   }));
+  const conversation_projection_outbox = keys.map((key, index) => {
+    const request = JSON.stringify({ fixture: index });
+    const hints = JSON.stringify({});
+    return {
+      request_id: uuid(1200 + index),
+      tenant_id: uuid(1),
+      key_id: key.key_id,
+      principal_id: key.principal_id,
+      request_json_bytes: Buffer.byteLength(request),
+      hints_json_bytes: Buffer.byteLength(hints),
+      request_json_sha256: createHash("sha256").update(request).digest("hex"),
+      hints_json_sha256: createHash("sha256").update(hints).digest("hex"),
+      client_name: index % 2 === 0 ? "fixture-client" : null,
+      upstream_response_id: index % 2 === 0 ? `response-${index}` : null,
+      observed_at: 2000 + index,
+      lease_owner: null,
+      lease_expires_at: null,
+      attempts: 1,
+      projected_at: 2800 + index,
+    };
+  });
   const credential_groups = keys.flatMap(key => key.credential_group_memberships.map(membership => {
     const suffix = Number(membership.credential_group_id.slice(-12)) - 600;
     return { id: membership.credential_group_id, tenant_id: uuid(1), name: `legacy-group-${suffix}`, normalized_name: `legacy-group-${suffix}`, created_at: 1700 + suffix, updated_at: 1800 + suffix };
   }));
   const route_groups = [{ id: uuid(900), tenant_id: uuid(1), name: "legacy-route-group", normalized_name: "legacy-route-group", created_at: 1700, updated_at: 1800 }];
   return parseManifest({
-    schema_version: 2,
+    schema_version: 3,
     idempotency_key: "retired-api2-trial-fixture-v1",
     tenant_external_id: "fixture-tenant",
     expected: { deleted_upstream_account_snapshots: 17, key_records: 7, routing_relations: 16 },
@@ -76,6 +98,7 @@ function fixtureManifest(): ReviewedManifest {
     keys,
     credential_groups,
     route_groups,
+    conversation_projection_outbox,
     conversation_rewrites,
   } as never);
 }
@@ -94,7 +117,7 @@ function baseSchema(postgres: boolean): string {
     "key_budget_daily_rollups", "key_budget_usage_events", "rate_limit_windows",
     "key_runtime_state", "metered_usage_projection_outbox",
     "key_credential_recovery_audit", "key_credential_recovery_access_audit",
-    "conversation_key_clusters", "conversation_projection_outbox",
+    "conversation_key_clusters",
     "conversation_unresolved_explicit_parents", "session_routing_terminals",
   ];
   return `${postgres ? "" : "PRAGMA foreign_keys=ON;"}
@@ -123,6 +146,7 @@ CREATE TABLE synchronous_image_idempotency(key_id TEXT NOT NULL REFERENCES key_r
 CREATE TABLE request_records(id TEXT PRIMARY KEY,key_id TEXT NOT NULL,completed_at BIGINT);
 CREATE TABLE usage_reservations(id TEXT PRIMARY KEY,key_id TEXT NOT NULL,status TEXT NOT NULL);
 CREATE TABLE generation_jobs(id TEXT PRIMARY KEY,key_id TEXT NOT NULL,status TEXT NOT NULL,stats_aggregated_at BIGINT);
+CREATE TABLE conversation_projection_outbox(request_id TEXT PRIMARY KEY,tenant_id TEXT NOT NULL,key_id TEXT NOT NULL,principal_id TEXT NOT NULL,request_json TEXT NOT NULL,hints_json TEXT NOT NULL,client_name TEXT,upstream_response_id TEXT,observed_at BIGINT NOT NULL,lease_owner TEXT,lease_expires_at BIGINT,attempts BIGINT NOT NULL,projected_at BIGINT);
 ${protectedTables.map(name => `CREATE TABLE ${name}(id TEXT PRIMARY KEY,key_id TEXT NOT NULL);`).join("\n")}
 `;
 }
@@ -153,7 +177,9 @@ function fixtureSql(manifest: ReviewedManifest, postgres: boolean): string {
     statements.push(`INSERT INTO request_records VALUES (${q(`request_records-${index}`)},${q(key.key_id)},${key.archived_at});`);
     statements.push(`INSERT INTO usage_reservations VALUES (${q(`usage_reservations-${index}`)},${q(key.key_id)},'settled');`);
     statements.push(`INSERT INTO generation_jobs VALUES (${q(`generation_jobs-${index}`)},${q(key.key_id)},'succeeded',${key.archived_at});`);
-    for (const table of ["request_events", "request_record_locators", "request_event_locators", "request_stats_facts", "request_daily_aggregates", "usage_daily_aggregates", "usage_analysis_hourly", "usage_analysis_daily", "session_usage_totals", "session_usage_hourly", "session_usage_daily", "session_archive_totals", "session_archive_import_records", "session_archive_quarantine_resolutions", "generation_stats_facts", "generation_daily_aggregates", "generation_usage_dimensions_hourly", "generation_usage_dimensions_daily", "ledger_entries", "account_settlement_feed", "key_budget_state", "key_budget_daily_rollups", "key_budget_usage_events", "rate_limit_windows", "key_runtime_state", "metered_usage_projection_outbox", "key_credential_recovery_audit", "key_credential_recovery_access_audit", "conversation_key_clusters", "conversation_projection_outbox", "conversation_unresolved_explicit_parents", "session_routing_terminals"]) statements.push(`INSERT INTO ${table} VALUES (${q(`${table}-${index}`)},${q(key.key_id)});`);
+    const projection = manifest.conversation_projection_outbox[index]!;
+    statements.push(`INSERT INTO conversation_projection_outbox VALUES (${q(projection.request_id)},${q(projection.tenant_id)},${q(projection.key_id)},${q(projection.principal_id)},${q(JSON.stringify({ fixture: index }))},'{}',${projection.client_name ? q(projection.client_name) : "NULL"},${projection.upstream_response_id ? q(projection.upstream_response_id) : "NULL"},${projection.observed_at},NULL,NULL,${projection.attempts},${projection.projected_at});`);
+    for (const table of ["request_events", "request_record_locators", "request_event_locators", "request_stats_facts", "request_daily_aggregates", "usage_daily_aggregates", "usage_analysis_hourly", "usage_analysis_daily", "session_usage_totals", "session_usage_hourly", "session_usage_daily", "session_archive_totals", "session_archive_import_records", "session_archive_quarantine_resolutions", "generation_stats_facts", "generation_daily_aggregates", "generation_usage_dimensions_hourly", "generation_usage_dimensions_daily", "ledger_entries", "account_settlement_feed", "key_budget_state", "key_budget_daily_rollups", "key_budget_usage_events", "rate_limit_windows", "key_runtime_state", "metered_usage_projection_outbox", "key_credential_recovery_audit", "key_credential_recovery_access_audit", "conversation_key_clusters", "conversation_unresolved_explicit_parents", "session_routing_terminals"]) statements.push(`INSERT INTO ${table} VALUES (${q(`${table}-${index}`)},${q(key.key_id)});`);
     statements.push(`INSERT INTO session_archive_correlations VALUES (${q(`correlation-${index}`)},${q(key.key_id)},${q(key.principal_id)});`);
     statements.push(`INSERT INTO session_archive_unlinked_requests VALUES (${q(`unlinked-${index}`)},${q(key.key_id)},${q(key.principal_id)});`);
     statements.push(`INSERT INTO memeloop_cloud_subscription_events VALUES (${q(`cloud-${index}`)},${q(key.key_id)},${q(key.principal_id)});`);
@@ -194,11 +220,14 @@ test("reviewed manifest is fixed to 17 snapshots, 7 revoked keys and 16 routing 
   invalid.snapshots.pop();
   assert.throws(() => parseManifest(invalid), (error: unknown) => error instanceof PurgeFailure && error.code === "manifest_invalid");
   const unsafe = JSON.parse(JSON.stringify(manifest));
-  unsafe.conversation_rewrites[0].replacement_session_name = "api2-retired";
+  unsafe.conversation_rewrites[0].replacement_session_name = "retired-session-00000000-0000-4000-8000-000000000001";
   assert.throws(() => parseManifest(unsafe), (error: unknown) => error instanceof PurgeFailure && error.code === "manifest_invalid");
   const oldSchema = JSON.parse(JSON.stringify(manifest));
-  oldSchema.schema_version = 1;
+  oldSchema.schema_version = 2;
   assert.throws(() => parseManifest(oldSchema), (error: unknown) => error instanceof PurgeFailure && error.code === "manifest_invalid");
+  const badProjectionDigest = JSON.parse(JSON.stringify(manifest));
+  badProjectionDigest.conversation_projection_outbox[0].request_json_sha256 = "invalid";
+  assert.throws(() => parseManifest(badProjectionDigest), (error: unknown) => error instanceof PurgeFailure && error.code === "manifest_invalid");
 });
 
 test("generated SQL clears recoverable secrets before exact deletes and rolls back by default", () => {
@@ -216,6 +245,9 @@ test("generated SQL clears recoverable secrets before exact deletes and rolls ba
   assert.match(sql, /target_rotation_replays expected LEFT JOIN credential_rotation_replays/u);
   assert.match(sql, /target_credential_groups expected LEFT JOIN credential_groups/u);
   assert.match(sql, /target_route_groups expected LEFT JOIN route_groups/u);
+  assert.match(sql, /target_conversation_projections expected LEFT JOIN conversation_projection_outbox/u);
+  assert.match(sql, /conversation_projection_outbox WHERE key_id IN \(SELECT key_id FROM target_keys\) AND projected_at IS NULL/u);
+  assert.match(sql, /SHA256_TEXT\(actual\.request_json\)<>expected\.request_json_sha256/u);
   assert.match(sql, /NOT EXISTS \(SELECT 1 FROM key_records remaining WHERE remaining\.principal_id=principals\.id\)/u);
   assert.doesNotMatch(sql, /remaining\.status='active'/u);
   assert.match(sql, /ROLLBACK;\s*$/u);
@@ -226,11 +258,12 @@ test("PostgreSQL plan locks mutable dependencies and applies the same fail-close
   const manifest = fixtureManifest();
   const sql = buildSql(manifest, manifestSha256(manifest), false, "postgres", 1234);
   assert.match(sql, /^BEGIN;\nSET TRANSACTION ISOLATION LEVEL SERIALIZABLE;/u);
-  assert.match(sql, /LOCK TABLE .*request_records, usage_reservations, generation_jobs.* IN SHARE ROW EXCLUSIVE MODE;/u);
+  assert.match(sql, /LOCK TABLE .*request_records, usage_reservations, generation_jobs.*conversation_projection_outbox IN SHARE ROW EXCLUSIVE MODE;/u);
   assert.match(sql, /target_legacy_credentials expected LEFT JOIN legacy_key_credentials/u);
   assert.match(sql, /target_rotation_replays expected LEFT JOIN credential_rotation_replays/u);
   assert.match(sql, /completed_at IS NULL/u);
   assert.match(sql, /stats_aggregated_at IS NULL/u);
+  assert.match(sql, /SHA256\(CONVERT_TO\(actual\.request_json,'UTF8'\)\)/u);
   assert.match(sql, /ROLLBACK;\s*$/u);
 });
 
@@ -248,6 +281,7 @@ test("SQLite dry-run fails closed on unfinished requests, reservations and gener
     ["UPDATE usage_reservations SET status='reserved' WHERE id='usage_reservations-0';", "UPDATE usage_reservations SET status='settled' WHERE id='usage_reservations-0';"],
     ["UPDATE generation_jobs SET status='running' WHERE id='generation_jobs-0';", "UPDATE generation_jobs SET status='succeeded' WHERE id='generation_jobs-0';"],
     ["UPDATE generation_jobs SET stats_aggregated_at=NULL WHERE id='generation_jobs-0';", "UPDATE generation_jobs SET stats_aggregated_at=3000 WHERE id='generation_jobs-0';"],
+    ["UPDATE conversation_projection_outbox SET projected_at=NULL WHERE request_id='00000000-0000-4000-8000-000000001200';", "UPDATE conversation_projection_outbox SET projected_at=2800 WHERE request_id='00000000-0000-4000-8000-000000001200';"],
   ];
   for (const [index, [introduce, restore]] of blockers.entries()) {
     success(run("sqlite3", [database], introduce), `introduce blocker ${index}`);
@@ -271,6 +305,7 @@ test("SQLite dry-run fails closed on reviewed child and group CAS drift", () => 
     ["UPDATE credential_rotation_replays SET request_hash='drift' WHERE idempotency_key='rotate-0';", "UPDATE credential_rotation_replays SET request_hash='request-0' WHERE idempotency_key='rotate-0';"],
     ["UPDATE credential_groups SET name='drift' WHERE id='00000000-0000-4000-8000-000000000600';", "UPDATE credential_groups SET name='legacy-group-0' WHERE id='00000000-0000-4000-8000-000000000600';"],
     ["UPDATE route_groups SET name='drift' WHERE id='00000000-0000-4000-8000-000000000900';", "UPDATE route_groups SET name='legacy-route-group' WHERE id='00000000-0000-4000-8000-000000000900';"],
+    ["UPDATE conversation_projection_outbox SET request_json='{\"fixture\":9}' WHERE request_id='00000000-0000-4000-8000-000000001200';", "UPDATE conversation_projection_outbox SET request_json='{\"fixture\":0}' WHERE request_id='00000000-0000-4000-8000-000000001200';"],
   ];
   for (const [index, [introduce, restore]] of drifts.entries()) {
     success(run("sqlite3", [database], introduce), `introduce drift ${index}`);
@@ -298,6 +333,7 @@ test("SQLite dry-run, approved apply and replay preserve historical facts", () =
   const applyReceipt = join(workspace, "apply.json");
   const applied = JSON.parse(success(run(process.execPath, toolArgs(workspace, manifestPath, applyReceipt, databaseArgs, true)), "SQLite apply"));
   assert.equal(applied.outcome, "planned");
+  assert.equal(applied.conversation_projection_outbox, 7);
   assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM key_records;"), "SQLite applied keys"), "1");
   assert.equal(success(run("sqlite3", [database], "SELECT status FROM key_records;"), "SQLite retained archived key"), "revoked");
   assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM legacy_key_credentials;"), "SQLite legacy credentials"), "0");
@@ -307,7 +343,8 @@ test("SQLite dry-run, approved apply and replay preserve historical facts", () =
   assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM deleted_upstream_account_snapshots;"), "SQLite applied snapshots"), "0");
   assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM request_records;"), "SQLite applied history"), before);
   assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM principals;"), "SQLite retained dependent principals"), "7");
-  assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM conversation_observations WHERE session_name LIKE 'retired-%' AND labels_json NOT LIKE '%api2%' AND labels_json NOT LIKE '%cpa-%' AND labels_json NOT LIKE '%bridge%';"), "SQLite normalized conversations"), "7");
+  assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM conversation_observations WHERE (session_name IS NULL OR session_name='') AND labels_json='{\"state\":\"retired\"}';"), "SQLite localized conversation tombstones"), "7");
+  assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM conversation_observations WHERE session_name LIKE 'retired-%' OR session_name LIKE '%00000000-%';"), "SQLite technical conversation titles"), "0");
   const replayReceipt = join(workspace, "replay.json");
   const replay = JSON.parse(success(run(process.execPath, toolArgs(workspace, manifestPath, replayReceipt, databaseArgs, true)), "SQLite replay"));
   assert.equal(replay.outcome, "replay");
