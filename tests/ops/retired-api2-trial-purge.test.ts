@@ -86,22 +86,44 @@ function fixtureManifest(): ReviewedManifest {
       projected_at: 2800 + index,
     };
   });
+  const synchronous_image_idempotency = Array.from({ length: 24 }, (_, index) => {
+    const key = keys[index % keys.length]!;
+    const status = index < 16 ? "completed" as const : index < 23 ? "failed" as const : "pending" as const;
+    const response = status === "completed" ? JSON.stringify({ data: [{ url: `fixture-only-${index}` }] }) : null;
+    return {
+      key_id: key.key_id,
+      idempotency_key: `fixture-image-${String(index).padStart(2, "0")}`,
+      request_hash: createHash("sha256").update(`image-request-${index}`).digest("hex"),
+      request_id: uuid(1600 + index),
+      reservation_id: uuid(1700 + index),
+      status,
+      response_status: status === "pending" ? null : status === "completed" ? 200 : 502,
+      response_object_present: response !== null,
+      response_object_bytes: response === null ? 0 : Buffer.byteLength(response),
+      response_object_sha256: response === null ? null : createHash("sha256").update(response).digest("hex"),
+      error_code: status === "failed" ? "fixture_image_failed" : null,
+      created_at: 2000 + index,
+      lease_expires_at: 2500 + index,
+      completed_at: status === "pending" ? null : 3000 + index,
+    };
+  }).sort((left, right) => `${left.key_id}:${left.idempotency_key}`.localeCompare(`${right.key_id}:${right.idempotency_key}`));
   const credential_groups = keys.flatMap(key => key.credential_group_memberships.map(membership => {
     const suffix = Number(membership.credential_group_id.slice(-12)) - 600;
     return { id: membership.credential_group_id, tenant_id: uuid(1), name: `legacy-group-${suffix}`, normalized_name: `legacy-group-${suffix}`, created_at: 1700 + suffix, updated_at: 1800 + suffix };
   }));
   const route_groups = [{ id: uuid(900), tenant_id: uuid(1), name: "legacy-route-group", normalized_name: "legacy-route-group", created_at: 1700, updated_at: 1800 }];
   return parseManifest({
-    schema_version: 4,
+    schema_version: 5,
     idempotency_key: "retired-api2-trial-fixture-v1",
     tenant_external_id: "fixture-tenant",
-    expected: { deleted_upstream_account_snapshots: 17, key_records: 7, routing_grants: 16, routing_revisions: 7, conversation_observations: 170 },
+    expected: { deleted_upstream_account_snapshots: 17, key_records: 7, routing_grants: 16, routing_revisions: 7, conversation_observations: 170, synchronous_image_idempotency: 24 },
     snapshots,
     keys,
     credential_groups,
     route_groups,
     conversation_projection_outbox,
     conversation_rewrites,
+    synchronous_image_idempotency,
   } as never);
 }
 
@@ -142,10 +164,10 @@ CREATE TABLE conversation_clusters(id TEXT PRIMARY KEY,principal_id TEXT NOT NUL
 CREATE TABLE session_archive_correlations(id TEXT PRIMARY KEY,key_id TEXT NOT NULL,principal_id TEXT NOT NULL);
 CREATE TABLE session_archive_unlinked_requests(id TEXT PRIMARY KEY,key_id TEXT NOT NULL,principal_id TEXT NOT NULL);
 CREATE TABLE memeloop_cloud_subscription_events(id TEXT PRIMARY KEY,key_id TEXT NOT NULL,principal_id TEXT NOT NULL);
-CREATE TABLE synchronous_image_idempotency(key_id TEXT NOT NULL REFERENCES key_records(id) ON DELETE CASCADE,idempotency_key TEXT NOT NULL,PRIMARY KEY(key_id,idempotency_key));
-CREATE TABLE request_records(id TEXT PRIMARY KEY,tenant_id TEXT NOT NULL,key_id TEXT NOT NULL,completed_at BIGINT);
+CREATE TABLE request_records(id TEXT PRIMARY KEY,tenant_id TEXT NOT NULL,key_id TEXT NOT NULL,completed_at BIGINT,response_object TEXT);
 CREATE TABLE session_archive_import_records(tenant_id TEXT NOT NULL,source TEXT NOT NULL,external_request_id TEXT NOT NULL,target_request_id TEXT NOT NULL,external_event_hash TEXT NOT NULL,record_digest TEXT NOT NULL,source_started_at BIGINT NOT NULL,imported_at BIGINT NOT NULL,PRIMARY KEY(tenant_id,source,external_request_id));
 CREATE TABLE usage_reservations(id TEXT PRIMARY KEY,key_id TEXT NOT NULL,status TEXT NOT NULL);
+CREATE TABLE synchronous_image_idempotency(key_id TEXT NOT NULL REFERENCES key_records(id) ON DELETE CASCADE,idempotency_key TEXT NOT NULL,request_hash TEXT NOT NULL,request_id TEXT NOT NULL,reservation_id TEXT REFERENCES usage_reservations(id),status TEXT NOT NULL,response_status BIGINT,response_object TEXT,error_code TEXT,created_at BIGINT NOT NULL,lease_expires_at BIGINT NOT NULL,completed_at BIGINT,PRIMARY KEY(key_id,idempotency_key));
 CREATE TABLE generation_jobs(id TEXT PRIMARY KEY,key_id TEXT NOT NULL,status TEXT NOT NULL,stats_aggregated_at BIGINT);
 CREATE TABLE conversation_projection_outbox(request_id TEXT PRIMARY KEY,tenant_id TEXT NOT NULL,key_id TEXT NOT NULL,principal_id TEXT NOT NULL,request_json TEXT NOT NULL,hints_json TEXT NOT NULL,client_name TEXT,upstream_response_id TEXT,observed_at BIGINT NOT NULL,lease_owner TEXT,lease_expires_at BIGINT,attempts BIGINT NOT NULL,projected_at BIGINT);
 CREATE TABLE conversation_unresolved_explicit_parents(child_observation_id TEXT PRIMARY KEY,tenant_id TEXT NOT NULL,principal_id TEXT NOT NULL,key_id TEXT NOT NULL,parent_reference TEXT NOT NULL,subagent BIGINT NOT NULL DEFAULT 0,created_at BIGINT NOT NULL);
@@ -176,7 +198,7 @@ function fixtureSql(manifest: ReviewedManifest, postgres: boolean): string {
       statements.push(`INSERT INTO routing_grants VALUES (${q(tenantId)},${q(key.key_id)},${grant.model_route_id ? q(grant.model_route_id) : "NULL"},${grant.route_group_id ? q(grant.route_group_id) : "NULL"},${grant.created_at});`);
     }
     statements.push(`INSERT INTO routing_grant_relation_revisions VALUES (${q(tenantId)},'credential',${q(key.key_id)},${q(key.key_id)},NULL,${key.routing_revision.revision});`);
-    statements.push(`INSERT INTO request_records VALUES (${q(`request_records-${index}`)},${q(tenantId)},${q(key.key_id)},${key.archived_at});`);
+    statements.push(`INSERT INTO request_records(id,tenant_id,key_id,completed_at) VALUES (${q(`request_records-${index}`)},${q(tenantId)},${q(key.key_id)},${key.archived_at});`);
     statements.push(`INSERT INTO session_archive_import_records VALUES (${q(tenantId)},'cpa-session-archive',${q(`external-${index}`)},${q(`request_records-${index}`)},${q(`event-${index}`)},${q(`digest-${index}`)},${key.created_at},${key.archived_at});`);
     statements.push(`INSERT INTO usage_reservations VALUES (${q(`usage_reservations-${index}`)},${q(key.key_id)},'settled');`);
     statements.push(`INSERT INTO generation_jobs VALUES (${q(`generation_jobs-${index}`)},${q(key.key_id)},'succeeded',${key.archived_at});`);
@@ -188,6 +210,14 @@ function fixtureSql(manifest: ReviewedManifest, postgres: boolean): string {
     statements.push(`INSERT INTO session_archive_correlations VALUES (${q(`correlation-${index}`)},${q(key.key_id)},${q(key.principal_id)});`);
     statements.push(`INSERT INTO session_archive_unlinked_requests VALUES (${q(`unlinked-${index}`)},${q(key.key_id)},${q(key.principal_id)});`);
     statements.push(`INSERT INTO memeloop_cloud_subscription_events VALUES (${q(`cloud-${index}`)},${q(key.key_id)},${q(key.principal_id)});`);
+  }
+  for (const replay of manifest.synchronous_image_idempotency) {
+    const index = Number(replay.idempotency_key.slice(-2));
+    const completedResponse = JSON.stringify({ data: [{ url: `fixture-only-${index}` }] });
+    const requestResponse = replay.status === "completed" ? completedResponse : JSON.stringify({ status: replay.status });
+    statements.push(`INSERT INTO usage_reservations VALUES (${q(replay.reservation_id)},${q(replay.key_id)},'settled');`);
+    statements.push(`INSERT INTO request_records VALUES (${q(replay.request_id)},${q(tenantId)},${q(replay.key_id)},${3000 + index},${q(requestResponse)});`);
+    statements.push(`INSERT INTO synchronous_image_idempotency VALUES (${q(replay.key_id)},${q(replay.idempotency_key)},${q(replay.request_hash)},${q(replay.request_id)},${q(replay.reservation_id)},${q(replay.status)},${replay.response_status ?? "NULL"},${replay.status === "completed" ? q(completedResponse) : "NULL"},${replay.error_code ? q(replay.error_code) : "NULL"},${replay.created_at},${replay.lease_expires_at},${replay.completed_at ?? "NULL"});`);
   }
   const retained = manifest.keys[6]!;
   statements.push(`INSERT INTO key_records VALUES (${q(uuid(999))},${q(tenantId)},${q(retained.principal_id)},${q(uuid(998))},'ordinary-archived-key','USD','revoked',1,NULL,6000,5000,6000);`);
@@ -223,6 +253,7 @@ test("reviewed manifest is fixed to the production-audited cohort", () => {
   assert.equal(manifest.keys.reduce((sum, key) => sum + key.routing_grants.length, 0), 16);
   assert.equal(manifest.keys.length, 7);
   assert.equal(manifest.conversation_rewrites.length, 170);
+  assert.equal(manifest.synchronous_image_idempotency.length, 24);
   const invalid = JSON.parse(JSON.stringify(manifest));
   invalid.snapshots.pop();
   assert.throws(() => parseManifest(invalid), (error: unknown) => error instanceof PurgeFailure && error.code === "manifest_invalid");
@@ -230,7 +261,7 @@ test("reviewed manifest is fixed to the production-audited cohort", () => {
   unsafe.conversation_rewrites[0].replacement_session_name = "retired-session-00000000-0000-4000-8000-000000000001";
   assert.throws(() => parseManifest(unsafe), (error: unknown) => error instanceof PurgeFailure && error.code === "manifest_invalid");
   const oldSchema = JSON.parse(JSON.stringify(manifest));
-  oldSchema.schema_version = 3;
+  oldSchema.schema_version = 4;
   assert.throws(() => parseManifest(oldSchema), (error: unknown) => error instanceof PurgeFailure && error.code === "manifest_invalid");
   const badProjectionDigest = JSON.parse(JSON.stringify(manifest));
   badProjectionDigest.conversation_projection_outbox[0].request_json_sha256 = "invalid";
@@ -252,6 +283,8 @@ test("generated SQL clears recoverable secrets before exact deletes and rolls ba
   assert.match(sql, /target_credential_groups expected LEFT JOIN credential_groups/u);
   assert.match(sql, /target_route_groups expected LEFT JOIN route_groups/u);
   assert.match(sql, /target_conversation_projections expected LEFT JOIN conversation_projection_outbox/u);
+  assert.match(sql, /target_synchronous_image_idempotency expected LEFT JOIN synchronous_image_idempotency/u);
+  assert.match(sql, /DELETE FROM synchronous_image_idempotency WHERE \(key_id,idempotency_key\) IN/u);
   assert.match(sql, /conversation_projection_outbox WHERE key_id IN \(SELECT key_id FROM target_keys\) AND projected_at IS NULL/u);
   assert.match(sql, /SHA256_TEXT\(actual\.request_json\)<>expected\.request_json_sha256/u);
   assert.match(sql, /NOT EXISTS \(SELECT 1 FROM key_records remaining WHERE remaining\.principal_id=principals\.id\)/u);
@@ -267,7 +300,7 @@ test("PostgreSQL plan locks mutable dependencies and applies the same fail-close
   const manifest = fixtureManifest();
   const sql = buildSql(manifest, manifestSha256(manifest), false, "postgres", 1234);
   assert.match(sql, /^BEGIN;\nSET TRANSACTION ISOLATION LEVEL SERIALIZABLE;/u);
-  assert.match(sql, /LOCK TABLE .*request_records, usage_reservations, generation_jobs.*conversation_projection_outbox, conversation_unresolved_explicit_parents, session_routing_terminals IN SHARE ROW EXCLUSIVE MODE;/u);
+  assert.match(sql, /LOCK TABLE .*request_records, usage_reservations, generation_jobs.*conversation_projection_outbox, conversation_unresolved_explicit_parents, session_routing_terminals, synchronous_image_idempotency IN SHARE ROW EXCLUSIVE MODE;/u);
   assert.doesNotMatch(sql, /legacy_key_credentials/u);
   assert.match(sql, /target_rotation_replays expected LEFT JOIN credential_rotation_replays/u);
   assert.match(sql, /completed_at IS NULL/u);
@@ -291,6 +324,7 @@ test("SQLite dry-run fails closed on unfinished requests, reservations and gener
     ["UPDATE generation_jobs SET status='running' WHERE id='generation_jobs-0';", "UPDATE generation_jobs SET status='succeeded' WHERE id='generation_jobs-0';"],
     ["UPDATE generation_jobs SET stats_aggregated_at=NULL WHERE id='generation_jobs-0';", "UPDATE generation_jobs SET stats_aggregated_at=3000 WHERE id='generation_jobs-0';"],
     ["UPDATE conversation_projection_outbox SET projected_at=NULL WHERE request_id='00000000-0000-4000-8000-000000001200';", "UPDATE conversation_projection_outbox SET projected_at=2800 WHERE request_id='00000000-0000-4000-8000-000000001200';"],
+    ["UPDATE synchronous_image_idempotency SET lease_expires_at=9999999999999 WHERE idempotency_key='fixture-image-00';", "UPDATE synchronous_image_idempotency SET lease_expires_at=2500 WHERE idempotency_key='fixture-image-00';"],
   ];
   for (const [index, [introduce, restore]] of blockers.entries()) {
     success(run("sqlite3", [database], introduce), `introduce blocker ${index}`);
@@ -315,6 +349,8 @@ test("SQLite dry-run fails closed on reviewed child and group CAS drift", () => 
     ["UPDATE credential_groups SET name='drift' WHERE id='00000000-0000-4000-8000-000000000600';", "UPDATE credential_groups SET name='legacy-group-0' WHERE id='00000000-0000-4000-8000-000000000600';"],
     ["UPDATE route_groups SET name='drift' WHERE id='00000000-0000-4000-8000-000000000900';", "UPDATE route_groups SET name='legacy-route-group' WHERE id='00000000-0000-4000-8000-000000000900';"],
     ["UPDATE conversation_projection_outbox SET request_json='{\"fixture\":9}' WHERE request_id='00000000-0000-4000-8000-000000001200';", "UPDATE conversation_projection_outbox SET request_json='{\"fixture\":0}' WHERE request_id='00000000-0000-4000-8000-000000001200';"],
+    ["UPDATE synchronous_image_idempotency SET request_hash='drift' WHERE idempotency_key='fixture-image-00';", `UPDATE synchronous_image_idempotency SET request_hash='${manifest.synchronous_image_idempotency.find(row => row.idempotency_key === "fixture-image-00")!.request_hash}' WHERE idempotency_key='fixture-image-00';`],
+    ["UPDATE request_records SET response_object='{\"drift\":true}' WHERE id='00000000-0000-4000-8000-000000001600';", "UPDATE request_records SET response_object='{\"data\":[{\"url\":\"fixture-only-0\"}]}' WHERE id='00000000-0000-4000-8000-000000001600';"],
   ];
   for (const [index, [introduce, restore]] of drifts.entries()) {
     success(run("sqlite3", [database], introduce), `introduce drift ${index}`);
@@ -343,9 +379,11 @@ test("SQLite dry-run, approved apply and replay preserve historical facts", () =
   const applied = JSON.parse(success(run(process.execPath, toolArgs(workspace, manifestPath, applyReceipt, databaseArgs, true)), "SQLite apply"));
   assert.equal(applied.outcome, "planned");
   assert.equal(applied.conversation_projection_outbox, 7);
+  assert.equal(applied.synchronous_image_idempotency, 24);
   assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM key_records;"), "SQLite applied keys"), "1");
   assert.equal(success(run("sqlite3", [database], "SELECT status FROM key_records;"), "SQLite retained archived key"), "revoked");
   assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM credential_rotation_replays;"), "SQLite rotation replays"), "0");
+  assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM synchronous_image_idempotency;"), "SQLite synchronous replay rows"), "0");
   assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM credential_groups;"), "SQLite empty credential groups"), "0");
   assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM route_groups;"), "SQLite empty route groups"), "0");
   assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM deleted_upstream_account_snapshots;"), "SQLite applied snapshots"), "0");
@@ -378,9 +416,10 @@ test("PostgreSQL dry-run and apply enforce the same reviewed cleanup contract", 
     assert.equal(dry.mode, "dry-run");
     const applied = JSON.parse(success(run(process.execPath, toolArgs(workspace, manifestPath, join(workspace, "apply.json"), databaseArgs, true)), "PostgreSQL apply"));
     assert.equal(applied.outcome, "planned");
-    assert.equal(success(run("psql", psqlBase, "SELECT COUNT(*) FROM request_records;", environment), "PostgreSQL history"), "7");
+    assert.equal(success(run("psql", psqlBase, "SELECT COUNT(*) FROM request_records;", environment), "PostgreSQL history"), "31");
     assert.equal(success(run("psql", psqlBase, "SELECT COUNT(*) FROM key_records;", environment), "PostgreSQL keys"), "1");
     assert.equal(success(run("psql", psqlBase, "SELECT COUNT(*) FROM credential_rotation_replays;", environment), "PostgreSQL rotation replays"), "0");
+    assert.equal(success(run("psql", psqlBase, "SELECT COUNT(*) FROM synchronous_image_idempotency;", environment), "PostgreSQL synchronous replay rows"), "0");
     assert.equal(success(run("psql", psqlBase, "SELECT COUNT(*) FROM principals;", environment), "PostgreSQL dependent principals"), "7");
   } finally {
     success(run("psql", psqlBase, `DROP SCHEMA ${schema} CASCADE;`, process.env), "drop PostgreSQL schema");

@@ -21,6 +21,8 @@ The command rejects any manifest that is not exactly:
 - 16 credential routing grants and 7 credential relation revisions;
 - 170 conversation observations whose presentation metadata is rewritten by
   exact CAS;
+- 24 synchronous image idempotency rows whose replay state is removed by exact
+  CAS after their durable request and settlement facts are verified;
 - a complete, sorted description of every credential,
   rotation replay, recovery envelope, source proof, membership, and touched
   credential/route group belonging to those keys.
@@ -61,9 +63,21 @@ The command snapshots row counts for requests, events, request/generation
 stats, session rollups/archive rows, ledger entries, reservations, generation
 jobs, conversation projections/observations and routing terminals. Any direct
 or cascading count change aborts the transaction. In particular, a selected
-key with a retained synchronous-generation idempotency row cannot be deleted
+key with an unreviewed synchronous-generation idempotency row cannot be deleted
 silently. Archive import rows are scoped through the current schema's
 `target_request_id -> request_records.id -> key_id` relationship.
+
+Synchronous image idempotency rows are operational replay and lease state. The
+private manifest binds all 24 rows by key, idempotency key, request hash,
+request/reservation IDs, lifecycle fields, response byte count and response
+SHA-256. The cleanup requires every linked request to exist under the same key
+and be complete, every reservation to exist under the same key and be settled,
+and every lease to have expired. A cached successful response is removable only
+when the durable request row contains the exact same response bytes. The tool
+then deletes the reviewed replay rows explicitly before deleting the archived
+keys; the foreign-key cascade has no remaining row to remove. Request records,
+reservations, ledger data, archive rows and conversation facts remain covered by
+the before/after invariants.
 
 Deletion also fails closed while any selected key has an incomplete request, a
 reservation whose status is not `settled`, a non-terminal generation job, or a
@@ -82,7 +96,7 @@ this intentionally invalid as an executable manifest.
 
 ```json
 {
-  "schema_version": 4,
+  "schema_version": 5,
   "idempotency_key": "owner-approved-operation-key",
   "tenant_external_id": "reviewed-tenant",
   "expected": {
@@ -90,7 +104,8 @@ this intentionally invalid as an executable manifest.
     "key_records": 7,
     "routing_grants": 16,
     "routing_revisions": 7,
-    "conversation_observations": 170
+    "conversation_observations": 170,
+    "synchronous_image_idempotency": 24
   },
   "snapshots": [
     {
@@ -170,6 +185,24 @@ this intentionally invalid as an executable manifest.
       "labels_json": "{\"alias\":\"reviewed-old-value\"}",
       "replacement_session_name": null,
       "replacement_labels_json": "{\"state\":\"retired\"}"
+    }
+  ],
+  "synchronous_image_idempotency": [
+    {
+      "key_id": "00000000-0000-4000-8000-000000000101",
+      "idempotency_key": "reviewed-private-idempotency-key",
+      "request_hash": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "request_id": "00000000-0000-4000-8000-000000000801",
+      "reservation_id": "00000000-0000-4000-8000-000000000901",
+      "status": "completed",
+      "response_status": 200,
+      "response_object_present": true,
+      "response_object_bytes": 2,
+      "response_object_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "error_code": null,
+      "created_at": 1,
+      "lease_expires_at": 2,
+      "completed_at": 3
     }
   ]
 }

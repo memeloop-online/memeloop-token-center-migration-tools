@@ -41,7 +41,7 @@
 - 已导入客户凭据的加密 recovery envelope 回填：只接受受保护的、明确的目标 identity→原始 key 映射，默认 dry-run，并且只调用固定 private control `PUT` endpoint；操作边界见 [`docs/operations/credential-recovery-backfill.md`](docs/operations/credential-recovery-backfill.md)。
 - Provider-exact 策略输入生成器在已审核的原生路由回放后，交叉校验完整源策略、源清单、原生候选池、路由清单和目标路由回执，再生成待复核的路由清单/策略映射；它不写目标 API，也不会把任何源密钥散列写入输出。
 - 活跃迁移主键到目标正式余额不受限策略的查询、原子 CAS 迁移和计数/摘要收据。
-- 已退役 API2 trial 对象的精确生产清理：固定 17 个快照、7 个归档凭据、16 条授权、7 条修订和 170 条会话观测，采用完整 CAS、默认事务回滚 dry-run、摘要审批、幂等回执与历史事实不变式；见 [`docs/operations/retired-api2-trial-purge.md`](docs/operations/retired-api2-trial-purge.md)。
+- 已退役 API2 trial 对象的精确生产清理：固定 17 个快照、7 个归档凭据、16 条授权、7 条修订、170 条会话观测和 24 条同步生图重放状态，采用完整 CAS、默认事务回滚 dry-run、摘要审批、幂等回执与历史事实不变式；见 [`docs/operations/retired-api2-trial-purge.md`](docs/operations/retired-api2-trial-purge.md)。
 - 对应的 TypeScript 契约测试与完全合成 fixtures。
 - CPA archive SQLite 一致性封存命令：online backup、`quick_check`、汇总计数、ingest fence、fsync、SHA-256 与 no-replace 原子发布；提取来源见 [`cmd/cpa-session-archive-backup/SOURCE.md`](cmd/cpa-session-archive-backup/SOURCE.md)。
 

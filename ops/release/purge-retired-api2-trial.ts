@@ -23,6 +23,7 @@ const EXPECTED_KEY_COUNT = 7;
 const EXPECTED_ROUTING_GRANT_COUNT = 16;
 const EXPECTED_ROUTING_REVISION_COUNT = 7;
 const EXPECTED_CONVERSATION_OBSERVATION_COUNT = 170;
+const EXPECTED_SYNCHRONOUS_IMAGE_IDEMPOTENCY_COUNT = 24;
 const MAX_MANIFEST_BYTES = 1024 * 1024;
 
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
@@ -149,8 +150,25 @@ export interface ReviewedConversationProjection {
   projected_at: number | null;
 }
 
+export interface ReviewedSynchronousImageIdempotency {
+  key_id: string;
+  idempotency_key: string;
+  request_hash: string;
+  request_id: string;
+  reservation_id: string;
+  status: "pending" | "completed" | "failed";
+  response_status: number | null;
+  response_object_present: boolean;
+  response_object_bytes: number;
+  response_object_sha256: string | null;
+  error_code: string | null;
+  created_at: number;
+  lease_expires_at: number;
+  completed_at: number | null;
+}
+
 export interface ReviewedManifest {
-  schema_version: 4;
+  schema_version: 5;
   idempotency_key: string;
   tenant_external_id: string;
   expected: {
@@ -159,6 +177,7 @@ export interface ReviewedManifest {
     routing_grants: 16;
     routing_revisions: 7;
     conversation_observations: 170;
+    synchronous_image_idempotency: 24;
   };
   snapshots: ReviewedSnapshot[];
   keys: ReviewedKey[];
@@ -166,6 +185,7 @@ export interface ReviewedManifest {
   route_groups: ReviewedGroup[];
   conversation_projection_outbox: ReviewedConversationProjection[];
   conversation_rewrites: ConversationRewrite[];
+  synchronous_image_idempotency: ReviewedSynchronousImageIdempotency[];
 }
 
 interface Options {
@@ -350,6 +370,42 @@ function parseConversationProjection(value: Json, index: number): ReviewedConver
   };
 }
 
+function parseSynchronousImageIdempotency(value: Json, index: number): ReviewedSynchronousImageIdempotency {
+  const label = `synchronous_image_idempotency[${index}]`;
+  const item = object(value, label);
+  exactKeys(item, ["key_id", "idempotency_key", "request_hash", "request_id", "reservation_id", "status", "response_status", "response_object_present", "response_object_bytes", "response_object_sha256", "error_code", "created_at", "lease_expires_at", "completed_at"], label);
+  const requestHash = text(item.request_hash, `${label}.request_hash`, 64);
+  const responseDigest = nullableText(item.response_object_sha256, `${label}.response_object_sha256`, 64);
+  if (!SHA256.test(requestHash) || (responseDigest !== null && !SHA256.test(responseDigest))) fail("manifest_invalid", `${label} payload digests must be lowercase SHA-256`);
+  const status = text(item.status, `${label}.status`, 16);
+  if (status !== "pending" && status !== "completed" && status !== "failed") fail("manifest_invalid", `${label}.status is unsupported`);
+  const responsePresent = bool(item.response_object_present, `${label}.response_object_present`);
+  const responseBytes = integer(item.response_object_bytes, `${label}.response_object_bytes`);
+  const responseStatus = nullableInteger(item.response_status, `${label}.response_status`);
+  const errorCode = nullableText(item.error_code, `${label}.error_code`, 256);
+  const completedAt = nullableInteger(item.completed_at, `${label}.completed_at`);
+  if (responsePresent !== (responseDigest !== null) || responsePresent !== (responseBytes > 0)) fail("manifest_invalid", `${label} response digest and size do not match presence`);
+  if (status === "completed" && (!responsePresent || responseStatus === null || errorCode !== null || completedAt === null)) fail("manifest_invalid", `${label} completed row shape is invalid`);
+  if (status === "failed" && (responsePresent || responseStatus === null || errorCode === null || completedAt === null)) fail("manifest_invalid", `${label} failed row shape is invalid`);
+  if (status === "pending" && (responsePresent || responseStatus !== null || errorCode !== null || completedAt !== null)) fail("manifest_invalid", `${label} pending row shape is invalid`);
+  return {
+    key_id: uuid(item.key_id, `${label}.key_id`),
+    idempotency_key: text(item.idempotency_key, `${label}.idempotency_key`, 256),
+    request_hash: requestHash,
+    request_id: uuid(item.request_id, `${label}.request_id`),
+    reservation_id: uuid(item.reservation_id, `${label}.reservation_id`),
+    status,
+    response_status: responseStatus,
+    response_object_present: responsePresent,
+    response_object_bytes: responseBytes,
+    response_object_sha256: responseDigest,
+    error_code: errorCode,
+    created_at: integer(item.created_at, `${label}.created_at`),
+    lease_expires_at: integer(item.lease_expires_at, `${label}.lease_expires_at`),
+    completed_at: completedAt,
+  };
+}
+
 function array(value: Json | undefined, label: string, max = 500): Json[] {
   if (!Array.isArray(value) || value.length > max) fail("manifest_invalid", `${label} must be a bounded array`);
   return value;
@@ -422,13 +478,13 @@ function parseRewrite(value: Json, index: number): ConversationRewrite {
 
 export function parseManifest(value: Json): ReviewedManifest {
   const root = object(value, "manifest");
-  exactKeys(root, ["schema_version", "idempotency_key", "tenant_external_id", "expected", "snapshots", "keys", "credential_groups", "route_groups", "conversation_projection_outbox", "conversation_rewrites"], "manifest");
-  if (root.schema_version !== 4) fail("manifest_invalid", "unsupported manifest schema_version");
+  exactKeys(root, ["schema_version", "idempotency_key", "tenant_external_id", "expected", "snapshots", "keys", "credential_groups", "route_groups", "conversation_projection_outbox", "conversation_rewrites", "synchronous_image_idempotency"], "manifest");
+  if (root.schema_version !== 5) fail("manifest_invalid", "unsupported manifest schema_version");
   const idempotencyKey = text(root.idempotency_key, "idempotency_key", 128);
   if (!IDEMPOTENCY_KEY.test(idempotencyKey)) fail("manifest_invalid", "idempotency_key has an unsupported format");
   const expected = object(root.expected, "expected");
-  exactKeys(expected, ["deleted_upstream_account_snapshots", "key_records", "routing_grants", "routing_revisions", "conversation_observations"], "expected");
-  if (expected.deleted_upstream_account_snapshots !== EXPECTED_SNAPSHOT_COUNT || expected.key_records !== EXPECTED_KEY_COUNT || expected.routing_grants !== EXPECTED_ROUTING_GRANT_COUNT || expected.routing_revisions !== EXPECTED_ROUTING_REVISION_COUNT || expected.conversation_observations !== EXPECTED_CONVERSATION_OBSERVATION_COUNT) fail("manifest_invalid", "manifest exact counts are not the approved 17 snapshots / 7 keys / 16 grants / 7 revisions / 170 observations cohort");
+  exactKeys(expected, ["deleted_upstream_account_snapshots", "key_records", "routing_grants", "routing_revisions", "conversation_observations", "synchronous_image_idempotency"], "expected");
+  if (expected.deleted_upstream_account_snapshots !== EXPECTED_SNAPSHOT_COUNT || expected.key_records !== EXPECTED_KEY_COUNT || expected.routing_grants !== EXPECTED_ROUTING_GRANT_COUNT || expected.routing_revisions !== EXPECTED_ROUTING_REVISION_COUNT || expected.conversation_observations !== EXPECTED_CONVERSATION_OBSERVATION_COUNT || expected.synchronous_image_idempotency !== EXPECTED_SYNCHRONOUS_IMAGE_IDEMPOTENCY_COUNT) fail("manifest_invalid", "manifest exact counts are not the approved 17 snapshots / 7 keys / 16 grants / 7 revisions / 170 observations / 24 synchronous image replay rows cohort");
   const snapshots = array(root.snapshots, "snapshots", EXPECTED_SNAPSHOT_COUNT).map((entry, index) => {
     const label = `snapshots[${index}]`;
     const item = object(entry, label);
@@ -450,32 +506,36 @@ export function parseManifest(value: Json): ReviewedManifest {
   const routeGroups = array(root.route_groups, "route_groups", 500).map((entry, index) => parseGroup(entry, `route_groups[${index}]`));
   const conversationProjections = array(root.conversation_projection_outbox, "conversation_projection_outbox", 500).map(parseConversationProjection);
   const rewrites = array(root.conversation_rewrites, "conversation_rewrites", 500).map(parseRewrite);
-  if (snapshots.length !== EXPECTED_SNAPSHOT_COUNT || keys.length !== EXPECTED_KEY_COUNT || rewrites.length !== EXPECTED_CONVERSATION_OBSERVATION_COUNT) fail("manifest_invalid", "manifest object counts do not match the approved cohort");
+  const synchronousImageIdempotency = array(root.synchronous_image_idempotency, "synchronous_image_idempotency", EXPECTED_SYNCHRONOUS_IMAGE_IDEMPOTENCY_COUNT).map(parseSynchronousImageIdempotency);
+  if (snapshots.length !== EXPECTED_SNAPSHOT_COUNT || keys.length !== EXPECTED_KEY_COUNT || rewrites.length !== EXPECTED_CONVERSATION_OBSERVATION_COUNT || synchronousImageIdempotency.length !== EXPECTED_SYNCHRONOUS_IMAGE_IDEMPOTENCY_COUNT) fail("manifest_invalid", "manifest object counts do not match the approved cohort");
   sortedUnique(snapshots, entry => entry.upstream_account_id, "snapshots");
   sortedUnique(keys, entry => entry.key_id, "keys");
   sortedUnique(credentialGroups, entry => entry.id, "credential_groups");
   sortedUnique(routeGroups, entry => entry.id, "route_groups");
   sortedUnique(conversationProjections, entry => entry.request_id, "conversation_projection_outbox");
   sortedUnique(rewrites, entry => entry.observation_id, "conversation_rewrites");
+  sortedUnique(synchronousImageIdempotency, entry => `${entry.key_id}:${entry.idempotency_key}`, "synchronous_image_idempotency");
   const keyIds = new Set(keys.map(entry => entry.key_id));
   if (rewrites.some(entry => !keyIds.has(entry.key_id))) fail("manifest_invalid", "conversation rewrites must belong to reviewed keys");
   if (conversationProjections.some(entry => !keyIds.has(entry.key_id))) fail("manifest_invalid", "conversation projection rows must belong to reviewed keys");
+  if (synchronousImageIdempotency.some(entry => !keyIds.has(entry.key_id))) fail("manifest_invalid", "synchronous image replay rows must belong to reviewed keys");
   if (credentialGroups.some(group => !keys.some(key => key.credential_group_memberships.some(member => member.credential_group_id === group.id)))) fail("manifest_invalid", "credential groups must be referenced by the reviewed cohort");
   if (routeGroups.some(group => !keys.some(key => key.routing_grants.some(grant => grant.route_group_id === group.id)))) fail("manifest_invalid", "route groups must be referenced by the reviewed cohort");
   const grantCount = keys.reduce((count, key) => count + key.routing_grants.length, 0);
   if (grantCount !== EXPECTED_ROUTING_GRANT_COUNT) fail("manifest_invalid", "routing grant count is not exactly 16");
   if (keys.length !== EXPECTED_ROUTING_REVISION_COUNT) fail("manifest_invalid", "routing revision count is not exactly 7");
   return {
-    schema_version: 4,
+    schema_version: 5,
     idempotency_key: idempotencyKey,
     tenant_external_id: text(root.tenant_external_id, "tenant_external_id", 200),
-    expected: { deleted_upstream_account_snapshots: 17, key_records: 7, routing_grants: 16, routing_revisions: 7, conversation_observations: 170 },
+    expected: { deleted_upstream_account_snapshots: 17, key_records: 7, routing_grants: 16, routing_revisions: 7, conversation_observations: 170, synchronous_image_idempotency: 24 },
     snapshots,
     keys,
     credential_groups: credentialGroups,
     route_groups: routeGroups,
     conversation_projection_outbox: conversationProjections,
     conversation_rewrites: rewrites,
+    synchronous_image_idempotency: synchronousImageIdempotency,
   };
 }
 
@@ -505,7 +565,6 @@ const protectedTables = [
   "key_credential_recovery_access_audit", "conversation_observations",
   "conversation_key_clusters", "conversation_projection_outbox",
   "conversation_unresolved_explicit_parents", "session_routing_terminals",
-  "synchronous_image_idempotency",
 ] as const;
 
 function protectedCount(table: typeof protectedTables[number]): string {
@@ -531,22 +590,29 @@ export function buildSql(manifest: ReviewedManifest, digest: string, apply: bool
   const revisionRows = manifest.keys.map(key => [sqlText(key.key_id), String(key.routing_revision.revision)]);
   const rewriteRows = manifest.conversation_rewrites.map(rewrite => [sqlText(rewrite.observation_id), sqlText(rewrite.key_id), sqlText(rewrite.session_name), sqlText(rewrite.labels_json), sqlNullable(rewrite.replacement_session_name), sqlText(rewrite.replacement_labels_json)]);
   const conversationProjectionRows = manifest.conversation_projection_outbox.map(row => [sqlText(row.request_id), sqlText(row.tenant_id), sqlText(row.key_id), sqlText(row.principal_id), String(row.request_json_bytes), String(row.hints_json_bytes), sqlText(row.request_json_sha256), sqlText(row.hints_json_sha256), sqlNullable(row.client_name), sqlNullable(row.upstream_response_id), String(row.observed_at), sqlNullable(row.lease_owner), sqlNullableInteger(row.lease_expires_at), String(row.attempts), sqlNullableInteger(row.projected_at)]);
+  const synchronousImageRows = manifest.synchronous_image_idempotency.map(row => [sqlText(row.key_id), sqlText(row.idempotency_key), sqlText(row.request_hash), sqlText(row.request_id), sqlText(row.reservation_id), sqlText(row.status), sqlNullableInteger(row.response_status), sqlBool(row.response_object_present), String(row.response_object_bytes), sqlNullable(row.response_object_sha256), sqlNullable(row.error_code), String(row.created_at), String(row.lease_expires_at), sqlNullableInteger(row.completed_at)]);
   const credentialGroupRows = manifest.credential_groups.map(group => [sqlText(group.id), sqlText(group.tenant_id), sqlText(group.name), sqlText(group.normalized_name), String(group.created_at), String(group.updated_at)]);
   const routeGroupRows = manifest.route_groups.map(group => [sqlText(group.id), sqlText(group.tenant_id), sqlText(group.name), sqlText(group.normalized_name), String(group.created_at), String(group.updated_at)]);
   const values = (rows: string[][], fallback: string[]) => rows.length === 0 ? `SELECT ${fallback.join(",")} WHERE 0` : `VALUES ${tuples(rows)}`;
   const begin = backend === "sqlite" ? "BEGIN IMMEDIATE;" : "BEGIN;\nSET TRANSACTION ISOLATION LEVEL SERIALIZABLE;";
-  const lock = backend === "postgres" ? "LOCK TABLE deleted_upstream_account_snapshots, key_records, key_credentials, credential_rotation_replays, key_credential_recovery_secrets, key_credential_source_proofs, credential_groups, credential_group_memberships, route_groups, model_route_group_memberships, routing_grants, routing_grant_relation_revisions, principals, credit_accounts, request_records, usage_reservations, generation_jobs, conversation_clusters, session_archive_correlations, session_archive_unlinked_requests, memeloop_cloud_subscription_events, conversation_observations, conversation_projection_outbox, conversation_unresolved_explicit_parents, session_routing_terminals IN SHARE ROW EXCLUSIVE MODE;" : "";
+  const lock = backend === "postgres" ? "LOCK TABLE deleted_upstream_account_snapshots, key_records, key_credentials, credential_rotation_replays, key_credential_recovery_secrets, key_credential_source_proofs, credential_groups, credential_group_memberships, route_groups, model_route_group_memberships, routing_grants, routing_grant_relation_revisions, principals, credit_accounts, request_records, usage_reservations, generation_jobs, conversation_clusters, session_archive_correlations, session_archive_unlinked_requests, memeloop_cloud_subscription_events, conversation_observations, conversation_projection_outbox, conversation_unresolved_explicit_parents, session_routing_terminals, synchronous_image_idempotency IN SHARE ROW EXCLUSIVE MODE;" : "";
   const octetLength = (expression: string): string => backend === "postgres" ? `OCTET_LENGTH(${expression})` : `LENGTH(CAST(${expression} AS BLOB))`;
   const projectionPayloadCas = backend === "postgres"
     ? "LOWER(ENCODE(SHA256(CONVERT_TO(actual.request_json,'UTF8')),'hex'))<>expected.request_json_sha256 OR LOWER(ENCODE(SHA256(CONVERT_TO(actual.hints_json,'UTF8')),'hex'))<>expected.hints_json_sha256"
     : "SHA256_TEXT(actual.request_json)<>expected.request_json_sha256 OR SHA256_TEXT(actual.hints_json)<>expected.hints_json_sha256";
+  const synchronousResponseDigest = backend === "postgres"
+    ? "CASE WHEN actual.response_object IS NULL THEN '' ELSE LOWER(ENCODE(SHA256(CONVERT_TO(actual.response_object,'UTF8')),'hex')) END"
+    : "CASE WHEN actual.response_object IS NULL THEN '' ELSE SHA256_TEXT(actual.response_object) END";
+  const requestResponseDigest = backend === "postgres"
+    ? "CASE WHEN request_row.response_object IS NULL THEN '' ELSE LOWER(ENCODE(SHA256(CONVERT_TO(request_row.response_object,'UTF8')),'hex')) END"
+    : "CASE WHEN request_row.response_object IS NULL THEN '' ELSE SHA256_TEXT(request_row.response_object) END";
   const replay = `EXISTS (SELECT 1 FROM migration_tool_operation_receipts WHERE idempotency_key=${sqlText(manifest.idempotency_key)})`;
   const fresh = "(SELECT initial_replay FROM operation_state)=0";
   const protectedBefore = protectedTables.map(table => `INSERT INTO protected_counts(table_name,before_count) VALUES (${sqlText(table)},${protectedCount(table)});`).join("\n");
   const protectedAfter = protectedTables.map(table => assertion(`(SELECT before_count FROM protected_counts WHERE table_name=${sqlText(table)})<>${protectedCount(table)}`)).join("\n");
   const outcome = "CASE WHEN (SELECT initial_replay FROM operation_state)=1 THEN 'replay' ELSE 'planned' END";
   const eligiblePrincipals = "(SELECT COUNT(DISTINCT principal_id) FROM target_keys WHERE NOT EXISTS (SELECT 1 FROM key_records remaining WHERE remaining.principal_id=target_keys.principal_id) AND NOT EXISTS (SELECT 1 FROM credit_accounts remaining WHERE remaining.principal_id=target_keys.principal_id) AND NOT EXISTS (SELECT 1 FROM conversation_clusters remaining WHERE remaining.principal_id=target_keys.principal_id) AND NOT EXISTS (SELECT 1 FROM session_archive_correlations remaining WHERE remaining.principal_id=target_keys.principal_id) AND NOT EXISTS (SELECT 1 FROM session_archive_unlinked_requests remaining WHERE remaining.principal_id=target_keys.principal_id) AND NOT EXISTS (SELECT 1 FROM memeloop_cloud_subscription_events remaining WHERE remaining.principal_id=target_keys.principal_id) AND NOT EXISTS (SELECT 1 FROM conversation_unresolved_explicit_parents remaining WHERE remaining.principal_id=target_keys.principal_id) AND NOT EXISTS (SELECT 1 FROM session_routing_terminals remaining WHERE remaining.principal_id=target_keys.principal_id))";
-  const summaryValues = `${outcome},${EXPECTED_SNAPSHOT_COUNT},${EXPECTED_KEY_COUNT},${EXPECTED_ROUTING_GRANT_COUNT},${EXPECTED_ROUTING_REVISION_COUNT},${rotationReplayRows.length},${credentialGroupRows.length},${routeGroupRows.length},${conversationProjectionRows.length},${manifest.conversation_rewrites.length},${eligiblePrincipals}`;
+  const summaryValues = `${outcome},${EXPECTED_SNAPSHOT_COUNT},${EXPECTED_KEY_COUNT},${EXPECTED_ROUTING_GRANT_COUNT},${EXPECTED_ROUTING_REVISION_COUNT},${EXPECTED_SYNCHRONOUS_IMAGE_IDEMPOTENCY_COUNT},${rotationReplayRows.length},${credentialGroupRows.length},${routeGroupRows.length},${conversationProjectionRows.length},${manifest.conversation_rewrites.length},${eligiblePrincipals}`;
   const summaryStatement = backend === "sqlite" ? `SELECT CAPTURE_PURGE_SUMMARY(${summaryValues});` : `SELECT ${summaryValues};`;
   return `${begin}
 ${lock}
@@ -582,15 +648,18 @@ CREATE TEMP TABLE target_rewrites(observation_id TEXT PRIMARY KEY,key_id TEXT NO
 INSERT INTO target_rewrites ${values(rewriteRows, ["''", "''", "''", "''", "NULL", "''"])};
 CREATE TEMP TABLE target_conversation_projections(request_id TEXT PRIMARY KEY,tenant_id TEXT NOT NULL,key_id TEXT NOT NULL,principal_id TEXT NOT NULL,request_json_bytes BIGINT NOT NULL,hints_json_bytes BIGINT NOT NULL,request_json_sha256 TEXT NOT NULL,hints_json_sha256 TEXT NOT NULL,client_name TEXT,upstream_response_id TEXT,observed_at BIGINT NOT NULL,lease_owner TEXT,lease_expires_at BIGINT,attempts BIGINT NOT NULL,projected_at BIGINT);
 INSERT INTO target_conversation_projections ${values(conversationProjectionRows, ["''", "''", "''", "''", "0", "0", "''", "''", "NULL", "NULL", "0", "NULL", "NULL", "0", "NULL"])};
+CREATE TEMP TABLE target_synchronous_image_idempotency(key_id TEXT NOT NULL,idempotency_key TEXT NOT NULL,request_hash TEXT NOT NULL,request_id TEXT NOT NULL,reservation_id TEXT NOT NULL,status TEXT NOT NULL,response_status BIGINT,response_object_present BIGINT NOT NULL,response_object_bytes BIGINT NOT NULL,response_object_sha256 TEXT,error_code TEXT,created_at BIGINT NOT NULL,lease_expires_at BIGINT NOT NULL,completed_at BIGINT,PRIMARY KEY(key_id,idempotency_key));
+INSERT INTO target_synchronous_image_idempotency ${values(synchronousImageRows, ["''", "''", "''", "''", "''", "''", "NULL", "0", "0", "NULL", "NULL", "0", "0", "NULL"])};
 CREATE TEMP TABLE target_credential_groups(id TEXT PRIMARY KEY,tenant_id TEXT NOT NULL,name TEXT NOT NULL,normalized_name TEXT NOT NULL,created_at BIGINT NOT NULL,updated_at BIGINT NOT NULL);
 INSERT INTO target_credential_groups ${values(credentialGroupRows, ["''", "''", "''", "''", "0", "0"])};
 CREATE TEMP TABLE target_route_groups(id TEXT PRIMARY KEY,tenant_id TEXT NOT NULL,name TEXT NOT NULL,normalized_name TEXT NOT NULL,created_at BIGINT NOT NULL,updated_at BIGINT NOT NULL);
 INSERT INTO target_route_groups ${values(routeGroupRows, ["''", "''", "''", "''", "0", "0"])};
-${assertion(`EXISTS (SELECT 1 FROM migration_tool_operation_receipts WHERE idempotency_key=${sqlText(manifest.idempotency_key)} AND (operation_kind<>'retired-api2-trial-purge-v4' OR manifest_sha256<>${sqlText(digest)}))`)}
+${assertion(`EXISTS (SELECT 1 FROM migration_tool_operation_receipts WHERE idempotency_key=${sqlText(manifest.idempotency_key)} AND (operation_kind<>'retired-api2-trial-purge-v5' OR manifest_sha256<>${sqlText(digest)}))`)}
 ${assertion(`${fresh} AND (SELECT COUNT(*) FROM target_snapshots)<>${EXPECTED_SNAPSHOT_COUNT}`)}
 ${assertion(`${fresh} AND (SELECT COUNT(*) FROM target_keys)<>${EXPECTED_KEY_COUNT}`)}
 ${assertion(`${fresh} AND (SELECT COUNT(*) FROM target_grants)<>${EXPECTED_ROUTING_GRANT_COUNT}`)}
 ${assertion(`${fresh} AND (SELECT COUNT(*) FROM target_revisions)<>${EXPECTED_ROUTING_REVISION_COUNT}`)}
+${assertion(`${fresh} AND (SELECT COUNT(*) FROM target_synchronous_image_idempotency)<>${EXPECTED_SYNCHRONOUS_IMAGE_IDEMPOTENCY_COUNT}`)}
 ${assertion(`${fresh} AND (SELECT COUNT(*) FROM tenants WHERE external_id=${sqlText(manifest.tenant_external_id)})<>1`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM target_snapshots expected LEFT JOIN deleted_upstream_account_snapshots actual ON actual.upstream_account_id=expected.upstream_account_id WHERE actual.upstream_account_id IS NULL OR actual.tenant_id<>(SELECT id FROM tenants WHERE external_id=${sqlText(manifest.tenant_external_id)}) OR actual.name<>expected.name OR actual.driver<>expected.driver OR actual.auth_kind<>expected.auth_kind OR actual.credential_generation<>expected.credential_generation OR actual.created_at<>expected.created_at OR actual.deleted_at<>expected.deleted_at)`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM deleted_upstream_account_snapshots actual JOIN tenants tenant ON tenant.id=actual.tenant_id WHERE tenant.external_id=${sqlText(manifest.tenant_external_id)} AND (actual.name LIKE 'legacy-cpa-bridge-%' OR actual.name LIKE 'cpa-%') AND NOT EXISTS (SELECT 1 FROM target_snapshots expected WHERE expected.upstream_account_id=actual.upstream_account_id))`)}
@@ -622,6 +691,12 @@ ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM target_rewrites expected LEFT JO
 ${assertion(`${fresh} AND (SELECT COUNT(*) FROM conversation_projection_outbox actual WHERE actual.key_id IN (SELECT key_id FROM target_keys))<>(SELECT COUNT(*) FROM target_conversation_projections)`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM target_conversation_projections expected LEFT JOIN conversation_projection_outbox actual ON actual.request_id=expected.request_id WHERE actual.request_id IS NULL OR actual.tenant_id<>expected.tenant_id OR actual.key_id<>expected.key_id OR actual.principal_id<>expected.principal_id OR ${octetLength("actual.request_json")}<>expected.request_json_bytes OR ${octetLength("actual.hints_json")}<>expected.hints_json_bytes OR ${projectionPayloadCas} OR COALESCE(actual.client_name,'')<>COALESCE(expected.client_name,'') OR COALESCE(actual.upstream_response_id,'')<>COALESCE(expected.upstream_response_id,'') OR actual.observed_at<>expected.observed_at OR COALESCE(actual.lease_owner,'')<>COALESCE(expected.lease_owner,'') OR COALESCE(actual.lease_expires_at,-1)<>COALESCE(expected.lease_expires_at,-1) OR actual.attempts<>expected.attempts OR COALESCE(actual.projected_at,-1)<>COALESCE(expected.projected_at,-1))`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM conversation_projection_outbox WHERE key_id IN (SELECT key_id FROM target_keys) AND projected_at IS NULL)`)}
+${assertion(`${fresh} AND (SELECT COUNT(*) FROM synchronous_image_idempotency actual WHERE actual.key_id IN (SELECT key_id FROM target_keys))<>(SELECT COUNT(*) FROM target_synchronous_image_idempotency)`)}
+${assertion(`${fresh} AND EXISTS (SELECT 1 FROM target_synchronous_image_idempotency expected LEFT JOIN synchronous_image_idempotency actual ON actual.key_id=expected.key_id AND actual.idempotency_key=expected.idempotency_key WHERE actual.key_id IS NULL OR actual.request_hash<>expected.request_hash OR actual.request_id<>expected.request_id OR COALESCE(actual.reservation_id,'')<>expected.reservation_id OR actual.status<>expected.status OR COALESCE(actual.response_status,-1)<>COALESCE(expected.response_status,-1) OR CASE WHEN actual.response_object IS NULL THEN 0 ELSE 1 END<>expected.response_object_present OR (expected.response_object_present=1 AND (${octetLength("actual.response_object")}<>expected.response_object_bytes OR ${synchronousResponseDigest}<>expected.response_object_sha256)) OR COALESCE(actual.error_code,'')<>COALESCE(expected.error_code,'') OR actual.created_at<>expected.created_at OR actual.lease_expires_at<>expected.lease_expires_at OR COALESCE(actual.completed_at,-1)<>COALESCE(expected.completed_at,-1))`)}
+${assertion(`${fresh} AND EXISTS (SELECT 1 FROM synchronous_image_idempotency actual JOIN target_synchronous_image_idempotency expected ON expected.key_id=actual.key_id AND expected.idempotency_key=actual.idempotency_key WHERE actual.lease_expires_at>${now})`)}
+${assertion(`${fresh} AND EXISTS (SELECT 1 FROM target_synchronous_image_idempotency expected LEFT JOIN request_records request_row ON request_row.id=expected.request_id WHERE request_row.id IS NULL OR request_row.key_id<>expected.key_id OR request_row.completed_at IS NULL)`)}
+${assertion(`${fresh} AND EXISTS (SELECT 1 FROM target_synchronous_image_idempotency expected LEFT JOIN usage_reservations reservation ON reservation.id=expected.reservation_id WHERE reservation.id IS NULL OR reservation.key_id<>expected.key_id OR reservation.status<>'settled')`)}
+${assertion(`${fresh} AND EXISTS (SELECT 1 FROM target_synchronous_image_idempotency expected JOIN request_records request_row ON request_row.id=expected.request_id WHERE expected.response_object_present=1 AND (request_row.response_object IS NULL OR ${octetLength("request_row.response_object")}<>expected.response_object_bytes OR ${requestResponseDigest}<>expected.response_object_sha256))`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM request_records WHERE key_id IN (SELECT key_id FROM target_keys) AND completed_at IS NULL)`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM usage_reservations WHERE key_id IN (SELECT key_id FROM target_keys) AND (status IS NULL OR status<>'settled'))`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM generation_jobs WHERE key_id IN (SELECT key_id FROM target_keys) AND (status IS NULL OR status NOT IN ('succeeded','failed','cancelled') OR stats_aggregated_at IS NULL))`)}
@@ -639,6 +714,7 @@ DELETE FROM credential_group_memberships WHERE key_id IN (SELECT key_id FROM tar
 DELETE FROM routing_grants WHERE key_id IN (SELECT key_id FROM target_keys) AND ${fresh};
 DELETE FROM routing_grant_relation_revisions WHERE subject_kind='credential' AND key_id IN (SELECT key_id FROM target_keys) AND ${fresh};
 DELETE FROM credential_rotation_replays WHERE idempotency_key IN (SELECT idempotency_key FROM target_rotation_replays) AND ${fresh};
+DELETE FROM synchronous_image_idempotency WHERE (key_id,idempotency_key) IN (SELECT key_id,idempotency_key FROM target_synchronous_image_idempotency) AND ${fresh};
 DELETE FROM key_credentials WHERE id IN (SELECT credential_id FROM target_credentials) AND ${fresh};
 DELETE FROM key_records WHERE id IN (SELECT key_id FROM target_keys) AND ${fresh};
 DELETE FROM credential_groups WHERE id IN (SELECT id FROM target_credential_groups) AND NOT EXISTS (SELECT 1 FROM credential_group_memberships remaining WHERE remaining.credential_group_id=credential_groups.id) AND ${fresh};
@@ -657,15 +733,16 @@ ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM deleted_upstream_account_snapsho
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM key_records WHERE id IN (SELECT key_id FROM target_keys))`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM key_credentials WHERE id IN (SELECT credential_id FROM target_credentials))`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM credential_rotation_replays WHERE idempotency_key IN (SELECT idempotency_key FROM target_rotation_replays))`)}
+${assertion(`${fresh} AND EXISTS (SELECT 1 FROM synchronous_image_idempotency WHERE (key_id,idempotency_key) IN (SELECT key_id,idempotency_key FROM target_synchronous_image_idempotency))`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM credential_groups WHERE id IN (SELECT id FROM target_credential_groups) AND NOT EXISTS (SELECT 1 FROM credential_group_memberships remaining WHERE remaining.credential_group_id=credential_groups.id))`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM route_groups WHERE id IN (SELECT id FROM target_route_groups) AND NOT EXISTS (SELECT 1 FROM routing_grants remaining WHERE remaining.route_group_id=route_groups.id) AND NOT EXISTS (SELECT 1 FROM model_route_group_memberships remaining WHERE remaining.route_group_id=route_groups.id))`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM conversation_observations actual JOIN target_rewrites expected ON expected.observation_id=actual.id WHERE COALESCE(actual.session_name,'')<>COALESCE(expected.replacement_session_name,'') OR actual.labels_json<>expected.replacement_labels_json)`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM conversation_observations actual WHERE actual.key_id IN (SELECT key_id FROM target_keys) AND (LOWER(COALESCE(actual.session_name,'')) LIKE '%api2%' OR LOWER(COALESCE(actual.session_name,'')) LIKE '%legacy-cpa-bridge%' OR LOWER(COALESCE(actual.session_name,'')) LIKE '%cpa-%' OR LOWER(COALESCE(actual.session_name,'')) LIKE '%bridge%' OR LOWER(actual.labels_json) LIKE '%api2%' OR LOWER(actual.labels_json) LIKE '%legacy-cpa-bridge%' OR LOWER(actual.labels_json) LIKE '%cpa-%' OR LOWER(actual.labels_json) LIKE '%bridge%'))`)}
 ${protectedAfter}
 INSERT INTO migration_tool_operation_receipts(idempotency_key,operation_kind,manifest_sha256,applied_at,summary_json)
-SELECT ${sqlText(manifest.idempotency_key)},'retired-api2-trial-purge-v4',${sqlText(digest)},${now},${sqlText(JSON.stringify({ deleted_upstream_account_snapshots: 17, key_records: 7, routing_grants: 16, routing_revisions: 7, credential_rotation_replays: rotationReplayRows.length, credential_groups: credentialGroupRows.length, route_groups: routeGroupRows.length, conversation_projection_outbox: conversationProjectionRows.length, conversation_rewrites: manifest.conversation_rewrites.length }))}
+SELECT ${sqlText(manifest.idempotency_key)},'retired-api2-trial-purge-v5',${sqlText(digest)},${now},${sqlText(JSON.stringify({ deleted_upstream_account_snapshots: 17, key_records: 7, routing_grants: 16, routing_revisions: 7, synchronous_image_idempotency: 24, credential_rotation_replays: rotationReplayRows.length, credential_groups: credentialGroupRows.length, route_groups: routeGroupRows.length, conversation_projection_outbox: conversationProjectionRows.length, conversation_rewrites: manifest.conversation_rewrites.length }))}
 WHERE ${fresh};
-${assertion(`(SELECT COUNT(*) FROM migration_tool_operation_receipts WHERE idempotency_key=${sqlText(manifest.idempotency_key)} AND operation_kind='retired-api2-trial-purge-v4' AND manifest_sha256=${sqlText(digest)})<>1`)}
+${assertion(`(SELECT COUNT(*) FROM migration_tool_operation_receipts WHERE idempotency_key=${sqlText(manifest.idempotency_key)} AND operation_kind='retired-api2-trial-purge-v5' AND manifest_sha256=${sqlText(digest)})<>1`)}
 ${summaryStatement}
 ${apply ? "COMMIT;" : "ROLLBACK;"}
 `;
@@ -741,15 +818,15 @@ function runDatabase(options: Options, sql: string): string {
       database?.close();
     }
   }
-  if (!summary || !/^(?:planned|replay)\|17\|7\|16\|7(?:\|\d+){6}$/u.test(summary)) fail("database_receipt_invalid", "database did not return the bounded cleanup summary");
+  if (!summary || !/^(?:planned|replay)\|17\|7\|16\|7\|24(?:\|\d+){6}$/u.test(summary)) fail("database_receipt_invalid", "database did not return the bounded cleanup summary");
   return summary;
 }
 
 export function receipt(manifest: ReviewedManifest, digest: string, mode: "dry-run" | "apply", summary: string): Obj {
-  const [outcome, snapshots, keys, routingGrants, routingRevisions, rotationReplays, credentialGroups, routeGroups, conversationProjections, rewrites, principals] = summary.split("|");
+  const [outcome, snapshots, keys, routingGrants, routingRevisions, synchronousImageIdempotency, rotationReplays, credentialGroups, routeGroups, conversationProjections, rewrites, principals] = summary.split("|");
   return {
-    schema_version: 4,
-    operation: "retired-api2-trial-purge-v4",
+    schema_version: 5,
+    operation: "retired-api2-trial-purge-v5",
     mode,
     outcome: outcome!,
     idempotency_key: manifest.idempotency_key,
@@ -759,6 +836,7 @@ export function receipt(manifest: ReviewedManifest, digest: string, mode: "dry-r
     key_records: Number(keys),
     routing_grants: Number(routingGrants),
     routing_revisions: Number(routingRevisions),
+    synchronous_image_idempotency: Number(synchronousImageIdempotency),
     credential_rotation_replays: Number(rotationReplays),
     credential_groups: Number(credentialGroups),
     route_groups: Number(routeGroups),
