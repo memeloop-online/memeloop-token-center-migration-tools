@@ -267,7 +267,7 @@ test("PostgreSQL plan locks mutable dependencies and applies the same fail-close
   const manifest = fixtureManifest();
   const sql = buildSql(manifest, manifestSha256(manifest), false, "postgres", 1234);
   assert.match(sql, /^BEGIN;\nSET TRANSACTION ISOLATION LEVEL SERIALIZABLE;/u);
-  assert.match(sql, /LOCK TABLE .*request_records, usage_reservations, generation_jobs.*conversation_projection_outbox IN SHARE ROW EXCLUSIVE MODE;/u);
+  assert.match(sql, /LOCK TABLE .*request_records, usage_reservations, generation_jobs.*conversation_projection_outbox, conversation_unresolved_explicit_parents, session_routing_terminals IN SHARE ROW EXCLUSIVE MODE;/u);
   assert.doesNotMatch(sql, /legacy_key_credentials/u);
   assert.match(sql, /target_rotation_replays expected LEFT JOIN credential_rotation_replays/u);
   assert.match(sql, /completed_at IS NULL/u);
