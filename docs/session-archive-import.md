@@ -99,12 +99,16 @@ without another source request by repeating the same command with `--resume`.
 If a stable snapshot download was interrupted earlier, repeat the same source,
 checkpoint, output path and validation contract with `--resume`. The exporter
 obtains a fresh snapshot, requires an identical versioned session projection,
-re-verifies completed session counts and digests, and downloads only unfinished
-sessions. Do not delete or edit an output, manifest, pending file, spool or
-checkpoint to force a transition; retain it for investigation and retry from
-the last verified state. A legacy projection has no source session digest, so a
-matching legacy spool is safely rebuilt as temporary scratch instead of
-claiming that its partial rows are resumable.
+reuses atomically completed sessions, and continues a partial stable session
+from its committed request cursor when `--source-sqlite` points at the same
+sealed read-only backup. HTTP tickets are still whole-session responses; their
+prefix may be read again after a failure, so an oversized offline baseline must
+use the direct SQLite path in the collector runbook. Do not delete or edit an
+output, manifest, pending file, spool or checkpoint to force a transition;
+retain it for investigation and retry from the last verified state. A legacy
+projection has no source session digest, so a matching legacy spool is safely
+rebuilt as temporary scratch instead of claiming that its partial rows are
+resumable.
 
 The pre-PR8 `3612a75` collector baseline used a distinct random
 `.mtc-archive-delta-spool.PID.EPOCH.sqlite` records-only file. For that exact
@@ -124,9 +128,14 @@ The host needs private scratch space for the bounded SQLite de-duplication spool
 and the final JSONL. Downloads are streamed into that spool; there is no separate
 download file. The spool has one payload-bearing `records` table and stores each
 canonical record body exactly once. Small metadata tables bind the resumable
-spool to its source projection and verified sessions. Its indexes carry request
-identity, session order and legacy output selection without a second
-payload-bearing `seen_records` table.
+spool to its source projection, verified sessions, and the current stable
+session's bytewise request cursor. Record/byte/time chunk commits bound the WAL
+working set. Its indexes carry request identity, session order and legacy output
+selection without a second payload-bearing `seen_records` table. Existing
+fixed-path spools gain this metadata table in place; completed sessions remain
+reusable, while an older interrupted all-session transaction contains no
+committed partial rows. Random 3612 spools still require the explicit one-time
+read-only conversion above.
 
 Use this peak-space equation for the filesystem that contains `--output`:
 
