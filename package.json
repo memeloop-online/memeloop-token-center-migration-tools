@@ -2,7 +2,7 @@
   "name": "memeloop-token-center-migration-tools",
   "private": false,
   "version": "0.1.0",
-  "description": "One-shot, TypeScript-only migration tools with fail-closed inputs, replay and reconciliation contracts.",
+  "description": "One-shot migration tools with fail-closed inputs, replay and reconciliation contracts.",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
