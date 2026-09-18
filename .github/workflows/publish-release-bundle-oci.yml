@@ -1,0 +1,98 @@
+name: Publish release bundle OCI image
+
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: Full 40-character Git revision of an existing immutable migration-tools release
+        required: true
+        type: string
+      archive_sha256:
+        description: Expected SHA-256 of the release tarball
+        required: true
+        type: string
+      manifest_sha256:
+        description: Expected SHA-256 of the release manifest
+        required: true
+        type: string
+      checksums_sha256:
+        description: Expected SHA-256 of SHA256SUMS
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: migration-tools-release-bundle-oci-${{ inputs.revision }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Verify release assets and publish OCI image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REVISION: ${{ inputs.revision }}
+      ARCHIVE_SHA256: ${{ inputs.archive_sha256 }}
+      MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
+      CHECKSUMS_SHA256: ${{ inputs.checksums_sha256 }}
+      RELEASE_ASSETS: ${{ runner.temp }}/migration-tools-release-assets
+      BASE_IMAGE: ghcr.io/memeloop-online/memeloop-token-center-importer@sha256:75fef96d76af5fb39851514fd89ba8e12fee394e88c7d6f5fac91a5e8ca5a429
+    steps:
+      - name: Check out delivery definition
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v6.0.0
+        with:
+          persist-credentials: false
+
+      - name: Download and verify immutable release assets
+        run: |
+          set -euo pipefail
+          [[ "$REVISION" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$CHECKSUMS_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          tag="migration-tools-$REVISION"
+          archive="memeloop-token-center-migration-tools-$REVISION.tar.gz"
+          manifest="memeloop-token-center-migration-tools-$REVISION.manifest.json"
+          test "$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json targetCommitish --jq .targetCommitish)" = "$REVISION"
+          mkdir -p "$RELEASE_ASSETS"
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$RELEASE_ASSETS"
+          test "$(find "$RELEASE_ASSETS" -maxdepth 1 -type f | wc -l)" = "3"
+          test "$(sha256sum "$RELEASE_ASSETS/$archive" | cut -d ' ' -f 1)" = "$ARCHIVE_SHA256"
+          test "$(sha256sum "$RELEASE_ASSETS/$manifest" | cut -d ' ' -f 1)" = "$MANIFEST_SHA256"
+          test "$(sha256sum "$RELEASE_ASSETS/SHA256SUMS" | cut -d ' ' -f 1)" = "$CHECKSUMS_SHA256"
+          (cd "$RELEASE_ASSETS" && sha256sum -c SHA256SUMS)
+          chmod 0444 "$RELEASE_ASSETS/$archive" "$RELEASE_ASSETS/$manifest" "$RELEASE_ASSETS/SHA256SUMS"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Publish digest-addressable release bundle image
+        id: publish
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.18.0
+        with:
+          context: ${{ runner.temp }}/migration-tools-release-assets
+          file: ${{ github.workspace }}/ops/ci/Dockerfile.release-bundle
+          build-args: |
+            BASE_IMAGE=${{ env.BASE_IMAGE }}
+            RELEASE_REVISION=${{ env.REVISION }}
+          tags: ghcr.io/${{ github.repository }}:release-bundle-${{ env.REVISION }}
+          push: true
+          provenance: mode=max
+          sbom: true
+
+      - name: Record immutable image identity
+        run: |
+          set -euo pipefail
+          [[ "${{ steps.publish.outputs.digest }}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf 'OCI image: `ghcr.io/%s@%s`\n' "$GITHUB_REPOSITORY" "${{ steps.publish.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
