@@ -39,7 +39,7 @@ jobs:
       ARCHIVE_SHA256: ${{ inputs.archive_sha256 }}
       MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
       CHECKSUMS_SHA256: ${{ inputs.checksums_sha256 }}
-      RELEASE_ASSETS: ${{ runner.temp }}/migration-tools-release-assets
+      RELEASE_ASSETS: ${{ github.workspace }}/.release-assets
       BASE_IMAGE: ghcr.io/memeloop-online/memeloop-token-center-importer@sha256:75fef96d76af5fb39851514fd89ba8e12fee394e88c7d6f5fac91a5e8ca5a429
     steps:
       - name: Check out delivery definition
@@ -81,7 +81,7 @@ jobs:
         id: publish
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.18.0
         with:
-          context: ${{ runner.temp }}/migration-tools-release-assets
+          context: ${{ env.RELEASE_ASSETS }}
           file: ${{ github.workspace }}/ops/ci/Dockerfile.release-bundle
           build-args: |
             BASE_IMAGE=${{ env.BASE_IMAGE }}
