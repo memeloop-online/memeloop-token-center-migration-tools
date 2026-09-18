@@ -1,0 +1,9 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+ARG RELEASE_REVISION
+LABEL org.opencontainers.image.source="https://github.com/memeloop-online/memeloop-token-center-migration-tools" \
+      org.opencontainers.image.revision="${RELEASE_REVISION}" \
+      org.opencontainers.image.title="MTC migration tools immutable release bundle"
+
+COPY --chown=10001:10001 . /opt/migration-tools-release/
