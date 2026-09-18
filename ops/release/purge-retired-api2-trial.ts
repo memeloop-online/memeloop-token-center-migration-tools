@@ -396,7 +396,7 @@ export function buildSql(manifest: ReviewedManifest, digest: string, apply: bool
   const rewriteRows = manifest.conversation_rewrites.map(rewrite => [sqlText(rewrite.observation_id), sqlText(rewrite.key_id), sqlText(rewrite.session_name), sqlText(rewrite.labels_json), sqlText(rewrite.replacement_session_name), sqlText(rewrite.replacement_labels_json)]);
   const values = (rows: string[][], fallback: string[]) => rows.length === 0 ? `SELECT ${fallback.join(",")} WHERE 0` : `VALUES ${tuples(rows)}`;
   const begin = backend === "sqlite" ? "BEGIN IMMEDIATE;" : "BEGIN;\nSET TRANSACTION ISOLATION LEVEL SERIALIZABLE;";
-  const lock = backend === "postgres" ? "LOCK TABLE deleted_upstream_account_snapshots, key_records, key_credentials, key_credential_recovery_secrets, key_credential_source_proofs, credential_group_memberships, routing_grants, routing_grant_relation_revisions, principals, conversation_observations IN SHARE ROW EXCLUSIVE MODE;" : "";
+  const lock = backend === "postgres" ? "LOCK TABLE deleted_upstream_account_snapshots, key_records, key_credentials, legacy_key_credentials, credential_rotation_replays, key_credential_recovery_secrets, key_credential_source_proofs, credential_groups, credential_group_memberships, route_groups, model_route_group_memberships, routing_grants, routing_grant_relation_revisions, principals, credit_accounts, conversation_clusters, session_archive_correlations, session_archive_unlinked_requests, memeloop_cloud_subscription_events, conversation_observations IN SHARE ROW EXCLUSIVE MODE;" : "";
   const replay = `EXISTS (SELECT 1 FROM migration_tool_operation_receipts WHERE idempotency_key=${sqlText(manifest.idempotency_key)})`;
   const fresh = "(SELECT initial_replay FROM operation_state)=0";
   const protectedBefore = protectedTables.map(table => `INSERT INTO protected_counts(table_name,before_count) SELECT ${sqlText(table)},COUNT(*) FROM ${table} row WHERE row.key_id IN (SELECT key_id FROM target_keys);`).join("\n");
@@ -432,6 +432,14 @@ CREATE TEMP TABLE target_revisions(key_id TEXT PRIMARY KEY,revision BIGINT NOT N
 INSERT INTO target_revisions ${values(revisionRows, ["''", "0"])};
 CREATE TEMP TABLE target_rewrites(observation_id TEXT PRIMARY KEY,key_id TEXT NOT NULL,session_name TEXT NOT NULL,labels_json TEXT NOT NULL,replacement_session_name TEXT NOT NULL,replacement_labels_json TEXT NOT NULL);
 INSERT INTO target_rewrites ${values(rewriteRows, ["''", "''", "''", "''", "''", "''"])};
+CREATE TEMP TABLE target_legacy_credentials(id TEXT PRIMARY KEY,key_id TEXT NOT NULL);
+INSERT INTO target_legacy_credentials SELECT id,key_id FROM legacy_key_credentials WHERE key_id IN (SELECT key_id FROM target_keys);
+CREATE TEMP TABLE target_rotation_replays(idempotency_key TEXT PRIMARY KEY,resource_id TEXT NOT NULL);
+INSERT INTO target_rotation_replays SELECT idempotency_key,resource_id FROM credential_rotation_replays WHERE resource_kind='key' AND resource_id IN (SELECT key_id FROM target_keys);
+CREATE TEMP TABLE target_credential_groups(id TEXT PRIMARY KEY);
+INSERT INTO target_credential_groups SELECT DISTINCT credential_group_id FROM target_memberships;
+CREATE TEMP TABLE target_route_groups(id TEXT PRIMARY KEY);
+INSERT INTO target_route_groups SELECT DISTINCT route_group_id FROM target_grants WHERE route_group_id IS NOT NULL;
 ${assertion(`EXISTS (SELECT 1 FROM migration_tool_operation_receipts WHERE idempotency_key=${sqlText(manifest.idempotency_key)} AND (operation_kind<>'retired-api2-trial-purge-v1' OR manifest_sha256<>${sqlText(digest)}))`)}
 ${assertion(`${fresh} AND (SELECT COUNT(*) FROM target_snapshots)<>${EXPECTED_SNAPSHOT_COUNT}`)}
 ${assertion(`${fresh} AND (SELECT COUNT(*) FROM target_keys)<>${EXPECTED_KEY_COUNT}`)}
@@ -460,6 +468,7 @@ ${protectedBefore}
 UPDATE key_records SET issued_key_ciphertext=NULL WHERE id IN (SELECT key_id FROM target_keys) AND ${fresh};
 UPDATE key_credentials SET secret_plaintext=NULL WHERE id IN (SELECT credential_id FROM target_credentials) AND ${fresh};
 UPDATE key_credential_recovery_secrets SET ciphertext='' WHERE credential_id IN (SELECT credential_id FROM target_recovery) AND ${fresh};
+UPDATE credential_rotation_replays SET response_ciphertext=NULL WHERE idempotency_key IN (SELECT idempotency_key FROM target_rotation_replays) AND ${fresh};
 UPDATE conversation_observations SET session_name=(SELECT replacement_session_name FROM target_rewrites WHERE observation_id=conversation_observations.id),labels_json=(SELECT replacement_labels_json FROM target_rewrites WHERE observation_id=conversation_observations.id) WHERE id IN (SELECT observation_id FROM target_rewrites) AND ${fresh};
 DELETE FROM deleted_upstream_account_snapshots WHERE upstream_account_id IN (SELECT upstream_account_id FROM target_snapshots) AND ${fresh};
 DELETE FROM key_credential_recovery_secrets WHERE credential_id IN (SELECT credential_id FROM target_recovery) AND ${fresh};
@@ -467,12 +476,27 @@ DELETE FROM key_credential_source_proofs WHERE credential_id IN (SELECT credenti
 DELETE FROM credential_group_memberships WHERE key_id IN (SELECT key_id FROM target_keys) AND ${fresh};
 DELETE FROM routing_grants WHERE key_id IN (SELECT key_id FROM target_keys) AND ${fresh};
 DELETE FROM routing_grant_relation_revisions WHERE subject_kind='credential' AND key_id IN (SELECT key_id FROM target_keys) AND ${fresh};
+DELETE FROM credential_rotation_replays WHERE idempotency_key IN (SELECT idempotency_key FROM target_rotation_replays) AND ${fresh};
+DELETE FROM legacy_key_credentials WHERE id IN (SELECT id FROM target_legacy_credentials) AND ${fresh};
 DELETE FROM key_credentials WHERE id IN (SELECT credential_id FROM target_credentials) AND ${fresh};
 DELETE FROM key_records WHERE id IN (SELECT key_id FROM target_keys) AND ${fresh};
-DELETE FROM principals WHERE id IN (SELECT DISTINCT principal_id FROM target_keys) AND NOT EXISTS (SELECT 1 FROM key_records remaining WHERE remaining.principal_id=principals.id AND remaining.status='active') AND ${fresh};
+DELETE FROM credential_groups WHERE id IN (SELECT id FROM target_credential_groups) AND NOT EXISTS (SELECT 1 FROM credential_group_memberships remaining WHERE remaining.credential_group_id=credential_groups.id) AND ${fresh};
+DELETE FROM route_groups WHERE id IN (SELECT id FROM target_route_groups) AND NOT EXISTS (SELECT 1 FROM routing_grants remaining WHERE remaining.route_group_id=route_groups.id) AND NOT EXISTS (SELECT 1 FROM model_route_group_memberships remaining WHERE remaining.route_group_id=route_groups.id) AND ${fresh};
+DELETE FROM principals WHERE id IN (SELECT DISTINCT principal_id FROM target_keys)
+  AND NOT EXISTS (SELECT 1 FROM key_records remaining WHERE remaining.principal_id=principals.id)
+  AND NOT EXISTS (SELECT 1 FROM credit_accounts remaining WHERE remaining.principal_id=principals.id)
+  AND NOT EXISTS (SELECT 1 FROM conversation_clusters remaining WHERE remaining.principal_id=principals.id)
+  AND NOT EXISTS (SELECT 1 FROM session_archive_correlations remaining WHERE remaining.principal_id=principals.id)
+  AND NOT EXISTS (SELECT 1 FROM session_archive_unlinked_requests remaining WHERE remaining.principal_id=principals.id)
+  AND NOT EXISTS (SELECT 1 FROM memeloop_cloud_subscription_events remaining WHERE remaining.principal_id=principals.id)
+  AND ${fresh};
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM deleted_upstream_account_snapshots WHERE upstream_account_id IN (SELECT upstream_account_id FROM target_snapshots))`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM key_records WHERE id IN (SELECT key_id FROM target_keys))`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM key_credentials WHERE id IN (SELECT credential_id FROM target_credentials))`)}
+${assertion(`${fresh} AND EXISTS (SELECT 1 FROM legacy_key_credentials WHERE id IN (SELECT id FROM target_legacy_credentials))`)}
+${assertion(`${fresh} AND EXISTS (SELECT 1 FROM credential_rotation_replays WHERE idempotency_key IN (SELECT idempotency_key FROM target_rotation_replays))`)}
+${assertion(`${fresh} AND EXISTS (SELECT 1 FROM credential_groups WHERE id IN (SELECT id FROM target_credential_groups) AND NOT EXISTS (SELECT 1 FROM credential_group_memberships remaining WHERE remaining.credential_group_id=credential_groups.id))`)}
+${assertion(`${fresh} AND EXISTS (SELECT 1 FROM route_groups WHERE id IN (SELECT id FROM target_route_groups) AND NOT EXISTS (SELECT 1 FROM routing_grants remaining WHERE remaining.route_group_id=route_groups.id) AND NOT EXISTS (SELECT 1 FROM model_route_group_memberships remaining WHERE remaining.route_group_id=route_groups.id))`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM conversation_observations actual JOIN target_rewrites expected ON expected.observation_id=actual.id WHERE actual.session_name<>expected.replacement_session_name OR actual.labels_json<>expected.replacement_labels_json)`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM conversation_observations actual WHERE actual.key_id IN (SELECT key_id FROM target_keys) AND (LOWER(COALESCE(actual.session_name,'')) LIKE '%api2%' OR LOWER(COALESCE(actual.session_name,'')) LIKE '%legacy-cpa-bridge%' OR LOWER(COALESCE(actual.session_name,'')) LIKE '%cpa-%' OR LOWER(COALESCE(actual.session_name,'')) LIKE '%bridge%' OR LOWER(actual.labels_json) LIKE '%api2%' OR LOWER(actual.labels_json) LIKE '%legacy-cpa-bridge%' OR LOWER(actual.labels_json) LIKE '%cpa-%' OR LOWER(actual.labels_json) LIKE '%bridge%'))`)}
 ${protectedAfter}
@@ -480,7 +504,7 @@ INSERT INTO migration_tool_operation_receipts(idempotency_key,operation_kind,man
 SELECT ${sqlText(manifest.idempotency_key)},'retired-api2-trial-purge-v1',${sqlText(digest)},${now},${sqlText(JSON.stringify({ deleted_upstream_account_snapshots: 17, key_records: 7, routing_relations: 16, conversation_rewrites: manifest.conversation_rewrites.length }))}
 WHERE ${fresh};
 ${assertion(`(SELECT COUNT(*) FROM migration_tool_operation_receipts WHERE idempotency_key=${sqlText(manifest.idempotency_key)} AND operation_kind='retired-api2-trial-purge-v1' AND manifest_sha256=${sqlText(digest)})<>1`)}
-SELECT CASE WHEN (SELECT initial_replay FROM operation_state)=1 THEN 'replay' ELSE 'planned' END,${EXPECTED_SNAPSHOT_COUNT},${EXPECTED_KEY_COUNT},${relationExpected},${manifest.conversation_rewrites.length},(SELECT COUNT(DISTINCT principal_id) FROM target_keys WHERE NOT EXISTS (SELECT 1 FROM key_records remaining WHERE remaining.principal_id=target_keys.principal_id AND remaining.status='active'));
+SELECT CASE WHEN (SELECT initial_replay FROM operation_state)=1 THEN 'replay' ELSE 'planned' END,${EXPECTED_SNAPSHOT_COUNT},${EXPECTED_KEY_COUNT},${relationExpected},${manifest.conversation_rewrites.length},(SELECT COUNT(DISTINCT principal_id) FROM target_keys WHERE NOT EXISTS (SELECT 1 FROM key_records remaining WHERE remaining.principal_id=target_keys.principal_id) AND NOT EXISTS (SELECT 1 FROM credit_accounts remaining WHERE remaining.principal_id=target_keys.principal_id) AND NOT EXISTS (SELECT 1 FROM conversation_clusters remaining WHERE remaining.principal_id=target_keys.principal_id) AND NOT EXISTS (SELECT 1 FROM session_archive_correlations remaining WHERE remaining.principal_id=target_keys.principal_id) AND NOT EXISTS (SELECT 1 FROM session_archive_unlinked_requests remaining WHERE remaining.principal_id=target_keys.principal_id) AND NOT EXISTS (SELECT 1 FROM memeloop_cloud_subscription_events remaining WHERE remaining.principal_id=target_keys.principal_id));
 ${apply ? "COMMIT;" : "ROLLBACK;"}
 `;
 }
