@@ -117,7 +117,7 @@ jobs:
             -o dist/release/commands/runtime/cpa-session-archive-backup ./cmd/cpa-session-archive-backup
           file dist/release/commands/runtime/cpa-session-archive-backup | grep -- 'statically linked'
           ! readelf -l dist/release/commands/runtime/cpa-session-archive-backup | grep -q 'Requesting program interpreter'
-          dist/release/commands/runtime/cpa-session-archive-backup --help | grep -- '--pages-per-step'
+          dist/release/commands/runtime/cpa-session-archive-backup --help | grep -- 'pages-per-step'
           mkdir -p dist/release/commands/runtime/licenses
           install -m 0444 LICENSE dist/release/commands/runtime/licenses/LICENSE
           install -m 0444 THIRD_PARTY_NOTICES.md dist/release/commands/runtime/licenses/THIRD_PARTY_NOTICES.md
@@ -316,7 +316,7 @@ jobs:
             -o dist/release/commands/runtime/cpa-session-archive-backup ./cmd/cpa-session-archive-backup
           file dist/release/commands/runtime/cpa-session-archive-backup | grep -- 'statically linked'
           ! readelf -l dist/release/commands/runtime/cpa-session-archive-backup | grep -q 'Requesting program interpreter'
-          dist/release/commands/runtime/cpa-session-archive-backup --help | grep -- '--pages-per-step'
+          dist/release/commands/runtime/cpa-session-archive-backup --help | grep -- 'pages-per-step'
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
