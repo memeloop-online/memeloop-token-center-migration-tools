@@ -29,9 +29,16 @@ snapshot names or credential aliases in the selected tenant.
 
 Before deletion it sets `key_records.issued_key_ciphertext` and
 `key_credentials.secret_plaintext` to `NULL`, overwrites every reviewed recovery
-`ciphertext`, then deletes the reviewed recovery/source-proof/membership/routing
-rows and credentials. A principal is deleted only after the selected keys are
-gone and only when that principal has no other active key.
+`ciphertext`, and clears cached rotation responses. It inventories and removes
+matching `legacy_key_credentials` and key-scoped rotation replay rows before
+deleting the reviewed recovery/source-proof/membership/routing rows and
+credentials. Credential and route groups touched by the cohort are removed only
+when no membership, grant, or model-route membership remains.
+
+A principal is deleted only after the selected keys are gone and it has no
+remaining key of any status, credit account, conversation cluster, archive
+identity, or cloud subscription event. Revoked and archived shared keys retain
+their principal exactly like active keys.
 
 Conversation rewrites use exact old `session_name` and `labels_json` values as
 CAS inputs. Replacements must use a `retired-*` session name and may not contain
