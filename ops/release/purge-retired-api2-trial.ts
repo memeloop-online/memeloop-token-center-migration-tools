@@ -750,7 +750,7 @@ function runDatabase(options: Options, sql: string): string {
         if (typeof value !== "string") throw new TypeError("SHA256_TEXT requires text");
         return createHash("sha256").update(value).digest("hex");
       });
-      database.function("capture_purge_summary", (...values: unknown[]) => {
+      database.function("capture_purge_summary", { varargs: true }, (...values: unknown[]) => {
         summary = values.map(value => String(value)).join("|");
         return 0;
       });
