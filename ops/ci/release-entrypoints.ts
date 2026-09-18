@@ -25,6 +25,7 @@ export const releaseEntrypoints = Object.freeze({
   "import-cpa-model-routes": "ops/legacy-routes/import-cpa-model-routes.ts",
   "import-cpa-session-archive": "ops/import-cpa-session-archive.ts",
   "migrate-cpamp": "ops/migrate-cpamp.ts",
+  "purge-retired-api2-trial": "ops/release/purge-retired-api2-trial.ts",
   "reconcile-final-price-cache": "ops/reconcile-final-price-cache.ts",
   "reconcile-existing-transport": "ops/cpa-upstreams/reconcile-existing-transport.ts",
   "resolve-cpa-managed-codex-provenance": "ops/legacy-routes/resolve-cpa-managed-codex-provenance.ts",

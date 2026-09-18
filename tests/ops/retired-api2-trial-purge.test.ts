@@ -1,0 +1,224 @@
+import assert from "node:assert/strict";
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { spawnSync, type SpawnSyncReturns } from "node:child_process";
+import test from "node:test";
+import {
+  PurgeFailure,
+  buildSql,
+  manifestSha256,
+  parseManifest,
+  type ReviewedManifest,
+} from "../../ops/release/purge-retired-api2-trial.ts";
+
+const repository = join(import.meta.dirname, "../..");
+const tool = join(repository, "ops/release/purge-retired-api2-trial.ts");
+const uuid = (value: number): string => `00000000-0000-4000-8000-${String(value).padStart(12, "0")}`;
+
+function fixtureManifest(): ReviewedManifest {
+  const snapshots = Array.from({ length: 17 }, (_, index) => ({
+    upstream_account_id: uuid(100 + index),
+    name: index < 9 ? `legacy-cpa-bridge-fixture-${index}` : `cpa-fixture-${index}`,
+    driver: "retired-driver",
+    auth_kind: "api_key",
+    credential_generation: 2,
+    created_at: 1000 + index,
+    deleted_at: 2000 + index,
+  }));
+  const keys = Array.from({ length: 7 }, (_, index) => {
+    const keyId = uuid(200 + index);
+    const credentialId = uuid(300 + index);
+    return {
+      key_id: keyId,
+      principal_id: uuid(400 + index),
+      account_id: uuid(500 + index),
+      alias: `api2-trial-fixture-${index}`,
+      currency: "USD",
+      credential_generation: 1,
+      archived_at: 3000 + index,
+      created_at: 1000 + index,
+      updated_at: 3000 + index,
+      issued_ciphertext_present: index < 2,
+      credentials: [{ credential_id: credentialId, generation: 1, fingerprint: `fixture-${index}`, created_at: 1000 + index, revoked_at: 2900 + index, plaintext_present: index < 3 }],
+      recovery_secrets: index < 2 ? [{ credential_id: credentialId, credential_generation: 1, created_at: 1500 + index, updated_at: 2500 + index }] : [],
+      source_proofs: [{ credential_id: credentialId, proof_kind: "fixture-source-v1", source_digest: `fixture-only-source-${index}`, created_at: 1000 + index }],
+      credential_group_memberships: index < 3 ? [{ credential_group_id: uuid(600 + index), created_at: 1800 + index }] : [],
+      routing_grants: Array.from({ length: index < 2 ? 2 : 1 }, (_, grant) => ({ model_route_id: uuid(700 + index * 2 + grant), route_group_id: null, created_at: 1900 + index * 2 + grant })),
+      routing_revision: { revision: 10 + index },
+    };
+  });
+  const conversation_rewrites = keys.map((key, index) => ({
+    observation_id: uuid(800 + index),
+    key_id: key.key_id,
+    session_name: `api2 trial session ${index}`,
+    labels_json: JSON.stringify({ alias: `cpa-fixture-${index}`, cohort: "bridge" }),
+    replacement_session_name: `retired-session-${key.key_id}`,
+    replacement_labels_json: JSON.stringify({ credential: `retired-credential-${key.key_id}`, state: "retired" }),
+  }));
+  return parseManifest({
+    schema_version: 1,
+    idempotency_key: "retired-api2-trial-fixture-v1",
+    tenant_external_id: "fixture-tenant",
+    expected: { deleted_upstream_account_snapshots: 17, key_records: 7, routing_relations: 16 },
+    snapshots,
+    keys,
+    conversation_rewrites,
+  } as never);
+}
+
+function baseSchema(postgres: boolean): string {
+  const auto = postgres ? "BYTEA" : "BLOB";
+  const protectedTables = [
+    "request_records", "request_events", "request_record_locators", "request_event_locators",
+    "request_stats_facts", "request_daily_aggregates", "usage_daily_aggregates",
+    "usage_analysis_hourly", "usage_analysis_daily", "session_usage_totals",
+    "session_usage_hourly", "session_usage_daily", "session_archive_totals",
+    "session_archive_import_records", "session_archive_correlations",
+    "session_archive_unlinked_requests", "session_archive_quarantine_resolutions",
+    "generation_jobs", "generation_stats_facts", "generation_daily_aggregates",
+    "generation_usage_dimensions_hourly", "generation_usage_dimensions_daily",
+    "ledger_entries", "usage_reservations", "account_settlement_feed", "key_budget_state",
+    "key_budget_daily_rollups", "key_budget_usage_events", "rate_limit_windows",
+    "key_runtime_state", "metered_usage_projection_outbox", "memeloop_cloud_subscription_events",
+    "key_credential_recovery_audit", "key_credential_recovery_access_audit",
+    "conversation_key_clusters", "conversation_projection_outbox",
+    "conversation_unresolved_explicit_parents", "session_routing_terminals",
+  ];
+  return `${postgres ? "" : "PRAGMA foreign_keys=ON;"}
+CREATE TABLE tenants(id TEXT PRIMARY KEY,external_id TEXT UNIQUE NOT NULL);
+CREATE TABLE principals(id TEXT PRIMARY KEY,tenant_id TEXT NOT NULL,external_id TEXT NOT NULL,created_at BIGINT NOT NULL);
+CREATE TABLE key_records(id TEXT PRIMARY KEY,tenant_id TEXT NOT NULL,principal_id TEXT NOT NULL,account_id TEXT NOT NULL,alias TEXT NOT NULL,currency TEXT NOT NULL,status TEXT NOT NULL,credential_generation BIGINT NOT NULL,issued_key_ciphertext TEXT,archived_at BIGINT,created_at BIGINT NOT NULL,updated_at BIGINT NOT NULL);
+CREATE TABLE key_credentials(id TEXT PRIMARY KEY,key_id TEXT NOT NULL,generation BIGINT NOT NULL,secret_hash ${auto},fingerprint TEXT NOT NULL,created_at BIGINT NOT NULL,revoked_at BIGINT,secret_plaintext TEXT);
+CREATE TABLE key_credential_recovery_secrets(credential_id TEXT PRIMARY KEY,key_id TEXT NOT NULL REFERENCES key_records(id) ON DELETE CASCADE,credential_generation BIGINT NOT NULL,ciphertext TEXT NOT NULL,created_at BIGINT NOT NULL,updated_at BIGINT NOT NULL);
+CREATE TABLE key_credential_source_proofs(credential_id TEXT NOT NULL REFERENCES key_credentials(id) ON DELETE CASCADE,proof_kind TEXT NOT NULL,source_digest TEXT NOT NULL,created_at BIGINT NOT NULL,PRIMARY KEY(credential_id,proof_kind));
+CREATE TABLE credential_group_memberships(tenant_id TEXT NOT NULL,credential_group_id TEXT NOT NULL,key_id TEXT NOT NULL REFERENCES key_records(id) ON DELETE CASCADE,created_at BIGINT NOT NULL,PRIMARY KEY(credential_group_id,key_id));
+CREATE TABLE routing_grants(tenant_id TEXT NOT NULL,key_id TEXT NOT NULL REFERENCES key_records(id) ON DELETE CASCADE,model_route_id TEXT,route_group_id TEXT,created_at BIGINT NOT NULL);
+CREATE TABLE routing_grant_relation_revisions(tenant_id TEXT NOT NULL,subject_kind TEXT NOT NULL,subject_id TEXT NOT NULL,key_id TEXT REFERENCES key_records(id) ON DELETE CASCADE,model_route_id TEXT,revision BIGINT NOT NULL,PRIMARY KEY(tenant_id,subject_kind,subject_id));
+CREATE TABLE deleted_upstream_account_snapshots(upstream_account_id TEXT PRIMARY KEY,tenant_id TEXT NOT NULL,name TEXT NOT NULL,driver TEXT NOT NULL,auth_kind TEXT NOT NULL,credential_generation BIGINT NOT NULL,created_at BIGINT NOT NULL,deleted_at BIGINT NOT NULL);
+CREATE TABLE conversation_observations(id TEXT PRIMARY KEY,key_id TEXT NOT NULL,session_name TEXT,labels_json TEXT NOT NULL);
+CREATE TABLE synchronous_image_idempotency(key_id TEXT NOT NULL REFERENCES key_records(id) ON DELETE CASCADE,idempotency_key TEXT NOT NULL,PRIMARY KEY(key_id,idempotency_key));
+${protectedTables.map(name => `CREATE TABLE ${name}(id TEXT PRIMARY KEY,key_id TEXT NOT NULL);`).join("\n")}
+`;
+}
+
+function fixtureSql(manifest: ReviewedManifest, postgres: boolean): string {
+  const q = (value: string): string => `'${value.replaceAll("'", "''")}'`;
+  const tenantId = uuid(1);
+  const statements = [baseSchema(postgres), `INSERT INTO tenants VALUES (${q(tenantId)},'fixture-tenant');`];
+  for (const snapshot of manifest.snapshots) statements.push(`INSERT INTO deleted_upstream_account_snapshots VALUES (${q(snapshot.upstream_account_id)},${q(tenantId)},${q(snapshot.name)},${q(snapshot.driver)},${q(snapshot.auth_kind)},${snapshot.credential_generation},${snapshot.created_at},${snapshot.deleted_at});`);
+  for (const [index, key] of manifest.keys.entries()) {
+    statements.push(`INSERT INTO principals VALUES (${q(key.principal_id)},${q(tenantId)},${q(`api2-principal-${index}`)},${key.created_at});`);
+    statements.push(`INSERT INTO key_records VALUES (${q(key.key_id)},${q(tenantId)},${q(key.principal_id)},${q(key.account_id)},${q(key.alias)},${q(key.currency)},'revoked',${key.credential_generation},${key.issued_ciphertext_present ? q("fixture-only-ciphertext") : "NULL"},${key.archived_at},${key.created_at},${key.updated_at});`);
+    for (const credential of key.credentials) statements.push(`INSERT INTO key_credentials VALUES (${q(credential.credential_id)},${q(key.key_id)},${credential.generation},${postgres ? "decode('00','hex')" : "X'00'"},${q(credential.fingerprint)},${credential.created_at},${credential.revoked_at},${credential.plaintext_present ? q("fixture-only-plaintext") : "NULL"});`);
+    for (const recovery of key.recovery_secrets) statements.push(`INSERT INTO key_credential_recovery_secrets VALUES (${q(recovery.credential_id)},${q(key.key_id)},${recovery.credential_generation},'fixture-only-recovery-ciphertext',${recovery.created_at},${recovery.updated_at});`);
+    for (const proof of key.source_proofs) statements.push(`INSERT INTO key_credential_source_proofs VALUES (${q(proof.credential_id)},${q(proof.proof_kind)},${q(proof.source_digest)},${proof.created_at});`);
+    for (const membership of key.credential_group_memberships) statements.push(`INSERT INTO credential_group_memberships VALUES (${q(tenantId)},${q(membership.credential_group_id)},${q(key.key_id)},${membership.created_at});`);
+    for (const grant of key.routing_grants) statements.push(`INSERT INTO routing_grants VALUES (${q(tenantId)},${q(key.key_id)},${grant.model_route_id ? q(grant.model_route_id) : "NULL"},${grant.route_group_id ? q(grant.route_group_id) : "NULL"},${grant.created_at});`);
+    statements.push(`INSERT INTO routing_grant_relation_revisions VALUES (${q(tenantId)},'credential',${q(key.key_id)},${q(key.key_id)},NULL,${key.routing_revision.revision});`);
+    for (const table of ["request_records", "request_events", "request_record_locators", "request_event_locators", "request_stats_facts", "request_daily_aggregates", "usage_daily_aggregates", "usage_analysis_hourly", "usage_analysis_daily", "session_usage_totals", "session_usage_hourly", "session_usage_daily", "session_archive_totals", "session_archive_import_records", "session_archive_correlations", "session_archive_unlinked_requests", "session_archive_quarantine_resolutions", "generation_jobs", "generation_stats_facts", "generation_daily_aggregates", "generation_usage_dimensions_hourly", "generation_usage_dimensions_daily", "ledger_entries", "usage_reservations", "account_settlement_feed", "key_budget_state", "key_budget_daily_rollups", "key_budget_usage_events", "rate_limit_windows", "key_runtime_state", "metered_usage_projection_outbox", "memeloop_cloud_subscription_events", "key_credential_recovery_audit", "key_credential_recovery_access_audit", "conversation_key_clusters", "conversation_projection_outbox", "conversation_unresolved_explicit_parents", "session_routing_terminals"]) statements.push(`INSERT INTO ${table} VALUES (${q(`${table}-${index}`)},${q(key.key_id)});`);
+  }
+  const retained = manifest.keys[6]!;
+  statements.push(`INSERT INTO key_records VALUES (${q(uuid(999))},${q(tenantId)},${q(retained.principal_id)},${q(uuid(998))},'ordinary-active-key','USD','active',1,NULL,NULL,5000,5000);`);
+  for (const rewrite of manifest.conversation_rewrites) statements.push(`INSERT INTO conversation_observations VALUES (${q(rewrite.observation_id)},${q(rewrite.key_id)},${q(rewrite.session_name)},${q(rewrite.labels_json)});`);
+  return statements.join("\n");
+}
+
+function run(binary: string, args: string[], input?: string, env: NodeJS.ProcessEnv = process.env): SpawnSyncReturns<string> {
+  return spawnSync(binary, args, { encoding: "utf8", input, env, shell: false, maxBuffer: 8 * 1024 * 1024 });
+}
+
+function success(result: SpawnSyncReturns<string>, label: string): string {
+  assert.equal(result.error, undefined, `${label}: ${result.error?.message ?? "spawn failed"}`);
+  assert.equal(result.status, 0, `${label}: ${result.stderr}`);
+  return result.stdout.trim();
+}
+
+function writePrivate(path: string, body: string): void {
+  writeFileSync(path, body, { mode: 0o600 });
+  chmodSync(path, 0o600);
+}
+
+function toolArgs(workspace: string, manifestPath: string, receiptPath: string, databaseArgs: string[], apply = false): string[] {
+  const args = [tool, "--manifest", manifestPath, "--receipt-output", receiptPath, ...databaseArgs];
+  if (apply) args.push("--apply", "--approved-manifest-sha256", manifestSha256(parseManifest(JSON.parse(readFileSync(manifestPath, "utf8")) as never)));
+  return args;
+}
+
+test("reviewed manifest is fixed to 17 snapshots, 7 revoked keys and 16 routing relations", () => {
+  const manifest = fixtureManifest();
+  assert.equal(manifest.snapshots.length, 17);
+  assert.equal(manifest.keys.length, 7);
+  assert.equal(manifest.keys.reduce((sum, key) => sum + key.routing_grants.length + 1, 0), 16);
+  const invalid = JSON.parse(JSON.stringify(manifest));
+  invalid.snapshots.pop();
+  assert.throws(() => parseManifest(invalid), (error: unknown) => error instanceof PurgeFailure && error.code === "manifest_invalid");
+  const unsafe = JSON.parse(JSON.stringify(manifest));
+  unsafe.conversation_rewrites[0].replacement_session_name = "api2-retired";
+  assert.throws(() => parseManifest(unsafe), (error: unknown) => error instanceof PurgeFailure && error.code === "manifest_invalid");
+});
+
+test("generated SQL clears recoverable secrets before exact deletes and rolls back by default", () => {
+  const manifest = fixtureManifest();
+  const sql = buildSql(manifest, manifestSha256(manifest), false, "sqlite", 1234);
+  assert.ok(sql.indexOf("UPDATE key_records SET issued_key_ciphertext=NULL") < sql.indexOf("DELETE FROM key_records"));
+  assert.ok(sql.indexOf("UPDATE key_credentials SET secret_plaintext=NULL") < sql.indexOf("DELETE FROM key_credentials"));
+  assert.ok(sql.indexOf("UPDATE key_credential_recovery_secrets SET ciphertext=''") < sql.indexOf("DELETE FROM key_credential_recovery_secrets"));
+  assert.match(sql, /ROLLBACK;\s*$/u);
+  assert.doesNotMatch(sql, /DELETE FROM (?:request_records|ledger_entries|usage_reservations|generation_jobs|conversation_observations)/u);
+});
+
+test("SQLite dry-run, approved apply and replay preserve historical facts", () => {
+  const workspace = mkdtempSync(join(tmpdir(), "mtc-api2-purge-sqlite-"));
+  const database = join(workspace, "fixture.sqlite");
+  const manifest = fixtureManifest();
+  const manifestPath = join(workspace, "manifest.json");
+  writePrivate(manifestPath, `${JSON.stringify(manifest)}\n`);
+  success(run("sqlite3", [database], fixtureSql(manifest, false)), "initialize SQLite");
+  chmodSync(database, 0o600);
+  const databaseArgs = ["--backend", "sqlite", "--sqlite-database", database];
+  const before = success(run("sqlite3", [database], "SELECT COUNT(*) FROM request_records;"), "SQLite history count");
+  const dryReceipt = join(workspace, "dry.json");
+  const dry = success(run(process.execPath, toolArgs(workspace, manifestPath, dryReceipt, databaseArgs)), "SQLite dry-run");
+  assert.equal(JSON.parse(dry).mode, "dry-run");
+  assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM key_records;"), "SQLite dry-run keys"), "8");
+  assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM request_records;"), "SQLite dry-run history"), before);
+  const applyReceipt = join(workspace, "apply.json");
+  const applied = JSON.parse(success(run(process.execPath, toolArgs(workspace, manifestPath, applyReceipt, databaseArgs, true)), "SQLite apply"));
+  assert.equal(applied.outcome, "planned");
+  assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM key_records;"), "SQLite applied keys"), "1");
+  assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM deleted_upstream_account_snapshots;"), "SQLite applied snapshots"), "0");
+  assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM request_records;"), "SQLite applied history"), before);
+  assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM principals;"), "SQLite retained active principal"), "1");
+  assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM conversation_observations WHERE session_name LIKE 'retired-%' AND labels_json NOT LIKE '%api2%' AND labels_json NOT LIKE '%cpa-%' AND labels_json NOT LIKE '%bridge%';"), "SQLite normalized conversations"), "7");
+  const replayReceipt = join(workspace, "replay.json");
+  const replay = JSON.parse(success(run(process.execPath, toolArgs(workspace, manifestPath, replayReceipt, databaseArgs, true)), "SQLite replay"));
+  assert.equal(replay.outcome, "replay");
+});
+
+const postgresConfigured = ["PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE"].every(name => Boolean(process.env[name]));
+
+test("PostgreSQL dry-run and apply enforce the same reviewed cleanup contract", { skip: !postgresConfigured }, () => {
+  const workspace = mkdtempSync(join(tmpdir(), "mtc-api2-purge-postgres-"));
+  const schema = `purge_${Date.now()}_${process.pid}`;
+  const environment = { ...process.env, PGOPTIONS: `-csearch_path=${schema}` };
+  const psqlBase = ["-X", "--no-psqlrc", "-v", "ON_ERROR_STOP=1", "-qAt"];
+  success(run("psql", psqlBase, `CREATE SCHEMA ${schema};`, process.env), "create PostgreSQL schema");
+  try {
+    const manifest = fixtureManifest();
+    success(run("psql", psqlBase, fixtureSql(manifest, true), environment), "initialize PostgreSQL");
+    const serviceFile = join(workspace, "pg_service.conf");
+    writePrivate(serviceFile, `[purge_fixture]\nhost=${process.env.PGHOST}\nport=${process.env.PGPORT}\nuser=${process.env.PGUSER}\npassword=${process.env.PGPASSWORD}\ndbname=${process.env.PGDATABASE}\noptions=-csearch_path=${schema}\n`);
+    const manifestPath = join(workspace, "manifest.json");
+    writePrivate(manifestPath, `${JSON.stringify(manifest)}\n`);
+    const databaseArgs = ["--backend", "postgres", "--pg-service-file", serviceFile, "--pg-service", "purge_fixture"];
+    const dry = JSON.parse(success(run(process.execPath, toolArgs(workspace, manifestPath, join(workspace, "dry.json"), databaseArgs)), "PostgreSQL dry-run"));
+    assert.equal(dry.mode, "dry-run");
+    const applied = JSON.parse(success(run(process.execPath, toolArgs(workspace, manifestPath, join(workspace, "apply.json"), databaseArgs, true)), "PostgreSQL apply"));
+    assert.equal(applied.outcome, "planned");
+    assert.equal(success(run("psql", psqlBase, "SELECT COUNT(*) FROM request_records;", environment), "PostgreSQL history"), "7");
+    assert.equal(success(run("psql", psqlBase, "SELECT COUNT(*) FROM key_records;", environment), "PostgreSQL keys"), "1");
+  } finally {
+    success(run("psql", psqlBase, `DROP SCHEMA ${schema} CASCADE;`, process.env), "drop PostgreSQL schema");
+  }
+});

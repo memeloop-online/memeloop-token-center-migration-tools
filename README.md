@@ -41,6 +41,7 @@
 - 已导入客户凭据的加密 recovery envelope 回填：只接受受保护的、明确的目标 identity→原始 key 映射，默认 dry-run，并且只调用固定 private control `PUT` endpoint；操作边界见 [`docs/operations/credential-recovery-backfill.md`](docs/operations/credential-recovery-backfill.md)。
 - Provider-exact 策略输入生成器在已审核的原生路由回放后，交叉校验完整源策略、源清单、原生候选池、路由清单和目标路由回执，再生成待复核的路由清单/策略映射；它不写目标 API，也不会把任何源密钥散列写入输出。
 - 活跃迁移主键到目标正式余额不受限策略的查询、原子 CAS 迁移和计数/摘要收据。
+- 已退役 API2 trial 对象的精确生产清理：固定 17/7/16 数量、完整 CAS、默认事务回滚 dry-run、摘要审批、幂等回执与历史事实不变式；见 [`docs/operations/retired-api2-trial-purge.md`](docs/operations/retired-api2-trial-purge.md)。
 - 对应的 TypeScript 契约测试与完全合成 fixtures。
 
 ## CI 验证
@@ -53,7 +54,7 @@ npm run typecheck
 npm test
 ```
 
-PostgreSQL acceptance 默认跳过，只有显式提供隔离 schema 的测试环境变量时才会执行。Release CI 为 archive 引擎提供隔离 PostgreSQL，并执行 SQLite/PostgreSQL 导入契约。`ops/import-cpa-session-archive.ts` 使用固定 product revision 构建并随 Release 封存的 Rust 二进制；这是交付中间步骤，并不表示历史源码闭包已提取或允许清理。本地不安装依赖、不拉取源码、不接触真实源/目标数据；本地验证仅限 `git diff --check`。
+大体量 PostgreSQL acceptance 默认跳过，只有显式提供隔离 schema 的测试环境变量时才会执行；退役对象清理契约则由普通 CI 提供隔离 PostgreSQL，并与 SQLite 路径成对验证。Release CI 为 archive 引擎提供隔离 PostgreSQL，并执行 SQLite/PostgreSQL 导入契约。`ops/import-cpa-session-archive.ts` 使用固定 product revision 构建并随 Release 封存的 Rust 二进制；这是交付中间步骤，并不表示历史源码闭包已提取或允许清理。本地不安装依赖、不拉取源码、不接触真实源/目标数据；本地验证仅限 `git diff --check`。
 
 ## 固定 revision 的 Release 执行模型
 
