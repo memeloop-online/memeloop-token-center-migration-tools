@@ -365,7 +365,8 @@ SELECT 'candidate_drift_or_missing_evidence', true
 INSERT INTO fra_fence(reason, invalid)
 SELECT 'refund_projection_precondition_failed', true
  WHERE EXISTS (SELECT 1 FROM fra_new_plan)
-   AND EXISTS (
+   AND (
+   EXISTS (
    SELECT 1 FROM fra_account_refunds refund
     LEFT JOIN credit_accounts account ON account.id = refund.account_id
     LEFT JOIN account_usage_state usage_state ON usage_state.account_id = refund.account_id
@@ -421,7 +422,7 @@ SELECT 'refund_projection_precondition_failed', true
      AND analysis_daily.service_tier = refund.service_tier AND analysis_daily.currency = refund.currency
    WHERE analysis_daily.cost_micros IS DISTINCT FROM refund.current_cost_micros
       OR analysis_daily.cost_micros < refund.refund_micros
- );
+ ));
 INSERT INTO fra_fence(reason, invalid)
 SELECT 'already_refunded_by_another_plan', true
  WHERE EXISTS (
