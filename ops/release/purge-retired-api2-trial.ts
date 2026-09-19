@@ -463,7 +463,17 @@ function parseRewrite(value: Json, index: number): ConversationRewrite {
   try { JSON.parse(labelsJson); replacementLabels = JSON.parse(replacementLabelsJson) as Json; } catch { fail("manifest_invalid", `${label} labels must be valid JSON`); }
   const sessionNameContainsLegacyText = sessionName !== null && LEGACY_TEXT.test(sessionName);
   const labelsContainLegacyText = LEGACY_TEXT.test(labelsJson);
-  if (!sessionNameContainsLegacyText && !labelsContainLegacyText) fail("manifest_invalid", `${label} does not contain retired API2/bridge text`);
+  if (!sessionNameContainsLegacyText && !labelsContainLegacyText) {
+    if (replacementSessionName !== sessionName || replacementLabelsJson !== labelsJson) fail("manifest_invalid", `${label} without retired API2/bridge text must be an exact no-op`);
+    return {
+      observation_id: uuid(item.observation_id, `${label}.observation_id`),
+      key_id: uuid(item.key_id, `${label}.key_id`),
+      session_name: sessionName,
+      labels_json: labelsJson,
+      replacement_session_name: replacementSessionName,
+      replacement_labels_json: replacementLabelsJson,
+    };
+  }
   if (sessionNameContainsLegacyText) {
     if (replacementSessionName !== null && replacementSessionName !== "") fail("manifest_invalid", `${label}.replacement_session_name must be empty or null when clearing a retired title`);
   } else if (replacementSessionName !== sessionName) {
@@ -616,6 +626,10 @@ export function buildSql(manifest: ReviewedManifest, digest: string, apply: bool
   const requestResponseDigest = backend === "postgres"
     ? "CASE WHEN request_row.response_object IS NULL THEN '' ELSE LOWER(ENCODE(SHA256(CONVERT_TO(request_row.response_object,'UTF8')),'hex')) END"
     : "CASE WHEN request_row.response_object IS NULL THEN '' ELSE SHA256_TEXT(request_row.response_object) END";
+  const rewriteChanged = (actual: string, expected: string): string => {
+    const nullSafeDifference = backend === "postgres" ? "IS DISTINCT FROM" : "IS NOT";
+    return `${actual}.session_name ${nullSafeDifference} ${expected}.replacement_session_name OR ${actual}.labels_json ${nullSafeDifference} ${expected}.replacement_labels_json`;
+  };
   const replay = `EXISTS (SELECT 1 FROM migration_tool_operation_receipts WHERE idempotency_key=${sqlText(manifest.idempotency_key)})`;
   const fresh = "(SELECT initial_replay FROM operation_state)=0";
   const protectedBefore = protectedTables.map(table => `INSERT INTO protected_counts(table_name,before_count) VALUES (${sqlText(table)},${protectedCount(table)});`).join("\n");
@@ -716,7 +730,7 @@ UPDATE key_records SET issued_key_ciphertext=NULL WHERE id IN (SELECT key_id FRO
 UPDATE key_credentials SET secret_plaintext=NULL WHERE id IN (SELECT credential_id FROM target_credentials) AND ${fresh};
 UPDATE key_credential_recovery_secrets SET ciphertext='' WHERE credential_id IN (SELECT credential_id FROM target_recovery) AND ${fresh};
 UPDATE credential_rotation_replays SET response_ciphertext=NULL WHERE idempotency_key IN (SELECT idempotency_key FROM target_rotation_replays) AND ${fresh};
-UPDATE conversation_observations SET session_name=(SELECT replacement_session_name FROM target_rewrites WHERE observation_id=conversation_observations.id),labels_json=(SELECT replacement_labels_json FROM target_rewrites WHERE observation_id=conversation_observations.id) WHERE id IN (SELECT observation_id FROM target_rewrites) AND ${fresh};
+UPDATE conversation_observations SET session_name=(SELECT replacement_session_name FROM target_rewrites WHERE observation_id=conversation_observations.id),labels_json=(SELECT replacement_labels_json FROM target_rewrites WHERE observation_id=conversation_observations.id) WHERE id IN (SELECT observation_id FROM target_rewrites) AND ${fresh} AND EXISTS (SELECT 1 FROM target_rewrites expected WHERE expected.observation_id=conversation_observations.id AND (${rewriteChanged("conversation_observations", "expected")}));
 DELETE FROM deleted_upstream_account_snapshots WHERE upstream_account_id IN (SELECT upstream_account_id FROM target_snapshots) AND ${fresh};
 DELETE FROM key_credential_recovery_secrets WHERE credential_id IN (SELECT credential_id FROM target_recovery) AND ${fresh};
 DELETE FROM key_credential_source_proofs WHERE credential_id IN (SELECT credential_id FROM target_proofs) AND ${fresh};
@@ -746,7 +760,7 @@ ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM credential_rotation_replays WHER
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM synchronous_image_idempotency WHERE (key_id,idempotency_key) IN (SELECT key_id,idempotency_key FROM target_synchronous_image_idempotency))`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM credential_groups WHERE id IN (SELECT id FROM target_credential_groups) AND NOT EXISTS (SELECT 1 FROM credential_group_memberships remaining WHERE remaining.credential_group_id=credential_groups.id))`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM route_groups WHERE id IN (SELECT id FROM target_route_groups) AND NOT EXISTS (SELECT 1 FROM routing_grants remaining WHERE remaining.route_group_id=route_groups.id) AND NOT EXISTS (SELECT 1 FROM model_route_group_memberships remaining WHERE remaining.route_group_id=route_groups.id))`)}
-${assertion(`${fresh} AND EXISTS (SELECT 1 FROM conversation_observations actual JOIN target_rewrites expected ON expected.observation_id=actual.id WHERE (actual.session_name IS NULL)<> (expected.replacement_session_name IS NULL) OR (actual.session_name IS NOT NULL AND expected.replacement_session_name IS NOT NULL AND actual.session_name<>expected.replacement_session_name) OR actual.labels_json<>expected.replacement_labels_json)`)}
+${assertion(`${fresh} AND EXISTS (SELECT 1 FROM conversation_observations actual JOIN target_rewrites expected ON expected.observation_id=actual.id WHERE ${rewriteChanged("actual", "expected")})`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM conversation_observations actual WHERE actual.key_id IN (SELECT key_id FROM target_keys) AND (LOWER(COALESCE(actual.session_name,'')) LIKE '%api2%' OR LOWER(COALESCE(actual.session_name,'')) LIKE '%legacy-cpa-bridge%' OR LOWER(COALESCE(actual.session_name,'')) LIKE '%cpa-%' OR LOWER(COALESCE(actual.session_name,'')) LIKE '%bridge%' OR LOWER(actual.labels_json) LIKE '%api2%' OR LOWER(actual.labels_json) LIKE '%legacy-cpa-bridge%' OR LOWER(actual.labels_json) LIKE '%cpa-%' OR LOWER(actual.labels_json) LIKE '%bridge%'))`)}
 ${protectedAfter}
 INSERT INTO migration_tool_operation_receipts(idempotency_key,operation_kind,manifest_sha256,applied_at,summary_json)

@@ -57,16 +57,16 @@ function fixtureManifest(): ReviewedManifest {
   const conversation_rewrites = Array.from({ length: 170 }, (_, index) => {
     const key = keys[index % keys.length]!;
     const sessionName = index < 20 ? `api2 trial session ${index}` : null;
-    const labelsJson = index === 0
-      ? JSON.stringify({ ui: "preserve-this-label" })
-      : JSON.stringify({ alias: `cpa-fixture-${index}`, cohort: "bridge" });
-    const labelsContainLegacyText = index !== 0;
+    const labelsJson = index < 20
+      ? JSON.stringify({ alias: `cpa-fixture-${index}`, cohort: "bridge" })
+      : JSON.stringify({ ui: "preserve-this-label" });
+    const labelsContainLegacyText = index < 20;
     return {
       observation_id: uuid(800 + index),
       key_id: key.key_id,
       session_name: sessionName,
       labels_json: labelsJson,
-      replacement_session_name: null,
+      replacement_session_name: index < 20 ? null : sessionName,
       replacement_labels_json: labelsContainLegacyText ? JSON.stringify({ state: "retired" }) : labelsJson,
     };
   });
@@ -165,6 +165,10 @@ CREATE TABLE routing_grants(tenant_id TEXT NOT NULL,key_id TEXT NOT NULL REFEREN
 CREATE TABLE routing_grant_relation_revisions(tenant_id TEXT NOT NULL,subject_kind TEXT NOT NULL,subject_id TEXT NOT NULL,key_id TEXT REFERENCES key_records(id) ON DELETE CASCADE,model_route_id TEXT,revision BIGINT NOT NULL,PRIMARY KEY(tenant_id,subject_kind,subject_id));
 CREATE TABLE deleted_upstream_account_snapshots(upstream_account_id TEXT PRIMARY KEY,tenant_id TEXT NOT NULL,name TEXT NOT NULL,driver TEXT NOT NULL,auth_kind TEXT NOT NULL,credential_generation BIGINT NOT NULL,created_at BIGINT NOT NULL,deleted_at BIGINT NOT NULL);
 CREATE TABLE conversation_observations(id TEXT PRIMARY KEY,key_id TEXT NOT NULL,session_name TEXT,labels_json TEXT NOT NULL);
+CREATE TABLE conversation_observation_update_audit(observation_id TEXT NOT NULL,old_session_name TEXT,old_labels_json TEXT NOT NULL,new_session_name TEXT,new_labels_json TEXT NOT NULL);
+${postgres
+    ? "CREATE FUNCTION conversation_observation_update_audit_fn() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO conversation_observation_update_audit VALUES (OLD.id,OLD.session_name,OLD.labels_json,NEW.session_name,NEW.labels_json); RETURN NEW; END; $$;\nCREATE TRIGGER conversation_observation_update_audit_trigger AFTER UPDATE OF session_name,labels_json ON conversation_observations FOR EACH ROW EXECUTE FUNCTION conversation_observation_update_audit_fn();"
+    : "CREATE TRIGGER conversation_observation_update_audit_trigger AFTER UPDATE OF session_name,labels_json ON conversation_observations BEGIN INSERT INTO conversation_observation_update_audit VALUES (OLD.id,OLD.session_name,OLD.labels_json,NEW.session_name,NEW.labels_json); END;"}
 CREATE TABLE conversation_clusters(id TEXT PRIMARY KEY,principal_id TEXT NOT NULL);
 CREATE TABLE session_archive_correlations(id TEXT PRIMARY KEY,key_id TEXT NOT NULL,principal_id TEXT NOT NULL);
 CREATE TABLE session_archive_unlinked_requests(id TEXT PRIMARY KEY,key_id TEXT NOT NULL,principal_id TEXT NOT NULL);
@@ -259,12 +263,15 @@ test("reviewed manifest is fixed to the production-audited cohort", () => {
   assert.equal(manifest.keys.length, 7);
   assert.equal(manifest.conversation_rewrites.length, 170);
   assert.equal(manifest.conversation_rewrites.filter(entry => entry.session_name === null).length, 150);
-  assert.equal(manifest.conversation_rewrites[0]!.replacement_labels_json, manifest.conversation_rewrites[0]!.labels_json);
+  assert.equal(manifest.conversation_rewrites.filter(entry => entry.session_name === null && entry.labels_json === JSON.stringify({ ui: "preserve-this-label" })).length, 150);
+  assert.equal(manifest.conversation_rewrites[20]!.replacement_labels_json, manifest.conversation_rewrites[20]!.labels_json);
   assert.equal(manifest.conversation_rewrites[20]!.replacement_session_name, null);
   assert.equal(manifest.synchronous_image_idempotency.length, 24);
   const namedSessionWithMarkedLabels = JSON.parse(JSON.stringify(manifest));
   namedSessionWithMarkedLabels.conversation_rewrites[20].session_name = "ordinary user title";
+  namedSessionWithMarkedLabels.conversation_rewrites[20].labels_json = JSON.stringify({ alias: "cpa-fixture-20" });
   namedSessionWithMarkedLabels.conversation_rewrites[20].replacement_session_name = "ordinary user title";
+  namedSessionWithMarkedLabels.conversation_rewrites[20].replacement_labels_json = JSON.stringify({ state: "retired" });
   const preservedNamedSession = parseManifest(namedSessionWithMarkedLabels);
   assert.equal(preservedNamedSession.conversation_rewrites[20]!.replacement_session_name, "ordinary user title");
   const invalid = JSON.parse(JSON.stringify(manifest));
@@ -280,7 +287,7 @@ test("reviewed manifest is fixed to the production-audited cohort", () => {
   badProjectionDigest.conversation_projection_outbox[0].request_json_sha256 = "invalid";
   assert.throws(() => parseManifest(badProjectionDigest), (error: unknown) => error instanceof PurgeFailure && error.code === "manifest_invalid");
   const rewrittenUnmarkedLabels = JSON.parse(JSON.stringify(manifest));
-  rewrittenUnmarkedLabels.conversation_rewrites[0].replacement_labels_json = JSON.stringify({ state: "retired" });
+  rewrittenUnmarkedLabels.conversation_rewrites[20].replacement_labels_json = JSON.stringify({ state: "retired" });
   assert.throws(() => parseManifest(rewrittenUnmarkedLabels), (error: unknown) => error instanceof PurgeFailure && error.code === "manifest_invalid");
   const fabricatedUnnamedTitle = JSON.parse(JSON.stringify(manifest));
   fabricatedUnnamedTitle.conversation_rewrites[20].replacement_session_name = "generated-title";
@@ -313,6 +320,7 @@ test("generated SQL clears recoverable secrets before exact deletes and rolls ba
   assert.match(sql, /NOT EXISTS \(SELECT 1 FROM session_routing_terminals remaining WHERE remaining\.principal_id=principals\.id\)/u);
   assert.match(sql, /session_archive_import_records row JOIN request_records request_row ON request_row\.id=row\.target_request_id/u);
   assert.doesNotMatch(sql, /remaining\.status='active'/u);
+  assert.match(sql, /conversation_observations\.session_name IS NOT expected\.replacement_session_name OR conversation_observations\.labels_json IS NOT expected\.replacement_labels_json/u);
   assert.match(sql, /ROLLBACK;\s*$/u);
   assert.doesNotMatch(sql, /DELETE FROM (?:request_records|ledger_entries|usage_reservations|generation_jobs|conversation_observations)/u);
 });
@@ -327,6 +335,7 @@ test("PostgreSQL plan locks mutable dependencies and applies the same fail-close
   assert.match(sql, /completed_at IS NULL/u);
   assert.match(sql, /stats_aggregated_at IS NULL/u);
   assert.match(sql, /SHA256\(CONVERT_TO\(actual\.request_json,'UTF8'\)\)/u);
+  assert.match(sql, /conversation_observations\.session_name IS DISTINCT FROM expected\.replacement_session_name OR conversation_observations\.labels_json IS DISTINCT FROM expected\.replacement_labels_json/u);
   assert.match(sql, /ROLLBACK;\s*$/u);
 });
 
@@ -410,12 +419,16 @@ test("SQLite dry-run, approved apply and replay preserve historical facts", () =
   assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM deleted_upstream_account_snapshots;"), "SQLite applied snapshots"), "0");
   assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM request_records;"), "SQLite applied history"), before);
   assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM principals;"), "SQLite retained dependent principals"), "7");
-  assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM conversation_observations WHERE (session_name IS NULL OR session_name='') AND labels_json='{\"state\":\"retired\"}';"), "SQLite localized conversation tombstones"), "169");
-  assert.equal(success(run("sqlite3", [database], "SELECT labels_json FROM conversation_observations WHERE id='00000000-0000-4000-8000-000000000800';"), "SQLite preserves unmarked labels"), "{\"ui\":\"preserve-this-label\"}");
+  assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM conversation_observation_update_audit;"), "SQLite changed conversation observations"), "20");
+  assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM conversation_observation_update_audit WHERE old_session_name IS NULL AND old_labels_json='{\"ui\":\"preserve-this-label\"}';"), "SQLite no-op conversation observations"), "0");
+  assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM conversation_observations WHERE (session_name IS NULL OR session_name='') AND labels_json='{\"state\":\"retired\"}';"), "SQLite localized conversation tombstones"), "20");
+  assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM conversation_observations WHERE session_name IS NULL AND labels_json='{\"ui\":\"preserve-this-label\"}';"), "SQLite preserves unnamed no-op observations"), "150");
+  assert.equal(success(run("sqlite3", [database], "SELECT labels_json FROM conversation_observations WHERE id='00000000-0000-4000-8000-000000000820';"), "SQLite preserves unmarked labels"), "{\"ui\":\"preserve-this-label\"}");
   assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM conversation_observations WHERE session_name LIKE 'retired-%' OR session_name LIKE '%00000000-%';"), "SQLite technical conversation titles"), "0");
   const replayReceipt = join(workspace, "replay.json");
   const replay = JSON.parse(success(run(process.execPath, toolArgs(workspace, manifestPath, replayReceipt, databaseArgs, true)), "SQLite replay"));
   assert.equal(replay.outcome, "replay");
+  assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM conversation_observation_update_audit;"), "SQLite replay conversation updates"), "20");
 });
 
 const postgresConfigured = ["PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE"].every(name => Boolean(process.env[name]));
@@ -443,6 +456,13 @@ test("PostgreSQL dry-run and apply enforce the same reviewed cleanup contract", 
     assert.equal(success(run("psql", psqlBase, "SELECT COUNT(*) FROM credential_rotation_replays;", environment), "PostgreSQL rotation replays"), "0");
     assert.equal(success(run("psql", psqlBase, "SELECT COUNT(*) FROM synchronous_image_idempotency;", environment), "PostgreSQL synchronous replay rows"), "0");
     assert.equal(success(run("psql", psqlBase, "SELECT COUNT(*) FROM principals;", environment), "PostgreSQL dependent principals"), "7");
+    assert.equal(success(run("psql", psqlBase, "SELECT COUNT(*) FROM conversation_observation_update_audit;", environment), "PostgreSQL changed conversation observations"), "20");
+    assert.equal(success(run("psql", psqlBase, "SELECT COUNT(*) FROM conversation_observation_update_audit WHERE old_session_name IS NULL AND old_labels_json='{\"ui\":\"preserve-this-label\"}';", environment), "PostgreSQL no-op conversation observations"), "0");
+    const replayReceipt = join(workspace, "replay.json");
+    const replay = JSON.parse(success(run(process.execPath, toolArgs(workspace, manifestPath, replayReceipt, databaseArgs, true)), "PostgreSQL replay"));
+    assert.equal(replay.outcome, "replay");
+    assert.equal(success(run("psql", psqlBase, "SELECT COUNT(*) FROM conversation_observation_update_audit;", environment), "PostgreSQL replay conversation updates"), "20");
+    assert.equal(success(run("psql", psqlBase, "SELECT COUNT(*) FROM conversation_observation_update_audit WHERE old_session_name IS NULL AND old_labels_json='{\"ui\":\"preserve-this-label\"}';", environment), "PostgreSQL replay no-op conversation observations"), "0");
   } finally {
     success(run("psql", psqlBase, `DROP SCHEMA ${schema} CASCADE;`, process.env), "drop PostgreSQL schema");
   }

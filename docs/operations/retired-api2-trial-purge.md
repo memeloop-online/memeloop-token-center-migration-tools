@@ -55,11 +55,14 @@ exactly like active keys.
 Conversation rewrites use exact old `session_name` and `labels_json` values as
 CAS inputs. `session_name` may be `null`; the manifest keeps that value as
 `null` and never invents a title. Each field is checked independently for
-retired API2/CPA text. A manifest row must contain a marker in at least one
-field. A marked title is replaced with an empty value or `null`, while an
-unmarked title must be copied byte-for-byte (including `null`). Marked labels
-are replaced with only `{ "state": "retired" }`; unmarked labels must be
-copied byte-for-byte. This limits the rewrite to fields that actually contain
+retired API2/CPA text. A row with a marker is rewritten only in the fields
+that contain retired material: a marked title is replaced with an empty value
+or `null`, while an unmarked title must be copied byte-for-byte (including
+`null`); marked labels are replaced with only `{ "state": "retired" }`, while
+unmarked labels must be copied byte-for-byte. A row with no marker may still
+be included to complete the audited cohort, but it must be an exact no-op in
+both replacement fields. Every row remains covered by the full CAS and
+protected-fact checks. This limits the rewrite to fields that actually contain
 retired material and leaves the user-facing tombstone title to the localized
 product UI. After rewriting, the transaction scans all selected-key
 observations and fails if any legacy markers remain.
