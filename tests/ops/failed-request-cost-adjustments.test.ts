@@ -48,9 +48,11 @@ test("plan is read-only, excludes 504 by default, and writes a sealed approval a
     assert.equal(invocations.length, 1);
     assert.match(invocations[0]!.sql, /BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY/);
     assert.doesNotMatch(invocations[0]!.sql, /\b(?:INSERT|UPDATE|DELETE|ALTER|CREATE|DROP|LOCK)\b/);
+    assert.doesNotMatch(invocations[0]!.sql, /LEFT\s+JOIN\s+LATERAL/iu);
     const codes = invocations[0]!.argv.find((value) => value.startsWith("status_codes="));
     assert.equal(codes, "status_codes=499,502,503");
     assert.equal(result.stdout.includes("fixture-password"), false);
+    assert.equal(result.stdout.includes("00000000-0000-5000-a000-000000000111"), false);
   } finally { rmSync(workspace, { recursive: true, force: true }); }
 });
 
@@ -79,6 +81,20 @@ test("blocked plans remain inspectable but cannot become silent partial refunds"
   } finally { rmSync(workspace, { recursive: true, force: true }); }
 });
 
+test("an empty scope is blocked before it can be presented as a successful correction", () => {
+  const workspace = mkdtempSync(join(tmpdir(), "mtc-failed-request-empty."));
+  try {
+    installExecutableHelper("tests/ops/helpers/fake-psql-failed-request-adjustments.ts", workspace, "psql");
+    const planPath = join(workspace, "empty-plan.json");
+    const env = { ...environment(workspace), FRA_PLAN_OUTPUT: planPath };
+    writeFileSync(join(workspace, "failed-request-adjustments-fixture.json"), JSON.stringify({ empty: true }), { mode: 0o600 });
+    const result = invoke(["--plan"], env);
+    assert.equal(result.status, 1, result.stderr);
+    const receipt = JSON.parse(result.stdout) as { blockers: Array<{ reason: string }> };
+    assert.equal(receipt.blockers.some((blocker) => blocker.reason === "empty_scope_requires_explicit_override"), true);
+  } finally { rmSync(workspace, { recursive: true, force: true }); }
+});
+
 test("apply requires an explicit confirmation and consumes the exact sealed plan without mutating evidence", () => {
   const workspace = mkdtempSync(join(tmpdir(), "mtc-failed-request-apply."));
   try {
@@ -102,8 +118,36 @@ test("apply requires an explicit confirmation and consumes the exact sealed plan
     const applySql = invocations.find((entry) => entry.mode === "apply")!.sql;
     assert.match(applySql, /failed_request_refund/);
     assert.match(applySql, /failed_request_cost_adjustment_daily/);
+    assert.doesNotMatch(applySql, /LOCK\s+TABLE/iu);
+    assert.doesNotMatch(applySql, /LEFT\s+JOIN\s+LATERAL/iu);
     assert.doesNotMatch(applySql, /UPDATE\s+(?:request_records|ledger_entries)\b/iu);
     assert.doesNotMatch(applySql, /DELETE\s+FROM\s+(?:request_records|ledger_entries)\b/iu);
+  } finally { rmSync(workspace, { recursive: true, force: true }); }
+});
+
+test("a large sealed plan is streamed from its 0600 file instead of a psql argv payload", () => {
+  const workspace = mkdtempSync(join(tmpdir(), "mtc-failed-request-large-plan."));
+  try {
+    installExecutableHelper("tests/ops/helpers/fake-psql-failed-request-adjustments.ts", workspace, "psql");
+    const planPath = join(workspace, "large-approval-plan.json");
+    const env = { ...environment(workspace), FRA_PLAN_OUTPUT: planPath };
+    writeFileSync(join(workspace, "failed-request-adjustments-fixture.json"), JSON.stringify({ large: true }), { mode: 0o600 });
+    const planned = invoke(["--plan"], env);
+    assert.equal(planned.status, 0, planned.stderr);
+    assert.ok(statSync(planPath).size > 128 * 1024);
+    const applied = invoke(["--apply"], {
+      ...env,
+      FRA_APPROVED_PLAN: planPath,
+      FRA_APPROVAL_REFERENCE: "ops-large-123",
+      FRA_APPLY_CONFIRM: "APPLY_FAILED_REQUEST_COST_ADJUSTMENTS",
+    });
+    assert.equal(applied.status, 0, applied.stderr);
+    const invocations = JSON.parse(readFileSync(join(workspace, "psql-invocations.json"), "utf8")) as Array<{ mode: string; argv: string[]; sql: string }>;
+    const apply = invocations.find((entry) => entry.mode === "apply")!;
+    assert.equal(apply.argv.some((value) => value.startsWith("plan_json=")), false);
+    assert.equal(apply.argv.some((value) => value === `plan_file=${planPath}`), true);
+    assert.equal(Math.max(...apply.argv.map((value) => value.length)) < 8_192, true);
+    assert.match(apply.sql, /\\copy fra_plan_payload\(payload\) FROM :'plan_file'/);
   } finally { rmSync(workspace, { recursive: true, force: true }); }
 });
 

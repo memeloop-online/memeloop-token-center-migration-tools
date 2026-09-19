@@ -213,6 +213,9 @@ function planBody(value: unknown): PlanBody {
   const ledgers = new Set(candidates.map((entry) => entry.usage_ledger_id));
   if (requests.size !== candidates.length || ledgers.size !== candidates.length) fail("plan contains duplicate request or usage ledger IDs");
   if (candidates.some((entry) => !scope.status_codes.includes(Number(entry.status_code)))) fail("plan candidate status is outside its scope");
+  if (candidates.some((entry) => BigInt(entry.request_created_at) < BigInt(scope.from_ms) || BigInt(entry.request_created_at) >= BigInt(scope.to_ms))) {
+    fail("plan candidate time is outside its scope");
+  }
   if (!Array.isArray(input.blockers) || input.blockers.length > 100) fail("plan blockers are invalid");
   const blockers = input.blockers.map((value) => {
     const blocker = record(value, "plan blocker is invalid");
@@ -285,9 +288,24 @@ function canonicalPlan(scope: Scope, raw: Record<string, unknown>): { plan: Plan
   const blockers = rawBlockers.map((value) => {
     const item = record(value, "PostgreSQL plan blocker is invalid");
     return { reason: text(item.reason, "PostgreSQL plan blocker is invalid"), count: unsigned(item.count, "PostgreSQL plan blocker is invalid", true) };
-  }).sort((left, right) => left.reason.localeCompare(right.reason));
+  });
+  const tenantCount = unsigned(raw.selected_tenant_count, "PostgreSQL plan receipt has invalid tenant coverage");
+  const observedCount = unsigned(raw.observed_request_count, "PostgreSQL plan receipt has invalid request coverage");
+  if (tenantCount !== "1") blockers.push({ reason: "selected_tenant_missing", count: "1" });
+  if (observedCount === "0" && process.env.FRA_ALLOW_EMPTY_PLAN !== "true") blockers.push({ reason: "empty_scope_requires_explicit_override", count: "1" });
+  blockers.sort((left, right) => left.reason.localeCompare(right.reason));
+  if (new Set(blockers.map((blocker) => blocker.reason)).size !== blockers.length) fail("PostgreSQL plan receipt has duplicate blockers");
   const body: PlanBody = { schema_version: planSchema, scope, candidates, blockers };
-  return { plan: { ...body, plan_sha256: sha256(JSON.stringify(body)) }, blockers, receipt: raw };
+  return {
+    plan: { ...body, plan_sha256: sha256(JSON.stringify(body)) },
+    blockers,
+    receipt: {
+      selected_tenant_count: tenantCount,
+      observed_request_count: observedCount,
+      eligible_candidate_count: String(candidates.length),
+      already_zero_cost_count: unsigned(raw.already_zero_cost_count, "PostgreSQL plan receipt has invalid zero-cost coverage"),
+    },
+  };
 }
 
 function planMode(): void {
@@ -335,7 +353,7 @@ function applyMode(): void {
     "-v", `plan_sha256=${plan.plan_sha256}`,
     "-v", `approval_reference=${approvalReference}`,
     "-v", `now_ms=${Date.now()}`,
-    "-v", `plan_json=${JSON.stringify(plan)}`,
+    "-v", `plan_file=${resolve(required("FRA_APPROVED_PLAN"))}`,
   ], readSql("apply.sql")));
   process.stdout.write(`${JSON.stringify({ schema_version: planSchema, mode: "apply", plan_sha256: plan.plan_sha256, receipt: output })}\n`);
 }
@@ -343,6 +361,7 @@ function applyMode(): void {
 function verifyMode(): void {
   const output = parsedPsqlJson(psql([
     "-v", `tenant_external_id=${required("FRA_TENANT_EXTERNAL_ID")}`,
+    "-v", `now_ms=${Date.now()}`,
   ], readSql("verify.sql")));
   process.stdout.write(`${JSON.stringify({ schema_version: planSchema, mode: "verify", receipt: output })}\n`);
   if (output.outcome !== "pass") process.exitCode = 1;

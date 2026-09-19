@@ -43,15 +43,12 @@ CREATE TABLE IF NOT EXISTS failed_request_cost_adjustment_daily (
   PRIMARY KEY(tenant_id, key_id, day_bucket, currency, status_code)
 );
 
-LOCK TABLE request_records, request_stats_facts, ledger_entries, usage_reservations,
-  credit_accounts, account_usage_state, key_budget_state, key_budget_daily_rollups,
-  key_budget_usage_events, entitlement_cycles, entitlement_usage_allocations,
-  failed_request_cost_adjustment_plans, failed_request_cost_adjustment_items,
-  failed_request_cost_adjustment_daily IN SHARE ROW EXCLUSIVE MODE;
-
+CREATE TEMP TABLE fra_plan_payload (payload JSONB NOT NULL) ON COMMIT DROP;
+\copy fra_plan_payload(payload) FROM :'plan_file'
 CREATE TEMP TABLE fra_scope ON COMMIT DROP AS
-SELECT (:'plan_json'::jsonb->'scope'->>'tenant_external_id') AS tenant_external_id,
-       (:'plan_json'::jsonb->'scope') AS scope_json;
+SELECT (payload->'scope'->>'tenant_external_id') AS tenant_external_id,
+       (payload->'scope') AS scope_json
+  FROM fra_plan_payload;
 CREATE TEMP TABLE fra_input (
   request_id TEXT PRIMARY KEY,
   request_created_at BIGINT NOT NULL,
@@ -69,12 +66,42 @@ INSERT INTO fra_input
 SELECT request_id, request_created_at, tenant_id, key_id, account_id,
        reservation_id, usage_ledger_id, usage_ledger_created_at, status_code,
        currency, refund_micros
-  FROM jsonb_to_recordset(:'plan_json'::jsonb->'candidates') AS input(
+  FROM fra_plan_payload payload,
+       jsonb_to_recordset(payload.payload->'candidates') AS input(
     request_id TEXT, request_created_at BIGINT, tenant_id TEXT, key_id TEXT,
     account_id TEXT, reservation_id TEXT, usage_ledger_id TEXT,
     usage_ledger_created_at BIGINT, status_code BIGINT, currency TEXT,
     refund_micros BIGINT
   );
+
+/* Lock only rows that this approved plan can change, before taking the
+ * evidence snapshot used by the preconditions below. */
+DO $$
+BEGIN
+  PERFORM 1 FROM request_records request_row
+    JOIN fra_input input ON input.request_id = request_row.id
+   FOR UPDATE OF request_row;
+  PERFORM 1 FROM ledger_entries ledger_row
+    JOIN fra_input input ON input.usage_ledger_id = ledger_row.id
+   FOR UPDATE OF ledger_row;
+  PERFORM 1 FROM credit_accounts account_row
+    JOIN fra_input input ON input.account_id = account_row.id
+   FOR UPDATE OF account_row;
+  PERFORM 1 FROM account_usage_state account_state
+    JOIN fra_input input ON input.account_id = account_state.account_id
+   FOR UPDATE OF account_state;
+  PERFORM 1 FROM key_budget_state key_state
+    JOIN fra_input input ON input.key_id = key_state.key_id
+   FOR UPDATE OF key_state;
+  PERFORM 1 FROM key_budget_daily_rollups daily_rollup
+    JOIN fra_input input ON input.key_id = daily_rollup.key_id
+      AND input.usage_ledger_created_at / 86400000 = daily_rollup.day_bucket
+   FOR UPDATE OF daily_rollup;
+  PERFORM 1 FROM entitlement_cycles cycle_row
+    JOIN entitlement_usage_allocations allocation ON allocation.entitlement_cycle_id = cycle_row.id
+    JOIN fra_input input ON input.usage_ledger_id = allocation.usage_ledger_entry_id
+   FOR UPDATE OF cycle_row;
+END $$;
 
 CREATE TEMP TABLE fra_new_plan ON COMMIT DROP AS
 WITH inserted AS (
@@ -109,8 +136,39 @@ SELECT 'existing_plan_conflict', true
      WHERE p.plan_sha256 = :'plan_sha256' AND p.tenant_id = t.id
        AND p.scope_json = s.scope_json
    );
+INSERT INTO fra_fence(reason, invalid)
+SELECT 'empty_candidate_plan', true
+ WHERE EXISTS (SELECT 1 FROM fra_new_plan)
+   AND NOT EXISTS (SELECT 1 FROM fra_input);
 
 CREATE TEMP TABLE fra_observed ON COMMIT DROP AS
+WITH facts AS MATERIALIZED (
+  SELECT i.request_id, i.tenant_id, count(*) AS fact_count, min(f.cost_micros) AS fact_cost_micros
+    FROM fra_input i JOIN request_stats_facts f ON f.request_id = i.request_id AND f.tenant_id = i.tenant_id
+   GROUP BY i.request_id, i.tenant_id
+), reservations AS MATERIALIZED (
+  SELECT i.request_id, count(*) AS reservation_count, min(u.account_id) AS reservation_account_id,
+         min(u.key_id) AS reservation_key_id, min(u.actual_micros) AS reservation_actual_micros,
+         min(u.status) AS reservation_status
+    FROM fra_input i JOIN usage_reservations u ON u.id = i.reservation_id
+   GROUP BY i.request_id
+), usage_ledgers AS MATERIALIZED (
+  SELECT i.request_id, count(*) AS usage_count, min(l.id) AS usage_ledger_id,
+         min(l.created_at) AS usage_ledger_created_at, min(l.account_id) AS usage_ledger_account_id,
+         min(l.key_id) AS usage_ledger_key_id, min(l.currency) AS usage_ledger_currency,
+         min(l.amount_micros) AS usage_ledger_amount_micros
+    FROM fra_input i JOIN ledger_entries l ON l.source = i.reservation_id AND l.kind = 'usage'
+   GROUP BY i.request_id
+), prior_refunds AS MATERIALIZED (
+  SELECT i.request_id, count(refund.id) AS refund_count
+    FROM fra_input i LEFT JOIN ledger_entries refund ON refund.kind = 'failed_request_refund'
+      AND refund.reference_entry_id = i.usage_ledger_id
+   GROUP BY i.request_id
+), entitlement_allocations AS MATERIALIZED (
+  SELECT i.request_id, COALESCE(sum(a.amount_micros), 0) AS entitlement_allocated_micros
+    FROM fra_input i LEFT JOIN entitlement_usage_allocations a ON a.usage_ledger_entry_id = i.usage_ledger_id
+   GROUP BY i.request_id
+)
 SELECT i.*, r.id AS observed_request_id, r.created_at AS observed_request_created_at,
        r.tenant_id AS observed_tenant_id, r.key_id AS observed_key_id,
        r.reservation_id AS observed_reservation_id, r.status_code AS observed_status_code,
@@ -137,71 +195,159 @@ SELECT i.*, r.id AS observed_request_id, r.created_at AS observed_request_create
   FROM fra_input i
   LEFT JOIN request_records r ON r.id = i.request_id
   LEFT JOIN key_records k ON k.id = r.key_id AND k.tenant_id = r.tenant_id
-  LEFT JOIN LATERAL (
-    SELECT count(*) AS fact_count, min(cost_micros) AS fact_cost_micros
-      FROM request_stats_facts f WHERE f.request_id = i.request_id AND f.tenant_id = i.tenant_id
-  ) f ON true
-  LEFT JOIN LATERAL (
-    SELECT count(*) AS reservation_count, min(account_id) AS reservation_account_id,
-           min(key_id) AS reservation_key_id, min(actual_micros) AS reservation_actual_micros,
-           min(status) AS reservation_status
-      FROM usage_reservations u WHERE u.id = i.reservation_id
-  ) u ON true
-  LEFT JOIN LATERAL (
-    SELECT count(*) AS usage_count, min(id) AS usage_ledger_id,
-           min(created_at) AS usage_ledger_created_at, min(account_id) AS usage_ledger_account_id,
-           min(key_id) AS usage_ledger_key_id, min(currency) AS usage_ledger_currency,
-           min(amount_micros) AS usage_ledger_amount_micros
-      FROM ledger_entries l WHERE l.source = i.reservation_id AND l.kind = 'usage'
-  ) l ON true
-  LEFT JOIN LATERAL (
-    SELECT count(*) AS refund_count
-      FROM ledger_entries refund
-     WHERE refund.kind = 'failed_request_refund'
-       AND refund.reference_entry_id = i.usage_ledger_id
-  ) prior_refund ON true
-  LEFT JOIN LATERAL (
-    SELECT sum(amount_micros) AS entitlement_allocated_micros
-      FROM entitlement_usage_allocations a WHERE a.usage_ledger_entry_id = i.usage_ledger_id
-  ) a ON true
+  LEFT JOIN facts f ON f.request_id = i.request_id AND f.tenant_id = i.tenant_id
+  LEFT JOIN reservations u ON u.request_id = i.request_id
+  LEFT JOIN usage_ledgers l ON l.request_id = i.request_id
+  LEFT JOIN prior_refunds prior_refund ON prior_refund.request_id = i.request_id
+  LEFT JOIN entitlement_allocations a ON a.request_id = i.request_id
   LEFT JOIN credit_accounts c ON c.id = i.account_id
   LEFT JOIN account_usage_state aus ON aus.account_id = i.account_id
   LEFT JOIN key_budget_state kbs ON kbs.key_id = i.key_id
   LEFT JOIN key_budget_daily_rollups kbd
     ON kbd.key_id = i.key_id AND kbd.day_bucket = i.usage_ledger_created_at / 86400000;
 
+CREATE TEMP TABLE fra_account_refunds ON COMMIT DROP AS
+SELECT account_id, sum(refund_micros) AS refund_micros
+  FROM fra_observed GROUP BY account_id;
+CREATE TEMP TABLE fra_key_refunds ON COMMIT DROP AS
+SELECT key_id, sum(refund_micros) AS refund_micros
+  FROM fra_observed GROUP BY key_id;
+CREATE TEMP TABLE fra_budget_day_refunds ON COMMIT DROP AS
+SELECT key_id, usage_ledger_created_at / 86400000 AS day_bucket,
+       sum(refund_micros) AS refund_micros
+  FROM fra_observed GROUP BY key_id, usage_ledger_created_at / 86400000;
+CREATE TEMP TABLE fra_entitlement_refund_requirements ON COMMIT DROP AS
+SELECT allocation.entitlement_cycle_id,
+       sum(allocation.amount_micros) AS refund_micros
+  FROM fra_input input
+  JOIN entitlement_usage_allocations allocation ON allocation.usage_ledger_entry_id = input.usage_ledger_id
+ GROUP BY allocation.entitlement_cycle_id;
+CREATE TEMP TABLE fra_planned_rollup_refunds ON COMMIT DROP AS
+SELECT f.tenant_id, f.key_id, f.created_at, f.model, f.protocol, f.status_class,
+       f.error_code, f.upstream_account_id, f.model_route_id, f.service_tier,
+       f.currency, sum(o.refund_micros) AS refund_micros
+  FROM fra_observed o
+  JOIN request_stats_facts f ON f.request_id = o.request_id AND f.tenant_id = o.tenant_id
+ GROUP BY f.tenant_id, f.key_id, f.created_at, f.model, f.protocol, f.status_class,
+          f.error_code, f.upstream_account_id, f.model_route_id, f.service_tier, f.currency;
+
+/* Projection preconditions and updates operate on these exact rows. */
+DO $$
+BEGIN
+  PERFORM 1 FROM request_daily_aggregates daily
+    JOIN fra_planned_rollup_refunds refund ON daily.tenant_id = refund.tenant_id AND daily.key_id = refund.key_id
+      AND daily.day_bucket = refund.created_at / 86400000 AND daily.model = refund.model
+      AND daily.protocol = refund.protocol AND daily.status_class = refund.status_class
+      AND daily.error_code = refund.error_code AND daily.upstream_account_id = refund.upstream_account_id
+      AND daily.model_route_id = refund.model_route_id AND daily.service_tier = refund.service_tier
+      AND daily.currency = refund.currency
+   FOR UPDATE OF daily;
+  PERFORM 1 FROM usage_analysis_hourly hourly
+    JOIN fra_planned_rollup_refunds refund ON hourly.tenant_id = refund.tenant_id AND hourly.key_id = refund.key_id
+      AND hourly.hour_bucket = refund.created_at / 3600000 AND hourly.source_kind = 'request'
+      AND hourly.model = refund.model
+      AND hourly.protocol = CASE WHEN refund.protocol = 'anthropic' OR refund.protocol LIKE 'anthropic-%' THEN 'anthropic'
+                                 WHEN refund.protocol = 'openai-image' THEN 'openai-image' ELSE 'openai' END
+      AND hourly.status_class = refund.status_class AND hourly.error_code = refund.error_code
+      AND hourly.upstream_account_id = refund.upstream_account_id AND hourly.model_route_id = refund.model_route_id
+      AND hourly.service_tier = refund.service_tier AND hourly.currency = refund.currency
+   FOR UPDATE OF hourly;
+  PERFORM 1 FROM usage_analysis_daily daily
+    JOIN fra_planned_rollup_refunds refund ON daily.tenant_id = refund.tenant_id AND daily.key_id = refund.key_id
+      AND daily.day_bucket = refund.created_at / 86400000 AND daily.source_kind = 'request'
+      AND daily.model = refund.model
+      AND daily.protocol = CASE WHEN refund.protocol = 'anthropic' OR refund.protocol LIKE 'anthropic-%' THEN 'anthropic'
+                                WHEN refund.protocol = 'openai-image' THEN 'openai-image' ELSE 'openai' END
+      AND daily.status_class = refund.status_class AND daily.error_code = refund.error_code
+      AND daily.upstream_account_id = refund.upstream_account_id AND daily.model_route_id = refund.model_route_id
+      AND daily.service_tier = refund.service_tier AND daily.currency = refund.currency
+   FOR UPDATE OF daily;
+END $$;
+
 INSERT INTO fra_fence(reason, invalid)
 SELECT 'candidate_drift_or_missing_evidence', true
  WHERE EXISTS (SELECT 1 FROM fra_new_plan)
    AND EXISTS (
    SELECT 1 FROM fra_observed o
+    CROSS JOIN fra_scope scope
+    JOIN tenants scoped_tenant ON scoped_tenant.external_id = scope.tenant_external_id
     WHERE o.observed_request_id IS NULL
-       OR o.observed_request_created_at <> o.request_created_at
-       OR o.observed_tenant_id <> o.tenant_id OR o.observed_key_id <> o.key_id
-       OR o.observed_account_id <> o.account_id OR o.observed_reservation_id <> o.reservation_id
-       OR o.observed_status_code <> o.status_code OR o.observed_currency <> o.currency
-       OR o.observed_cost_micros <> o.refund_micros
-       OR o.fact_count <> 1 OR o.fact_cost_micros <> o.refund_micros
-       OR o.reservation_count <> 1 OR o.reservation_status <> 'settled'
-       OR o.reservation_account_id <> o.account_id OR o.reservation_key_id <> o.key_id
-       OR o.reservation_actual_micros <> o.refund_micros
-       OR o.usage_count <> 1 OR o.observed_usage_ledger_id <> o.usage_ledger_id
-       OR o.observed_usage_ledger_created_at <> o.usage_ledger_created_at
-       OR o.usage_ledger_account_id <> o.account_id OR o.usage_ledger_key_id <> o.key_id
-       OR o.usage_ledger_currency <> o.currency OR o.usage_ledger_amount_micros <> -o.refund_micros
-       OR o.observed_key_currency <> o.currency
-       OR o.refund_count <> 0
+       OR o.tenant_id <> scoped_tenant.id
+       OR o.request_created_at < (scope.scope_json->>'from_ms')::bigint
+       OR o.request_created_at >= (scope.scope_json->>'to_ms')::bigint
+       OR NOT EXISTS (
+         SELECT 1 FROM jsonb_array_elements_text(scope.scope_json->'status_codes') status
+          WHERE status::bigint = o.status_code
+       )
+       OR o.observed_request_created_at IS DISTINCT FROM o.request_created_at
+       OR o.observed_tenant_id IS DISTINCT FROM o.tenant_id OR o.observed_key_id IS DISTINCT FROM o.key_id
+       OR o.observed_account_id IS DISTINCT FROM o.account_id OR o.observed_reservation_id IS DISTINCT FROM o.reservation_id
+       OR o.observed_status_code IS DISTINCT FROM o.status_code OR o.observed_currency IS DISTINCT FROM o.currency
+       OR o.observed_cost_micros IS DISTINCT FROM o.refund_micros
+       OR o.fact_count IS DISTINCT FROM 1 OR o.fact_cost_micros IS DISTINCT FROM o.refund_micros
+       OR o.reservation_count IS DISTINCT FROM 1 OR o.reservation_status IS DISTINCT FROM 'settled'
+       OR o.reservation_account_id IS DISTINCT FROM o.account_id OR o.reservation_key_id IS DISTINCT FROM o.key_id
+       OR o.reservation_actual_micros IS DISTINCT FROM o.refund_micros
+       OR o.usage_count IS DISTINCT FROM 1 OR o.observed_usage_ledger_id IS DISTINCT FROM o.usage_ledger_id
+       OR o.observed_usage_ledger_created_at IS DISTINCT FROM o.usage_ledger_created_at
+       OR o.usage_ledger_account_id IS DISTINCT FROM o.account_id OR o.usage_ledger_key_id IS DISTINCT FROM o.key_id
+       OR o.usage_ledger_currency IS DISTINCT FROM o.currency OR o.usage_ledger_amount_micros IS DISTINCT FROM -o.refund_micros
+       OR o.observed_key_currency IS DISTINCT FROM o.currency
+       OR o.refund_count IS DISTINCT FROM 0
        OR o.entitlement_allocated_micros > o.refund_micros
  );
 INSERT INTO fra_fence(reason, invalid)
 SELECT 'refund_projection_precondition_failed', true
  WHERE EXISTS (SELECT 1 FROM fra_new_plan)
    AND EXISTS (
-   SELECT 1 FROM fra_observed o
-    WHERE o.available_micros IS NULL OR o.available_micros > 9223372036854775807 - o.refund_micros
-       OR o.account_settled_micros IS NULL OR o.account_settled_micros < o.refund_micros
-       OR o.key_settled_micros IS NULL OR o.key_settled_micros < o.refund_micros
-       OR o.day_settled_micros IS NULL OR o.day_settled_micros < o.refund_micros
+   SELECT 1 FROM fra_account_refunds refund
+    LEFT JOIN credit_accounts account ON account.id = refund.account_id
+    LEFT JOIN account_usage_state usage_state ON usage_state.account_id = refund.account_id
+    WHERE account.available_micros IS NULL
+       OR account.available_micros > 9223372036854775807 - refund.refund_micros
+       OR usage_state.settled_lifetime_micros IS NULL OR usage_state.settled_lifetime_micros < refund.refund_micros
+ )
+   OR EXISTS (
+   SELECT 1 FROM fra_key_refunds refund
+    LEFT JOIN key_budget_state state ON state.key_id = refund.key_id
+    WHERE state.settled_lifetime_micros IS NULL OR state.settled_lifetime_micros < refund.refund_micros
+ )
+   OR EXISTS (
+   SELECT 1 FROM fra_budget_day_refunds refund
+    LEFT JOIN key_budget_daily_rollups rollup
+      ON rollup.key_id = refund.key_id AND rollup.day_bucket = refund.day_bucket
+    WHERE rollup.settled_micros IS NULL OR rollup.settled_micros < refund.refund_micros
+ )
+   OR EXISTS (
+   SELECT 1 FROM fra_planned_rollup_refunds refund
+    LEFT JOIN request_daily_aggregates daily
+      ON daily.tenant_id = refund.tenant_id AND daily.key_id = refund.key_id
+     AND daily.day_bucket = refund.created_at / 86400000 AND daily.model = refund.model
+     AND daily.protocol = refund.protocol AND daily.status_class = refund.status_class
+     AND daily.error_code = refund.error_code AND daily.upstream_account_id = refund.upstream_account_id
+     AND daily.model_route_id = refund.model_route_id AND daily.service_tier = refund.service_tier
+     AND daily.currency = refund.currency
+    LEFT JOIN usage_analysis_hourly hourly
+      ON hourly.tenant_id = refund.tenant_id AND hourly.key_id = refund.key_id
+     AND hourly.hour_bucket = refund.created_at / 3600000 AND hourly.source_kind = 'request'
+     AND hourly.model = refund.model
+     AND hourly.protocol = CASE WHEN refund.protocol = 'anthropic' OR refund.protocol LIKE 'anthropic-%'
+                                THEN 'anthropic' WHEN refund.protocol = 'openai-image' THEN 'openai-image' ELSE 'openai' END
+     AND hourly.status_class = refund.status_class AND hourly.error_code = refund.error_code
+     AND hourly.upstream_account_id = refund.upstream_account_id AND hourly.model_route_id = refund.model_route_id
+     AND hourly.service_tier = refund.service_tier AND hourly.currency = refund.currency
+    LEFT JOIN usage_analysis_daily analysis_daily
+      ON analysis_daily.tenant_id = refund.tenant_id AND analysis_daily.key_id = refund.key_id
+     AND analysis_daily.day_bucket = refund.created_at / 86400000 AND analysis_daily.source_kind = 'request'
+     AND analysis_daily.model = refund.model
+     AND analysis_daily.protocol = CASE WHEN refund.protocol = 'anthropic' OR refund.protocol LIKE 'anthropic-%'
+                                        THEN 'anthropic' WHEN refund.protocol = 'openai-image' THEN 'openai-image' ELSE 'openai' END
+     AND analysis_daily.status_class = refund.status_class AND analysis_daily.error_code = refund.error_code
+     AND analysis_daily.upstream_account_id = refund.upstream_account_id AND analysis_daily.model_route_id = refund.model_route_id
+     AND analysis_daily.service_tier = refund.service_tier AND analysis_daily.currency = refund.currency
+   WHERE daily.cost_micros IS NULL OR daily.cost_micros < refund.refund_micros
+      OR hourly.cost_micros IS NULL OR hourly.cost_micros < refund.refund_micros
+      OR analysis_daily.cost_micros IS NULL OR analysis_daily.cost_micros < refund.refund_micros
  );
 INSERT INTO fra_fence(reason, invalid)
 SELECT 'already_refunded_by_another_plan', true
@@ -215,12 +361,9 @@ INSERT INTO fra_fence(reason, invalid)
 SELECT 'entitlement_projection_precondition_failed', true
  WHERE EXISTS (SELECT 1 FROM fra_new_plan)
    AND EXISTS (
-   SELECT 1
-     FROM fra_observed o
-     JOIN entitlement_usage_allocations allocation ON allocation.usage_ledger_entry_id = o.usage_ledger_id
-     JOIN entitlement_cycles cycle ON cycle.id = allocation.entitlement_cycle_id
-    GROUP BY o.usage_ledger_id, cycle.id, cycle.consumed_micros
-   HAVING cycle.consumed_micros < sum(allocation.amount_micros)
+   SELECT 1 FROM fra_entitlement_refund_requirements refund
+    LEFT JOIN entitlement_cycles cycle ON cycle.id = refund.entitlement_cycle_id
+   WHERE cycle.consumed_micros IS NULL OR cycle.consumed_micros < refund.refund_micros
  );
 
 CREATE TEMP TABLE fra_refunds ON COMMIT DROP AS
@@ -244,12 +387,26 @@ SELECT 'refund_ledger_idempotency_conflict', true
  WHERE EXISTS (SELECT 1 FROM fra_new_plan)
    AND (SELECT count(*) FROM fra_refunds) <> (SELECT count(*) FROM fra_input);
 
-CREATE TEMP TABLE fra_refund_entitlements ON COMMIT DROP AS
+CREATE TEMP TABLE fra_refund_entitlement_allocations ON COMMIT DROP AS
 SELECT r.refund_ledger_id, allocation.entitlement_cycle_id,
        sum(allocation.amount_micros) AS amount_micros
   FROM fra_refunds r
-  JOIN entitlement_usage_allocations allocation ON allocation.usage_ledger_entry_id = r.usage_ledger_id
+ JOIN entitlement_usage_allocations allocation ON allocation.usage_ledger_entry_id = r.usage_ledger_id
  GROUP BY r.refund_ledger_id, allocation.entitlement_cycle_id;
+CREATE TEMP TABLE fra_refund_entitlements ON COMMIT DROP AS
+SELECT entitlement_cycle_id, sum(amount_micros) AS amount_micros
+  FROM fra_refund_entitlement_allocations
+ GROUP BY entitlement_cycle_id;
+CREATE TEMP TABLE fra_applied_account_refunds ON COMMIT DROP AS
+SELECT account_id, sum(refund_micros) AS refund_micros
+  FROM fra_refunds GROUP BY account_id;
+CREATE TEMP TABLE fra_applied_key_refunds ON COMMIT DROP AS
+SELECT key_id, sum(refund_micros) AS refund_micros
+  FROM fra_refunds GROUP BY key_id;
+CREATE TEMP TABLE fra_applied_budget_day_refunds ON COMMIT DROP AS
+SELECT key_id, usage_ledger_created_at / 86400000 AS day_bucket,
+       sum(refund_micros) AS refund_micros
+  FROM fra_refunds GROUP BY key_id, usage_ledger_created_at / 86400000;
 
 INSERT INTO failed_request_cost_adjustment_items
   (plan_sha256, request_id, request_created_at, usage_ledger_id, refund_ledger_id,
@@ -263,21 +420,21 @@ SELECT :'plan_sha256', request_id, request_created_at, usage_ledger_id,
 UPDATE credit_accounts account
    SET available_micros = account.available_micros + refund.refund_micros,
        updated_at = :'now_ms'::bigint
-  FROM fra_refunds refund
+  FROM fra_applied_account_refunds refund
  WHERE account.id = refund.account_id;
 UPDATE account_usage_state state
    SET settled_lifetime_micros = state.settled_lifetime_micros - refund.refund_micros,
        updated_at = :'now_ms'::bigint
-  FROM fra_refunds refund
+  FROM fra_applied_account_refunds refund
  WHERE state.account_id = refund.account_id;
 UPDATE key_budget_state state
    SET settled_lifetime_micros = state.settled_lifetime_micros - refund.refund_micros,
        updated_at = :'now_ms'::bigint
-  FROM fra_refunds refund
+  FROM fra_applied_key_refunds refund
  WHERE state.key_id = refund.key_id;
 UPDATE key_budget_daily_rollups rollup
    SET settled_micros = rollup.settled_micros - refund.refund_micros
-  FROM fra_refunds refund
+  FROM fra_applied_budget_day_refunds refund
  WHERE rollup.key_id = refund.key_id
    AND rollup.day_bucket = refund.usage_ledger_created_at / 86400000;
 INSERT INTO key_budget_usage_events
@@ -300,14 +457,48 @@ SELECT lower(substr(md5('failed-request-entitlement-refund-v1:' || refund.refund
        || '-' || substr(md5('failed-request-entitlement-refund-v1:' || refund.refund_ledger_id || ':' || refund.entitlement_cycle_id), 21, 12)
        ), refund.entitlement_cycle_id, refund.refund_ledger_id,
        -refund.amount_micros, :'now_ms'::bigint
-  FROM fra_refund_entitlements refund;
+  FROM fra_refund_entitlement_allocations refund;
+UPDATE request_daily_aggregates daily
+   SET cost_micros = daily.cost_micros - refund.refund_micros
+  FROM fra_planned_rollup_refunds refund
+  CROSS JOIN fra_new_plan
+ WHERE daily.tenant_id = refund.tenant_id AND daily.key_id = refund.key_id
+   AND daily.day_bucket = refund.created_at / 86400000 AND daily.model = refund.model
+   AND daily.protocol = refund.protocol AND daily.status_class = refund.status_class
+   AND daily.error_code = refund.error_code AND daily.upstream_account_id = refund.upstream_account_id
+   AND daily.model_route_id = refund.model_route_id AND daily.service_tier = refund.service_tier
+   AND daily.currency = refund.currency;
+UPDATE usage_analysis_hourly hourly
+   SET cost_micros = hourly.cost_micros - refund.refund_micros
+  FROM fra_planned_rollup_refunds refund
+  CROSS JOIN fra_new_plan
+ WHERE hourly.tenant_id = refund.tenant_id AND hourly.key_id = refund.key_id
+   AND hourly.hour_bucket = refund.created_at / 3600000 AND hourly.source_kind = 'request'
+   AND hourly.model = refund.model
+   AND hourly.protocol = CASE WHEN refund.protocol = 'anthropic' OR refund.protocol LIKE 'anthropic-%'
+                              THEN 'anthropic' WHEN refund.protocol = 'openai-image' THEN 'openai-image' ELSE 'openai' END
+   AND hourly.status_class = refund.status_class AND hourly.error_code = refund.error_code
+   AND hourly.upstream_account_id = refund.upstream_account_id AND hourly.model_route_id = refund.model_route_id
+   AND hourly.service_tier = refund.service_tier AND hourly.currency = refund.currency;
+UPDATE usage_analysis_daily daily
+   SET cost_micros = daily.cost_micros - refund.refund_micros
+  FROM fra_planned_rollup_refunds refund
+  CROSS JOIN fra_new_plan
+ WHERE daily.tenant_id = refund.tenant_id AND daily.key_id = refund.key_id
+   AND daily.day_bucket = refund.created_at / 86400000 AND daily.source_kind = 'request'
+   AND daily.model = refund.model
+   AND daily.protocol = CASE WHEN refund.protocol = 'anthropic' OR refund.protocol LIKE 'anthropic-%'
+                             THEN 'anthropic' WHEN refund.protocol = 'openai-image' THEN 'openai-image' ELSE 'openai' END
+   AND daily.status_class = refund.status_class AND daily.error_code = refund.error_code
+   AND daily.upstream_account_id = refund.upstream_account_id AND daily.model_route_id = refund.model_route_id
+   AND daily.service_tier = refund.service_tier AND daily.currency = refund.currency;
 INSERT INTO failed_request_cost_adjustment_daily
   (tenant_id, key_id, day_bucket, currency, status_code, adjustment_count,
    refund_micros, rebuilt_at)
-SELECT tenant_id, key_id, usage_ledger_created_at / 86400000, currency, status_code,
+SELECT tenant_id, key_id, request_created_at / 86400000, currency, status_code,
        count(*), sum(refund_micros), :'now_ms'::bigint
   FROM fra_refunds
- GROUP BY tenant_id, key_id, usage_ledger_created_at / 86400000, currency, status_code
+ GROUP BY tenant_id, key_id, request_created_at / 86400000, currency, status_code
 ON CONFLICT (tenant_id, key_id, day_bucket, currency, status_code) DO UPDATE SET
   adjustment_count = failed_request_cost_adjustment_daily.adjustment_count + excluded.adjustment_count,
   refund_micros = failed_request_cost_adjustment_daily.refund_micros + excluded.refund_micros,

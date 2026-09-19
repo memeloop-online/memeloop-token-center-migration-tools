@@ -16,8 +16,9 @@ plan/approval/apply sequence:
 4. `--rebuild-derived` can rebuild the derived daily correction projection
    from append-only adjustment evidence; it has a separate explicit
    confirmation.
-5. `--verify` is read-only and validates the linked ledger pairs and derived
-   daily correction totals.
+5. `--verify` is read-only and validates plan/item totals, linked ledger pairs,
+   account and budget projections, entitlement allocations, and the request
+   daily/hourly analytics projections.
 
 The original request, fact, and usage-ledger rows remain immutable. The plan
 contains opaque accounting identifiers and belongs in a private operator
@@ -91,8 +92,10 @@ node ops/adjust-failed-request-costs.ts --rebuild-derived \
   > /private-evidence/failed-request-adjustment-rebuild.json
 ```
 
-The rebuild replaces only rows in `failed_request_cost_adjustment_daily` for
-the selected tenant. It does not modify requests, facts, or ledger evidence.
+The rebuild deterministically recalculates the affected request daily/hourly
+analytics costs and `failed_request_cost_adjustment_daily` from immutable facts
+and append-only adjustment evidence. It does not modify requests, facts, or
+ledger evidence.
 
 ```text
 FRA_PGHOST=REPLACE_HOST \

@@ -18,8 +18,8 @@ let invocations: Array<Record<string, unknown>> = [];
 try { invocations = JSON.parse(readFileSync(logPath, "utf8")) as Array<Record<string, unknown>>; } catch { /* first call */ }
 const mode = sql.includes("FRA_PLAN_READ_ONLY_V1") ? "plan"
   : sql.includes("FRA_APPLY_APPROVED_PLAN_V1") ? "apply"
-    : sql.includes("FRA_REBUILD_DERIVED_V1") ? "rebuild-derived"
-    : sql.includes("FRA_VERIFY_READ_ONLY_V1") ? "verify" : "unknown";
+    : sql.includes("FRA_REBUILD_DERIVED_V2") ? "rebuild-derived"
+    : sql.includes("FRA_VERIFY_READ_ONLY_V2") ? "verify" : "unknown";
 invocations.push({ mode, argv: process.argv.slice(2), sql, pgpassfile: passFile });
 writeFileSync(logPath, JSON.stringify(invocations));
 if (mode === "unknown") process.exit(9);
@@ -40,8 +40,15 @@ const candidate = {
 if (mode === "plan") {
   if (!sql.includes("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
     || /\b(?:INSERT|UPDATE|DELETE|ALTER|CREATE|DROP|LOCK)\b/u.test(sql)) process.exit(9);
+  const candidates = fixture.large === true
+    ? Array.from({ length: 1_200 }, (_, index) => ({
+      ...candidate,
+      request_id: `fixture-request-${index.toString().padStart(5, "0")}-${"x".repeat(96)}`,
+      usage_ledger_id: `fixture-ledger-${index.toString().padStart(5, "0")}-${"y".repeat(96)}`,
+    }))
+    : [candidate];
   process.stdout.write(`${JSON.stringify({
-    observed_request_count: "2", eligible_candidates: [candidate], already_zero_cost_count: "1",
+    selected_tenant_count: "1", observed_request_count: fixture.empty === true ? "0" : "2", eligible_candidates: fixture.empty === true ? [] : candidates, already_zero_cost_count: "1",
     blockers: fixture.blocked ? [{ reason: "request_stats_cost_mismatch", count: "1" }] : [],
   })}\n`);
   process.exit(0);
