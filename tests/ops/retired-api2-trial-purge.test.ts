@@ -262,6 +262,11 @@ test("reviewed manifest is fixed to the production-audited cohort", () => {
   assert.equal(manifest.conversation_rewrites[0]!.replacement_labels_json, manifest.conversation_rewrites[0]!.labels_json);
   assert.equal(manifest.conversation_rewrites[20]!.replacement_session_name, null);
   assert.equal(manifest.synchronous_image_idempotency.length, 24);
+  const namedSessionWithMarkedLabels = JSON.parse(JSON.stringify(manifest));
+  namedSessionWithMarkedLabels.conversation_rewrites[20].session_name = "ordinary user title";
+  namedSessionWithMarkedLabels.conversation_rewrites[20].replacement_session_name = "ordinary user title";
+  const preservedNamedSession = parseManifest(namedSessionWithMarkedLabels);
+  assert.equal(preservedNamedSession.conversation_rewrites[20]!.replacement_session_name, "ordinary user title");
   const invalid = JSON.parse(JSON.stringify(manifest));
   invalid.snapshots.pop();
   assert.throws(() => parseManifest(invalid), (error: unknown) => error instanceof PurgeFailure && error.code === "manifest_invalid");
