@@ -463,7 +463,17 @@ function parseRewrite(value: Json, index: number): ConversationRewrite {
   try { JSON.parse(labelsJson); replacementLabels = JSON.parse(replacementLabelsJson) as Json; } catch { fail("manifest_invalid", `${label} labels must be valid JSON`); }
   const sessionNameContainsLegacyText = sessionName !== null && LEGACY_TEXT.test(sessionName);
   const labelsContainLegacyText = LEGACY_TEXT.test(labelsJson);
-  if (!sessionNameContainsLegacyText && !labelsContainLegacyText) fail("manifest_invalid", `${label} does not contain retired API2/bridge text`);
+  if (!sessionNameContainsLegacyText && !labelsContainLegacyText) {
+    if (replacementSessionName !== sessionName || replacementLabelsJson !== labelsJson) fail("manifest_invalid", `${label} without retired API2/bridge text must be an exact no-op`);
+    return {
+      observation_id: uuid(item.observation_id, `${label}.observation_id`),
+      key_id: uuid(item.key_id, `${label}.key_id`),
+      session_name: sessionName,
+      labels_json: labelsJson,
+      replacement_session_name: replacementSessionName,
+      replacement_labels_json: replacementLabelsJson,
+    };
+  }
   if (sessionNameContainsLegacyText) {
     if (replacementSessionName !== null && replacementSessionName !== "") fail("manifest_invalid", `${label}.replacement_session_name must be empty or null when clearing a retired title`);
   } else if (replacementSessionName !== sessionName) {

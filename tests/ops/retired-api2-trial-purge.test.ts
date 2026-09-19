@@ -57,16 +57,16 @@ function fixtureManifest(): ReviewedManifest {
   const conversation_rewrites = Array.from({ length: 170 }, (_, index) => {
     const key = keys[index % keys.length]!;
     const sessionName = index < 20 ? `api2 trial session ${index}` : null;
-    const labelsJson = index === 0
-      ? JSON.stringify({ ui: "preserve-this-label" })
-      : JSON.stringify({ alias: `cpa-fixture-${index}`, cohort: "bridge" });
-    const labelsContainLegacyText = index !== 0;
+    const labelsJson = index > 0 && index < 20
+      ? JSON.stringify({ alias: `cpa-fixture-${index}`, cohort: "bridge" })
+      : JSON.stringify({ ui: "preserve-this-label" });
+    const labelsContainLegacyText = index > 0 && index < 20;
     return {
       observation_id: uuid(800 + index),
       key_id: key.key_id,
       session_name: sessionName,
       labels_json: labelsJson,
-      replacement_session_name: null,
+      replacement_session_name: index < 20 ? null : sessionName,
       replacement_labels_json: labelsContainLegacyText ? JSON.stringify({ state: "retired" }) : labelsJson,
     };
   });
@@ -259,12 +259,15 @@ test("reviewed manifest is fixed to the production-audited cohort", () => {
   assert.equal(manifest.keys.length, 7);
   assert.equal(manifest.conversation_rewrites.length, 170);
   assert.equal(manifest.conversation_rewrites.filter(entry => entry.session_name === null).length, 150);
+  assert.equal(manifest.conversation_rewrites.filter(entry => entry.session_name === null && entry.labels_json === JSON.stringify({ ui: "preserve-this-label" })).length, 150);
   assert.equal(manifest.conversation_rewrites[0]!.replacement_labels_json, manifest.conversation_rewrites[0]!.labels_json);
   assert.equal(manifest.conversation_rewrites[20]!.replacement_session_name, null);
   assert.equal(manifest.synchronous_image_idempotency.length, 24);
   const namedSessionWithMarkedLabels = JSON.parse(JSON.stringify(manifest));
   namedSessionWithMarkedLabels.conversation_rewrites[20].session_name = "ordinary user title";
+  namedSessionWithMarkedLabels.conversation_rewrites[20].labels_json = JSON.stringify({ alias: "cpa-fixture-20" });
   namedSessionWithMarkedLabels.conversation_rewrites[20].replacement_session_name = "ordinary user title";
+  namedSessionWithMarkedLabels.conversation_rewrites[20].replacement_labels_json = JSON.stringify({ state: "retired" });
   const preservedNamedSession = parseManifest(namedSessionWithMarkedLabels);
   assert.equal(preservedNamedSession.conversation_rewrites[20]!.replacement_session_name, "ordinary user title");
   const invalid = JSON.parse(JSON.stringify(manifest));
@@ -410,7 +413,8 @@ test("SQLite dry-run, approved apply and replay preserve historical facts", () =
   assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM deleted_upstream_account_snapshots;"), "SQLite applied snapshots"), "0");
   assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM request_records;"), "SQLite applied history"), before);
   assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM principals;"), "SQLite retained dependent principals"), "7");
-  assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM conversation_observations WHERE (session_name IS NULL OR session_name='') AND labels_json='{\"state\":\"retired\"}';"), "SQLite localized conversation tombstones"), "169");
+  assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM conversation_observations WHERE (session_name IS NULL OR session_name='') AND labels_json='{\"state\":\"retired\"}';"), "SQLite localized conversation tombstones"), "19");
+  assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM conversation_observations WHERE session_name IS NULL AND labels_json='{\"ui\":\"preserve-this-label\"}';"), "SQLite preserves unnamed no-op observations"), "150");
   assert.equal(success(run("sqlite3", [database], "SELECT labels_json FROM conversation_observations WHERE id='00000000-0000-4000-8000-000000000800';"), "SQLite preserves unmarked labels"), "{\"ui\":\"preserve-this-label\"}");
   assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM conversation_observations WHERE session_name LIKE 'retired-%' OR session_name LIKE '%00000000-%';"), "SQLite technical conversation titles"), "0");
   const replayReceipt = join(workspace, "replay.json");
