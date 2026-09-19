@@ -189,7 +189,7 @@ this intentionally invalid as an executable manifest.
       "session_name": "reviewed old API2 session name",
       "labels_json": "{\"alias\":\"reviewed-old-value\"}",
       "replacement_session_name": null,
-      "replacement_labels_json": "{\"state\":\"retired\"}"
+      "replacement_labels_json": "{\"alias\":\"reviewed-old-value\"}"
     }
   ],
   "synchronous_image_idempotency": [
