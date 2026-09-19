@@ -126,7 +126,7 @@ export interface ReviewedKey {
 export interface ConversationRewrite {
   observation_id: string;
   key_id: string;
-  session_name: string;
+  session_name: string | null;
   labels_json: string;
   replacement_session_name: string | null;
   replacement_labels_json: string;
@@ -455,17 +455,27 @@ function parseRewrite(value: Json, index: number): ConversationRewrite {
   const label = `conversation_rewrites[${index}]`;
   const item = object(value, label);
   exactKeys(item, ["observation_id", "key_id", "session_name", "labels_json", "replacement_session_name", "replacement_labels_json"], label);
-  const sessionName = text(item.session_name, `${label}.session_name`, 1024);
+  const sessionName = nullableTitle(item.session_name, `${label}.session_name`);
   const labelsJson = text(item.labels_json, `${label}.labels_json`, 64 * 1024);
   const replacementSessionName = nullableTitle(item.replacement_session_name, `${label}.replacement_session_name`);
   const replacementLabelsJson = text(item.replacement_labels_json, `${label}.replacement_labels_json`, 64 * 1024);
   let replacementLabels: Json;
   try { JSON.parse(labelsJson); replacementLabels = JSON.parse(replacementLabelsJson) as Json; } catch { fail("manifest_invalid", `${label} labels must be valid JSON`); }
-  if (!LEGACY_TEXT.test(`${sessionName}\n${labelsJson}`)) fail("manifest_invalid", `${label} does not contain retired API2/bridge text`);
-  if (replacementSessionName !== null && replacementSessionName !== "") fail("manifest_invalid", `${label}.replacement_session_name must be empty or null for localized presentation`);
-  const replacementObject = object(replacementLabels, `${label}.replacement_labels_json`);
-  exactKeys(replacementObject, ["state"], `${label}.replacement_labels_json`);
-  if (replacementObject.state !== "retired" || LEGACY_TEXT.test(replacementLabelsJson)) fail("manifest_invalid", `${label} replacement must carry neutral retired state`);
+  const sessionNameContainsLegacyText = sessionName !== null && LEGACY_TEXT.test(sessionName);
+  const labelsContainLegacyText = LEGACY_TEXT.test(labelsJson);
+  if (!sessionNameContainsLegacyText && !labelsContainLegacyText) fail("manifest_invalid", `${label} does not contain retired API2/bridge text`);
+  if (sessionNameContainsLegacyText) {
+    if (replacementSessionName !== null && replacementSessionName !== "") fail("manifest_invalid", `${label}.replacement_session_name must be empty or null when clearing a retired title`);
+  } else if (replacementSessionName !== sessionName) {
+    fail("manifest_invalid", `${label}.replacement_session_name must preserve a title without retired API2/bridge text`);
+  }
+  if (labelsContainLegacyText) {
+    const replacementObject = object(replacementLabels, `${label}.replacement_labels_json`);
+    exactKeys(replacementObject, ["state"], `${label}.replacement_labels_json`);
+    if (replacementObject.state !== "retired" || LEGACY_TEXT.test(replacementLabelsJson)) fail("manifest_invalid", `${label} replacement must carry neutral retired state`);
+  } else if (replacementLabelsJson !== labelsJson) {
+    fail("manifest_invalid", `${label}.replacement_labels_json must preserve labels without retired API2/bridge text`);
+  }
   return {
     observation_id: uuid(item.observation_id, `${label}.observation_id`),
     key_id: uuid(item.key_id, `${label}.key_id`),
@@ -588,7 +598,7 @@ export function buildSql(manifest: ReviewedManifest, digest: string, apply: bool
   const membershipRows = manifest.keys.flatMap(key => key.credential_group_memberships.map(membership => [sqlText(key.key_id), sqlText(membership.credential_group_id), String(membership.created_at)]));
   const grantRows = manifest.keys.flatMap(key => key.routing_grants.map(grant => [sqlText(key.key_id), sqlNullable(grant.model_route_id), sqlNullable(grant.route_group_id), String(grant.created_at)]));
   const revisionRows = manifest.keys.map(key => [sqlText(key.key_id), String(key.routing_revision.revision)]);
-  const rewriteRows = manifest.conversation_rewrites.map(rewrite => [sqlText(rewrite.observation_id), sqlText(rewrite.key_id), sqlText(rewrite.session_name), sqlText(rewrite.labels_json), sqlNullable(rewrite.replacement_session_name), sqlText(rewrite.replacement_labels_json)]);
+  const rewriteRows = manifest.conversation_rewrites.map(rewrite => [sqlText(rewrite.observation_id), sqlText(rewrite.key_id), sqlNullable(rewrite.session_name), sqlText(rewrite.labels_json), sqlNullable(rewrite.replacement_session_name), sqlText(rewrite.replacement_labels_json)]);
   const conversationProjectionRows = manifest.conversation_projection_outbox.map(row => [sqlText(row.request_id), sqlText(row.tenant_id), sqlText(row.key_id), sqlText(row.principal_id), String(row.request_json_bytes), String(row.hints_json_bytes), sqlText(row.request_json_sha256), sqlText(row.hints_json_sha256), sqlNullable(row.client_name), sqlNullable(row.upstream_response_id), String(row.observed_at), sqlNullable(row.lease_owner), sqlNullableInteger(row.lease_expires_at), String(row.attempts), sqlNullableInteger(row.projected_at)]);
   const synchronousImageRows = manifest.synchronous_image_idempotency.map(row => [sqlText(row.key_id), sqlText(row.idempotency_key), sqlText(row.request_hash), sqlText(row.request_id), sqlText(row.reservation_id), sqlText(row.status), sqlNullableInteger(row.response_status), sqlBool(row.response_object_present), String(row.response_object_bytes), sqlNullable(row.response_object_sha256), sqlNullable(row.error_code), String(row.created_at), String(row.lease_expires_at), sqlNullableInteger(row.completed_at)]);
   const credentialGroupRows = manifest.credential_groups.map(group => [sqlText(group.id), sqlText(group.tenant_id), sqlText(group.name), sqlText(group.normalized_name), String(group.created_at), String(group.updated_at)]);
@@ -644,8 +654,8 @@ CREATE TEMP TABLE target_grants(key_id TEXT NOT NULL,model_route_id TEXT,route_g
 INSERT INTO target_grants ${values(grantRows, ["''", "NULL", "NULL", "0"])};
 CREATE TEMP TABLE target_revisions(key_id TEXT PRIMARY KEY,revision BIGINT NOT NULL);
 INSERT INTO target_revisions ${values(revisionRows, ["''", "0"])};
-CREATE TEMP TABLE target_rewrites(observation_id TEXT PRIMARY KEY,key_id TEXT NOT NULL,session_name TEXT NOT NULL,labels_json TEXT NOT NULL,replacement_session_name TEXT,replacement_labels_json TEXT NOT NULL);
-INSERT INTO target_rewrites ${values(rewriteRows, ["''", "''", "''", "''", "NULL", "''"])};
+CREATE TEMP TABLE target_rewrites(observation_id TEXT PRIMARY KEY,key_id TEXT NOT NULL,session_name TEXT,labels_json TEXT NOT NULL,replacement_session_name TEXT,replacement_labels_json TEXT NOT NULL);
+INSERT INTO target_rewrites ${values(rewriteRows, ["''", "''", "NULL", "''", "NULL", "''"])};
 CREATE TEMP TABLE target_conversation_projections(request_id TEXT PRIMARY KEY,tenant_id TEXT NOT NULL,key_id TEXT NOT NULL,principal_id TEXT NOT NULL,request_json_bytes BIGINT NOT NULL,hints_json_bytes BIGINT NOT NULL,request_json_sha256 TEXT NOT NULL,hints_json_sha256 TEXT NOT NULL,client_name TEXT,upstream_response_id TEXT,observed_at BIGINT NOT NULL,lease_owner TEXT,lease_expires_at BIGINT,attempts BIGINT NOT NULL,projected_at BIGINT);
 INSERT INTO target_conversation_projections ${values(conversationProjectionRows, ["''", "''", "''", "''", "0", "0", "''", "''", "NULL", "NULL", "0", "NULL", "NULL", "0", "NULL"])};
 CREATE TEMP TABLE target_synchronous_image_idempotency(key_id TEXT NOT NULL,idempotency_key TEXT NOT NULL,request_hash TEXT NOT NULL,request_id TEXT NOT NULL,reservation_id TEXT NOT NULL,status TEXT NOT NULL,response_status BIGINT,response_object_present BIGINT NOT NULL,response_object_bytes BIGINT NOT NULL,response_object_sha256 TEXT,error_code TEXT,created_at BIGINT NOT NULL,lease_expires_at BIGINT NOT NULL,completed_at BIGINT,PRIMARY KEY(key_id,idempotency_key));
@@ -687,7 +697,7 @@ ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM target_grants touched WHERE touc
 ${assertion(`${fresh} AND (SELECT COUNT(*) FROM routing_grant_relation_revisions actual WHERE actual.subject_kind='credential' AND actual.key_id IN (SELECT key_id FROM target_keys))<>(SELECT COUNT(*) FROM target_revisions)`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM target_revisions expected LEFT JOIN routing_grant_relation_revisions actual ON actual.subject_kind='credential' AND actual.subject_id=expected.key_id AND actual.key_id=expected.key_id WHERE actual.key_id IS NULL OR actual.tenant_id<>(SELECT id FROM tenants WHERE external_id=${sqlText(manifest.tenant_external_id)}) OR actual.model_route_id IS NOT NULL OR actual.revision<>expected.revision)`)}
 ${assertion(`${fresh} AND (SELECT COUNT(*) FROM conversation_observations actual WHERE actual.id IN (SELECT observation_id FROM target_rewrites))<>(SELECT COUNT(*) FROM target_rewrites)`)}
-${assertion(`${fresh} AND EXISTS (SELECT 1 FROM target_rewrites expected LEFT JOIN conversation_observations actual ON actual.id=expected.observation_id WHERE actual.id IS NULL OR actual.key_id<>expected.key_id OR actual.session_name<>expected.session_name OR actual.labels_json<>expected.labels_json)`)}
+${assertion(`${fresh} AND EXISTS (SELECT 1 FROM target_rewrites expected LEFT JOIN conversation_observations actual ON actual.id=expected.observation_id WHERE actual.id IS NULL OR actual.key_id<>expected.key_id OR (actual.session_name IS NULL)<> (expected.session_name IS NULL) OR (actual.session_name IS NOT NULL AND expected.session_name IS NOT NULL AND actual.session_name<>expected.session_name) OR actual.labels_json<>expected.labels_json)`)}
 ${assertion(`${fresh} AND (SELECT COUNT(*) FROM conversation_projection_outbox actual WHERE actual.key_id IN (SELECT key_id FROM target_keys))<>(SELECT COUNT(*) FROM target_conversation_projections)`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM target_conversation_projections expected LEFT JOIN conversation_projection_outbox actual ON actual.request_id=expected.request_id WHERE actual.request_id IS NULL OR actual.tenant_id<>expected.tenant_id OR actual.key_id<>expected.key_id OR actual.principal_id<>expected.principal_id OR ${octetLength("actual.request_json")}<>expected.request_json_bytes OR ${octetLength("actual.hints_json")}<>expected.hints_json_bytes OR ${projectionPayloadCas} OR COALESCE(actual.client_name,'')<>COALESCE(expected.client_name,'') OR COALESCE(actual.upstream_response_id,'')<>COALESCE(expected.upstream_response_id,'') OR actual.observed_at<>expected.observed_at OR COALESCE(actual.lease_owner,'')<>COALESCE(expected.lease_owner,'') OR COALESCE(actual.lease_expires_at,-1)<>COALESCE(expected.lease_expires_at,-1) OR actual.attempts<>expected.attempts OR COALESCE(actual.projected_at,-1)<>COALESCE(expected.projected_at,-1))`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM conversation_projection_outbox WHERE key_id IN (SELECT key_id FROM target_keys) AND projected_at IS NULL)`)}
@@ -736,7 +746,7 @@ ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM credential_rotation_replays WHER
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM synchronous_image_idempotency WHERE (key_id,idempotency_key) IN (SELECT key_id,idempotency_key FROM target_synchronous_image_idempotency))`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM credential_groups WHERE id IN (SELECT id FROM target_credential_groups) AND NOT EXISTS (SELECT 1 FROM credential_group_memberships remaining WHERE remaining.credential_group_id=credential_groups.id))`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM route_groups WHERE id IN (SELECT id FROM target_route_groups) AND NOT EXISTS (SELECT 1 FROM routing_grants remaining WHERE remaining.route_group_id=route_groups.id) AND NOT EXISTS (SELECT 1 FROM model_route_group_memberships remaining WHERE remaining.route_group_id=route_groups.id))`)}
-${assertion(`${fresh} AND EXISTS (SELECT 1 FROM conversation_observations actual JOIN target_rewrites expected ON expected.observation_id=actual.id WHERE COALESCE(actual.session_name,'')<>COALESCE(expected.replacement_session_name,'') OR actual.labels_json<>expected.replacement_labels_json)`)}
+${assertion(`${fresh} AND EXISTS (SELECT 1 FROM conversation_observations actual JOIN target_rewrites expected ON expected.observation_id=actual.id WHERE (actual.session_name IS NULL)<> (expected.replacement_session_name IS NULL) OR (actual.session_name IS NOT NULL AND expected.replacement_session_name IS NOT NULL AND actual.session_name<>expected.replacement_session_name) OR actual.labels_json<>expected.replacement_labels_json)`)}
 ${assertion(`${fresh} AND EXISTS (SELECT 1 FROM conversation_observations actual WHERE actual.key_id IN (SELECT key_id FROM target_keys) AND (LOWER(COALESCE(actual.session_name,'')) LIKE '%api2%' OR LOWER(COALESCE(actual.session_name,'')) LIKE '%legacy-cpa-bridge%' OR LOWER(COALESCE(actual.session_name,'')) LIKE '%cpa-%' OR LOWER(COALESCE(actual.session_name,'')) LIKE '%bridge%' OR LOWER(actual.labels_json) LIKE '%api2%' OR LOWER(actual.labels_json) LIKE '%legacy-cpa-bridge%' OR LOWER(actual.labels_json) LIKE '%cpa-%' OR LOWER(actual.labels_json) LIKE '%bridge%'))`)}
 ${protectedAfter}
 INSERT INTO migration_tool_operation_receipts(idempotency_key,operation_kind,manifest_sha256,applied_at,summary_json)

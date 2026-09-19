@@ -53,10 +53,15 @@ subscription event. Revoked and archived shared keys retain their principal
 exactly like active keys.
 
 Conversation rewrites use exact old `session_name` and `labels_json` values as
-CAS inputs. The replacement title must be empty or `null`, and replacement
-labels contain only `{ "state": "retired" }`. This leaves the user-facing
-tombstone title to the localized product UI and avoids exposing UUID-based
-technical names. After rewriting, the transaction scans all selected-key
+CAS inputs. `session_name` may be `null`; the manifest keeps that value as
+`null` and never invents a title. Each field is checked independently for
+retired API2/CPA text. A manifest row must contain a marker in at least one
+field. A marked title is replaced with an empty value or `null`, while an
+unmarked title must be copied byte-for-byte (including `null`). Marked labels
+are replaced with only `{ "state": "retired" }`; unmarked labels must be
+copied byte-for-byte. This limits the rewrite to fields that actually contain
+retired material and leaves the user-facing tombstone title to the localized
+product UI. After rewriting, the transaction scans all selected-key
 observations and fails if any legacy markers remain.
 
 The command snapshots row counts for requests, events, request/generation
@@ -184,7 +189,7 @@ this intentionally invalid as an executable manifest.
       "session_name": "reviewed old API2 session name",
       "labels_json": "{\"alias\":\"reviewed-old-value\"}",
       "replacement_session_name": null,
-      "replacement_labels_json": "{\"state\":\"retired\"}"
+      "replacement_labels_json": "{\"alias\":\"reviewed-old-value\"}"
     }
   ],
   "synchronous_image_idempotency": [
