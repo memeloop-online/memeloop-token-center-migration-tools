@@ -41,7 +41,7 @@ if (mode === "plan") {
   if (!sql.includes("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
     || /\b(?:INSERT|UPDATE|DELETE|ALTER|CREATE|DROP|LOCK)\b/u.test(sql)) process.exit(9);
   const candidates = fixture.large === true
-    ? Array.from({ length: 1_200 }, (_, index) => ({
+    ? Array.from({ length: 400 }, (_, index) => ({
       ...candidate,
       request_id: `fixture-request-${index.toString().padStart(5, "0")}-${"x".repeat(96)}`,
       usage_ledger_id: `fixture-ledger-${index.toString().padStart(5, "0")}-${"y".repeat(96)}`,

@@ -13,13 +13,10 @@ import {
   closeSync,
   constants as fsConstants,
   lstatSync,
-  mkdtempSync,
   openSync,
   readFileSync,
-  rmSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseStrictJson, StrictJsonError } from "./lib/strict-json.ts";
@@ -276,15 +273,12 @@ function readPlan(path: string): Plan {
   }
 }
 
-function withVerifiedPlanFile<T>(plan: Plan, run: (path: string) => T): T {
-  const directory = mkdtempSync(join(tmpdir(), "mtc-failed-request-plan-"));
-  const path = join(directory, "approved.json");
-  try {
-    writeFileSync(path, `${JSON.stringify(plan)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
-    return run(path);
-  } finally {
-    rmSync(directory, { recursive: true, force: true });
-  }
+function applySql(plan: Plan): string {
+  const marker = "-- FRA_PLAN_PAYLOAD_STDIN";
+  const sql = readSql("apply.sql");
+  const replacement = `COPY fra_plan_payload(payload) FROM STDIN;\n${JSON.stringify(plan)}\n\\.\n`;
+  if (sql.split(marker).length !== 2) fail("apply SQL payload marker is invalid");
+  return sql.replace(marker, replacement);
 }
 
 function parsedPsqlJson(output: string): Record<string, unknown> {
@@ -364,12 +358,11 @@ function applyMode(): void {
   if (!/^[A-Za-z0-9._:-]{1,160}$/u.test(approvalReference)) fail("FRA_APPROVAL_REFERENCE is invalid");
   const plan = readPlan(required("FRA_APPROVED_PLAN"));
   if (plan.blockers.length > 0) fail("approved plan contains unresolved accounting blockers");
-  const output = withVerifiedPlanFile(plan, (planFile) => parsedPsqlJson(psql([
+  const output = parsedPsqlJson(psql([
     "-v", `plan_sha256=${plan.plan_sha256}`,
     "-v", `approval_reference=${approvalReference}`,
     "-v", `now_ms=${Date.now()}`,
-    "-v", `plan_file=${planFile}`,
-  ], readSql("apply.sql"))));
+  ], applySql(plan)));
   process.stdout.write(`${JSON.stringify({ schema_version: planSchema, mode: "apply", plan_sha256: plan.plan_sha256, receipt: output })}\n`);
 }
 
