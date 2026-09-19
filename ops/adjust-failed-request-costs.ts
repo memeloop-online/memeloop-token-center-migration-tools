@@ -99,7 +99,7 @@ function statusCodes(): number[] {
 }
 
 function psql(extra: readonly string[], input: string): string {
-  const result = spawnSync("psql", ["-X", "--no-psqlrc", "-v", "ON_ERROR_STOP=1", "-At", ...extra], {
+  const result = spawnSync("psql", ["-X", "--no-psqlrc", "-q", "-v", "ON_ERROR_STOP=1", "-At", ...extra], {
     encoding: "utf8",
     env: {
       ...process.env,
