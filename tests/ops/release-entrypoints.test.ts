@@ -30,6 +30,10 @@ test("release registry is the explicit non-container command contract", () => {
     releaseEntrypoints["purge-retired-api2-trial"],
     "ops/release/purge-retired-api2-trial.ts",
   );
+  assert.equal(
+    releaseEntrypoints["adjust-failed-request-costs"],
+    "ops/adjust-failed-request-costs.ts",
+  );
   for (const retired of [
     ["native", "kimi", "import"].join("-"),
     ["import", "cpa", "upstreams"].join("-"),

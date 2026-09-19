@@ -69,11 +69,12 @@ if (backupHelp.status !== 0 || !/pages-per-step/u.test(backupHelp.stdout)) {
 const runtimePaths = new Set(runtimeFiles.map(releasePath));
 for (const path of files(commandsDirectory)) {
   const packaged = releasePath(path);
-  if (!expected.has(packaged) && !runtimePaths.has(packaged) && !packaged.startsWith("commands/sql/cpamp/")) throw new Error(`release artifact contains an unregistered file: ${packaged}`);
+  if (!expected.has(packaged) && !runtimePaths.has(packaged) && !packaged.startsWith("commands/sql/cpamp/") && !packaged.startsWith("commands/sql/failed-request-adjustments/")) throw new Error(`release artifact contains an unregistered file: ${packaged}`);
 }
 
-const assets = files(resolve(commandsDirectory, "sql", "cpamp")).map((path) => ({ path: releasePath(path), sha256: digest(path) }));
-if (assets.length === 0) throw new Error("release artifact is missing CPAMP SQL inputs");
+const sqlAssetDirectories = ["cpamp", "failed-request-adjustments"];
+const assets = sqlAssetDirectories.flatMap((directory) => files(resolve(commandsDirectory, "sql", directory)).map((path) => ({ path: releasePath(path), sha256: digest(path) })));
+if (assets.length === 0) throw new Error("release artifact is missing SQL inputs");
 assets.push(...runtimeFiles.map((path) => ({ path: releasePath(path), sha256: digest(path) })));
 
 const manifest = {

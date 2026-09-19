@@ -24,5 +24,7 @@ await build({
   outdir: commands,
   logLevel: 'info',
 });
-mkdirSync(resolve(commands, 'sql/cpamp'), { recursive: true });
-cpSync(resolve(repository, 'ops/sql/cpamp'), resolve(commands, 'sql/cpamp'), { recursive: true, force: false });
+for (const directory of ["cpamp", "failed-request-adjustments"]) {
+  mkdirSync(resolve(commands, "sql", directory), { recursive: true });
+  cpSync(resolve(repository, "ops/sql", directory), resolve(commands, "sql", directory), { recursive: true, force: false });
+}
