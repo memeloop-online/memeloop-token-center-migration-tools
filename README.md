@@ -35,6 +35,7 @@
 ## 工具范围
 
 - CPAMP 历史与缓存计价修正：`ops/migrate-cpamp.ts`、`ops/sql/cpamp/`。
+- 失败终态请求的可审批计费校正：计划先行、账本追加退款、派生汇总验证；见 [`docs/operations/failed-request-cost-adjustments.md`](docs/operations/failed-request-cost-adjustments.md)。
 - CPA 会话增量导出、归档导入包装和迁移对账。
 - 最终 session/archive snapshot+delta 封存、审批导入、回放幂等与聚合收据：`ops/finalize-session-archive-delta.ts`；操作边界见 [`docs/final-session-archive-reconciliation.md`](docs/final-session-archive-reconciliation.md)。
 - 旧凭据、策略、模型路由和上游账户的严格导入；动态 CPA 源路由清单导出见 [`docs/operations/cpa-source-route-inventory.md`](docs/operations/cpa-source-route-inventory.md)。
