@@ -56,13 +56,18 @@ function fixtureManifest(): ReviewedManifest {
   });
   const conversation_rewrites = Array.from({ length: 170 }, (_, index) => {
     const key = keys[index % keys.length]!;
+    const sessionName = index < 20 ? `api2 trial session ${index}` : null;
+    const labelsJson = index === 0
+      ? JSON.stringify({ ui: "preserve-this-label" })
+      : JSON.stringify({ alias: `cpa-fixture-${index}`, cohort: "bridge" });
+    const labelsContainLegacyText = index !== 0;
     return {
     observation_id: uuid(800 + index),
     key_id: key.key_id,
-    session_name: `api2 trial session ${index}`,
-    labels_json: JSON.stringify({ alias: `cpa-fixture-${index}`, cohort: "bridge" }),
-    replacement_session_name: index % 2 === 0 ? null : "",
-    replacement_labels_json: JSON.stringify({ state: "retired" }),
+    session_name: sessionName,
+    labels_json: labelsJson,
+    replacement_session_name: null,
+    replacement_labels_json: labelsContainLegacyText ? JSON.stringify({ state: "retired" }) : labelsJson,
     };
   });
   const conversation_projection_outbox = keys.map((key, index) => {
@@ -221,7 +226,7 @@ function fixtureSql(manifest: ReviewedManifest, postgres: boolean): string {
   }
   const retained = manifest.keys[6]!;
   statements.push(`INSERT INTO key_records VALUES (${q(uuid(999))},${q(tenantId)},${q(retained.principal_id)},${q(uuid(998))},'ordinary-archived-key','USD','revoked',1,NULL,6000,5000,6000);`);
-  for (const rewrite of manifest.conversation_rewrites) statements.push(`INSERT INTO conversation_observations VALUES (${q(rewrite.observation_id)},${q(rewrite.key_id)},${q(rewrite.session_name)},${q(rewrite.labels_json)});`);
+  for (const rewrite of manifest.conversation_rewrites) statements.push(`INSERT INTO conversation_observations VALUES (${q(rewrite.observation_id)},${q(rewrite.key_id)},${rewrite.session_name === null ? "NULL" : q(rewrite.session_name)},${q(rewrite.labels_json)});`);
   return statements.join("\n");
 }
 
@@ -253,6 +258,9 @@ test("reviewed manifest is fixed to the production-audited cohort", () => {
   assert.equal(manifest.keys.reduce((sum, key) => sum + key.routing_grants.length, 0), 16);
   assert.equal(manifest.keys.length, 7);
   assert.equal(manifest.conversation_rewrites.length, 170);
+  assert.equal(manifest.conversation_rewrites.filter(entry => entry.session_name === null).length, 150);
+  assert.equal(manifest.conversation_rewrites[0]!.replacement_labels_json, manifest.conversation_rewrites[0]!.labels_json);
+  assert.equal(manifest.conversation_rewrites[20]!.replacement_session_name, null);
   assert.equal(manifest.synchronous_image_idempotency.length, 24);
   const invalid = JSON.parse(JSON.stringify(manifest));
   invalid.snapshots.pop();
@@ -266,6 +274,12 @@ test("reviewed manifest is fixed to the production-audited cohort", () => {
   const badProjectionDigest = JSON.parse(JSON.stringify(manifest));
   badProjectionDigest.conversation_projection_outbox[0].request_json_sha256 = "invalid";
   assert.throws(() => parseManifest(badProjectionDigest), (error: unknown) => error instanceof PurgeFailure && error.code === "manifest_invalid");
+  const rewrittenUnmarkedLabels = JSON.parse(JSON.stringify(manifest));
+  rewrittenUnmarkedLabels.conversation_rewrites[0].replacement_labels_json = JSON.stringify({ state: "retired" });
+  assert.throws(() => parseManifest(rewrittenUnmarkedLabels), (error: unknown) => error instanceof PurgeFailure && error.code === "manifest_invalid");
+  const fabricatedUnnamedTitle = JSON.parse(JSON.stringify(manifest));
+  fabricatedUnnamedTitle.conversation_rewrites[20].replacement_session_name = "generated-title";
+  assert.throws(() => parseManifest(fabricatedUnnamedTitle), (error: unknown) => error instanceof PurgeFailure && error.code === "manifest_invalid");
 });
 
 test("generated SQL clears recoverable secrets before exact deletes and rolls back by default", () => {
@@ -284,6 +298,8 @@ test("generated SQL clears recoverable secrets before exact deletes and rolls ba
   assert.match(sql, /target_route_groups expected LEFT JOIN route_groups/u);
   assert.match(sql, /target_conversation_projections expected LEFT JOIN conversation_projection_outbox/u);
   assert.match(sql, /target_synchronous_image_idempotency expected LEFT JOIN synchronous_image_idempotency/u);
+  assert.match(sql, /target_rewrites\(observation_id TEXT PRIMARY KEY,key_id TEXT NOT NULL,session_name TEXT,labels_json TEXT NOT NULL/u);
+  assert.match(sql, /actual\.session_name IS NULL/u);
   assert.match(sql, /DELETE FROM synchronous_image_idempotency WHERE \(key_id,idempotency_key\) IN/u);
   assert.match(sql, /conversation_projection_outbox WHERE key_id IN \(SELECT key_id FROM target_keys\) AND projected_at IS NULL/u);
   assert.match(sql, /SHA256_TEXT\(actual\.request_json\)<>expected\.request_json_sha256/u);
@@ -389,7 +405,8 @@ test("SQLite dry-run, approved apply and replay preserve historical facts", () =
   assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM deleted_upstream_account_snapshots;"), "SQLite applied snapshots"), "0");
   assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM request_records;"), "SQLite applied history"), before);
   assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM principals;"), "SQLite retained dependent principals"), "7");
-  assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM conversation_observations WHERE (session_name IS NULL OR session_name='') AND labels_json='{\"state\":\"retired\"}';"), "SQLite localized conversation tombstones"), "170");
+  assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM conversation_observations WHERE (session_name IS NULL OR session_name='') AND labels_json='{\"state\":\"retired\"}';"), "SQLite localized conversation tombstones"), "169");
+  assert.equal(success(run("sqlite3", [database], "SELECT labels_json FROM conversation_observations WHERE id='00000000-0000-4000-8000-000000000800';"), "SQLite preserves unmarked labels"), "{\"ui\":\"preserve-this-label\"}");
   assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM conversation_observations WHERE session_name LIKE 'retired-%' OR session_name LIKE '%00000000-%';"), "SQLite technical conversation titles"), "0");
   const replayReceipt = join(workspace, "replay.json");
   const replay = JSON.parse(success(run(process.execPath, toolArgs(workspace, manifestPath, replayReceipt, databaseArgs, true)), "SQLite replay"));
