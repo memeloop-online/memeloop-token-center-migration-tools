@@ -62,12 +62,12 @@ function fixtureManifest(): ReviewedManifest {
       : JSON.stringify({ alias: `cpa-fixture-${index}`, cohort: "bridge" });
     const labelsContainLegacyText = index !== 0;
     return {
-    observation_id: uuid(800 + index),
-    key_id: key.key_id,
-    session_name: sessionName,
-    labels_json: labelsJson,
-    replacement_session_name: null,
-    replacement_labels_json: labelsContainLegacyText ? JSON.stringify({ state: "retired" }) : labelsJson,
+      observation_id: uuid(800 + index),
+      key_id: key.key_id,
+      session_name: sessionName,
+      labels_json: labelsJson,
+      replacement_session_name: null,
+      replacement_labels_json: labelsContainLegacyText ? JSON.stringify({ state: "retired" }) : labelsJson,
     };
   });
   const conversation_projection_outbox = keys.map((key, index) => {
