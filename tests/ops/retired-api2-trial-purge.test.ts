@@ -458,6 +458,11 @@ test("PostgreSQL dry-run and apply enforce the same reviewed cleanup contract", 
     assert.equal(success(run("psql", psqlBase, "SELECT COUNT(*) FROM principals;", environment), "PostgreSQL dependent principals"), "7");
     assert.equal(success(run("psql", psqlBase, "SELECT COUNT(*) FROM conversation_observation_update_audit;", environment), "PostgreSQL changed conversation observations"), "20");
     assert.equal(success(run("psql", psqlBase, "SELECT COUNT(*) FROM conversation_observation_update_audit WHERE old_session_name IS NULL AND old_labels_json='{\"ui\":\"preserve-this-label\"}';", environment), "PostgreSQL no-op conversation observations"), "0");
+    const replayReceipt = join(workspace, "replay.json");
+    const replay = JSON.parse(success(run(process.execPath, toolArgs(workspace, manifestPath, replayReceipt, databaseArgs, true)), "PostgreSQL replay"));
+    assert.equal(replay.outcome, "replay");
+    assert.equal(success(run("psql", psqlBase, "SELECT COUNT(*) FROM conversation_observation_update_audit;", environment), "PostgreSQL replay conversation updates"), "20");
+    assert.equal(success(run("psql", psqlBase, "SELECT COUNT(*) FROM conversation_observation_update_audit WHERE old_session_name IS NULL AND old_labels_json='{\"ui\":\"preserve-this-label\"}';", environment), "PostgreSQL replay no-op conversation observations"), "0");
   } finally {
     success(run("psql", psqlBase, `DROP SCHEMA ${schema} CASCADE;`, process.env), "drop PostgreSQL schema");
   }
