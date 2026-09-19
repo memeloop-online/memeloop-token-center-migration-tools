@@ -112,7 +112,7 @@ function psql(extra: readonly string[], input: string): string {
     input,
     shell: false,
     stdio: ["pipe", "pipe", "pipe"],
-    maxBuffer: maxPlanBytes + 64 * 1024,
+    maxBuffer: maxPlanBytes + 512 * 1024,
   });
   if (result.error) fail(`psql is unavailable: ${result.error.message}`);
   if (result.status !== 0) {

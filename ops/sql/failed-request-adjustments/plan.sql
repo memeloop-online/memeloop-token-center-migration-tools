@@ -103,7 +103,7 @@ SELECT json_build_object(
   'observed_request_count', (SELECT count(*)::text FROM classified),
   'eligible_candidates', COALESCE((
     SELECT json_agg(json_build_object(
-      'request_id', request_id,
+      'request_id', id,
       'request_created_at', created_at::text,
       'tenant_id', tenant_id,
       'key_id', key_id,
@@ -114,7 +114,7 @@ SELECT json_build_object(
       'status_code', status_code::text,
       'currency', currency,
       'refund_micros', cost_micros::text
-    ) ORDER BY request_id)
+    ) ORDER BY id)
       FROM classified WHERE classification = 'eligible'
   ), '[]'::json),
   'already_zero_cost_count', (SELECT count(*)::text FROM classified WHERE classification = 'already_zero_cost'),
