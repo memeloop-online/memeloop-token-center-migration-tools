@@ -415,7 +415,7 @@ test("SQLite dry-run, approved apply and replay preserve historical facts", () =
   assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM principals;"), "SQLite retained dependent principals"), "7");
   assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM conversation_observations WHERE (session_name IS NULL OR session_name='') AND labels_json='{\"state\":\"retired\"}';"), "SQLite localized conversation tombstones"), "20");
   assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM conversation_observations WHERE session_name IS NULL AND labels_json='{\"ui\":\"preserve-this-label\"}';"), "SQLite preserves unnamed no-op observations"), "150");
-  assert.equal(success(run("sqlite3", [database], "SELECT labels_json FROM conversation_observations WHERE id='00000000-0000-4000-8000-000000000800';"), "SQLite preserves unmarked labels"), "{\"ui\":\"preserve-this-label\"}");
+  assert.equal(success(run("sqlite3", [database], "SELECT labels_json FROM conversation_observations WHERE id='00000000-0000-4000-8000-000000000820';"), "SQLite preserves unmarked labels"), "{\"ui\":\"preserve-this-label\"}");
   assert.equal(success(run("sqlite3", [database], "SELECT COUNT(*) FROM conversation_observations WHERE session_name LIKE 'retired-%' OR session_name LIKE '%00000000-%';"), "SQLite technical conversation titles"), "0");
   const replayReceipt = join(workspace, "replay.json");
   const replay = JSON.parse(success(run(process.execPath, toolArgs(workspace, manifestPath, replayReceipt, databaseArgs, true)), "SQLite replay"));
