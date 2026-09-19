@@ -28,7 +28,12 @@ const maxPlanBytes = 1_000_000;
 const defaultStatusCodes = [499, 502, 503] as const;
 
 class CliError extends Error {
-  constructor(message: string, readonly exitCode = 2) { super(message); }
+  readonly exitCode: number;
+
+  constructor(message: string, exitCode = 2) {
+    super(message);
+    this.exitCode = exitCode;
+  }
 }
 
 function fail(message: string, exitCode = 2): never { throw new CliError(message, exitCode); }
