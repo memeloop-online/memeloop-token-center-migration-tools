@@ -392,6 +392,7 @@ function rebuildDerivedMode(): void {
     "-v", `now_ms=${Date.now()}`,
   ], readSql("rebuild-derived.sql")));
   process.stdout.write(`${JSON.stringify({ schema_version: planSchema, mode: "rebuild-derived", receipt: output })}\n`);
+  if (output.outcome !== "rebuilt") process.exitCode = 1;
 }
 
 function usage(): void {
