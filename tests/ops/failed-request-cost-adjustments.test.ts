@@ -148,7 +148,7 @@ test("a large sealed plan is streamed from its 0600 file instead of a psql argv 
     assert.equal(apply.argv.some((value) => value === `plan_file=${planPath}`), false);
     assert.equal(apply.argv.some((value) => /^plan_file=\/tmp\/mtc-failed-request-plan-/u.test(value)), true);
     assert.equal(Math.max(...apply.argv.map((value) => value.length)) < 8_192, true);
-    assert.match(apply.sql, /\\copy fra_plan_payload\(payload\) FROM :'plan_file'/);
+    assert.match(apply.sql, /\\copy fra_plan_payload\(payload\) FROM :plan_file/);
   } finally { rmSync(workspace, { recursive: true, force: true }); }
 });
 

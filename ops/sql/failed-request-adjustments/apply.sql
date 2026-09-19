@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS failed_request_cost_adjustment_daily (
 );
 
 CREATE TEMP TABLE fra_plan_payload (payload JSONB NOT NULL) ON COMMIT DROP;
-\copy fra_plan_payload(payload) FROM :'plan_file'
+\copy fra_plan_payload(payload) FROM :plan_file
 CREATE TEMP TABLE fra_scope ON COMMIT DROP AS
 SELECT (payload->'scope'->>'tenant_external_id') AS tenant_external_id,
        (payload->'scope') AS scope_json
