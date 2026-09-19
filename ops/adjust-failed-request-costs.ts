@@ -13,10 +13,13 @@ import {
   closeSync,
   constants as fsConstants,
   lstatSync,
+  mkdtempSync,
   openSync,
   readFileSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseStrictJson, StrictJsonError } from "./lib/strict-json.ts";
@@ -109,6 +112,7 @@ function psql(extra: readonly string[], input: string): string {
     input,
     shell: false,
     stdio: ["pipe", "pipe", "pipe"],
+    maxBuffer: maxPlanBytes + 64 * 1024,
   });
   if (result.error) fail(`psql is unavailable: ${result.error.message}`);
   if (result.status !== 0) {
@@ -272,6 +276,17 @@ function readPlan(path: string): Plan {
   }
 }
 
+function withVerifiedPlanFile<T>(plan: Plan, run: (path: string) => T): T {
+  const directory = mkdtempSync(join(tmpdir(), "mtc-failed-request-plan-"));
+  const path = join(directory, "approved.json");
+  try {
+    writeFileSync(path, `${JSON.stringify(plan)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    return run(path);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
 function parsedPsqlJson(output: string): Record<string, unknown> {
   try { return record(parseStrictJson(output), "PostgreSQL returned an invalid receipt"); } catch (error) {
     if (error instanceof CliError) throw error;
@@ -349,12 +364,12 @@ function applyMode(): void {
   if (!/^[A-Za-z0-9._:-]{1,160}$/u.test(approvalReference)) fail("FRA_APPROVAL_REFERENCE is invalid");
   const plan = readPlan(required("FRA_APPROVED_PLAN"));
   if (plan.blockers.length > 0) fail("approved plan contains unresolved accounting blockers");
-  const output = parsedPsqlJson(psql([
+  const output = withVerifiedPlanFile(plan, (planFile) => parsedPsqlJson(psql([
     "-v", `plan_sha256=${plan.plan_sha256}`,
     "-v", `approval_reference=${approvalReference}`,
     "-v", `now_ms=${Date.now()}`,
-    "-v", `plan_file=${resolve(required("FRA_APPROVED_PLAN"))}`,
-  ], readSql("apply.sql")));
+    "-v", `plan_file=${planFile}`,
+  ], readSql("apply.sql"))));
   process.stdout.write(`${JSON.stringify({ schema_version: planSchema, mode: "apply", plan_sha256: plan.plan_sha256, receipt: output })}\n`);
 }
 

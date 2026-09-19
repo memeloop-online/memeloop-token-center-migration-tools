@@ -72,10 +72,10 @@ test("failed-request adjustment aggregates shared projections and is replay-safe
       INSERT INTO entitlement_cycles VALUES ('cycle',200,0);
       INSERT INTO ledger_entries VALUES ('grant','account','key','grant',200,'USD','fixture',NULL,NULL,1726358300000),('usage-1','account','key','usage',-100,'USD','reservation-1','usage-1',NULL,1726358400000),('usage-2','account','key','usage',-100,'USD','reservation-2','usage-2',NULL,1726358400000);
       INSERT INTO usage_reservations VALUES ('reservation-1','account','key',100,'settled'),('reservation-2','account','key',100,'settled');
-      INSERT INTO request_records VALUES ('request-1','tenant','key',1726358400000,1726358400001,'reservation-1',503,'USD',100),('request-2','tenant','key',1726358400000,1726358400001,'reservation-2',503,'USD',100);
-      INSERT INTO request_stats_facts VALUES ('request-1','tenant','key',1726358400000,'gpt','openai','failure','http_503','upstream','route','default','USD',100),('request-2','tenant','key',1726358400000,'gpt','openai','failure','http_503','upstream','route','default','USD',100);
+      INSERT INTO request_records VALUES ('request-1','tenant','key',1726358400000,1726358400001,'reservation-1',503,'USD',100),('request-2','tenant','key',1726358401000,1726358401001,'reservation-2',503,'USD',100);
+      INSERT INTO request_stats_facts VALUES ('request-1','tenant','key',1726358400000,'gpt','openai-chat','failure','http_503','upstream','route','default','USD',100),('request-2','tenant','key',1726358401000,'gpt','openai-responses','failure','http_503','upstream','route','default','USD',100);
       INSERT INTO entitlement_usage_allocations VALUES ('allocation-1','cycle','usage-1',100,0),('allocation-2','cycle','usage-2',100,0);
-      INSERT INTO request_daily_aggregates VALUES ('tenant','key',19981,'gpt','openai','failure','http_503','upstream','route','default','USD',200);
+      INSERT INTO request_daily_aggregates VALUES ('tenant','key',19981,'gpt','openai-chat','failure','http_503','upstream','route','default','USD',100),('tenant','key',19981,'gpt','openai-responses','failure','http_503','upstream','route','default','USD',100);
       INSERT INTO usage_analysis_hourly VALUES ('tenant','key',479544,'request','gpt','openai','failure','http_503','upstream','route','default','USD',200);
       INSERT INTO usage_analysis_daily VALUES ('tenant','key',19981,'request','gpt','openai','failure','http_503','upstream','route','default','USD',200);`);
 
@@ -86,7 +86,7 @@ test("failed-request adjustment aggregates shared projections and is replay-safe
     assert.equal(psql("SELECT count(*) || '|' || sum(amount_micros) FROM ledger_entries WHERE kind='failed_request_refund';"), "2|200");
     assert.equal(psql("SELECT available_micros || '|' || (SELECT settled_lifetime_micros FROM account_usage_state) || '|' || (SELECT settled_lifetime_micros FROM key_budget_state) || '|' || (SELECT settled_micros FROM key_budget_daily_rollups) FROM credit_accounts;"), "200|0|0|0");
     assert.equal(psql("SELECT consumed_micros || '|' || (SELECT sum(amount_micros) FROM entitlement_usage_allocations) FROM entitlement_cycles;"), "0|0");
-    assert.equal(psql("SELECT (SELECT cost_micros FROM request_daily_aggregates) || '|' || (SELECT cost_micros FROM usage_analysis_hourly) || '|' || (SELECT cost_micros FROM usage_analysis_daily) || '|' || (SELECT refund_micros FROM failed_request_cost_adjustment_daily);"), "0|0|0|200");
+    assert.equal(psql("SELECT (SELECT sum(cost_micros) FROM request_daily_aggregates) || '|' || (SELECT cost_micros FROM usage_analysis_hourly) || '|' || (SELECT cost_micros FROM usage_analysis_daily) || '|' || (SELECT refund_micros FROM failed_request_cost_adjustment_daily);"), "0|0|0|200");
   } finally {
     try { execute("psql", ["-X", "--no-psqlrc", "-v", "ON_ERROR_STOP=1", "-At"], `DROP SCHEMA IF EXISTS ${schema} CASCADE;`, { ...process.env, PGOPTIONS: "" }); } finally { rmSync(root, { recursive: true, force: true }); }
   }

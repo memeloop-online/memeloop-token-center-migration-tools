@@ -222,42 +222,108 @@ SELECT allocation.entitlement_cycle_id,
   FROM fra_input input
   JOIN entitlement_usage_allocations allocation ON allocation.usage_ledger_entry_id = input.usage_ledger_id
  GROUP BY allocation.entitlement_cycle_id;
-CREATE TEMP TABLE fra_planned_rollup_refunds ON COMMIT DROP AS
-SELECT f.tenant_id, f.key_id, f.created_at, f.model, f.protocol, f.status_class,
+CREATE TEMP TABLE fra_planned_request_daily_refunds ON COMMIT DROP AS
+SELECT f.tenant_id, f.key_id, f.created_at / 86400000 AS day_bucket,
+       f.model, f.protocol, f.status_class,
        f.error_code, f.upstream_account_id, f.model_route_id, f.service_tier,
        f.currency, sum(o.refund_micros) AS refund_micros
   FROM fra_observed o
   JOIN request_stats_facts f ON f.request_id = o.request_id AND f.tenant_id = o.tenant_id
- GROUP BY f.tenant_id, f.key_id, f.created_at, f.model, f.protocol, f.status_class,
+ GROUP BY f.tenant_id, f.key_id, f.created_at / 86400000, f.model, f.protocol, f.status_class,
           f.error_code, f.upstream_account_id, f.model_route_id, f.service_tier, f.currency;
+CREATE TEMP TABLE fra_planned_analysis_hourly_refunds ON COMMIT DROP AS
+SELECT f.tenant_id, f.key_id, f.created_at / 3600000 AS hour_bucket, f.model,
+       CASE WHEN f.protocol = 'anthropic' OR f.protocol LIKE 'anthropic-%' THEN 'anthropic'
+            WHEN f.protocol = 'openai-image' THEN 'openai-image' ELSE 'openai' END AS protocol,
+       f.status_class, f.error_code, f.upstream_account_id, f.model_route_id,
+       f.service_tier, f.currency, sum(o.refund_micros) AS refund_micros
+  FROM fra_observed o
+  JOIN request_stats_facts f ON f.request_id = o.request_id AND f.tenant_id = o.tenant_id
+ GROUP BY f.tenant_id, f.key_id, f.created_at / 3600000, f.model,
+          CASE WHEN f.protocol = 'anthropic' OR f.protocol LIKE 'anthropic-%' THEN 'anthropic'
+               WHEN f.protocol = 'openai-image' THEN 'openai-image' ELSE 'openai' END,
+          f.status_class, f.error_code, f.upstream_account_id, f.model_route_id,
+          f.service_tier, f.currency;
+CREATE TEMP TABLE fra_planned_analysis_daily_refunds ON COMMIT DROP AS
+SELECT f.tenant_id, f.key_id, f.created_at / 86400000 AS day_bucket, f.model,
+       CASE WHEN f.protocol = 'anthropic' OR f.protocol LIKE 'anthropic-%' THEN 'anthropic'
+            WHEN f.protocol = 'openai-image' THEN 'openai-image' ELSE 'openai' END AS protocol,
+       f.status_class, f.error_code, f.upstream_account_id, f.model_route_id,
+       f.service_tier, f.currency, sum(o.refund_micros) AS refund_micros
+  FROM fra_observed o
+  JOIN request_stats_facts f ON f.request_id = o.request_id AND f.tenant_id = o.tenant_id
+ GROUP BY f.tenant_id, f.key_id, f.created_at / 86400000, f.model,
+          CASE WHEN f.protocol = 'anthropic' OR f.protocol LIKE 'anthropic-%' THEN 'anthropic'
+               WHEN f.protocol = 'openai-image' THEN 'openai-image' ELSE 'openai' END,
+          f.status_class, f.error_code, f.upstream_account_id, f.model_route_id,
+          f.service_tier, f.currency;
+CREATE TEMP TABLE fra_expected_request_daily ON COMMIT DROP AS
+SELECT planned.*, sum(fact.cost_micros - COALESCE(item.refund_micros, 0)) AS current_cost_micros
+  FROM fra_planned_request_daily_refunds planned
+  JOIN request_stats_facts fact ON fact.tenant_id = planned.tenant_id AND fact.key_id = planned.key_id
+    AND fact.created_at / 86400000 = planned.day_bucket AND fact.model = planned.model
+    AND fact.protocol = planned.protocol AND fact.status_class = planned.status_class
+    AND fact.error_code = planned.error_code AND fact.upstream_account_id = planned.upstream_account_id
+    AND fact.model_route_id = planned.model_route_id AND fact.service_tier = planned.service_tier
+    AND fact.currency = planned.currency
+  LEFT JOIN failed_request_cost_adjustment_items item ON item.request_id = fact.request_id AND item.tenant_id = fact.tenant_id
+ GROUP BY planned.tenant_id, planned.key_id, planned.day_bucket, planned.model, planned.protocol,
+          planned.status_class, planned.error_code, planned.upstream_account_id, planned.model_route_id,
+          planned.service_tier, planned.currency, planned.refund_micros;
+CREATE TEMP TABLE fra_expected_analysis_hourly ON COMMIT DROP AS
+SELECT planned.*, sum(fact.cost_micros - COALESCE(item.refund_micros, 0)) AS current_cost_micros
+  FROM fra_planned_analysis_hourly_refunds planned
+  JOIN request_stats_facts fact ON fact.tenant_id = planned.tenant_id AND fact.key_id = planned.key_id
+    AND fact.created_at / 3600000 = planned.hour_bucket AND fact.model = planned.model
+    AND (CASE WHEN fact.protocol = 'anthropic' OR fact.protocol LIKE 'anthropic-%' THEN 'anthropic'
+              WHEN fact.protocol = 'openai-image' THEN 'openai-image' ELSE 'openai' END) = planned.protocol
+    AND fact.status_class = planned.status_class AND fact.error_code = planned.error_code
+    AND fact.upstream_account_id = planned.upstream_account_id AND fact.model_route_id = planned.model_route_id
+    AND fact.service_tier = planned.service_tier AND fact.currency = planned.currency
+  LEFT JOIN failed_request_cost_adjustment_items item ON item.request_id = fact.request_id AND item.tenant_id = fact.tenant_id
+ GROUP BY planned.tenant_id, planned.key_id, planned.hour_bucket, planned.model, planned.protocol,
+          planned.status_class, planned.error_code, planned.upstream_account_id, planned.model_route_id,
+          planned.service_tier, planned.currency, planned.refund_micros;
+CREATE TEMP TABLE fra_expected_analysis_daily ON COMMIT DROP AS
+SELECT planned.*, sum(fact.cost_micros - COALESCE(item.refund_micros, 0)) AS current_cost_micros
+  FROM fra_planned_analysis_daily_refunds planned
+  JOIN request_stats_facts fact ON fact.tenant_id = planned.tenant_id AND fact.key_id = planned.key_id
+    AND fact.created_at / 86400000 = planned.day_bucket AND fact.model = planned.model
+    AND (CASE WHEN fact.protocol = 'anthropic' OR fact.protocol LIKE 'anthropic-%' THEN 'anthropic'
+              WHEN fact.protocol = 'openai-image' THEN 'openai-image' ELSE 'openai' END) = planned.protocol
+    AND fact.status_class = planned.status_class AND fact.error_code = planned.error_code
+    AND fact.upstream_account_id = planned.upstream_account_id AND fact.model_route_id = planned.model_route_id
+    AND fact.service_tier = planned.service_tier AND fact.currency = planned.currency
+  LEFT JOIN failed_request_cost_adjustment_items item ON item.request_id = fact.request_id AND item.tenant_id = fact.tenant_id
+ GROUP BY planned.tenant_id, planned.key_id, planned.day_bucket, planned.model, planned.protocol,
+          planned.status_class, planned.error_code, planned.upstream_account_id, planned.model_route_id,
+          planned.service_tier, planned.currency, planned.refund_micros;
 
 /* Projection preconditions and updates operate on these exact rows. */
 DO $$
 BEGIN
   PERFORM 1 FROM request_daily_aggregates daily
-    JOIN fra_planned_rollup_refunds refund ON daily.tenant_id = refund.tenant_id AND daily.key_id = refund.key_id
-      AND daily.day_bucket = refund.created_at / 86400000 AND daily.model = refund.model
+    JOIN fra_planned_request_daily_refunds refund ON daily.tenant_id = refund.tenant_id AND daily.key_id = refund.key_id
+      AND daily.day_bucket = refund.day_bucket AND daily.model = refund.model
       AND daily.protocol = refund.protocol AND daily.status_class = refund.status_class
       AND daily.error_code = refund.error_code AND daily.upstream_account_id = refund.upstream_account_id
       AND daily.model_route_id = refund.model_route_id AND daily.service_tier = refund.service_tier
       AND daily.currency = refund.currency
    FOR UPDATE OF daily;
   PERFORM 1 FROM usage_analysis_hourly hourly
-    JOIN fra_planned_rollup_refunds refund ON hourly.tenant_id = refund.tenant_id AND hourly.key_id = refund.key_id
-      AND hourly.hour_bucket = refund.created_at / 3600000 AND hourly.source_kind = 'request'
+    JOIN fra_planned_analysis_hourly_refunds refund ON hourly.tenant_id = refund.tenant_id AND hourly.key_id = refund.key_id
+      AND hourly.hour_bucket = refund.hour_bucket AND hourly.source_kind = 'request'
       AND hourly.model = refund.model
-      AND hourly.protocol = CASE WHEN refund.protocol = 'anthropic' OR refund.protocol LIKE 'anthropic-%' THEN 'anthropic'
-                                 WHEN refund.protocol = 'openai-image' THEN 'openai-image' ELSE 'openai' END
+      AND hourly.protocol = refund.protocol
       AND hourly.status_class = refund.status_class AND hourly.error_code = refund.error_code
       AND hourly.upstream_account_id = refund.upstream_account_id AND hourly.model_route_id = refund.model_route_id
       AND hourly.service_tier = refund.service_tier AND hourly.currency = refund.currency
    FOR UPDATE OF hourly;
   PERFORM 1 FROM usage_analysis_daily daily
-    JOIN fra_planned_rollup_refunds refund ON daily.tenant_id = refund.tenant_id AND daily.key_id = refund.key_id
-      AND daily.day_bucket = refund.created_at / 86400000 AND daily.source_kind = 'request'
+    JOIN fra_planned_analysis_daily_refunds refund ON daily.tenant_id = refund.tenant_id AND daily.key_id = refund.key_id
+      AND daily.day_bucket = refund.day_bucket AND daily.source_kind = 'request'
       AND daily.model = refund.model
-      AND daily.protocol = CASE WHEN refund.protocol = 'anthropic' OR refund.protocol LIKE 'anthropic-%' THEN 'anthropic'
-                                WHEN refund.protocol = 'openai-image' THEN 'openai-image' ELSE 'openai' END
+      AND daily.protocol = refund.protocol
       AND daily.status_class = refund.status_class AND daily.error_code = refund.error_code
       AND daily.upstream_account_id = refund.upstream_account_id AND daily.model_route_id = refund.model_route_id
       AND daily.service_tier = refund.service_tier AND daily.currency = refund.currency
@@ -319,35 +385,42 @@ SELECT 'refund_projection_precondition_failed', true
     WHERE rollup.settled_micros IS NULL OR rollup.settled_micros < refund.refund_micros
  )
    OR EXISTS (
-   SELECT 1 FROM fra_planned_rollup_refunds refund
+   SELECT 1 FROM fra_expected_request_daily refund
     LEFT JOIN request_daily_aggregates daily
       ON daily.tenant_id = refund.tenant_id AND daily.key_id = refund.key_id
-     AND daily.day_bucket = refund.created_at / 86400000 AND daily.model = refund.model
+     AND daily.day_bucket = refund.day_bucket AND daily.model = refund.model
      AND daily.protocol = refund.protocol AND daily.status_class = refund.status_class
      AND daily.error_code = refund.error_code AND daily.upstream_account_id = refund.upstream_account_id
      AND daily.model_route_id = refund.model_route_id AND daily.service_tier = refund.service_tier
      AND daily.currency = refund.currency
+   WHERE daily.cost_micros IS DISTINCT FROM refund.current_cost_micros
+      OR daily.cost_micros < refund.refund_micros
+ )
+   OR EXISTS (
+   SELECT 1 FROM fra_expected_analysis_hourly refund
     LEFT JOIN usage_analysis_hourly hourly
       ON hourly.tenant_id = refund.tenant_id AND hourly.key_id = refund.key_id
-     AND hourly.hour_bucket = refund.created_at / 3600000 AND hourly.source_kind = 'request'
+     AND hourly.hour_bucket = refund.hour_bucket AND hourly.source_kind = 'request'
      AND hourly.model = refund.model
-     AND hourly.protocol = CASE WHEN refund.protocol = 'anthropic' OR refund.protocol LIKE 'anthropic-%'
-                                THEN 'anthropic' WHEN refund.protocol = 'openai-image' THEN 'openai-image' ELSE 'openai' END
+     AND hourly.protocol = refund.protocol
      AND hourly.status_class = refund.status_class AND hourly.error_code = refund.error_code
      AND hourly.upstream_account_id = refund.upstream_account_id AND hourly.model_route_id = refund.model_route_id
      AND hourly.service_tier = refund.service_tier AND hourly.currency = refund.currency
+   WHERE hourly.cost_micros IS DISTINCT FROM refund.current_cost_micros
+      OR hourly.cost_micros < refund.refund_micros
+ )
+   OR EXISTS (
+   SELECT 1 FROM fra_expected_analysis_daily refund
     LEFT JOIN usage_analysis_daily analysis_daily
       ON analysis_daily.tenant_id = refund.tenant_id AND analysis_daily.key_id = refund.key_id
-     AND analysis_daily.day_bucket = refund.created_at / 86400000 AND analysis_daily.source_kind = 'request'
+     AND analysis_daily.day_bucket = refund.day_bucket AND analysis_daily.source_kind = 'request'
      AND analysis_daily.model = refund.model
-     AND analysis_daily.protocol = CASE WHEN refund.protocol = 'anthropic' OR refund.protocol LIKE 'anthropic-%'
-                                        THEN 'anthropic' WHEN refund.protocol = 'openai-image' THEN 'openai-image' ELSE 'openai' END
+     AND analysis_daily.protocol = refund.protocol
      AND analysis_daily.status_class = refund.status_class AND analysis_daily.error_code = refund.error_code
      AND analysis_daily.upstream_account_id = refund.upstream_account_id AND analysis_daily.model_route_id = refund.model_route_id
      AND analysis_daily.service_tier = refund.service_tier AND analysis_daily.currency = refund.currency
-   WHERE daily.cost_micros IS NULL OR daily.cost_micros < refund.refund_micros
-      OR hourly.cost_micros IS NULL OR hourly.cost_micros < refund.refund_micros
-      OR analysis_daily.cost_micros IS NULL OR analysis_daily.cost_micros < refund.refund_micros
+   WHERE analysis_daily.cost_micros IS DISTINCT FROM refund.current_cost_micros
+      OR analysis_daily.cost_micros < refund.refund_micros
  );
 INSERT INTO fra_fence(reason, invalid)
 SELECT 'already_refunded_by_another_plan', true
@@ -434,9 +507,9 @@ UPDATE key_budget_state state
  WHERE state.key_id = refund.key_id;
 UPDATE key_budget_daily_rollups rollup
    SET settled_micros = rollup.settled_micros - refund.refund_micros
-  FROM fra_applied_budget_day_refunds refund
+ FROM fra_applied_budget_day_refunds refund
  WHERE rollup.key_id = refund.key_id
-   AND rollup.day_bucket = refund.usage_ledger_created_at / 86400000;
+   AND rollup.day_bucket = refund.day_bucket;
 INSERT INTO key_budget_usage_events
   (usage_entry_id, reservation_id, key_id, account_id, amount_micros, settled_at)
 SELECT refund_ledger_id, reservation_id, key_id, account_id, -refund_micros,
@@ -460,35 +533,33 @@ SELECT lower(substr(md5('failed-request-entitlement-refund-v1:' || refund.refund
   FROM fra_refund_entitlement_allocations refund;
 UPDATE request_daily_aggregates daily
    SET cost_micros = daily.cost_micros - refund.refund_micros
-  FROM fra_planned_rollup_refunds refund
+  FROM fra_planned_request_daily_refunds refund
   CROSS JOIN fra_new_plan
  WHERE daily.tenant_id = refund.tenant_id AND daily.key_id = refund.key_id
-   AND daily.day_bucket = refund.created_at / 86400000 AND daily.model = refund.model
+   AND daily.day_bucket = refund.day_bucket AND daily.model = refund.model
    AND daily.protocol = refund.protocol AND daily.status_class = refund.status_class
    AND daily.error_code = refund.error_code AND daily.upstream_account_id = refund.upstream_account_id
    AND daily.model_route_id = refund.model_route_id AND daily.service_tier = refund.service_tier
    AND daily.currency = refund.currency;
 UPDATE usage_analysis_hourly hourly
    SET cost_micros = hourly.cost_micros - refund.refund_micros
-  FROM fra_planned_rollup_refunds refund
+  FROM fra_planned_analysis_hourly_refunds refund
   CROSS JOIN fra_new_plan
  WHERE hourly.tenant_id = refund.tenant_id AND hourly.key_id = refund.key_id
-   AND hourly.hour_bucket = refund.created_at / 3600000 AND hourly.source_kind = 'request'
+   AND hourly.hour_bucket = refund.hour_bucket AND hourly.source_kind = 'request'
    AND hourly.model = refund.model
-   AND hourly.protocol = CASE WHEN refund.protocol = 'anthropic' OR refund.protocol LIKE 'anthropic-%'
-                              THEN 'anthropic' WHEN refund.protocol = 'openai-image' THEN 'openai-image' ELSE 'openai' END
+   AND hourly.protocol = refund.protocol
    AND hourly.status_class = refund.status_class AND hourly.error_code = refund.error_code
    AND hourly.upstream_account_id = refund.upstream_account_id AND hourly.model_route_id = refund.model_route_id
    AND hourly.service_tier = refund.service_tier AND hourly.currency = refund.currency;
 UPDATE usage_analysis_daily daily
    SET cost_micros = daily.cost_micros - refund.refund_micros
-  FROM fra_planned_rollup_refunds refund
+  FROM fra_planned_analysis_daily_refunds refund
   CROSS JOIN fra_new_plan
  WHERE daily.tenant_id = refund.tenant_id AND daily.key_id = refund.key_id
-   AND daily.day_bucket = refund.created_at / 86400000 AND daily.source_kind = 'request'
+   AND daily.day_bucket = refund.day_bucket AND daily.source_kind = 'request'
    AND daily.model = refund.model
-   AND daily.protocol = CASE WHEN refund.protocol = 'anthropic' OR refund.protocol LIKE 'anthropic-%'
-                             THEN 'anthropic' WHEN refund.protocol = 'openai-image' THEN 'openai-image' ELSE 'openai' END
+   AND daily.protocol = refund.protocol
    AND daily.status_class = refund.status_class AND daily.error_code = refund.error_code
    AND daily.upstream_account_id = refund.upstream_account_id AND daily.model_route_id = refund.model_route_id
    AND daily.service_tier = refund.service_tier AND daily.currency = refund.currency;
