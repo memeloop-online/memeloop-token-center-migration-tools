@@ -37,6 +37,14 @@ const candidate = {
   currency: "USD",
   refund_micros: "594137836",
 };
+function receipt(value: unknown): never {
+  // The large-plan transport check deliberately exceeds a pipe's usual
+  // high-water mark. A synchronous descriptor write keeps this fake's
+  // process lifetime from truncating its own test receipt before Node flushes
+  // stdout on exit.
+  writeFileSync(1, `${JSON.stringify(value)}\n`);
+  process.exit(0);
+}
 if (mode === "plan") {
   if (!sql.includes("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
     || /\b(?:INSERT|UPDATE|DELETE|ALTER|CREATE|DROP|LOCK)\b/u.test(sql)) process.exit(9);
@@ -47,27 +55,24 @@ if (mode === "plan") {
       usage_ledger_id: `fixture-ledger-${index.toString().padStart(5, "0")}-${"y".repeat(96)}`,
     }))
     : [candidate];
-  process.stdout.write(`${JSON.stringify({
+  receipt({
     selected_tenant_count: "1", observed_request_count: fixture.empty === true ? "0" : "2", eligible_candidates: fixture.empty === true ? [] : candidates, already_zero_cost_count: "1",
     blockers: fixture.blocked ? [{ reason: "request_stats_cost_mismatch", count: "1" }] : [],
-  })}\n`);
-  process.exit(0);
+  });
 }
 if (mode === "apply") {
   if (!sql.includes("failed_request_refund")
     || !sql.includes("failed_request_cost_adjustment_daily")
     || /UPDATE\s+(?:request_records|ledger_entries)\b/iu.test(sql)
     || /DELETE\s+FROM\s+(?:request_records|ledger_entries)\b/iu.test(sql)) process.exit(9);
-  process.stdout.write('{"outcome":"applied","candidate_count":"1","refund_micros":"594137836"}\n');
-  process.exit(0);
+  receipt({ outcome: "applied", candidate_count: "1", refund_micros: "594137836" });
 }
 if (mode === "rebuild-derived") {
   if (!sql.includes("DELETE FROM failed_request_cost_adjustment_daily")
     || /DELETE\s+FROM\s+(?:request_records|request_stats_facts|ledger_entries)\b/iu.test(sql)
     || /UPDATE\s+(?:request_records|request_stats_facts|ledger_entries)\b/iu.test(sql)) process.exit(9);
-  process.stdout.write('{"outcome":"rebuilt","daily_rows":"1"}\n');
-  process.exit(0);
+  receipt({ outcome: "rebuilt", daily_rows: "1" });
 }
 if (!sql.includes("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
   || /\b(?:INSERT|UPDATE|DELETE|ALTER|CREATE|DROP|LOCK)\b/u.test(sql)) process.exit(9);
-process.stdout.write('{"outcome":"pass","aggregate_counts":{"plans":"1","items":"1","refund_micros":"594137836","invalid_ledger_pairs":"0","derived_daily_mismatches":"0"}}\n');
+receipt({ outcome: "pass", aggregate_counts: { plans: "1", items: "1", refund_micros: "594137836", invalid_ledger_pairs: "0", derived_daily_mismatches: "0" } });
