@@ -34,7 +34,7 @@ import { request as httpsRequest, type RequestOptions } from "node:https";
 import { isIP } from "node:net";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { invokedAsEntrypoint } from "./lib/invoked-as-entrypoint.ts";
 import { parseArgs } from "node:util";
 import { parseStrictJson } from "./lib/strict-json.ts";
@@ -860,7 +860,7 @@ export class SQLiteArchiveSource {
     if ((metadata.mode & 0o222) !== 0) throw new DeltaError("source SQLite snapshot must be filesystem read-only");
     if (archiveSpoolSidecars(path).some(existsSync)) throw new DeltaError("source SQLite snapshot must not have WAL or SHM sidecars");
     this.path = path;
-    this.database = new DatabaseSync(path, { readOnly: true });
+    this.database = new DatabaseSync(`${pathToFileURL(path).href}?mode=ro&immutable=1`, { readOnly: true });
     try {
       this.database.exec("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF");
       this.verifySchema();

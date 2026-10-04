@@ -3,7 +3,7 @@
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmodSync, closeSync, constants as fsConstants, existsSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, constants as fsConstants, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
@@ -22,6 +22,7 @@ import {
   selectionDigest,
   SourceClient,
   sourceFingerprint,
+  SQLiteArchiveSource,
   STABLE_CURSOR_PROTOCOL,
   unwrapJson,
 } from "../../ops/export-cpa-session-archive-delta.ts";
@@ -781,6 +782,36 @@ test("stable spool resume skips previously verified sessions after a fresh snaps
     const requestIds = readFileSync(paths.output, "utf8").trim().split("\n").map((line) => (JSON.parse(line) as RecordValue).request_id);
     assert.deepEqual(requestIds, ["request-a", "request-b"]);
   } finally { rmSync(paths.directory, { recursive: true, force: true }); }
+});
+
+test("sealed WAL SQLite opens without sidecars in a read-only directory with URI characters", () => {
+  const paths = fixture();
+  const directory = join(paths.directory, "sealed ?#% snapshot");
+  mkdirSync(directory, { mode: 0o700 });
+  const source = join(directory, "archive.sqlite");
+  try {
+    writeLargeArchiveSQLite(source, 3);
+    chmodSync(source, 0o600);
+    const database = new DatabaseSync(source);
+    database.exec("PRAGMA journal_mode=WAL");
+    database.close();
+    chmodSync(source, 0o400);
+    const before = readFileSync(source);
+    assert.equal(before[18], 2);
+    assert.equal(before[19], 2);
+    assert.deepEqual(readdirSync(directory), ["archive.sqlite"]);
+    chmodSync(directory, 0o500);
+    const archive = new SQLiteArchiveSource(source);
+    try {
+      assert.equal(archive.stableProjection().ingestFence, "3");
+      assert.equal(archive.statsRecords(), 3);
+    } finally { archive.close(); }
+    assert.deepEqual(readFileSync(source), before);
+    assert.deepEqual(readdirSync(directory), ["archive.sqlite"]);
+    chmodSync(directory, 0o700);
+    writeFileSync(`${source}-wal`, "unsealed", { mode: 0o600 });
+    assert.throws(() => new SQLiteArchiveSource(source), /must not have WAL or SHM sidecars/);
+  } finally { chmodSync(directory, 0o700); rmSync(paths.directory, { recursive: true, force: true }); }
 });
 
 test("read-only SQLite large session checkpoints a request cursor and resumes without an HTTP ticket", async () => {

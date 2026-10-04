@@ -41,3 +41,9 @@ complete nonempty artifact chain, matching history/identity inputs, target
 schema and paired database/object-store rollback receipts, dry-run disposition,
 apply, exact replay and source-to-target reconciliation. Retire old resources
 only after final live delta closure and reference/backup dependency review.
+
+The sealed SQLite reader uses an encoded `file:` URI with `mode=ro&immutable=1`
+after rejecting writable files and WAL/SHM sidecars. A checkpointed WAL-format
+database can otherwise fail with `SQLITE_CANTOPEN` on a read-only mount because
+SQLite tries to initialize sidecars. This mode is only for the verified sealed
+snapshot; never use it to read a changing collector database or bypass sealing.
