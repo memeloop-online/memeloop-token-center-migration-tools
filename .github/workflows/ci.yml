@@ -65,6 +65,9 @@ jobs:
       - name: Verify repository policy, types, and tests
         run: npm run verify
 
+      - name: Verify archive recovery preflight
+        run: node --test tests/ops/archive-recovery-preflight.test.ts
+
       - name: Verify SQLite backup command
         run: |
           test -z "$(gofmt -l cmd/cpa-session-archive-backup)"

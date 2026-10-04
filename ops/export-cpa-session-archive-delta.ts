@@ -8,6 +8,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { archiveErrorDiagnostic } from "./lib/archive-error-diagnostic.ts";
 import { spawn } from "node:child_process";
 import { promises as dns } from "node:dns";
 import {
@@ -1647,7 +1648,7 @@ if (invokedAsEntrypoint("export-cpa-session-archive-delta", import.meta.url)) {
   runCheckpointLockHolder(process.argv.slice(2)).then((held) => held ? 0 : main()).then((code) => { process.exitCode = code; }).catch((error: unknown) => {
     if (error instanceof DeltaError) process.stderr.write(`delta export refused: ${error.message}\n`);
     else if (process.env.MTC_DELTA_DEBUG === "1") process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
-    else process.stderr.write("delta export failed because of a local I/O error\n");
+    else process.stderr.write(`${archiveErrorDiagnostic(error)}\n`);
     process.exitCode = 2;
   });
 }
