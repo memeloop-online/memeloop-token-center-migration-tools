@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync, readFileSync, statfsSync, chmodSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, statfsSync, chmodSync, unlinkSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { X509Certificate } from "node:crypto";
 import { COPY, identityName, requireCopy, safeFailure } from "./lib/cpa-stream.ts";
@@ -41,6 +41,7 @@ function main(): void {
     const identity = { ca: readFileSync(file("ca.crt"), "utf8"), cert: readFileSync(file(`${role}.crt`), "utf8"), key: readFileSync(file(`${role}.key`), "utf8"), peerFingerprint: new X509Certificate(readFileSync(file(`${peer}.crt`))).fingerprint256 };
     writeFileSync(file(`${role}.json`), JSON.stringify(identity), { flag: "wx", mode: 0o600 });
   }
+  for (const name of ["ca.key", "reader.key", "receiver.key"]) unlinkSync(file(name));
   console.log(JSON.stringify({ run: COPY.run, generated: true, expires: ended }));
 }
 

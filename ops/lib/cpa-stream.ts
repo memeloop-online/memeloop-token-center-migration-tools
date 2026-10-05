@@ -168,6 +168,7 @@ export async function sendFile(socket: TLSSocket, plan: CopyPlan, started: numbe
     const buffer = Buffer.alloc(plan.chunk);
     const digest = createHash("sha256");
     const transferStarted = performance.now();
+    let reported = transferStarted;
     while (copied < plan.size) {
       checkBudget(plan, started, copied);
       const { bytesRead } = await source.read(buffer, 0, Math.min(buffer.length, plan.size - copied), null);
@@ -178,6 +179,10 @@ export async function sendFile(socket: TLSSocket, plan: CopyPlan, started: numbe
       await frame(socket, 1, data);
       copied += bytesRead;
       requireCopy((await wire.take(8)).equals(countBuffer(copied)), "ACK_MISMATCH");
+      if (performance.now() - reported >= 10000) {
+        console.log(JSON.stringify({ stage: "source-stream", confirmedBytes: copied }));
+        reported = performance.now();
+      }
     }
     await noSidecars(plan.source);
     requireCopy(unchanged(before, await source.stat({ bigint: true })) && unchanged(before, await lstat(plan.source, { bigint: true })), "SOURCE_CHANGED");
@@ -203,6 +208,7 @@ export async function verifyDestination(plan: CopyPlan, file: string, signal?: A
     const buffer = Buffer.alloc(plan.chunk);
     let copied = 0;
     const started = performance.now();
+    let reported = started;
     while (copied < plan.size) {
       requireCopy(!signal?.aborted, "TRANSFER_CANCELLED");
       requireCopy(performance.now() - started < plan.verifyMs, "VERIFY_DEADLINE");
@@ -211,6 +217,10 @@ export async function verifyDestination(plan: CopyPlan, file: string, signal?: A
       digest.update(buffer.subarray(0, bytesRead));
       copied += bytesRead;
       await throttle(plan, started, copied);
+      if (performance.now() - reported >= 10000) {
+        console.log(JSON.stringify({ stage: "destination-verify", bytes: copied }));
+        reported = performance.now();
+      }
     }
     requireCopy(unchanged(before, await source.stat({ bigint: true })) && unchanged(before, await lstat(file, { bigint: true })), "DESTINATION_CHANGED");
     requireCopy(digest.digest("hex") === plan.sha256, "DESTINATION_HASH_MISMATCH");

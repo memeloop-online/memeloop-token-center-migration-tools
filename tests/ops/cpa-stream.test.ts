@@ -58,6 +58,8 @@ test("one-use short-lived role identities stay private in RAM and cannot overwri
   assert.throws(() => validateIdentity(readerIdentity, "receiver", COPY.run), /IDENTITY_ROLE/);
   assert.throws(() => validateIdentity({ ...readerIdentity, key: receiverIdentity.key }, "reader", COPY.run), /IDENTITY_KEY/);
   assert.equal(lstatSync(`${identityDirectory}/reader.json`).mode & 0o777, 0o600);
+  assert.equal(existsSync(`${identityDirectory}/ca.key`), false);
+  assert.equal(existsSync(`${identityDirectory}/reader.key`), false);
   const result = spawnSync(process.execPath, ["ops/cpa-stream-identity.ts", "create"], { encoding: "utf8" });
   assert.equal(result.status, 1);
   assert.equal(result.stderr.includes(readerIdentity.key), false);
@@ -82,13 +84,14 @@ test("mTLS copy verifies source once, independent destination, durable receipt a
 });
 
 test("existing partial, unsafe directory, sidecar, writable source, and source symlink fail closed", async () => {
-  for (const condition of ["partial", "directory", "sidecar", "writable", "symlink"]) {
+  for (const condition of ["partial", "directory", "sidecar", "writable", "symlink", "space"]) {
     const sample = fixture();
     try {
       if (condition === "partial") writeFileSync(`${sample.plan.destination}/archive.sqlite.partial`, "keep");
       if (condition === "directory") chmodSync(sample.plan.destination, 0o750);
       if (condition === "sidecar") writeFileSync(sample.plan.source + "-wal", "keep");
       if (condition === "writable") chmodSync(sample.plan.source, 0o600);
+      if (condition === "space") sample.plan.reserveBytes = Number.MAX_SAFE_INTEGER;
       if (condition === "symlink") { symlinkSync(sample.plan.source, join(sample.root, "link")); sample.plan.source = join(sample.root, "link"); }
       const outcomes = await pair(sample.plan);
       assert.ok(outcomes.every((outcome) => outcome.status === "rejected"), condition);
@@ -141,8 +144,8 @@ test("reader refuses unexpected server fingerprint", async () => {
   } finally { receiver.close(); sample.cleanup(); }
 });
 
-test("truncation, overflow, corrupt stream, bad seal, trailing bytes and stalled sender preserve partial", async () => {
-  for (const condition of ["truncated", "overflow", "corrupt", "seal", "trailing", "idle"]) {
+test("truncation, oversized frames, overflow, corrupt stream, bad seal, trailing bytes and stalled sender preserve partial", async () => {
+  for (const condition of ["truncated", "frame", "overflow", "corrupt", "seal", "trailing", "idle"]) {
     const sample = fixture({ size: 16, sha256: createHash("sha256").update(Buffer.alloc(16, 71)).digest("hex") });
     const receiver = startReceiver(sample.plan, receiverIdentity, "127.0.0.1");
     const result = receiver.completion.then(() => "unexpected success", (error: Error) => error.message);
@@ -153,6 +156,11 @@ test("truncation, overflow, corrupt stream, bad seal, trailing bytes and stalled
       await wire.take(8);
       if (condition === "idle") {
         await pause(500);
+      } else if (condition === "frame") {
+        const oversized = Buffer.alloc(5);
+        oversized[0] = 1;
+        oversized.writeUInt32BE(COPY.chunk + 1, 1);
+        socket.end(oversized);
       } else if (condition === "overflow") {
         await frame(socket, 1, Buffer.alloc(17));
         socket.end();
@@ -183,6 +191,7 @@ test("destination hash detects stored corruption without rereading source", asyn
     const partial = `${sample.plan.destination}/archive.sqlite.partial`;
     writeFileSync(partial, Buffer.alloc(sample.bytes.length, 70));
     await assert.rejects(verifyDestination(sample.plan, partial), /DESTINATION_HASH_MISMATCH/);
+    await assert.rejects(verifyDestination(sample.plan, partial, AbortSignal.abort()), /TRANSFER_CANCELLED/);
   } finally { sample.cleanup(); }
 });
 

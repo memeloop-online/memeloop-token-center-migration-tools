@@ -59,7 +59,7 @@ Only AFTER a separate execution approval: verify unique resource/label ownership
 node ops/cpa-stream-identity.ts create
 ```
 
-The helper has no path/subject/lifetime overrides. It exclusively creates `/dev/shm/cpa-stream-20261005a` after checking tmpfs, uses OpenSSL to issue a unique internal CA and role-specific 40-minute leaf certificates, and prints no private material. All keys, CSRs, CA database and role bundles remain in that private RAM directory. These certificates are solely internal test/data-copy transport identities, not user-service credentials.
+The helper has no path/subject/lifetime overrides. It exclusively creates `/dev/shm/cpa-stream-20261005a` after checking tmpfs, uses OpenSSL to issue a unique internal CA and role-specific 40-minute leaf certificates, and prints no private material. After packaging the role bundles it removes its newly generated CA signing key and redundant individual key files; only the two role bundles retain private material, in RAM. On generation failure, preserve diagnostics without printing contents and explicitly clear only this newly owned RAM directory. These certificates are solely internal test/data-copy transport identities, not user-service credentials.
 
 After approved unsuspend of the receiver, deliver only its bundle through exec stdin within the 120-second readiness window (no shell tracing, printing or base64 output). Then render/create the reader with the actual receiver Pod IP; after placement approval unsuspend it and deliver its bundle:
 
