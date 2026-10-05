@@ -1,0 +1,189 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mtc-cpa-recovery-copy-20261005
+  namespace: cliproxyapi
+  labels:
+    memeloop.io/recovery: cpa-20261005
+spec:
+  suspend: true
+  backoffLimit: 0
+  activeDeadlineSeconds: 1800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cpa-recovery-copy
+        memeloop.io/migration: mtc-session-archive-v08-final
+        memeloop.io/recovery: cpa-20261005
+    spec:
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 10
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      nodeSelector:
+        kubernetes.io/hostname: westlake
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: create-new-private-destination
+          image: ghcr.io/memeloop-online/memeloop-token-center-migration-tools@sha256:348c6ef444e1744798a0ec0d13ca394a8dd413e5fb7d1fe277b7f52684892126
+          command: [node, --input-type=module, -e]
+          args:
+            - |
+              import { mkdirSync, chownSync, lstatSync } from 'node:fs';
+              const directory = '/destination/recovery-20261005';
+              const targetUid = 10001;
+              const targetGid = 10001;
+              try {
+                let created = false;
+                try { mkdirSync(directory, { mode: 0o700 }); created = true; }
+                catch (error) { if (error.code !== 'EEXIST') throw error; }
+                if (created) chownSync(directory, targetUid, targetGid);
+                const metadata = lstatSync(directory);
+                if (!metadata.isDirectory() || metadata.isSymbolicLink() || metadata.uid !== targetUid || metadata.gid !== targetGid || (metadata.mode & 0o7777) !== 0o700) throw new Error();
+              } catch {
+                console.error('new private destination could not be created; existing files are retained');
+                process.exitCode = 1;
+              }
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { cpu: 100m, memory: 64Mi }
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+              add: [CHOWN]
+          volumeMounts:
+            - name: destination
+              mountPath: /destination
+      containers:
+        - name: verified-copy
+          image: ghcr.io/memeloop-online/memeloop-token-center-migration-tools@sha256:348c6ef444e1744798a0ec0d13ca394a8dd413e5fb7d1fe277b7f52684892126
+          command: [node, --input-type=module, -e]
+          args:
+            - |
+              import { constants, lstatSync, readdirSync, openSync, fstatSync, readSync, writeSync, closeSync, fsyncSync, readFileSync, statfsSync, linkSync, unlinkSync, writeFileSync } from 'node:fs';
+              import { createHash } from 'node:crypto';
+              import { setTimeout as pause } from 'node:timers/promises';
+              const expectedSize = 30205399040;
+              const expectedHash = 'd42a11cebe062ea6c908ebf2ff6cdbdae410e392a01af5faf577a4eab30e589f';
+              const destination = '/destination/recovery-20261005';
+              const result = { started_at: new Date().toISOString(), mode: 'verified-frozen-file-copy', expected_bytes: expectedSize };
+              let source;
+              let output;
+              function requireValue(condition, code) { if (!condition) throw Object.assign(new Error(), { safeCode: code }); }
+              function absent(path) {
+                try { lstatSync(path); return false; } catch (error) { if (error.code === 'ENOENT') return true; throw error; }
+              }
+              function sidecarsAbsent() { return ['-wal', '-shm', '-journal'].every((suffix) => absent('/source/archive.sqlite' + suffix)); }
+              function unchanged(before, after) {
+                return before.dev === after.dev && before.ino === after.ino && before.size === after.size && before.mtimeNs === after.mtimeNs && before.ctimeNs === after.ctimeNs && before.mode === after.mode;
+              }
+              try {
+                const mounts = readFileSync('/proc/self/mountinfo', 'utf8').trim().split('\n').map((line) => line.split(' '));
+                requireValue(mounts.some((fields) => fields[4] === '/source' && fields[5].split(',').includes('ro')), 'SOURCE_MOUNT_NOT_READ_ONLY');
+                const directoryMetadata = lstatSync(destination);
+                requireValue(directoryMetadata.isDirectory() && !directoryMetadata.isSymbolicLink() && directoryMetadata.uid === 10001 && directoryMetadata.gid === 10001 && (directoryMetadata.mode & 0o7777) === 0o700 && readdirSync(destination).length === 0, 'DESTINATION_NOT_EMPTY_OR_PRIVATE');
+                requireValue(sidecarsAbsent(), 'SOURCE_SIDECAR_PRESENT');
+                requireValue(absent(destination + '/archive.sqlite') && absent(destination + '/copy-receipt.json'), 'DESTINATION_EXISTS');
+                source = openSync('/source/archive.sqlite', constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+                const before = fstatSync(source, { bigint: true });
+                requireValue(before.isFile() && before.size === BigInt(expectedSize) && (before.mode & 0o222n) === 0n, 'SOURCE_METADATA_MISMATCH');
+                const space = statfsSync(destination, { bigint: true });
+                requireValue(space.bavail * space.bsize >= BigInt(expectedSize) + 20n * 1024n ** 3n, 'DESTINATION_SPACE_INSUFFICIENT');
+                output = openSync(destination + '/archive.sqlite.partial', constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+                const buffer = Buffer.alloc(4 * 1024 * 1024);
+                const sourceHash = createHash('sha256');
+                const started = performance.now();
+                let consumed = 0;
+                let nextProgress = 1024 ** 3;
+                while (consumed < expectedSize) {
+                  requireValue(performance.now() - started < 1200000, 'COPY_DEADLINE');
+                  const bytes = readSync(source, buffer, 0, Math.min(buffer.length, expectedSize - consumed), null);
+                  requireValue(bytes > 0, 'UNEXPECTED_EOF');
+                  sourceHash.update(buffer.subarray(0, bytes));
+                  let written = 0;
+                  while (written < bytes) {
+                    const count = writeSync(output, buffer, written, bytes - written);
+                    requireValue(count > 0, 'SHORT_WRITE');
+                    written += count;
+                  }
+                  consumed += bytes;
+                  if (consumed >= nextProgress) {
+                    console.log(JSON.stringify({ stage: 'copy', bytes: consumed }));
+                    nextProgress += 1024 ** 3;
+                  }
+                  const delay = consumed / 67108864 * 1000 - (performance.now() - started);
+                  if (delay > 0) await pause(delay);
+                }
+                requireValue(unchanged(before, fstatSync(source, { bigint: true })) && unchanged(before, lstatSync('/source/archive.sqlite', { bigint: true })) && sidecarsAbsent(), 'SOURCE_CHANGED');
+                requireValue(sourceHash.digest('hex') === expectedHash, 'SOURCE_HASH_MISMATCH');
+                fsyncSync(output); closeSync(output); output = undefined;
+                closeSync(source); source = undefined;
+                source = openSync(destination + '/archive.sqlite.partial', constants.O_RDONLY | constants.O_NOFOLLOW);
+                requireValue(fstatSync(source).size === expectedSize, 'COPIED_SIZE_MISMATCH');
+                const destinationHash = createHash('sha256');
+                consumed = 0;
+                const verificationStarted = performance.now();
+                while (consumed < expectedSize) {
+                  requireValue(performance.now() - started < 1500000, 'VERIFY_DEADLINE');
+                  const bytes = readSync(source, buffer, 0, Math.min(buffer.length, expectedSize - consumed), null);
+                  requireValue(bytes > 0, 'UNEXPECTED_EOF');
+                  destinationHash.update(buffer.subarray(0, bytes)); consumed += bytes;
+                  const delay = consumed / 67108864 * 1000 - (performance.now() - verificationStarted);
+                  if (delay > 0) await pause(delay);
+                }
+                result.sha256 = destinationHash.digest('hex');
+                requireValue(result.sha256 === expectedHash, 'COPIED_HASH_MISMATCH');
+                closeSync(source); source = undefined;
+                linkSync(destination + '/archive.sqlite.partial', destination + '/archive.sqlite');
+                unlinkSync(destination + '/archive.sqlite.partial');
+                result.passed = true;
+                result.finished_at = new Date().toISOString();
+                writeFileSync(destination + '/copy-receipt.json', JSON.stringify(result) + '\n', { flag: 'wx', mode: 0o600 });
+                const receipt = openSync(destination + '/copy-receipt.json', constants.O_RDONLY);
+                fsyncSync(receipt); closeSync(receipt);
+                const directory = openSync(destination, constants.O_RDONLY | constants.O_DIRECTORY);
+                fsyncSync(directory); closeSync(directory);
+              } catch (error) {
+                result.passed = false;
+                result.failure = error.safeCode ?? (['ENOENT', 'EACCES', 'EROFS', 'EIO', 'ENOSPC', 'EEXIST'].includes(error.code) ? error.code : 'UNCLASSIFIED');
+                process.exitCode = 1;
+              } finally {
+                if (source !== undefined) closeSync(source);
+                if (output !== undefined) closeSync(output);
+              }
+              result.finished_at = new Date().toISOString();
+              const summary = JSON.stringify(result);
+              writeFileSync('/dev/termination-log', summary);
+              console.log(summary);
+          resources:
+            requests: { cpu: 100m, memory: 96Mi, ephemeral-storage: 32Mi }
+            limits: { cpu: 500m, memory: 256Mi, ephemeral-storage: 64Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: source
+              mountPath: /source
+              readOnly: true
+            - name: destination
+              mountPath: /destination
+      volumes:
+        - name: source
+          persistentVolumeClaim:
+            claimName: mtc-session-archive-v08-live-clone-20260919a
+            readOnly: true
+        - name: destination
+          persistentVolumeClaim:
+            claimName: mtc-cpa-recovery-work-20261005
