@@ -17,7 +17,7 @@ export function job(role: "reader" | "receiver", receiverIp?: string): unknown {
   if (role === "reader") validateEndpoint(receiverIp ?? "");
   const receiver = role === "receiver";
   const destination = receiver ? [{ name: "destination", mountPath: "/destination" }] : [];
-  const privateDirectory = receiver ? `mkdirSync('${COPY.destination}', {mode:0o700}); chownSync('${COPY.destination}',10001,10001);` : "";
+  const privateDirectory = receiver ? `mkdirSync('${COPY.destination}', {mode:0o700}); chownSync('${COPY.destination}',10001,10001); const parentDirectory = openSync('/destination', constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW); try { fsyncSync(parentDirectory); } finally { closeSync(parentDirectory); }` : "";
   return {
     apiVersion: "batch/v1", kind: "Job",
     metadata: { name: `mtc-cpa-stream-${role}-20261005a`, namespace, labels: labels(role), annotations: { "memeloop.io/tool-sha256": codeHash } },
@@ -29,7 +29,7 @@ export function job(role: "reader" | "receiver", receiverIp?: string): unknown {
         securityContext: { runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, seccompProfile: { type: "RuntimeDefault" } },
         initContainers: [{
           name: "private-new-directories", image, command: ["node", "--input-type=module", "-e"],
-          args: [`import {mkdirSync,chownSync,chmodSync} from 'node:fs'; chmodSync('/identity',0o700); chownSync('/identity',10001,10001); ${privateDirectory}`],
+          args: [`import {mkdirSync,chownSync,chmodSync,openSync,fsyncSync,closeSync,constants} from 'node:fs'; chmodSync('/identity',0o700); chownSync('/identity',10001,10001); ${privateDirectory}`],
           resources: { requests: { cpu: "10m", memory: "16Mi" }, limits: { cpu: "100m", memory: "64Mi" } },
           securityContext: { runAsNonRoot: false, runAsUser: 0, runAsGroup: 0, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"], add: ["CHOWN"] } },
           volumeMounts: [{ name: "identity", mountPath: "/identity" }, ...destination],

@@ -82,6 +82,18 @@ jobs:
             ghcr.io/memeloop-online/memeloop-token-center-migration-tools@sha256:348c6ef444e1744798a0ec0d13ca394a8dd413e5fb7d1fe277b7f52684892126 \
             node /tool/cpa-frozen-stream-copy.ts --help
 
+      - name: Verify real stream under each role's 128Mi and 250m budget
+        run: sudo --preserve-env=GITHUB_ACTIONS,GITHUB_SHA,RUNNER_TEMP "$(command -v node)" --test tests/ops/cpa-stream-bounded.test.ts
+
+      - name: Upload bounded-stream measurement evidence
+        if: always()
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.6.2
+        with:
+          name: cpa-stream-bounded-${{ github.sha }}
+          path: ${{ runner.temp }}/cpa-stream-bounded-result.json
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: Render review-only stream resources
         run: |
           mkdir -p "$RUNNER_TEMP/cpa-stream-review"

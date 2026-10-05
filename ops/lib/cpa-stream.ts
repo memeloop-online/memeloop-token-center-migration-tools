@@ -2,6 +2,7 @@ import { createHash, X509Certificate, createPrivateKey } from "node:crypto";
 import { constants, type BigIntStats } from "node:fs";
 import { open, lstat, readdir, readFile, statfs, link } from "node:fs/promises";
 import { connect, createServer, checkServerIdentity, type TLSSocket } from "node:tls";
+import { dirname } from "node:path";
 import { setTimeout as pause } from "node:timers/promises";
 
 export const COPY = Object.freeze({
@@ -233,6 +234,11 @@ export async function receiveFile(socket: TLSSocket, plan: CopyPlan, signal?: Ab
   requireCopy((await readdir(plan.destination)).length === 0, "DESTINATION_NOT_EMPTY");
   const space = await statfs(plan.destination, { bigint: true });
   requireCopy(space.bavail * space.bsize >= BigInt(plan.size + plan.reserveBytes), "DESTINATION_SPACE");
+  for (const path of [plan.destination, dirname(plan.destination)]) {
+    requireCopy(!signal?.aborted, "TRANSFER_CANCELLED");
+    const directoryFile = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    try { await directoryFile.sync(); } finally { await directoryFile.close(); }
+  }
   const partial = `${plan.destination}/archive.sqlite.partial`;
   const output = await open(partial, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
   const wire = new Wire(socket);

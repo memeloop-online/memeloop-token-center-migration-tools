@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import { after, before, test, mock } from "node:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
-import { open } from "node:fs/promises";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { open, type FileHandle } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { connect, type TLSSocket } from "node:tls";
@@ -199,13 +199,73 @@ test("fsync failure preserves partial and refuses publication", async () => {
   const sample = fixture();
   const handle = await open(join(sample.root, "probe"), "wx");
   const prototype = Object.getPrototypeOf(handle);
+  const originalSync = handle.sync;
   await handle.close();
-  const mocked = mock.method(prototype, "sync", async () => { throw new Error("FSYNC_FAILED"); });
+  const mocked = mock.method(prototype, "sync", async function(this: FileHandle) {
+    if (readlinkSync(`/proc/self/fd/${this.fd}`) === `${sample.plan.destination}/archive.sqlite.partial`) throw new Error("FSYNC_FAILED");
+    await originalSync.call(this);
+  });
   try {
     assert.ok((await pair(sample.plan)).every((outcome) => outcome.status === "rejected"));
     assert.equal(existsSync(`${sample.plan.destination}/archive.sqlite.partial`), true);
     assert.equal(existsSync(`${sample.plan.destination}/archive.sqlite`), false);
   } finally { mocked.mock.restore(); sample.cleanup(); }
+});
+
+test("destination parent fsync precedes payload and failures cannot signal ready or success", async () => {
+  for (const injectFailure of [false, true]) {
+    const sample = fixture();
+    const handle = await open(join(sample.root, "probe"), "wx");
+    const prototype = Object.getPrototypeOf(handle);
+    const originalSync = handle.sync;
+    await handle.close();
+    const synced: string[] = [];
+    const mocked = mock.method(prototype, "sync", async function(this: FileHandle) {
+      const path = readlinkSync(`/proc/self/fd/${this.fd}`);
+      synced.push(path);
+      if (injectFailure && path === sample.root) throw new Error("PARENT_FSYNC_FAILED");
+      await originalSync.call(this);
+    });
+    try {
+      const outcomes = await pair(sample.plan, injectFailure ? { ...sample.plan, source: join(sample.root, "must-not-open") } : sample.plan);
+      assert.deepEqual(synced.slice(0, 2), [sample.plan.destination, sample.root]);
+      if (injectFailure) {
+        assert.ok(outcomes.every((outcome) => outcome.status === "rejected"));
+        assert.match(String((outcomes[0] as PromiseRejectedResult).reason), /PARENT_FSYNC_FAILED/);
+        assert.doesNotMatch(String((outcomes[1] as PromiseRejectedResult).reason), /ENOENT/);
+        assert.deepEqual(readdirSync(sample.plan.destination), []);
+      } else {
+        assert.ok(outcomes.every((outcome) => outcome.status === "fulfilled"));
+        assert.ok(synced.indexOf(sample.root) < synced.indexOf(`${sample.plan.destination}/archive.sqlite.partial`));
+      }
+    } finally { mocked.mock.restore(); sample.cleanup(); }
+  }
+});
+
+test("exclusive directory init fails if its parent cannot be fsynced, retaining the new directory", () => {
+  const root = mkdtempSync(join(tmpdir(), "cpa-stream-init-"));
+  const identity = join(root, "identity");
+  const parent = join(root, "destination");
+  mkdirSync(identity, { mode: 0o700 });
+  mkdirSync(parent, { mode: 0o700 });
+  const destination = join(parent, "recovery-stream-20261005a");
+  const manifest = job("receiver") as any;
+  const script = (manifest.spec.template.spec.initContainers[0].args[0] as string)
+    .replaceAll("'/identity'", JSON.stringify(identity))
+    .replaceAll(`'${COPY.destination}'`, JSON.stringify(destination))
+    .replaceAll("'/destination'", JSON.stringify(parent))
+    .replaceAll(",10001,10001", `,${process.getuid!()},${process.getgid!()}`);
+  try {
+    assert.ok(script.includes("fsyncSync(parentDirectory)"));
+    const failed = spawnSync(process.execPath, ["--input-type=module", "-e", script.replace("fsyncSync(parentDirectory)", "(() => { throw new Error('PARENT_FSYNC_FAILED'); })()")], { encoding: "utf8" });
+    assert.equal(failed.status, 1);
+    assert.match(failed.stderr, /PARENT_FSYNC_FAILED/);
+    assert.ok(lstatSync(destination).isDirectory());
+    assert.deepEqual(readdirSync(destination), []);
+    const retry = spawnSync(process.execPath, ["--input-type=module", "-e", script], { encoding: "utf8" });
+    assert.equal(retry.status, 1);
+    assert.match(retry.stderr, /EEXIST/);
+  } finally { rmSync(root, { recursive: true }); }
 });
 
 test("endpoints, RO mount, deadline and throughput cannot silently bypass policy", () => {
