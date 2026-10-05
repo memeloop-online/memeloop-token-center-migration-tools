@@ -71,6 +71,34 @@ jobs:
       - name: Verify copy directory recovery
         run: node --test tests/ops/cpa-copy-directory.test.ts
 
+      - name: Verify isolated mTLS frozen-copy transport
+        run: node --test tests/ops/cpa-stream.test.ts
+
+      - name: Check fixed stream runtime without cluster access
+        run: |
+          docker run --rm --network none --read-only --memory 128m --cpus .25 \
+            --cap-drop ALL --security-opt no-new-privileges --user 10001:10001 \
+            --volume "$PWD/ops:/tool:ro" \
+            ghcr.io/memeloop-online/memeloop-token-center-migration-tools@sha256:348c6ef444e1744798a0ec0d13ca394a8dd413e5fb7d1fe277b7f52684892126 \
+            node /tool/cpa-frozen-stream-copy.ts --help
+
+      - name: Render review-only stream resources
+        run: |
+          mkdir -p "$RUNNER_TEMP/cpa-stream-review"
+          node ops/cpa-stream-resources.ts code > "$RUNNER_TEMP/cpa-stream-review/code.yaml"
+          node ops/cpa-stream-resources.ts policies > "$RUNNER_TEMP/cpa-stream-review/policies.yaml"
+          node ops/cpa-stream-resources.ts receiver > "$RUNNER_TEMP/cpa-stream-review/receiver.yaml"
+          CPA_RECEIVER_IP=10.42.3.254 node ops/cpa-stream-resources.ts reader > "$RUNNER_TEMP/cpa-stream-review/reader-EXAMPLE-IP-NOT-FOR-APPLY.yaml"
+          (cd "$RUNNER_TEMP/cpa-stream-review" && sha256sum *.yaml > SHA256SUMS)
+
+      - name: Upload review-only stream resources
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.6.2
+        with:
+          name: cpa-stream-review-${{ github.sha }}
+          path: ${{ runner.temp }}/cpa-stream-review/
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Verify SQLite backup command
         run: |
           test -z "$(gofmt -l cmd/cpa-session-archive-backup)"
