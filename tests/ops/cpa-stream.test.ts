@@ -33,7 +33,7 @@ function fixture(overrides: Partial<CopyPlan> = {}) {
   const bytes = Buffer.alloc(256 * 1024, 71);
   writeFileSync(source, bytes, { mode: 0o400 });
   mkdirSync(destination, { mode: 0o700 });
-  const plan: CopyPlan = { ...COPY, source, destination, size: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"), chunk: 65536, rate: 100 * 1024 ** 2, reserveBytes: 0, uid: process.getuid!(), gid: process.getgid!(), totalMs: 3000, verifyMs: 500, idleMs: 300, ...overrides };
+  const plan: CopyPlan = { ...COPY, port: 0, source, destination, size: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"), chunk: 65536, rate: 100 * 1024 ** 2, reserveBytes: 0, uid: process.getuid!(), gid: process.getgid!(), totalMs: 3000, verifyMs: 500, idleMs: 300, ...overrides };
   return { root, plan, bytes, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
@@ -45,7 +45,8 @@ async function pair(plan: CopyPlan, senderPlan: CopyPlan = plan) {
 }
 
 async function peer(port: number): Promise<TLSSocket> {
-  const socket = connect({ host: "127.0.0.1", port, ...readerIdentity, servername: identityName("receiver", COPY.run), rejectUnauthorized: true, allowHalfOpen: true });
+  const socket = connect({ host: "127.0.0.1", port, ...readerIdentity, servername: identityName("receiver", COPY.run), rejectUnauthorized: true });
+  socket.allowHalfOpen = true;
   socket.on("error", () => {});
   await new Promise<void>((resolve, reject) => { socket.once("secureConnect", resolve); socket.once("error", reject); });
   return socket;
@@ -165,7 +166,8 @@ test("truncation, overflow, corrupt stream, bad seal, trailing bytes and stalled
         Buffer.from(sample.plan.sha256, "hex").copy(seal, 8);
         if (condition === "seal") seal[8] = seal[8]! ^ 1;
         await frame(socket, 2, seal);
-        socket.end(condition === "trailing" ? Buffer.from([1]) : undefined);
+        if (condition === "trailing") socket.end(Buffer.from([1]));
+        else socket.end();
       }
       assert.notEqual(await result, "unexpected success", condition);
       assert.equal(existsSync(`${sample.plan.destination}/archive.sqlite.partial`), true);

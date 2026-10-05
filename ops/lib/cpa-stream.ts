@@ -22,7 +22,7 @@ export const COPY = Object.freeze({
   gid: 10001,
 });
 
-export type CopyPlan = { [Key in keyof typeof COPY]: (typeof COPY)[Key] extends number ? number : string };
+export type CopyPlan = { -readonly [Key in keyof typeof COPY]: (typeof COPY)[Key] extends number ? number : string };
 export type Identity = { ca: string; cert: string; key: string; peerFingerprint: string };
 export type Receipt = { run: string; passed: true; bytes: number; sha256: string; sourceVerified: true; destinationVerified: true };
 
@@ -70,7 +70,9 @@ function authorize(socket: TLSSocket, identity: Identity, peer: string): void {
 export class Wire {
   private readonly iterator: AsyncIterator<Buffer>;
   private pending: Buffer = Buffer.alloc(0);
-  constructor(readonly socket: TLSSocket) {
+  readonly socket: TLSSocket;
+  constructor(socket: TLSSocket) {
+    this.socket = socket;
     this.iterator = socket.iterator({ destroyOnReturn: false });
   }
   async take(length: number): Promise<Buffer> {
@@ -283,7 +285,8 @@ function watchSocket(socket: TLSSocket, idleMs: number): void {
 export async function runReader(plan: CopyPlan, identity: Identity, host: string): Promise<Receipt> {
   validateIdentity(identity, "reader", plan.run);
   const started = performance.now();
-  const socket = connect({ host, port: plan.port, ca: identity.ca, cert: identity.cert, key: identity.key, servername: identityName("receiver", plan.run), minVersion: "TLSv1.3", rejectUnauthorized: true, allowHalfOpen: true });
+  const socket = connect({ host, port: plan.port, ca: identity.ca, cert: identity.cert, key: identity.key, servername: identityName("receiver", plan.run), minVersion: "TLSv1.3", rejectUnauthorized: true });
+  socket.allowHalfOpen = true;
   watchSocket(socket, plan.idleMs);
   const deadline = setTimeout(() => socket.destroy(new Error("TOTAL_DEADLINE")), plan.totalMs);
   try {
