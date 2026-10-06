@@ -2,6 +2,8 @@
 
 This candidate is for review and GHA validation only. Implementing/merging it does not authorize deployment, source attachment, transfer, new storage, digest preparation, production import or deletion. It does not replace any production service or modify MTU, routes, Longhorn settings or old failed Jobs.
 
+This document describes the original two-node profile and RAM diagnostic. The separately fixed same-node profile, its GHA contract and unapproved target-only performance proposal are documented in [cpa-stream-same-node.md](cpa-stream-same-node.md). Original consumed run names/directories are retained, not reused by the new profile.
+
 ## Fixed resource inventory
 
 All resources belong to namespace `cliproxyapi`, run `cpa-stream-20261005a`.

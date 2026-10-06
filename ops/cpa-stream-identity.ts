@@ -1,7 +1,7 @@
 import { mkdirSync, writeFileSync, readFileSync, statfsSync, chmodSync, unlinkSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { X509Certificate } from "node:crypto";
-import { COPY, MEMORY_DIAGNOSTIC, identityName, requireCopy, safeFailure } from "./lib/cpa-stream.ts";
+import { COPY, MEMORY_DIAGNOSTIC, SAME_NODE_COPY, identityName, requireCopy, safeFailure } from "./lib/cpa-stream.ts";
 
 export const IDENTITY_DIRECTORY = "/dev/shm/cpa-stream-20261005a";
 
@@ -16,12 +16,12 @@ function timestamp(milliseconds: number): string {
 
 function main(): void {
   if (process.argv.length === 3 && process.argv[2] === "--help") {
-    console.log("cpa-stream-identity create|create-diagnostic; fixed-purpose 40-minute internal identities, RAM only, no private stdout");
+    console.log("cpa-stream-identity create|create-diagnostic|create-same-node; fixed-purpose 40-minute internal identities, RAM only, no private stdout");
     return;
   }
-  requireCopy(process.argv.length === 3 && ["create", "create-diagnostic"].includes(process.argv[2]!), "ARGUMENTS");
-  const run = process.argv[2] === "create-diagnostic" ? MEMORY_DIAGNOSTIC.run : COPY.run;
-  const directory = process.argv[2] === "create-diagnostic" ? `/dev/shm/${MEMORY_DIAGNOSTIC.run}` : IDENTITY_DIRECTORY;
+  requireCopy(process.argv.length === 3 && ["create", "create-diagnostic", "create-same-node"].includes(process.argv[2]!), "ARGUMENTS");
+  const run = process.argv[2] === "create-same-node" ? SAME_NODE_COPY.run : process.argv[2] === "create-diagnostic" ? MEMORY_DIAGNOSTIC.run : COPY.run;
+  const directory = `/dev/shm/${run}`;
   requireCopy(statfsSync("/dev/shm").type === 0x01021994, "IDENTITY_NOT_RAM");
   process.umask(0o077);
   mkdirSync(directory, { mode: 0o700 });
