@@ -6,9 +6,10 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync,
 import { open, type FileHandle } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { createServer as createTcpServer } from "node:net";
 import { connect, type TLSSocket } from "node:tls";
 import { setTimeout as pause } from "node:timers/promises";
-import { COPY, Wire, checkBudget, frame, identityName, requireReadOnlyMount, runReader, startReceiver, validateEndpoint, validateIdentity, verifyDestination, type CopyPlan, type Identity } from "../../ops/lib/cpa-stream.ts";
+import { COPY, Wire, checkBudget, frame, identityName, requireReadOnlyMount, runReader, safeFailure, startReceiver, validateEndpoint, validateIdentity, verifyDestination, type CopyPlan, type Identity } from "../../ops/lib/cpa-stream.ts";
 import { job, policies } from "../../ops/cpa-stream-resources.ts";
 
 const identityDirectory = "/dev/shm/cpa-stream-20261005a";
@@ -63,6 +64,35 @@ test("one-use short-lived role identities stay private in RAM and cannot overwri
   const result = spawnSync(process.execPath, ["ops/cpa-stream-identity.ts", "create"], { encoding: "utf8" });
   assert.equal(result.status, 1);
   assert.equal(result.stderr.includes(readerIdentity.key), false);
+});
+
+test("native failure diagnostics preserve allowlisted codes without paths, keys, or raw TLS messages", () => {
+  const sensitive = `connect 10.42.3.159:18443 /identity/bundle.json ${readerIdentity.key}`;
+  for (const code of ["ECONNREFUSED", "EHOSTUNREACH", "ETIMEDOUT", "EACCES", "ERR_TLS_CERT_ALTNAME_INVALID", "ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED"]) {
+    const error = Object.assign(new Error(sensitive), { code });
+    assert.equal(safeFailure(error), code);
+    assert.equal(safeFailure(new Error(safeFailure(error))), code);
+  }
+  assert.equal(safeFailure(Object.assign(new Error(sensitive), { code: "ERR_SSL_PRIVATE_UNKNOWN" })), "COPY_FAILED");
+  assert.equal(safeFailure(Object.assign(new Error(sensitive), { code: sensitive })), "COPY_FAILED");
+  assert.equal(safeFailure(new Error(sensitive)), "COPY_FAILED");
+  assert.equal(safeFailure({ message: sensitive, code: "ECONNREFUSED" }), "COPY_FAILED");
+  assert.equal(safeFailure(new Error("SOURCE_HASH_MISMATCH")), "SOURCE_HASH_MISMATCH");
+});
+
+test("a refused connection reports its phase and errno without opening source or destination", async () => {
+  const sample = fixture();
+  const listener = createTcpServer();
+  await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
+  const address = listener.address();
+  assert.ok(address && typeof address !== "string");
+  await new Promise<void>((resolve, reject) => listener.close((error) => error ? reject(error) : resolve()));
+  const diagnostic = mock.method(console, "error", () => {});
+  try {
+    await assert.rejects(runReader({ ...sample.plan, port: address.port, source: join(sample.root, "missing-source") }, readerIdentity, "127.0.0.1"), { code: "ECONNREFUSED" });
+    assert.deepEqual(diagnostic.mock.calls.map((call) => JSON.parse(String(call.arguments[0]))), [{ stage: "reader-tls-connect", failure: "ECONNREFUSED" }]);
+    assert.deepEqual(readdirSync(sample.plan.destination), []);
+  } finally { diagnostic.mock.restore(); sample.cleanup(); }
 });
 
 test("mTLS copy verifies source once, independent destination, durable receipt and preserved partial", async () => {
@@ -126,12 +156,18 @@ test("source identity changes during a backpressured copy are rejected", async (
 
 test("receiver refuses unexpected client fingerprint before opening destination", async () => {
   const sample = fixture({ totalMs: 700 });
+  const diagnostic = mock.method(console, "error", () => {});
   const receiver = startReceiver(sample.plan, { ...receiverIdentity, peerFingerprint: Array(32).fill("AA").join(":") }, "127.0.0.1");
   const outcomes = Promise.allSettled([receiver.completion, receiver.listening.then((port) => runReader({ ...sample.plan, port }, readerIdentity, "127.0.0.1"))]);
   try {
     assert.ok((await outcomes).every((outcome) => outcome.status === "rejected"));
     assert.deepEqual(readdirSync(sample.plan.destination), []);
-  } finally { receiver.close(); sample.cleanup(); }
+    const messages = diagnostic.mock.calls.map((call) => JSON.parse(String(call.arguments[0])));
+    assert.ok(messages.some((message) => message.stage === "receiver-peer-authorization" && message.failure === "PEER_PIN"));
+    assert.ok(messages.every((message) => Object.keys(message).sort().join(",") === "failure,stage"));
+    assert.equal(JSON.stringify(messages).includes(readerIdentity.key), false);
+    assert.equal(JSON.stringify(messages).includes(receiverIdentity.key), false);
+  } finally { diagnostic.mock.restore(); receiver.close(); sample.cleanup(); }
 });
 
 test("reader refuses unexpected server fingerprint", async () => {

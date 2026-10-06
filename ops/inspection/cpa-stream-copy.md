@@ -44,6 +44,8 @@ Receiver enforces exact byte length, frame bounds, source-success frame, EOF (re
 
 Acceptance requires BOTH Job successes, matching termination receipts and the durable destination receipt; a pending receipt alone is not acceptance. Hash mismatch, timeout, EOF, extra bytes, source change, stored corruption, fsync failure or insufficient throughput refuses success. The reader reserves verification time and stops early if receiver-confirmed throughput cannot fit the remaining budget. Local-reader/app-stream removes remote Longhorn block RPCs, NOT loss on the underlying Tailnet; ping does not promise completion within 1800 seconds.
 
+Failure diagnostics retain only explicitly allowlisted native errno/TLS codes, never raw native messages, paths, peer addresses, keys or TLS error details. Reader failures distinguish TLS connection, peer authorization and stream phases; receiver handshake/peer rejection logs use the same sanitizer. `source-ready` means the authenticated receiver sent READY, not that the source hash or transfer succeeded. Unknown errors remain `COPY_FAILED`; do not infer a network root cause from that generic value. These diagnostics do not authorize a retry or make an already-created exclusive directory reusable.
+
 ## GHA-only constrained-stream evidence
 
 The memory budget is **128Mi per role, 256Mi total**, and the CPU budget is **250m per role, 500m total**. **64MiB/s is the throughput ceiling, not a 64Mi memory allocation.** The runtime `--help` smoke test is not memory acceptance.
