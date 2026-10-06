@@ -19,7 +19,7 @@ metadata:
 spec:
   suspend: true
   backoffLimit: 0
-  activeDeadlineSeconds: 180
+  activeDeadlineSeconds: 175
   template:
     metadata:
       labels:

@@ -122,14 +122,16 @@ function authorize(socket: TLSSocket, identity: Identity, peer: string): void {
 export class Wire {
   private readonly iterator: AsyncIterator<Buffer>;
   private pending: Buffer = Buffer.alloc(0);
+  private frameStorage: Buffer | undefined;
   readonly socket: TLSSocket;
   constructor(socket: TLSSocket) {
     this.socket = socket;
     this.iterator = socket.iterator({ destroyOnReturn: false });
   }
-  async take(length: number): Promise<Buffer> {
+  async take(length: number, storage?: Buffer): Promise<Buffer> {
     requireCopy(length >= 0 && length <= COPY.chunk + 2048, "FRAME_SIZE");
-    const output = Buffer.allocUnsafe(length);
+    const output = storage ?? Buffer.allocUnsafe(length);
+    requireCopy(output.length === length, "FRAME_SIZE");
     let offset = 0;
     while (offset < length) {
       if (this.pending.length === 0) {
@@ -151,7 +153,8 @@ export class Wire {
     const header = await this.take(5);
     const size = header.readUInt32BE(1);
     requireCopy(size <= COPY.chunk, "FRAME_SIZE");
-    return { kind: header[0]!, body: await this.take(size) };
+    if (!this.frameStorage || this.frameStorage.length < size) this.frameStorage = Buffer.allocUnsafe(size);
+    return { kind: header[0]!, body: await this.take(size, this.frameStorage.subarray(0, size)) };
   }
 }
 

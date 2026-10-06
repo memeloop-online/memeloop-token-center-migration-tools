@@ -80,6 +80,29 @@ test("native failure diagnostics preserve allowlisted codes without paths, keys,
   assert.equal(safeFailure(new Error("SOURCE_HASH_MISMATCH")), "SOURCE_HASH_MISMATCH");
 });
 
+test("sequentially consumed frames reuse bounded body storage rather than relying on external-buffer GC", async () => {
+  const bodies = [Buffer.alloc(COPY.chunk, 71), Buffer.alloc(COPY.chunk, 72), Buffer.alloc(40, 73)];
+  async function* chunks() {
+    for (const body of bodies) {
+      const header = Buffer.alloc(5);
+      header[0] = 1;
+      header.writeUInt32BE(body.length, 1);
+      yield header;
+      for (let offset = 0; offset < body.length; offset += 16384) yield body.subarray(offset, offset + 16384);
+    }
+  }
+  const wire = new Wire({ iterator: () => chunks() } as unknown as TLSSocket);
+  let storage: ArrayBufferLike | undefined;
+  for (const body of bodies) {
+    const received = await wire.frame();
+    assert.deepEqual(received.body, body);
+    if (storage) assert.equal(received.body.buffer, storage);
+    storage = received.body.buffer;
+    assert.equal(storage.byteLength, COPY.chunk);
+  }
+  await wire.eof();
+});
+
 test("a refused connection reports its phase and errno without opening source or destination", async () => {
   const sample = fixture();
   const listener = createTcpServer();

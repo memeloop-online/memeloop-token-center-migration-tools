@@ -14,7 +14,7 @@ test("review-only target probe uses pinned dd direct I/O under 128Mi/250m, never
   assert.deepEqual(policy.spec.egress, []);
   assert.equal(job.spec.suspend, true);
   assert.equal(job.spec.backoffLimit, 0);
-  assert.equal(job.spec.activeDeadlineSeconds, 180);
+  assert.equal(job.spec.activeDeadlineSeconds + job.spec.template.spec.terminationGracePeriodSeconds, 180);
   const pod = job.spec.template.spec;
   assert.equal(pod.nodeSelector["kubernetes.io/hostname"], "sansheng-hv");
   assert.equal(pod.automountServiceAccountToken, false);
