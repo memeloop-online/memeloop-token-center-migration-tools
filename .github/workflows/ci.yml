@@ -76,11 +76,12 @@ jobs:
 
       - name: Check fixed stream runtime without cluster access
         run: |
-          docker run --rm --network none --read-only --memory 128m --cpus .25 \
+          docker run --rm --network none --read-only --memory 128m --memory-swap 128m --cpus .25 \
             --cap-drop ALL --security-opt no-new-privileges --user 10001:10001 \
+            --entrypoint node \
             --volume "$PWD/ops:/tool:ro" \
             ghcr.io/memeloop-online/memeloop-token-center-migration-tools@sha256:348c6ef444e1744798a0ec0d13ca394a8dd413e5fb7d1fe277b7f52684892126 \
-            node /tool/cpa-frozen-stream-copy.ts --help
+            /tool/cpa-frozen-stream-copy.ts --help
 
       - name: Verify real stream under each role's 128Mi and 250m budget
         run: sudo --preserve-env=GITHUB_ACTIONS,GITHUB_SHA,RUNNER_TEMP "$(command -v node)" --test tests/ops/cpa-stream-bounded.test.ts
