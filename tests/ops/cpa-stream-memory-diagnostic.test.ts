@@ -8,7 +8,7 @@ import { job, policies } from "../../ops/cpa-stream-resources.ts";
 
 test("diagnostic resources have only private RAM and unchanged role-selector networking", () => {
   for (const role of ["reader", "receiver"] as const) {
-    const rendered = JSON.parse(JSON.stringify(job(role, role === "reader" ? "10.42.3.2" : undefined, true)));
+    const rendered = JSON.parse(JSON.stringify(job(role, role === "reader" ? "10.42.3.2" : undefined, "diagnostic")));
     const pod = rendered.spec.template.spec;
     assert.equal(rendered.spec.suspend, true);
     assert.equal(rendered.spec.backoffLimit, 0);
@@ -22,7 +22,7 @@ test("diagnostic resources have only private RAM and unchanged role-selector net
     assert.equal(JSON.stringify(rendered).includes("hostPath"), false);
     assert.equal(JSON.stringify(rendered).includes("secretName"), false);
   }
-  const diagnosticPolicies = JSON.stringify(policies(true)).replaceAll("diagnostic-", "").replaceAll("20261006a", "20261005a");
+  const diagnosticPolicies = JSON.stringify(policies("diagnostic")).replaceAll("diagnostic-", "").replaceAll("20261006a", "20261005a");
   assert.equal(diagnosticPolicies, JSON.stringify(policies()));
 });
 

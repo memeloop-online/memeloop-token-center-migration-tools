@@ -1,25 +1,29 @@
 import { readFile, writeFile, open, statfs } from "node:fs/promises";
 import { setTimeout as pause } from "node:timers/promises";
-import { COPY, MEMORY_DIAGNOSTIC, loadIdentity, requireCopy, requireReadOnlyMount, runReader, safeFailure, startReceiver, validateEndpoint, validateIdentity, type Identity } from "./lib/cpa-stream.ts";
+import { COPY, STREAM_PROFILES, loadIdentity, profileCommand, requireCopy, requirePlacement, requireReadOnlyMount, runReader, safeFailure, startReceiver, validateEndpoint, validateIdentity, type Identity } from "./lib/cpa-stream.ts";
 
 let phase = "preflight";
+let run: string = COPY.run;
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   if (args.length === 1 && args[0] === "--help") {
-    console.log("cpa-frozen-stream-copy reader|receiver|stage-reader|stage-receiver|diagnostic-reader|diagnostic-receiver|stage-diagnostic-reader|stage-diagnostic-receiver; fixed paths, RAM-only diagnostic, one-use mTLS, no path/URL overrides");
+    console.log("cpa-frozen-stream-copy [stage-][same-node-|diagnostic-]reader|receiver; fixed profiles/paths, RAM-only diagnostic, one-use mTLS, no path/URL overrides");
     return;
   }
-  requireCopy(args.length === 1 && ["reader", "receiver", "stage-reader", "stage-receiver", "diagnostic-reader", "diagnostic-receiver", "stage-diagnostic-reader", "stage-diagnostic-receiver"].includes(args[0]!), "ARGUMENTS");
-  const role = args[0]!.endsWith("reader") ? "reader" : "receiver";
-  const diagnostic = args[0]!.includes("diagnostic");
-  const plan = diagnostic ? MEMORY_DIAGNOSTIC : COPY;
-  requireCopy(process.env.NODE_NAME === (role === "reader" ? "sansheng-hv" : "westlake"), "NODE_PLACEMENT");
-  requireCopy(process.env.POD_NAME?.startsWith(diagnostic ? `mtc-cpa-stream-diagnostic-${role}-20261006a-` : `mtc-cpa-stream-${role}-20261005a-`), "POD_IDENTITY");
+  requireCopy(args.length === 1, "ARGUMENTS");
+  const staging = args[0]!.startsWith("stage-");
+  const { profile, command: role } = profileCommand(staging ? args[0]!.slice(6) : args[0]!);
+  requireCopy(role === "reader" || role === "receiver", "ARGUMENTS");
+  const diagnostic = profile === "diagnostic";
+  const plan = STREAM_PROFILES[profile].plan;
+  run = plan.run;
+  requirePlacement(role, profile, process.env.NODE_NAME, process.env.POD_NAME);
+  const endpoint = validateEndpoint((role === "reader" ? process.env.CPA_RECEIVER_IP : process.env.POD_IP) ?? "", profile);
   requireCopy(process.getuid?.() === COPY.uid && process.getgid?.() === COPY.gid, "PROCESS_IDENTITY");
   requireCopy((await statfs("/identity")).type === 0x01021994, "IDENTITY_NOT_RAM");
   if (diagnostic) requireCopy((await statfs(role === "reader" ? "/source" : "/destination")).type === 0x01021994, "DIAGNOSTIC_NOT_RAM");
-  if (args[0]!.startsWith("stage-")) {
+  if (staging) {
     const chunks: Buffer[] = [];
     let length = 0;
     for await (const chunk of process.stdin) {
@@ -53,12 +57,12 @@ async function main(): Promise<void> {
       phase = "readonly-mount";
       requireReadOnlyMount(await readFile("/proc/self/mountinfo", "utf8"));
       phase = "reader-transport";
-      const receipt = await runReader(plan, identity, validateEndpoint(process.env.CPA_RECEIVER_IP ?? ""));
+      const receipt = await runReader(plan, identity, endpoint);
       await writeFile("/dev/termination-log", JSON.stringify({ role, ...receipt }));
       console.log(JSON.stringify({ role, ...receipt }));
     } else {
       phase = "receiver-transport";
-      const receiver = startReceiver(plan, identity, validateEndpoint(process.env.POD_IP ?? ""));
+      const receiver = startReceiver(plan, identity, endpoint);
       try {
         await receiver.listening;
         console.log(JSON.stringify({ role, listening: true, port: COPY.port }));
@@ -71,7 +75,7 @@ async function main(): Promise<void> {
 }
 
 void main().catch(async (error: unknown) => {
-  const result = JSON.stringify({ run: process.argv[2]?.includes("diagnostic") ? MEMORY_DIAGNOSTIC.run : COPY.run, passed: false, phase, failure: safeFailure(error) });
+  const result = JSON.stringify({ run, passed: false, phase, failure: safeFailure(error) });
   if (!process.argv[2]?.startsWith("stage-")) await writeFile("/dev/termination-log", result).catch(() => {});
   console.error(result);
   process.exitCode = 1;

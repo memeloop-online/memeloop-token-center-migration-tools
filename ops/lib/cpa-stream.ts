@@ -32,6 +32,36 @@ export const MEMORY_DIAGNOSTIC = Object.freeze({
   reserveBytes: 0,
 });
 
+export const SAME_NODE_COPY = Object.freeze({
+  ...COPY,
+  run: "cpa-stream-local-20261006a",
+  destination: "/destination/recovery-stream-local-20261006a",
+});
+
+export const STREAM_PROFILES = Object.freeze({
+  original: Object.freeze({ plan: COPY, receiverNode: "westlake", receiverSubnet: "10.42.3", prefix: "mtc-cpa-stream", suffix: "20261005a" }),
+  diagnostic: Object.freeze({ plan: MEMORY_DIAGNOSTIC, receiverNode: "westlake", receiverSubnet: "10.42.3", prefix: "mtc-cpa-stream-diagnostic", suffix: "20261006a" }),
+  "same-node": Object.freeze({ plan: SAME_NODE_COPY, receiverNode: "sansheng-hv", receiverSubnet: "10.42.2", prefix: "mtc-cpa-stream-local", suffix: "20261006a" }),
+});
+export type StreamProfile = keyof typeof STREAM_PROFILES;
+
+export function profileCommand(argument: string): { profile: StreamProfile; command: string } {
+  for (const profile of ["same-node", "diagnostic"] as const) {
+    if (argument.startsWith(`${profile}-`)) return { profile, command: argument.slice(profile.length + 1) };
+  }
+  return { profile: "original", command: argument };
+}
+
+export function streamResourceName(role: string, profile: StreamProfile = "original"): string {
+  const selected = STREAM_PROFILES[profile];
+  return `${selected.prefix}-${role}-${selected.suffix}`;
+}
+
+export function requirePlacement(role: "reader" | "receiver", profile: StreamProfile, node: string | undefined, pod: string | undefined): void {
+  requireCopy(node === (role === "reader" ? "sansheng-hv" : STREAM_PROFILES[profile].receiverNode), "NODE_PLACEMENT");
+  requireCopy(pod?.startsWith(`${streamResourceName(role, profile)}-`), "POD_IDENTITY");
+}
+
 export type CopyPlan = { -readonly [Key in keyof typeof COPY]: (typeof COPY)[Key] extends number ? number : string };
 export type Identity = { ca: string; cert: string; key: string; peerFingerprint: string };
 export type Receipt = { run: string; passed: true; bytes: number; sha256: string; sourceVerified: true; destinationVerified: true };
@@ -56,8 +86,9 @@ export function safeFailure(error: unknown): string {
   return nativeFailureCodes.has(code) || /^[A-Z][A-Z_]{1,60}$/.test(code) ? code : "COPY_FAILED";
 }
 
-export function validateEndpoint(address: string): string {
-  requireCopy(/^10\.42\.3\.(?:[2-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-4])$/.test(address), "RECEIVER_NOT_WESTLAKE_POD");
+export function validateEndpoint(address: string, profile: StreamProfile = "original"): string {
+  const subnet = STREAM_PROFILES[profile].receiverSubnet.replaceAll(".", "\\.");
+  requireCopy(address === address.trim() && new RegExp(`^${subnet}\\.(?:[2-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-4])$`).test(address), profile === "same-node" ? "RECEIVER_NOT_SANSHENG_POD" : "RECEIVER_NOT_WESTLAKE_POD");
   return address;
 }
 
@@ -91,14 +122,16 @@ function authorize(socket: TLSSocket, identity: Identity, peer: string): void {
 export class Wire {
   private readonly iterator: AsyncIterator<Buffer>;
   private pending: Buffer = Buffer.alloc(0);
+  private frameStorage: Buffer | undefined;
   readonly socket: TLSSocket;
   constructor(socket: TLSSocket) {
     this.socket = socket;
     this.iterator = socket.iterator({ destroyOnReturn: false });
   }
-  async take(length: number): Promise<Buffer> {
+  async take(length: number, storage?: Buffer): Promise<Buffer> {
     requireCopy(length >= 0 && length <= COPY.chunk + 2048, "FRAME_SIZE");
-    const output = Buffer.allocUnsafe(length);
+    const output = storage ?? Buffer.allocUnsafe(length);
+    requireCopy(output.length === length, "FRAME_SIZE");
     let offset = 0;
     while (offset < length) {
       if (this.pending.length === 0) {
@@ -120,7 +153,8 @@ export class Wire {
     const header = await this.take(5);
     const size = header.readUInt32BE(1);
     requireCopy(size <= COPY.chunk, "FRAME_SIZE");
-    return { kind: header[0]!, body: await this.take(size) };
+    if (!this.frameStorage || this.frameStorage.length < size) this.frameStorage = Buffer.allocUnsafe(size);
+    return { kind: header[0]!, body: await this.take(size, this.frameStorage.subarray(0, size)) };
   }
 }
 

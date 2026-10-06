@@ -1,5 +1,5 @@
 import { readFileSync, readdirSync, readlinkSync, lstatSync } from "node:fs";
-import { COPY, requireCopy, requireReadOnlyMount, runReader, safeFailure, startReceiver, type CopyPlan, type Identity } from "../../ops/lib/cpa-stream.ts";
+import { COPY, SAME_NODE_COPY, loadIdentity, requireCopy, requirePlacement, requireReadOnlyMount, runReader, safeFailure, startReceiver, validateEndpoint, type CopyPlan, type Identity } from "../../ops/lib/cpa-stream.ts";
 
 async function main(): Promise<void> {
   requireCopy(process.env.CPA_GHA_FIXTURE === "1", "GHA_FIXTURE_ONLY");
@@ -7,8 +7,12 @@ async function main(): Promise<void> {
   requireCopy(process.argv.length === 3 && (role === "reader" || role === "receiver"), "FIXTURE_ROLE");
   const fixture = JSON.parse(readFileSync("/fixture.json", "utf8")) as { size: number; sha256: string };
   requireCopy(fixture.size === 256 * 1024 ** 2 && /^[a-f0-9]{64}$/.test(fixture.sha256), "FIXTURE_METADATA");
-  const identity = JSON.parse(readFileSync("/identity.json", "utf8")) as Identity;
-  const plan: CopyPlan = { ...COPY, ...fixture, totalMs: 300000, verifyMs: 120000, reserveBytes: 0, rate: role === "receiver" ? 8 * 1024 ** 2 : COPY.rate };
+  const sameNode = process.env.CPA_GHA_PROFILE === "same-node";
+  const selected = sameNode ? SAME_NODE_COPY : COPY;
+  const identity = sameNode ? await loadIdentity(role, selected.run) : JSON.parse(readFileSync("/identity.json", "utf8")) as Identity;
+  if (sameNode) requirePlacement(role, "same-node", process.env.NODE_NAME, process.env.POD_NAME);
+  const endpoint = sameNode ? validateEndpoint("10.42.2.2", "same-node") : role === "reader" ? "receiver" : "0.0.0.0";
+  const plan: CopyPlan = { ...selected, ...fixture, totalMs: 300000, verifyMs: 120000, reserveBytes: 0, rate: role === "receiver" ? 8 * 1024 ** 2 : COPY.rate };
   const memoryLimit = Number(readFileSync("/sys/fs/cgroup/memory.max", "utf8").trim());
   const swapLimit = Number(readFileSync("/sys/fs/cgroup/memory.swap.max", "utf8").trim());
   const quota = readFileSync("/sys/fs/cgroup/cpu.max", "utf8").trim().split(/\s+/).map(Number);
@@ -25,7 +29,7 @@ async function main(): Promise<void> {
         } catch {}
       }
     } else {
-      try { position = lstatSync(`${COPY.destination}/archive.sqlite.partial`).size; } catch {}
+      try { position = lstatSync(`${plan.destination}/archive.sqlite.partial`).size; } catch {}
     }
     if (samples.length < 4000) samples.push({ at: Date.now(), position, rss: process.memoryUsage().rss });
   };
@@ -35,9 +39,9 @@ async function main(): Promise<void> {
     let receipt;
     if (role === "reader") {
       requireReadOnlyMount(readFileSync("/proc/self/mountinfo", "utf8"));
-      receipt = await runReader(plan, identity, "receiver");
+      receipt = await runReader(plan, identity, endpoint);
     } else {
-      const receiver = startReceiver(plan, identity, "0.0.0.0");
+      const receiver = startReceiver(plan, identity, endpoint);
       try {
         await receiver.listening;
         console.log(JSON.stringify({ kind: "fixture-listening" }));

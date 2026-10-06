@@ -74,6 +74,9 @@ jobs:
       - name: Verify isolated mTLS frozen-copy transport
         run: node --test tests/ops/cpa-stream.test.ts
 
+      - name: Verify fixed same-node profile, CLI rejection and identity isolation
+        run: node --test tests/ops/cpa-stream-profiles.test.ts
+
       - name: Check fixed stream runtime without cluster access
         run: |
           docker run --rm --network none --read-only --memory 128m --memory-swap 128m --cpus .25 \
@@ -89,12 +92,18 @@ jobs:
       - name: Verify fixed RAM-only diagnostic CLI and resource isolation
         run: sudo --preserve-env=GITHUB_ACTIONS "$(command -v node)" --test tests/ops/cpa-stream-memory-diagnostic.test.ts
 
+      - name: Verify review-only target direct-IO command on GHA scratch disk
+        run: sudo --preserve-env=GITHUB_ACTIONS,GITHUB_SHA,RUNNER_TEMP "$(command -v node)" --test tests/ops/cpa-work-directio-plan.test.ts
+
       - name: Upload bounded-stream measurement evidence
         if: always()
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.6.2
         with:
           name: cpa-stream-bounded-${{ github.sha }}
-          path: ${{ runner.temp }}/cpa-stream-bounded-result.json
+          path: |
+            ${{ runner.temp }}/cpa-stream-bounded-result.json
+            ${{ runner.temp }}/cpa-stream-same-node-bounded-result.json
+            ${{ runner.temp }}/cpa-work-directio-command-result.json
           if-no-files-found: ignore
           retention-days: 14
 
@@ -109,6 +118,11 @@ jobs:
           node ops/cpa-stream-resources.ts diagnostic-policies > "$RUNNER_TEMP/cpa-stream-review/diagnostic-policies.yaml"
           node ops/cpa-stream-resources.ts diagnostic-receiver > "$RUNNER_TEMP/cpa-stream-review/diagnostic-receiver.yaml"
           CPA_RECEIVER_IP=10.42.3.254 node ops/cpa-stream-resources.ts diagnostic-reader > "$RUNNER_TEMP/cpa-stream-review/diagnostic-reader-EXAMPLE-IP-NOT-FOR-APPLY.yaml"
+          node ops/cpa-stream-resources.ts same-node-code > "$RUNNER_TEMP/cpa-stream-review/same-node-code.yaml"
+          node ops/cpa-stream-resources.ts same-node-policies > "$RUNNER_TEMP/cpa-stream-review/same-node-policies.yaml"
+          node ops/cpa-stream-resources.ts same-node-receiver > "$RUNNER_TEMP/cpa-stream-review/same-node-receiver.yaml"
+          CPA_RECEIVER_IP=10.42.2.254 node ops/cpa-stream-resources.ts same-node-reader > "$RUNNER_TEMP/cpa-stream-review/same-node-reader-EXAMPLE-IP-NOT-FOR-APPLY.yaml"
+          cp ops/inspection/cpa-work-directio-20261006a.yaml "$RUNNER_TEMP/cpa-stream-review/target-only-directio-SUSPENDED-NOT-APPROVED.yaml"
           (cd "$RUNNER_TEMP/cpa-stream-review" && sha256sum *.yaml > SHA256SUMS)
 
       - name: Upload review-only stream resources

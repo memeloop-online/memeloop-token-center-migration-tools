@@ -1,0 +1,101 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mtc-cpa-work-directio-20261006a
+  namespace: cliproxyapi
+spec:
+  podSelector:
+    matchLabels:
+      memeloop.io/cpa-work-probe: directio-20261006a
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress: []
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mtc-cpa-work-directio-20261006a
+  namespace: cliproxyapi
+spec:
+  suspend: true
+  backoffLimit: 0
+  activeDeadlineSeconds: 175
+  template:
+    metadata:
+      labels:
+        memeloop.io/cpa-work-probe: directio-20261006a
+    spec:
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 5
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      nodeSelector:
+        kubernetes.io/hostname: sansheng-hv
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: exclusive-probe-directory
+          image: ghcr.io/memeloop-online/memeloop-token-center-migration-tools@sha256:348c6ef444e1744798a0ec0d13ca394a8dd413e5fb7d1fe277b7f52684892126
+          command: [node, --input-type=module, -e]
+          args:
+            - |
+              import {mkdirSync,chownSync,openSync,fsyncSync,closeSync,constants} from 'node:fs';
+              mkdirSync('/destination/perf-directio-20261006a', {mode:0o700});
+              chownSync('/destination/perf-directio-20261006a',10001,10001);
+              const parent = openSync('/destination',constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW);
+              try { fsyncSync(parent); } finally { closeSync(parent); }
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {cpu: 100m, memory: 64Mi}
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+              add: [CHOWN]
+          volumeMounts:
+            - {name: destination, mountPath: /destination}
+      containers:
+        - name: directio
+          image: ghcr.io/memeloop-online/memeloop-token-center-migration-tools@sha256:348c6ef444e1744798a0ec0d13ca394a8dd413e5fb7d1fe277b7f52684892126
+          command: [timeout, -s, TERM, -k, "5", "165", sh, -ec]
+          args:
+            - |
+              test "$(id -u):$(id -g)" = 10001:10001
+              test ! -L /destination/perf-directio-20261006a
+              test "$(stat -c '%u:%g:%a' /destination/perf-directio-20261006a)" = 10001:10001:700
+              test -z "$(ls -A /destination/perf-directio-20261006a)"
+              test "$(df -Pk /destination | awk 'END {print $4}')" -ge 22020096
+              file=/destination/perf-directio-20261006a/probe.bin
+              set -C
+              : > "$file"
+              set +C
+              trap 'rm -- "$file"' EXIT
+              trap 'exit 124' TERM INT
+              printf 'WRITE_START '; date -u +%FT%TZ
+              dd if=/dev/urandom of="$file" bs=4M count=256 iflag=fullblock oflag=direct conv=notrunc,fsync
+              test "$(stat -c %s "$file")" = 1073741824
+              printf 'READ_START '; date -u +%FT%TZ
+              dd if="$file" of=/dev/null bs=4M count=256 iflag=direct
+              printf 'DIRECTIO_COMPLETE '; date -u +%FT%TZ
+          resources:
+            requests: {cpu: 50m, memory: 48Mi, ephemeral-storage: 16Mi}
+            limits: {cpu: 250m, memory: 128Mi, ephemeral-storage: 32Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - {name: destination, mountPath: /destination}
+      volumes:
+        - name: destination
+          persistentVolumeClaim:
+            claimName: mtc-cpa-recovery-work-20261005
