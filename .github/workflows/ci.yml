@@ -86,6 +86,9 @@ jobs:
       - name: Verify real stream under each role's 128Mi and 250m budget
         run: sudo --preserve-env=GITHUB_ACTIONS,GITHUB_SHA,RUNNER_TEMP "$(command -v node)" --test tests/ops/cpa-stream-bounded.test.ts
 
+      - name: Verify fixed RAM-only diagnostic CLI and resource isolation
+        run: sudo --preserve-env=GITHUB_ACTIONS "$(command -v node)" --test tests/ops/cpa-stream-memory-diagnostic.test.ts
+
       - name: Upload bounded-stream measurement evidence
         if: always()
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.6.2
@@ -102,6 +105,10 @@ jobs:
           node ops/cpa-stream-resources.ts policies > "$RUNNER_TEMP/cpa-stream-review/policies.yaml"
           node ops/cpa-stream-resources.ts receiver > "$RUNNER_TEMP/cpa-stream-review/receiver.yaml"
           CPA_RECEIVER_IP=10.42.3.254 node ops/cpa-stream-resources.ts reader > "$RUNNER_TEMP/cpa-stream-review/reader-EXAMPLE-IP-NOT-FOR-APPLY.yaml"
+          node ops/cpa-stream-resources.ts diagnostic-code > "$RUNNER_TEMP/cpa-stream-review/diagnostic-code.yaml"
+          node ops/cpa-stream-resources.ts diagnostic-policies > "$RUNNER_TEMP/cpa-stream-review/diagnostic-policies.yaml"
+          node ops/cpa-stream-resources.ts diagnostic-receiver > "$RUNNER_TEMP/cpa-stream-review/diagnostic-receiver.yaml"
+          CPA_RECEIVER_IP=10.42.3.254 node ops/cpa-stream-resources.ts diagnostic-reader > "$RUNNER_TEMP/cpa-stream-review/diagnostic-reader-EXAMPLE-IP-NOT-FOR-APPLY.yaml"
           (cd "$RUNNER_TEMP/cpa-stream-review" && sha256sum *.yaml > SHA256SUMS)
 
       - name: Upload review-only stream resources

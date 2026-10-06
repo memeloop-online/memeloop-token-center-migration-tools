@@ -23,6 +23,15 @@ export const COPY = Object.freeze({
   gid: 10001,
 });
 
+export const MEMORY_DIAGNOSTIC = Object.freeze({
+  ...COPY,
+  run: "cpa-stream-diagnostic-20261006a",
+  destination: "/destination/recovery-diagnostic-20261006a",
+  size: 1024 * 1024,
+  sha256: createHash("sha256").update(Buffer.alloc(1024 * 1024, 71)).digest("hex"),
+  reserveBytes: 0,
+});
+
 export type CopyPlan = { -readonly [Key in keyof typeof COPY]: (typeof COPY)[Key] extends number ? number : string };
 export type Identity = { ca: string; cert: string; key: string; peerFingerprint: string };
 export type Receipt = { run: string; passed: true; bytes: number; sha256: string; sourceVerified: true; destinationVerified: true };
@@ -373,10 +382,10 @@ export function startReceiver(plan: CopyPlan, identity: Identity, host: string):
   return { completion, listening, close };
 }
 
-export async function loadIdentity(role: "reader" | "receiver"): Promise<Identity> {
+export async function loadIdentity(role: "reader" | "receiver", run: string = COPY.run): Promise<Identity> {
   const metadata = await lstat("/identity/bundle.json");
   requireCopy(metadata.isFile() && !metadata.isSymbolicLink() && metadata.size <= 32768 && metadata.uid === COPY.uid && (metadata.mode & 0o7777) === 0o600, "IDENTITY_FILE");
   const identity = JSON.parse(await readFile("/identity/bundle.json", "utf8")) as Identity;
-  validateIdentity(identity, role, COPY.run);
+  validateIdentity(identity, role, run);
   return identity;
 }
