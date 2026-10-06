@@ -23,6 +23,15 @@ export const COPY = Object.freeze({
   gid: 10001,
 });
 
+export const MEMORY_DIAGNOSTIC = Object.freeze({
+  ...COPY,
+  run: "cpa-stream-diagnostic-20261006a",
+  destination: "/destination/recovery-diagnostic-20261006a",
+  size: 1024 * 1024,
+  sha256: createHash("sha256").update(Buffer.alloc(1024 * 1024, 71)).digest("hex"),
+  reserveBytes: 0,
+});
+
 export type CopyPlan = { -readonly [Key in keyof typeof COPY]: (typeof COPY)[Key] extends number ? number : string };
 export type Identity = { ca: string; cert: string; key: string; peerFingerprint: string };
 export type Receipt = { run: string; passed: true; bytes: number; sha256: string; sourceVerified: true; destinationVerified: true };
@@ -31,9 +40,20 @@ export function requireCopy(condition: unknown, code: string): asserts condition
   if (!condition) throw new Error(code);
 }
 
+const nativeFailureCodes = new Set([
+  "EACCES", "EPERM", "ENOENT", "EEXIST", "EIO", "ENOSPC", "EROFS", "EMFILE", "ENFILE", "ELOOP",
+  "ECONNREFUSED", "ECONNRESET", "ECONNABORTED", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "EPIPE", "EADDRINUSE", "ENOBUFS",
+  "CERT_HAS_EXPIRED", "CERT_NOT_YET_VALID", "DEPTH_ZERO_SELF_SIGNED_CERT", "SELF_SIGNED_CERT_IN_CHAIN", "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+  "ERR_TLS_CERT_ALTNAME_INVALID", "ERR_TLS_HANDSHAKE_TIMEOUT", "ERR_TLS_CERT_SIGNATURE_ALGORITHM_UNSUPPORTED",
+  "ERR_SSL_TLSV1_ALERT_UNKNOWN_CA", "ERR_SSL_SSLV3_ALERT_BAD_CERTIFICATE", "ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED",
+  "ERR_SSL_TLSV1_ALERT_INTERNAL_ERROR", "ERR_SSL_UNEXPECTED_EOF_WHILE_READING",
+]);
+
 export function safeFailure(error: unknown): string {
+  const nativeCode = error instanceof Error ? (error as NodeJS.ErrnoException).code : undefined;
+  if (nativeCode && nativeFailureCodes.has(nativeCode)) return nativeCode;
   const code = error instanceof Error ? error.message : "";
-  return /^[A-Z][A-Z_]{1,60}$/.test(code) ? code : "COPY_FAILED";
+  return nativeFailureCodes.has(code) || /^[A-Z][A-Z_]{1,60}$/.test(code) ? code : "COPY_FAILED";
 }
 
 export function validateEndpoint(address: string): string {
@@ -160,6 +180,7 @@ async function throttle(plan: CopyPlan, started: number, copied: number): Promis
 export async function sendFile(socket: TLSSocket, plan: CopyPlan, started: number): Promise<Receipt> {
   const wire = new Wire(socket);
   requireCopy((await wire.take(8)).equals(Buffer.from("CPA00001")), "PROTOCOL_READY");
+  console.log(JSON.stringify({ stage: "source-ready" }));
   await noSidecars(plan.source);
   const source = await open(plan.source, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   let copied = 0;
@@ -305,13 +326,19 @@ export async function runReader(plan: CopyPlan, identity: Identity, host: string
   socket.allowHalfOpen = true;
   watchSocket(socket, plan.idleMs);
   const deadline = setTimeout(() => socket.destroy(new Error("TOTAL_DEADLINE")), plan.totalMs);
+  let stage = "reader-tls-connect";
   try {
     await new Promise<void>((resolve, reject) => {
       socket.once("secureConnect", resolve);
       socket.once("error", reject);
     });
+    stage = "reader-peer-authorization";
     authorize(socket, identity, identityName("receiver", plan.run));
+    stage = "reader-stream";
     return await sendFile(socket, plan, started);
+  } catch (error) {
+    console.error(JSON.stringify({ stage, failure: safeFailure(error) }));
+    throw error;
   } finally { clearTimeout(deadline); socket.destroy(); }
 }
 
@@ -333,10 +360,13 @@ export function startReceiver(plan: CopyPlan, identity: Identity, host: string):
       socket.on("error", () => cancellation.abort());
       server.close();
       void receiveFile(socket, plan, cancellation.signal).then(succeed, (error: unknown) => { socket.destroy(); fail(new Error(safeFailure(error))); });
-    } catch { socket.destroy(); }
+    } catch (error) {
+      console.error(JSON.stringify({ stage: "receiver-peer-authorization", failure: safeFailure(error) }));
+      socket.destroy();
+    }
   });
   server.maxConnections = 1;
-  server.on("tlsClientError", () => {});
+  server.on("tlsClientError", (error) => console.error(JSON.stringify({ stage: "receiver-tls-handshake", failure: safeFailure(error) })));
   server.on("error", (error) => fail(new Error(safeFailure(error))));
   const deadline = setTimeout(() => { cancellation.abort(); active?.destroy(); server.close(); fail(new Error("TOTAL_DEADLINE")); }, plan.totalMs);
   const listening = new Promise<number>((resolve, reject) => {
@@ -352,10 +382,10 @@ export function startReceiver(plan: CopyPlan, identity: Identity, host: string):
   return { completion, listening, close };
 }
 
-export async function loadIdentity(role: "reader" | "receiver"): Promise<Identity> {
+export async function loadIdentity(role: "reader" | "receiver", run: string = COPY.run): Promise<Identity> {
   const metadata = await lstat("/identity/bundle.json");
   requireCopy(metadata.isFile() && !metadata.isSymbolicLink() && metadata.size <= 32768 && metadata.uid === COPY.uid && (metadata.mode & 0o7777) === 0o600, "IDENTITY_FILE");
   const identity = JSON.parse(await readFile("/identity/bundle.json", "utf8")) as Identity;
-  validateIdentity(identity, role, COPY.run);
+  validateIdentity(identity, role, run);
   return identity;
 }
