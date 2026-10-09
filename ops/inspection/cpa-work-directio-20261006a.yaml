@@ -49,11 +49,67 @@ spec:
           command: [node, --input-type=module, -e]
           args:
             - |
-              import {mkdirSync,chownSync,openSync,fsyncSync,closeSync,constants} from 'node:fs';
-              mkdirSync('/destination/perf-directio-20261006a', {mode:0o700});
-              chownSync('/destination/perf-directio-20261006a',10001,10001);
-              const parent = openSync('/destination',constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW);
-              try { fsyncSync(parent); } finally { closeSync(parent); }
+              // Embedded verbatim in both manifest commands: pinned runtime needs no new image.
+              import { lstatSync, openSync, fstatSync, readdirSync, mkdirSync, fchownSync, fsyncSync, closeSync, unlinkSync, constants } from 'node:fs';
+              const directoryName = 'perf-directio-20261006a', fileName = 'probe.bin';
+              const same = (a, b) => a && b && a.dev === b.dev && a.ino === b.ino;
+              const fail = () => { throw new Error('DIRECTIO_PATH_REJECTED'); };
+              const absent = (path) => lstatSync(path, {throwIfNoEntry:false});
+              function openDirectory(root, create) {
+                const before = lstatSync(root);
+                if (!before.isDirectory() || before.isSymbolicLink()) fail();
+                const parent = openSync(root, constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW);
+                let directory;
+                try {
+                  if (!same(before, fstatSync(parent))) fail();
+                  const path = `/proc/self/fd/${parent}/${directoryName}`;
+                  let prior = absent(path), created = false;
+                  if (!prior && create) { mkdirSync(path, {mode:0o700}); prior = lstatSync(path); created = true; }
+                  if (!prior || !prior.isDirectory() || prior.isSymbolicLink()) fail();
+                  directory = openSync(path, constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW);
+                  if (!same(prior, fstatSync(directory))) fail();
+                  // Set ownership only on this newly created original directory; never repair.
+                  if (created) { fchownSync(directory, 10001, 10001); fsyncSync(parent); }
+                  const stat = fstatSync(directory);
+                  if (stat.uid !== 10001 || stat.gid !== 10001 || (stat.mode & 0o777) !== 0o700) fail();
+                  const check = () => {
+                    if (!same(before, lstatSync(root)) || !same(stat, absent(path))) fail();
+                  };
+                  check();
+                  return {parent, directory, check, file:`/proc/self/fd/${directory}/${fileName}`};
+                } catch (error) { if (directory !== undefined) closeSync(directory); closeSync(parent); throw error; }
+              }
+              function ownedFile(stat) {
+                if (!stat || !stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.uid !== 10001 || stat.gid !== 10001) fail();
+                // Normal dd output, including 0644, is valid; ownership/type/link checks suffice.
+              }
+              function removeKnown(handle, expected) {
+                handle.check();
+                const stat = lstatSync(handle.file); ownedFile(stat);
+                if (!same(stat, expected)) fail();
+                const fd = openSync(handle.file, constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
+                try {
+                  ownedFile(fstatSync(fd));
+                  if (!same(stat, fstatSync(fd))) fail();
+                  handle.check();
+                  const fresh = lstatSync(handle.file); ownedFile(fresh);
+                  if (!same(fresh, stat)) fail();
+                  unlinkSync(handle.file); fsyncSync(handle.directory);
+                  if (absent(handle.file)) fail();
+                } finally { closeSync(fd); }
+              }
+              function initialize(root) {
+                const handle = openDirectory(root, true);
+                try {
+                  const entries = readdirSync(`/proc/self/fd/${handle.directory}`);
+                  if (entries.length > 1 || entries.some((name) => name !== fileName)) fail();
+                  if (entries.length) { const stat = lstatSync(handle.file); ownedFile(stat); removeKnown(handle, stat); console.log('SYNTHETIC_REMOVED'); }
+                  handle.check();
+                  if (readdirSync(`/proc/self/fd/${handle.directory}`).length || absent(handle.file)) fail();
+                  console.log('SYNTHETIC_ABSENT');
+                } finally { closeSync(handle.directory); closeSync(handle.parent); }
+              }
+              initialize('/destination');
           resources:
             requests: {cpu: 10m, memory: 16Mi}
             limits: {cpu: 100m, memory: 64Mi}
@@ -71,26 +127,98 @@ spec:
       containers:
         - name: directio
           image: ghcr.io/memeloop-online/memeloop-token-center-migration-tools@sha256:348c6ef444e1744798a0ec0d13ca394a8dd413e5fb7d1fe277b7f52684892126
-          command: [timeout, -s, TERM, -k, "5", "165", sh, -ec]
+          command: [timeout, -s, TERM, -k, "5", "165", node, --input-type=module, -e]
           args:
             - |
-              test "$(id -u):$(id -g)" = 10001:10001
-              test ! -L /destination/perf-directio-20261006a
-              test "$(stat -c '%u:%g:%a' /destination/perf-directio-20261006a)" = 10001:10001:700
-              test -z "$(ls -A /destination/perf-directio-20261006a)"
-              test "$(df -Pk /destination | awk 'END {print $4}')" -ge 22020096
-              file=/destination/perf-directio-20261006a/probe.bin
-              set -C
-              : > "$file"
-              set +C
-              trap 'rm -- "$file"' EXIT
-              trap 'exit 124' TERM INT
-              printf 'WRITE_START '; date -u +%FT%TZ
-              dd if=/dev/urandom of="$file" bs=4M count=256 iflag=fullblock oflag=direct conv=notrunc,fsync
-              test "$(stat -c %s "$file")" = 1073741824
-              printf 'READ_START '; date -u +%FT%TZ
-              dd if="$file" of=/dev/null bs=4M count=256 iflag=direct
-              printf 'DIRECTIO_COMPLETE '; date -u +%FT%TZ
+              // Embedded verbatim in both manifest commands: pinned runtime needs no new image.
+              import { lstatSync, openSync, fstatSync, readdirSync, mkdirSync, fchownSync, fsyncSync, closeSync, unlinkSync, constants } from 'node:fs';
+              const directoryName = 'perf-directio-20261006a', fileName = 'probe.bin';
+              const same = (a, b) => a && b && a.dev === b.dev && a.ino === b.ino;
+              const fail = () => { throw new Error('DIRECTIO_PATH_REJECTED'); };
+              const absent = (path) => lstatSync(path, {throwIfNoEntry:false});
+              function openDirectory(root, create) {
+                const before = lstatSync(root);
+                if (!before.isDirectory() || before.isSymbolicLink()) fail();
+                const parent = openSync(root, constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW);
+                let directory;
+                try {
+                  if (!same(before, fstatSync(parent))) fail();
+                  const path = `/proc/self/fd/${parent}/${directoryName}`;
+                  let prior = absent(path), created = false;
+                  if (!prior && create) { mkdirSync(path, {mode:0o700}); prior = lstatSync(path); created = true; }
+                  if (!prior || !prior.isDirectory() || prior.isSymbolicLink()) fail();
+                  directory = openSync(path, constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW);
+                  if (!same(prior, fstatSync(directory))) fail();
+                  // Set ownership only on this newly created original directory; never repair.
+                  if (created) { fchownSync(directory, 10001, 10001); fsyncSync(parent); }
+                  const stat = fstatSync(directory);
+                  if (stat.uid !== 10001 || stat.gid !== 10001 || (stat.mode & 0o777) !== 0o700) fail();
+                  const check = () => {
+                    if (!same(before, lstatSync(root)) || !same(stat, absent(path))) fail();
+                  };
+                  check();
+                  return {parent, directory, check, file:`/proc/self/fd/${directory}/${fileName}`};
+                } catch (error) { if (directory !== undefined) closeSync(directory); closeSync(parent); throw error; }
+              }
+              function ownedFile(stat) {
+                if (!stat || !stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.uid !== 10001 || stat.gid !== 10001) fail();
+                // Normal dd output, including 0644, is valid; ownership/type/link checks suffice.
+              }
+              function removeKnown(handle, expected) {
+                handle.check();
+                const stat = lstatSync(handle.file); ownedFile(stat);
+                if (!same(stat, expected)) fail();
+                const fd = openSync(handle.file, constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
+                try {
+                  ownedFile(fstatSync(fd));
+                  if (!same(stat, fstatSync(fd))) fail();
+                  handle.check();
+                  const fresh = lstatSync(handle.file); ownedFile(fresh);
+                  if (!same(fresh, stat)) fail();
+                  unlinkSync(handle.file); fsyncSync(handle.directory);
+                  if (absent(handle.file)) fail();
+                } finally { closeSync(fd); }
+              }
+              function initialize(root) {
+                const handle = openDirectory(root, true);
+                try {
+                  const entries = readdirSync(`/proc/self/fd/${handle.directory}`);
+                  if (entries.length > 1 || entries.some((name) => name !== fileName)) fail();
+                  if (entries.length) { const stat = lstatSync(handle.file); ownedFile(stat); removeKnown(handle, stat); console.log('SYNTHETIC_REMOVED'); }
+                  handle.check();
+                  if (readdirSync(`/proc/self/fd/${handle.directory}`).length || absent(handle.file)) fail();
+                  console.log('SYNTHETIC_ABSENT');
+                } finally { closeSync(handle.directory); closeSync(handle.parent); }
+              }
+              import {spawnSync} from 'node:child_process';
+              import {statfsSync} from 'node:fs';
+              if (process.getuid() !== 10001 || process.getgid() !== 10001) fail();
+              const handle = openDirectory('/destination', false);
+              let fd, created;
+              const dd = (args) => {
+                const result = spawnSync('dd', args, {stdio:['ignore','inherit','inherit',fd]});
+                if (result.status !== 0) throw new Error('DIRECTIO_DD_FAILED');
+              };
+              try {
+                handle.check();
+                if (readdirSync(`/proc/self/fd/${handle.directory}`).length) fail();
+                const space = statfsSync('/destination');
+                if (space.bavail * space.bsize < 22020096 * 1024) throw new Error('DIRECTIO_SPACE');
+                fd = openSync(handle.file, constants.O_RDWR|constants.O_CREAT|constants.O_EXCL|constants.O_NOFOLLOW, 0o644);
+                created = fstatSync(fd); ownedFile(created); handle.check();
+                console.log('WRITE_START ' + new Date().toISOString());
+                dd(['if=/dev/urandom','of=/proc/self/fd/3','bs=4M','count=256','iflag=fullblock','oflag=direct','conv=notrunc,fsync']);
+                if (fstatSync(fd).size !== 1073741824) fail();
+                console.log('READ_START ' + new Date().toISOString());
+                dd(['if=/proc/self/fd/3','of=/dev/null','bs=4M','count=256','iflag=direct']);
+                removeKnown(handle, created); created = undefined;
+                console.log('SYNTHETIC_ABSENT');
+                console.log('DIRECTIO_COMPLETE ' + new Date().toISOString());
+              } finally {
+                if (created) removeKnown(handle, created);
+                if (fd !== undefined) closeSync(fd);
+                closeSync(handle.directory); closeSync(handle.parent);
+              }
           resources:
             requests: {cpu: 50m, memory: 48Mi, ephemeral-storage: 16Mi}
             limits: {cpu: 250m, memory: 128Mi, ephemeral-storage: 32Mi}
