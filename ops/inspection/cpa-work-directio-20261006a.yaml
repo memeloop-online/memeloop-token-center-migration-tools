@@ -17,19 +17,21 @@ metadata:
   name: mtc-cpa-work-directio-20261006a
   namespace: cliproxyapi
   annotations:
-    memeloop.io/startup-budget-seconds: "60"
+    memeloop.io/startup-budget-seconds: "300"
     memeloop.io/exec-budget-seconds: "165"
-    memeloop.io/overall-budget-seconds: "175"
+    memeloop.io/overall-budget-seconds: "480"
+    memeloop.io/cleanup-budget-seconds: "30"
 spec:
   suspend: true
   backoffLimit: 0
-  activeDeadlineSeconds: 175
+  activeDeadlineSeconds: 480
   template:
     metadata:
       labels:
         memeloop.io/cpa-work-probe: directio-20261006a
     spec:
       restartPolicy: Never
+      activeDeadlineSeconds: 480
       terminationGracePeriodSeconds: 5
       automountServiceAccountToken: false
       enableServiceLinks: false
