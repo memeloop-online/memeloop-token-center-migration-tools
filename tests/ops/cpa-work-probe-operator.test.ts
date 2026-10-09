@@ -112,6 +112,85 @@ test("preflight RV mismatch never unsuspends or cleans any resource", async () =
   assert.equal(f.operations.some((op) => op.method !== "GET"), false);
 });
 
+type PodSpec = Record<string, unknown>;
+function template(job: Resource): PodSpec { return (job.spec.template as { spec: PodSpec }).spec; }
+function context(spec: PodSpec, role: "containers" | "initContainers"): Record<string, unknown> {
+  return (spec[role] as Record<string, unknown>[])[0]!.securityContext as Record<string, unknown>;
+}
+
+test("N1 exact preflight fixtures reject nested privilege, seccomp and Job control expansion with zero PATCH/DELETE", async () => {
+  const vectors: [string, (job: Resource) => void][] = [
+    ["directio privileged true", (job) => { context(template(job), "containers").privileged = true; }],
+    ["init privileged true", (job) => { context(template(job), "initContainers").privileged = true; }],
+    ["directio add SYS_ADMIN retaining drop ALL", (job) => { (context(template(job), "containers").capabilities as Record<string, unknown>).add = ["SYS_ADMIN"]; }],
+    ["init add SYS_ADMIN retaining CHOWN and drop ALL", (job) => { (context(template(job), "initContainers").capabilities as Record<string, unknown>).add = ["CHOWN", "SYS_ADMIN"]; }],
+    ["pod seccomp Unconfined", (job) => { (template(job).securityContext as Record<string, unknown>).seccompProfile = { type: "Unconfined" }; }],
+    ["pod seccomp unexpected nested profile", (job) => { (template(job).securityContext as Record<string, unknown>).seccompProfile = { type: "RuntimeDefault", localhostProfile: "unreviewed" }; }],
+    ["directio seccomp Unconfined override", (job) => { context(template(job), "containers").seccompProfile = { type: "Unconfined" }; }],
+    ["init seccomp Unconfined override", (job) => { context(template(job), "initContainers").seccompProfile = { type: "Unconfined" }; }],
+    ["directio runAsUser root override", (job) => { context(template(job), "containers").runAsUser = 0; }],
+    ["directio procMount Unmasked", (job) => { context(template(job), "containers").procMount = "Unmasked"; }],
+    ["pod extra supplemental group", (job) => { (template(job).securityContext as Record<string, unknown>).supplementalGroups = [0]; }],
+    ["pod hostPID true", (job) => { template(job).hostPID = true; }],
+    ["pod unreviewed runtime class", (job) => { template(job).runtimeClassName = "unreviewed"; }],
+    ["Job manual selector true", (job) => { job.spec.manualSelector = true; }],
+    ["Job Indexed completion", (job) => { job.spec.completionMode = "Indexed"; }],
+    ["Job per-index retry", (job) => { job.spec.backoffLimitPerIndex = 1; }],
+    ["Job ignore failure policy", (job) => { job.spec.podFailurePolicy = { rules: [{ action: "Ignore", onExitCodes: { operator: "In", values: [1] } }] }; }],
+    ["Job unreviewed success policy", (job) => { job.spec.successPolicy = { rules: [{ succeededCount: 1 }] }; }],
+    ["Job foreign controller", (job) => { job.spec.managedBy = "unreviewed.example/controller"; }],
+    ["Job foreign selector", (job) => { job.spec.selector = { matchLabels: { app: "other" } }; }],
+    ["Job automatic TTL deletion", (job) => { job.spec.ttlSecondsAfterFinished = 0; }],
+  ];
+  for (const [name, mutate] of vectors) {
+    const f = fixture();
+    const api: ProbeApi = { call: async (method, path, timeout, body) => {
+      const data = await f.api.call(method, path, timeout, body);
+      if (method === "GET" && path === jobPath) mutate(data as Resource);
+      return data;
+    } };
+    const receipt = await runProbe(config, api, reviewedPlan, reviewedPolicy, f.clock);
+    assert.match(receipt.status, /^UNSAFE_(CONTAINER_SPEC|SECURITY_CONTEXT|POD_SPEC|JOB_CONTROL)$/, name);
+    assert.equal(receipt.passed, false, name); assert.equal(receipt.bytes, null, name);
+    assert.equal(receipt.attemptStartedAt, null, name);
+    assert.equal(f.operations.filter((op) => op.method === "PATCH").length, 0, name);
+    assert.equal(f.operations.filter((op) => op.method === "DELETE").length, 0, name);
+    console.log(JSON.stringify({ fixture: "N1", name, status: receipt.status, patches: 0, deletes: 0 }));
+  }
+});
+
+test("N1 normal Kubernetes defaults and inherited reviewed security remain accepted through operator cleanup", async () => {
+  const f = fixture();
+  const normalDefaults = (resource: Resource) => {
+    const isJob = resource.spec.template !== undefined;
+    const spec = isJob ? template(resource) : resource.spec;
+    if (isJob) Object.assign(resource.spec, { parallelism: 1, completions: 1, manualSelector: false, completionMode: "NonIndexed", podReplacementPolicy: "TerminatingOrFailed", managedBy: "kubernetes.io/job-controller", selector: { matchLabels: { "batch.kubernetes.io/controller-uid": config.jobUid } } });
+    Object.assign(spec, { hostNetwork: false, hostPID: false, hostIPC: false, shareProcessNamespace: false, hostUsers: true, imagePullSecrets: [], resourceClaims: [], hostAliases: [], ephemeralContainers: [], dnsPolicy: "ClusterFirst", schedulerName: "default-scheduler", serviceAccountName: "default" });
+    Object.assign(spec.securityContext as Record<string, unknown>, { supplementalGroups: [], sysctls: [], fsGroupChangePolicy: "Always" });
+    for (const role of ["containers", "initContainers"] as const) {
+      const container = (spec[role] as Record<string, unknown>[])[0]!;
+      Object.assign(container, { imagePullPolicy: "IfNotPresent", terminationMessagePath: "/dev/termination-log", terminationMessagePolicy: "File" });
+      Object.assign(context(spec, role), { privileged: false, procMount: "Default", seccompProfile: { type: "RuntimeDefault" } });
+    }
+    Object.assign(context(spec, "containers"), { runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true });
+    (context(spec, "containers").capabilities as Record<string, unknown>).add = [];
+  };
+  const api: ProbeApi = { call: async (method, path, timeout, body) => {
+    const data = await f.api.call(method, path, timeout, body);
+    if (method === "GET") {
+      if (path === jobPath || path === podPath) normalDefaults(data as Resource);
+      else if (path.includes("/pods?")) for (const pod of (data as { items: Resource[] }).items) normalDefaults(pod);
+    }
+    return data;
+  } };
+  const receipt = await runProbe(config, api, reviewedPlan, reviewedPolicy, f.clock);
+  assert.equal(receipt.status, "COMPLETE"); assert.equal(receipt.passed, true);
+  assert.equal(receipt.cleanup.complete, true); assert.equal(receipt.decision?.execDeadline, epoch + 345_000);
+  assert.equal(f.operations.filter((op) => op.method === "PATCH").length, 1);
+  assert.equal(f.operations.filter((op) => op.method === "DELETE").length, 2);
+  console.log(JSON.stringify({ fixture: "N1-normal-defaults", status: receipt.status, patches: 1, deletes: 2, cleanup: "confirmed" }));
+});
+
 test("cleanup RV conflict never deletes a Pod while its original Job remains active", async () => {
   const f = fixture();
   const transport: ProbeApi = { call: async (method, path, timeout, body) => {

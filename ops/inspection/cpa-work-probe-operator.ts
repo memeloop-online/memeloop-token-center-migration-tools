@@ -72,20 +72,56 @@ function subset(actual: unknown, expected: unknown): boolean {
   if (expected !== null && typeof expected === "object") return actual !== null && typeof actual === "object" && Object.entries(expected).every(([key, value]) => subset((actual as Record<string, unknown>)[key], value));
   return isDeepStrictEqual(actual, expected);
 }
+function reviewedDefaults(actual: Record<string, unknown>, expected: Record<string, unknown>, defaults: Record<string, unknown>): boolean {
+  const normalized = structuredClone(actual);
+  for (const [key, value] of Object.entries(defaults)) {
+    if (!(key in expected) && isDeepStrictEqual(normalized[key], value)) delete normalized[key];
+  }
+  return isDeepStrictEqual(normalized, expected);
+}
+function securityContext(actual: unknown, expected: unknown, defaults: Record<string, unknown>): boolean {
+  if (!actual || typeof actual !== "object" || Array.isArray(actual) || !expected || typeof expected !== "object" || Array.isArray(expected)) return false;
+  const normalized = structuredClone(actual) as Record<string, unknown>;
+  const reviewed = expected as Record<string, unknown>;
+  const caps = normalized.capabilities as Record<string, unknown> | undefined;
+  const reviewedCaps = reviewed.capabilities as Record<string, unknown> | undefined;
+  // An explicit empty add list grants nothing; every nonempty addition stays exact.
+  if (caps && reviewedCaps && reviewedCaps.add === undefined && isDeepStrictEqual(caps.add, [])) delete caps.add;
+  return reviewedDefaults(normalized, reviewed, defaults);
+}
+function validateJobControls(spec: Record<string, unknown>, jobUid: string, reviewed: Record<string, unknown>): void {
+  const defaults = { parallelism: 1, completions: 1, manualSelector: false, completionMode: "NonIndexed", podReplacementPolicy: "TerminatingOrFailed", managedBy: "kubernetes.io/job-controller" };
+  const allowed = new Set([...Object.keys(reviewed), ...Object.keys(defaults), "selector"]);
+  if (Object.keys(spec).some((key) => !allowed.has(key)) || Object.entries(defaults).some(([key, value]) => spec[key] !== undefined && !isDeepStrictEqual(spec[key], value))) throw new Error("UNSAFE_JOB_CONTROL");
+  if (spec.selector !== undefined && ![
+    { matchLabels: { "batch.kubernetes.io/controller-uid": jobUid } },
+    { matchLabels: { "controller-uid": jobUid } },
+    { matchLabels: { "batch.kubernetes.io/controller-uid": jobUid, "controller-uid": jobUid } },
+  ].some((selector) => isDeepStrictEqual(spec.selector, selector))) throw new Error("UNSAFE_JOB_CONTROL");
+}
 function validatePodSpec(actual: Record<string, unknown>, expected: Record<string, unknown>): void {
   if (!subset(actual, expected) || ["hostNetwork", "hostPID", "hostIPC", "shareProcessNamespace"].some((key) => actual[key] === true)) throw new Error("UNSAFE_POD_SPEC");
+  for (const [key, safeDefault] of Object.entries({ hostNetwork: false, hostPID: false, hostIPC: false, shareProcessNamespace: false, hostUsers: true, imagePullSecrets: [], resourceClaims: [], hostAliases: [] })) {
+    if (!(key in expected) && actual[key] !== undefined && !isDeepStrictEqual(actual[key], safeDefault)) throw new Error("UNSAFE_POD_SPEC");
+  }
+  if (actual.runtimeClassName !== undefined) throw new Error("UNSAFE_POD_SPEC");
   if (!isDeepStrictEqual(actual.volumes, expected.volumes)) throw new Error("UNSAFE_VOLUMES");
-  if (!isDeepStrictEqual(actual.securityContext, expected.securityContext)) throw new Error("UNSAFE_SECURITY_CONTEXT");
+  if (!securityContext(actual.securityContext, expected.securityContext, { supplementalGroups: [], sysctls: [], fsGroupChangePolicy: "Always" })) throw new Error("UNSAFE_SECURITY_CONTEXT");
+  const inherited = expected.securityContext as Record<string, unknown>;
+  const containerDefaults = { privileged: false, procMount: "Default", runAsUser: inherited.runAsUser, runAsGroup: inherited.runAsGroup, runAsNonRoot: inherited.runAsNonRoot, seccompProfile: inherited.seccompProfile };
   for (const key of ["containers", "initContainers"]) {
     const containers = actual[key] as Record<string, unknown>[];
     const reviewed = expected[key] as Record<string, unknown>[];
     for (let i = 0; i < containers.length; i++) {
       const container = containers[i]!;
       const allowed = new Set([...Object.keys(reviewed[i]!), "imagePullPolicy", "terminationMessagePath", "terminationMessagePolicy"]);
-      if (Object.keys(container).some((field) => !allowed.has(field)) || !isDeepStrictEqual(container.volumeMounts, reviewed[i]!.volumeMounts) || !isDeepStrictEqual(container.securityContext, reviewed[i]!.securityContext) || !isDeepStrictEqual(container.resources, reviewed[i]!.resources)) throw new Error("UNSAFE_CONTAINER_SPEC");
+      if (Object.keys(container).some((field) => !allowed.has(field)) || !isDeepStrictEqual(container.volumeMounts, reviewed[i]!.volumeMounts) || !securityContext(container.securityContext, reviewed[i]!.securityContext, containerDefaults) || !isDeepStrictEqual(container.resources, reviewed[i]!.resources)) throw new Error("UNSAFE_CONTAINER_SPEC");
+      for (const [field, value] of Object.entries({ imagePullPolicy: "IfNotPresent", terminationMessagePath: "/dev/termination-log", terminationMessagePolicy: "File" })) {
+        if (!(field in reviewed[i]!) && container[field] !== undefined && !isDeepStrictEqual(container[field], value)) throw new Error("UNSAFE_CONTAINER_SPEC");
+      }
     }
   }
-  if (actual.ephemeralContainers !== undefined) throw new Error("UNSAFE_CONTAINER_SPEC");
+  if (actual.ephemeralContainers !== undefined && !isDeepStrictEqual(actual.ephemeralContainers, [])) throw new Error("UNSAFE_CONTAINER_SPEC");
 }
 function listItems(value: unknown): Resource[] {
   const items = (value as { items?: Resource[] })?.items;
@@ -136,6 +172,7 @@ export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resourc
     const preflightDeadline = clock.now() + b.freshnessMs;
     const job = await resource(jobPath, preflightDeadline);
     identity(job, config.jobName, config.jobUid, config.jobResourceVersion);
+    validateJobControls(job.spec, config.jobUid, plan.spec);
     if (job.metadata.deletionTimestamp || job.spec.suspend !== true || job.status?.startTime || job.status?.active || job.status?.failed || job.status?.succeeded || job.status?.conditions?.length) throw new Error("ATTEMPT_ALREADY_USED");
     if (job.spec.backoffLimit !== 0 || job.spec.activeDeadlineSeconds !== b.totalMs / 1000 || (job.spec.parallelism ?? 1) !== 1 || (job.spec.completions ?? 1) !== 1 || !subset((job.spec.template as { metadata: unknown }).metadata, (plan.spec.template as { metadata: unknown }).metadata)) throw new Error("JOB_BUDGET_MISMATCH");
     validatePodSpec((job.spec.template as { spec: Record<string, unknown> }).spec, expectedPod);
@@ -169,6 +206,7 @@ export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resourc
       const readDeadline = Math.min(phaseDeadline, collection + b.freshnessMs);
       const currentJob = await resource(jobPath, readDeadline);
       identity(currentJob, config.jobName, config.jobUid);
+      validateJobControls(currentJob.spec, config.jobUid, plan.spec);
       if (currentJob.spec.suspend !== false || currentJob.spec.activeDeadlineSeconds !== b.totalMs / 1000 || currentJob.spec.backoffLimit !== 0 || (currentJob.spec.parallelism ?? 1) !== 1 || (currentJob.spec.completions ?? 1) !== 1) throw new Error("JOB_CHANGED");
       validatePodSpec((currentJob.spec.template as { spec: Record<string, unknown> }).spec, expectedPod);
       const currentPvc = await resource(pvcPath, readDeadline);
