@@ -149,12 +149,19 @@ export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resourc
     if (clock.cancelled()) throw new Error("CANCELLED");
     attemptStart = Math.floor(clock.now() / 1000) * 1000; phaseDeadline = attemptStart + b.startupMs;
     attempted = true; // Ambiguous PATCH completion still requires guarded cleanup.
-    await call("PATCH", jobPath, Math.min(phaseDeadline, attemptStart + b.apiMs), [
-      { op: "test", path: "/metadata/uid", value: config.jobUid },
-      { op: "test", path: "/metadata/resourceVersion", value: config.jobResourceVersion },
-      { op: "test", path: "/spec/suspend", value: true },
-      { op: "replace", path: "/spec/suspend", value: false },
-    ]);
+    try {
+      await call("PATCH", jobPath, Math.min(phaseDeadline, attemptStart + b.apiMs), [
+        { op: "test", path: "/metadata/uid", value: config.jobUid },
+        { op: "test", path: "/metadata/resourceVersion", value: config.jobResourceVersion },
+        { op: "test", path: "/spec/suspend", value: true },
+        { op: "replace", path: "/spec/suspend", value: false },
+      ]);
+    } catch (error) {
+      // A definitive rejected PATCH acquires no attempt. Never stop another
+      // actor's conflicting mutation. Transport/5xx ambiguity still cleans up.
+      if (error instanceof ApiFailure && error.statusCode >= 400 && error.statusCode < 500) attempted = false;
+      throw error;
+    }
     for (;;) {
       if (clock.cancelled()) throw new Error("CANCELLED");
       if (clock.now() >= phaseDeadline) { status = clock.now() >= attemptStart + b.totalMs ? "TOTAL_DEADLINE" : pod?.status?.containerStatuses?.some((s) => s.name === "directio" && (s.state.running || s.state.terminated?.startedAt)) ? "EXEC_DEADLINE" : "STARTUP_DEADLINE"; break; }

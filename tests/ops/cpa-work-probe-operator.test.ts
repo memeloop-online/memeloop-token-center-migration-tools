@@ -124,6 +124,18 @@ test("cleanup RV conflict never deletes a Pod while its original Job remains act
   assert.equal(f.operations.some((op) => op.method === "DELETE" && op.path === podPath), false);
 });
 
+test("definitive unsuspend conflict acquires no attempt and never cleans a concurrent actor's Job", async () => {
+  const f = fixture(); let patches = 0;
+  const transport: ProbeApi = { call: async (method, path, timeout, body) => {
+    if (method === "PATCH") { patches++; throw new ApiFailure(409); }
+    return f.api.call(method, path, timeout, body);
+  } };
+  const receipt = await runProbe(config, transport, reviewedPlan, reviewedPolicy, f.clock);
+  assert.equal(patches, 1); assert.equal(receipt.status, "API_FAILED");
+  assert.equal(receipt.attemptStartedAt, null); assert.equal(receipt.bytes, null);
+  assert.equal(f.operations.some((op) => op.method === "DELETE"), false);
+});
+
 test("operator fails closed on UID replacements, slow observation and cleanup noncompletion without spillover", async () => {
   for (const mode of ["job-replacement", "pvc-replacement", "replacement", "post-log-replacement", "stale", "cleanup-timeout"] as const) {
     const f = fixture(mode); const receipt = await runProbe(config, f.api, reviewedPlan, reviewedPolicy, f.clock);
