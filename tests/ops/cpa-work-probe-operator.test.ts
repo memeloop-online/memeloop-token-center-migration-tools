@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseAllDocuments } from "yaml";
 import { PROBE_BUDGET } from "../../ops/inspection/cpa-work-probe-budget.ts";
-import { ApiFailure, runProbe, type ProbeApi, type ProbeClock, type ProbeConfig, type Resource } from "../../ops/inspection/cpa-work-probe-operator.ts";
+import { ApiFailure, ApiTransportFailure, unixApi, runProbe, type ProbeApi, type ProbeClock, type ProbeConfig, type Resource } from "../../ops/inspection/cpa-work-probe-operator.ts";
 
 const [policy, plan] = parseAllDocuments(readFileSync("ops/inspection/cpa-work-directio-20261006a.yaml", "utf8")).map((doc) => doc.toJSON() as Resource);
 assert.ok(policy && plan);
@@ -405,6 +405,101 @@ test("operator fails closed on UID replacements, slow observation and cleanup no
     if (mode === "cleanup-timeout") assert.ok(receipt.cleanup.errors.includes("CLEANUP_DEADLINE_OR_UNCONFIRMED"));
     assert.ok(f.operations.every((op) => op.method !== "DELETE" || op.path === jobPath || op.path === podPath));
     assert.ok(f.now() <= epoch + PROBE_BUDGET.totalMs + PROBE_BUDGET.cleanupMs);
+  }
+});
+
+test("diagnostics retain observation GET and separate ambiguous cleanup DELETE without replay or private data", async () => {
+  const f = fixture(); let patched = false, failedRead = false, deletes = 0;
+  const api: ProbeApi = { call: async (method, path, timeout, body) => {
+    if (method === "GET" && patched && !failedRead) {
+      failedRead = true;
+      throw new ApiTransportFailure("API_TRANSPORT_FAILED", "SOCKET_RESET", null);
+    }
+    if (method === "DELETE") {
+      deletes++;
+      throw new ApiTransportFailure("API_TRANSPORT_FAILED", "REQUEST_DEADLINE", null);
+    }
+    const value = await f.api.call(method, path, timeout, body);
+    if (method === "PATCH") patched = true;
+    return value;
+  } };
+  const receipt = await runProbe(config, api, reviewedPlan, reviewedPolicy, f.clock);
+  assert.equal(receipt.status, "API_TRANSPORT_FAILED"); assert.equal(receipt.bytes, null);
+  const [read, cleanup] = receipt.apiDiagnostics.failures;
+  assert.ok(read && cleanup);
+  assert.equal(read.method, "GET"); assert.equal(read.stage, "OBSERVATION"); assert.equal(read.resource, "JOB");
+  assert.equal(read.category, "SOCKET_RESET"); assert.equal(read.httpStatus, null);
+  assert.equal(read.acknowledgement, "NOT_APPLICABLE");
+  assert.equal(read.previousSuccessfulCall?.method, "PATCH");
+  assert.equal(read.previousSuccessfulCall?.stage, "UNSUSPEND");
+  assert.equal(read.previousSuccessfulCall?.acknowledgement, "RESPONSE_RECEIVED");
+  assert.equal(cleanup.method, "DELETE"); assert.equal(cleanup.stage, "CLEANUP_JOB");
+  assert.equal(cleanup.category, "REQUEST_DEADLINE"); assert.equal(cleanup.acknowledgement, "UNKNOWN");
+  assert.equal(deletes, 1); assert.equal(f.operations.filter((op) => op.method === "PATCH").length, 1);
+  assert.deepEqual(receipt.cleanup.errors, ["JOB_STOP_UNCONFIRMED"]);
+  assert.deepEqual(receipt.budgets, PROBE_BUDGET);
+  const diagnosticText = JSON.stringify(receipt.apiDiagnostics);
+  for (const privateValue of [config.jobName, config.jobUid, config.pvcUid, "/apis/", "/api/", "preconditions", "headers", "body"]) assert.ok(!diagnosticText.includes(privateValue), privateValue);
+});
+
+test("unsuspend diagnostics distinguish a lost acknowledgement from definitive HTTP rejection", async () => {
+  for (const rejected of [false, true]) {
+    const f = fixture(); let patches = 0;
+    const api: ProbeApi = { call: async (method, path, timeout, body) => {
+      if (method === "PATCH") {
+        patches++;
+        if (rejected) throw new ApiFailure(409);
+        // Simulate server application followed by a lost reply.
+        await f.api.call(method, path, timeout, body);
+        throw new ApiTransportFailure("API_TRANSPORT_FAILED", "SOCKET_RESET", null);
+      }
+      return f.api.call(method, path, timeout, body);
+    } };
+    const receipt = await runProbe(config, api, reviewedPlan, reviewedPolicy, f.clock);
+    const failure = receipt.apiDiagnostics.failures[0]!;
+    assert.equal(patches, 1); assert.equal(failure.stage, "UNSUSPEND"); assert.equal(failure.method, "PATCH");
+    assert.equal(failure.acknowledgement, rejected ? "REJECTED_4XX" : "UNKNOWN");
+    assert.equal(failure.httpStatus, rejected ? 409 : null);
+    assert.equal(failure.category, rejected ? "HTTP_STATUS" : "SOCKET_RESET");
+    assert.equal(receipt.cleanup.complete, !rejected);
+    assert.equal(f.operations.filter((op) => op.method === "DELETE").length, rejected ? 0 : 1);
+  }
+});
+
+test("Unix transport reports fixed deadline, reset, body limit, read abort and JSON categories without raw errors", { timeout: 10_000 }, async () => {
+  assert.equal(process.env.GITHUB_ACTIONS, "true");
+  const directory = mkdtempSync(join(tmpdir(), "cpa-transport-fixture-"));
+  const socket = join(directory, "api.sock");
+  const server = createServer((req, res) => {
+    if (req.url === "/deadline") return;
+    if (req.url === "/reset") { req.socket.destroy(); return; }
+    if (req.url === "/abort") {
+      res.writeHead(200, { "Content-Length": "100" }); res.flushHeaders();
+      setTimeout(() => res.destroy(), 20); return;
+    }
+    if (req.url === "/limit") { res.end("x".repeat(1024 * 1024 + 1)); return; }
+    if (req.url === "/json") { res.end("private-response-marker"); return; }
+    if (req.url === "/status") { res.statusCode = 503; res.end("private-response-marker"); return; }
+    res.end("{}");
+  });
+  try {
+    await new Promise<void>((resolveListening, reject) => { server.once("error", reject); server.listen(socket, resolveListening); });
+    const api = unixApi(socket);
+    for (const [path, category, status] of [["/deadline", "REQUEST_DEADLINE", null], ["/reset", "SOCKET_RESET", null], ["/abort", "RESPONSE_ABORTED", 200], ["/limit", "RESPONSE_LIMIT", 200], ["/json", "JSON_INVALID", 200]] as const) {
+      await assert.rejects(api.call("GET", path, path === "/deadline" ? 50 : 1000), (error: unknown) => {
+        assert.ok(error instanceof ApiTransportFailure);
+        assert.equal(error.category, category); assert.equal(error.statusCode, status);
+        assert.ok(!error.message.includes("private-response-marker")); return true;
+      });
+    }
+    await assert.rejects(api.call("GET", "/status", 1000), (error: unknown) => error instanceof ApiFailure && error.statusCode === 503);
+    await api.call("GET", "/ok", 1000);
+    assert.equal(api.lastResponseStatus?.(), 200);
+    await assert.rejects(unixApi(join(directory, "missing.sock")).call("GET", "/", 1000), (error: unknown) => error instanceof ApiTransportFailure && error.category === "SOCKET_MISSING");
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolveClosed) => server.close(() => resolveClosed()));
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 

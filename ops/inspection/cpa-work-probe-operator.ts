@@ -25,7 +25,7 @@ export interface ProbeConfig {
   jobName: string; jobUid: string; jobResourceVersion: string;
   pvcUid: string; pvcResourceVersion: string; budgets: ProbeBudgets;
 }
-export interface ProbeApi { call(method: "GET" | "PATCH" | "DELETE", path: string, timeoutMs: number, body?: unknown): Promise<unknown> }
+export interface ProbeApi { call(method: "GET" | "PATCH" | "DELETE", path: string, timeoutMs: number, body?: unknown): Promise<unknown>; lastResponseStatus?(): number | null }
 export interface ProbeClock { now(): number; sleep(ms: number): Promise<void>; cancelled(): boolean }
 const realClock = (): ProbeClock => {
   const wall = Date.now(), mono = performance.now();
@@ -39,23 +39,44 @@ export class ApiFailure extends Error {
   constructor(statusCode: number) { super(statusCode === 404 ? "NOT_FOUND" : "API_FAILED"); this.statusCode = statusCode; }
 }
 
+type TransportCategory = "REQUEST_DEADLINE" | "RESPONSE_LIMIT" | "RESPONSE_ABORTED" | "SOCKET_RESET" | "SOCKET_REFUSED" | "SOCKET_MISSING" | "SOCKET_PIPE" | "SOCKET_TIMEOUT" | "SOCKET_DENIED" | "REQUEST_ERROR_OTHER" | "RESPONSE_ERROR_OTHER" | "JSON_INVALID";
+export class ApiTransportFailure extends Error {
+  readonly category: TransportCategory;
+  readonly statusCode: number | null;
+  constructor(message: "API_TRANSPORT_FAILED" | "API_READ_FAILED" | "API_JSON_INVALID", category: TransportCategory, statusCode: number | null) { super(message); this.category = category; this.statusCode = statusCode; }
+}
+function transportCategory(error: unknown, fallback: "REQUEST_ERROR_OTHER" | "RESPONSE_ERROR_OTHER"): TransportCategory {
+  const code = (error as { code?: unknown } | null)?.code;
+  const categories: Record<string, TransportCategory> = { ECONNRESET: "SOCKET_RESET", ECONNREFUSED: "SOCKET_REFUSED", ENOENT: "SOCKET_MISSING", EPIPE: "SOCKET_PIPE", ETIMEDOUT: "SOCKET_TIMEOUT", EACCES: "SOCKET_DENIED" };
+  return typeof code === "string" && Object.hasOwn(categories, code) ? categories[code]! : fallback;
+}
+type ApiStage = "PREFLIGHT" | "UNSUSPEND" | "OBSERVATION" | "CLEANUP_CAPTURE" | "CLEANUP_JOB" | "CLEANUP_POD" | "CLEANUP_ABSENCE";
+type ApiResource = "JOB" | "PVC" | "DENY_POLICY" | "OWNED_POD_LIST" | "OWNED_POD" | "DIRECTIO_LOG" | "UNRECOGNIZED";
+type ApiCallDiagnostic = { method: "GET" | "PATCH" | "DELETE"; resource: ApiResource; stage: ApiStage; httpStatus: number | null; startedAt: string; finishedAt: string; timeoutMs: number; requestIssued: boolean; acknowledgement: "NOT_APPLICABLE" | "NOT_ISSUED" | "REJECTED_4XX" | "RESPONSE_RECEIVED" | "UNKNOWN" };
+
 // Transport exposes only the local Unix socket, never TCP or a credential read.
 export function unixApi(socketPath: string): ProbeApi {
-  return { call: (method, path, timeoutMs, body) => new Promise((resolve, reject) => {
+  let responseStatus: number | null = null;
+  return { lastResponseStatus: () => responseStatus, call: (method, path, timeoutMs, body) => new Promise((resolve, reject) => {
+    responseStatus = null;
+    let deadlineExpired = false, responseLimit = false, responseAborted = false;
     const payload = body === undefined ? undefined : JSON.stringify(body);
     const req = request({ socketPath, path, method, headers: payload === undefined ? {} : { "Content-Type": method === "PATCH" ? "application/json-patch+json" : "application/json", "Content-Length": Buffer.byteLength(payload) } }, (res) => {
+      responseStatus = res.statusCode ?? null;
       const chunks: Buffer[] = []; let size = 0;
-      res.on("data", (chunk: Buffer) => { size += chunk.length; if (size > 1024 * 1024) req.destroy(new Error("API_RESPONSE_LIMIT")); else chunks.push(chunk); });
-      res.on("error", () => reject(new Error("API_READ_FAILED")));
+      res.on("data", (chunk: Buffer) => { size += chunk.length; if (size > 1024 * 1024) { responseLimit = true; req.destroy(new Error("API_RESPONSE_LIMIT")); } else chunks.push(chunk); });
+      res.on("aborted", () => { responseAborted = true; });
+      const category = (error: unknown, fallback: "REQUEST_ERROR_OTHER" | "RESPONSE_ERROR_OTHER") => deadlineExpired ? "REQUEST_DEADLINE" : responseLimit ? "RESPONSE_LIMIT" : responseAborted ? "RESPONSE_ABORTED" : transportCategory(error, fallback);
+      res.on("error", (error) => reject(new ApiTransportFailure("API_READ_FAILED", category(error, "RESPONSE_ERROR_OTHER"), responseStatus)));
       res.on("end", () => {
         if ((res.statusCode ?? 500) >= 300) { reject(new ApiFailure(res.statusCode ?? 500)); return; }
         const text = Buffer.concat(chunks).toString("utf8");
-        try { resolve(path.includes("/log?") ? text : JSON.parse(text)); } catch { reject(new Error("API_JSON_INVALID")); }
+        try { resolve(path.includes("/log?") ? text : JSON.parse(text)); } catch { reject(new ApiTransportFailure("API_JSON_INVALID", "JSON_INVALID", responseStatus)); }
       });
     });
-    const timer = setTimeout(() => req.destroy(new Error("API_DEADLINE")), Math.max(1, timeoutMs));
+    const timer = setTimeout(() => { deadlineExpired = true; req.destroy(new Error("API_DEADLINE")); }, Math.max(1, timeoutMs));
     req.on("close", () => clearTimeout(timer));
-    req.on("error", () => reject(new Error("API_TRANSPORT_FAILED")));
+    req.on("error", (error) => reject(new ApiTransportFailure("API_TRANSPORT_FAILED", deadlineExpired ? "REQUEST_DEADLINE" : responseLimit ? "RESPONSE_LIMIT" : responseAborted ? "RESPONSE_ABORTED" : transportCategory(error, "REQUEST_ERROR_OTHER"), responseStatus)));
     req.end(payload);
   }) };
 }
@@ -175,12 +196,29 @@ export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resourc
   let status = "PREFLIGHT_REJECTED";
   let execStartedAt: string | null = null;
   const cleanup = { complete: false, jobDeleted: false, podDeleted: false, errors: [] as string[] };
+  let stage: ApiStage = "PREFLIGHT";
+  const apiDiagnostics = { lastSuccessfulCall: null as ApiCallDiagnostic | null, failures: [] as (ApiCallDiagnostic & { category: string; previousSuccessfulCall: ApiCallDiagnostic | null })[] };
+  const resourceKind = (path: string): ApiResource => path === jobPath ? "JOB" : path === pvcPath ? "PVC" : path === POLICY ? "DENY_POLICY" : path === podsPath ? "OWNED_POD_LIST" : pod && path === `${CORE}/pods/${pod.metadata.name}` ? "OWNED_POD" : pod && path === `${CORE}/pods/${pod.metadata.name}/log?container=directio&limitBytes=4096&tailLines=100` ? "DIRECTIO_LOG" : "UNRECOGNIZED";
   const call = async (method: "GET" | "PATCH" | "DELETE", path: string, deadline: number, body?: unknown) => {
-    const remaining = deadline - clock.now();
-    if (remaining <= 0) throw new Error("READ_DEADLINE");
-    const value = await api.call(method, path, Math.min(b.apiMs, remaining), body);
-    if (clock.now() > deadline) throw new Error("READ_DEADLINE");
-    return value;
+    const started = clock.now(), remaining = deadline - started;
+    const timeoutMs = Math.min(b.apiMs, Math.max(0, remaining));
+    let issued = false, responded = false;
+    const diagnostic = (error?: unknown): ApiCallDiagnostic => ({ method, resource: resourceKind(path), stage,
+      httpStatus: error instanceof ApiFailure || error instanceof ApiTransportFailure ? error.statusCode : responded ? api.lastResponseStatus?.() ?? null : null,
+      startedAt: new Date(started).toISOString(), finishedAt: new Date(clock.now()).toISOString(), timeoutMs, requestIssued: issued,
+      acknowledgement: method === "GET" ? "NOT_APPLICABLE" : !issued ? "NOT_ISSUED" : responded ? "RESPONSE_RECEIVED" : error instanceof ApiFailure && error.statusCode >= 400 && error.statusCode < 500 ? "REJECTED_4XX" : "UNKNOWN" });
+    try {
+      if (remaining <= 0) throw new Error("READ_DEADLINE");
+      issued = true; // Transport invoked; this does not prove delivery to the API server.
+      const value = await api.call(method, path, timeoutMs, body);
+      responded = true;
+      if (clock.now() > deadline) throw new Error("READ_DEADLINE");
+      apiDiagnostics.lastSuccessfulCall = diagnostic();
+      return value;
+    } catch (error) {
+      if (apiDiagnostics.failures.length < 8) apiDiagnostics.failures.push({ ...diagnostic(error), category: error instanceof ApiTransportFailure ? error.category : error instanceof ApiFailure ? "HTTP_STATUS" : error instanceof Error && error.message === "READ_DEADLINE" ? !issued ? "BEFORE_REQUEST_DEADLINE" : "AFTER_RESPONSE_DEADLINE" : "UNCLASSIFIED", previousSuccessfulCall: apiDiagnostics.lastSuccessfulCall });
+      throw error;
+    }
   };
   const resource = async (path: string, deadline: number) => await call("GET", path, deadline) as Resource;
   const capture = async (deadline: number) => {
@@ -213,6 +251,7 @@ export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resourc
     if (clock.cancelled()) throw new Error("CANCELLED");
     attemptStart = Math.floor(clock.now() / 1000) * 1000; phaseDeadline = attemptStart + b.startupMs;
     attempted = true; // Ambiguous PATCH completion still requires guarded cleanup.
+    stage = "UNSUSPEND";
     try {
       await call("PATCH", jobPath, Math.min(phaseDeadline, attemptStart + b.apiMs), [
         { op: "test", path: "/metadata/uid", value: config.jobUid },
@@ -227,6 +266,7 @@ export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resourc
       throw error;
     }
     for (;;) {
+      stage = "OBSERVATION";
       if (clock.cancelled()) throw new Error("CANCELLED");
       if (clock.now() >= phaseDeadline) { status = clock.now() >= attemptStart + b.totalMs ? "TOTAL_DEADLINE" : pod?.status?.containerStatuses?.some((s) => s.name === "directio" && (s.state.running || s.state.terminated?.startedAt)) ? "EXEC_DEADLINE" : "STARTUP_DEADLINE"; break; }
       const collection = clock.now();
@@ -295,7 +335,9 @@ export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resourc
     if (attempted) {
       const deadline = clock.now() + b.cleanupMs;
       // Capture only the original controller's unique Pod if PATCH failed before adoption.
+      stage = "CLEANUP_CAPTURE";
       if (!pod) { try { await capture(deadline); } catch { cleanup.errors.push("POD_CAPTURE_UNCONFIRMED"); } }
+      stage = "CLEANUP_JOB";
       try {
         const job = await resource(jobPath, deadline); identity(job, config.jobName, config.jobUid);
         await call("DELETE", jobPath, deadline, { apiVersion: "v1", kind: "DeleteOptions", propagationPolicy: "Orphan", gracePeriodSeconds: 5, preconditions: { uid: config.jobUid, resourceVersion: job.metadata.resourceVersion } });
@@ -303,6 +345,7 @@ export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resourc
       } catch (error) { if (error instanceof ApiFailure && error.statusCode === 404) cleanup.jobDeleted = true; else cleanup.errors.push("JOB_STOP_UNCONFIRMED"); }
       const originalPod = pod as Resource | null;
       if (originalPod && cleanup.jobDeleted) {
+        stage = "CLEANUP_POD";
         try {
           const exact = await resource(`${CORE}/pods/${originalPod.metadata.name}`, deadline);
           identity(exact, originalPod.metadata.name, originalPod.metadata.uid);
@@ -315,6 +358,7 @@ export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resourc
       } else if (originalPod) cleanup.errors.push("POD_STOP_SKIPPED_JOB_UNCONFIRMED");
       else cleanup.podDeleted = cleanup.errors.length === 0;
       if (cleanup.jobDeleted && cleanup.podDeleted && !cleanup.errors.length) {
+        stage = "CLEANUP_ABSENCE";
         try {
           for (;;) {
             let gone = true;
@@ -331,7 +375,7 @@ export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resourc
     }
   }
   return { status, passed: status === "COMPLETE" && cleanup.complete, bytes: status === "COMPLETE" ? result?.bytes ?? null : null, budgets: b, attemptStartedAt: attempted ? new Date(attemptStart).toISOString() : null,
-    jobUid: config.jobUid, podUid: (pod as Resource | null)?.metadata.uid ?? null, pvcUid: config.pvcUid, decision: result, cleanup };
+    jobUid: config.jobUid, podUid: (pod as Resource | null)?.metadata.uid ?? null, pvcUid: config.pvcUid, decision: result, cleanup, apiDiagnostics };
 }
 
 if (invokedAsEntrypoint("cpa-work-probe-operator", import.meta.url)) {
