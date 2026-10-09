@@ -20,6 +20,16 @@ suspend=true. There is no apply/create/retry path. After unsuspension it capture
 the unique controller-owned Pod, verifies target-only spec and policy label,
 and pins its UID. No Pod UID is required before a suspended Job creates a Pod.
 
+An unused Job must have generation 1, no start/completion time, no execution or
+uncounted termination counters, and no existing owned Pod. Empty initial status
+is accepted, as is exactly one controller-generated Suspended=True condition
+with reason JobSuspended and message "Job suspended". Resumed/duplicate/unknown
+or terminal conditions remain rejected before PATCH or DELETE. Re-suspension
+can clear startTime in Kubernetes, so a Suspended condition alone never proves
+that the Job is unused. Exact self-created UID/RV receipts remain required.
+The condition values follow the upstream [Job controller](https://github.com/kubernetes/kubernetes/blob/v1.35.0/pkg/controller/job/job_controller.go);
+generation behavior follows the upstream [Job strategy](https://github.com/kubernetes/kubernetes/blob/v1.35.0/pkg/registry/batch/job/strategy.go).
+
 Startup includes no Pod, missing container status, mount, image pull and init.
 Execution starts only at the directio container's actual startedAt; that value
 is pinned, never inferred from Ready or Job age, and cannot reset the clock.

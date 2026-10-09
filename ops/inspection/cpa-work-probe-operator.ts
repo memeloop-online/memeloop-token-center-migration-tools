@@ -14,12 +14,12 @@ const PVC_UID = "a5045b54-0f10-4f60-b1f5-18167620ba31";
 const CORE = `/api/v1/namespaces/${NS}`;
 const JOBS = `/apis/batch/v1/namespaces/${NS}/jobs`;
 const POLICY = `/apis/networking.k8s.io/v1/namespaces/${NS}/networkpolicies/mtc-cpa-work-directio-20261006a`;
-type Metadata = { name: string; namespace: string; uid: string; resourceVersion: string; labels?: Record<string, string>; deletionTimestamp?: string; ownerReferences?: { uid: string; kind: string; controller?: boolean }[] };
+type Metadata = { name: string; namespace: string; uid: string; resourceVersion: string; generation?: number; labels?: Record<string, string>; deletionTimestamp?: string; ownerReferences?: { uid: string; kind: string; controller?: boolean }[] };
 type ContainerStatus = { name: string; restartCount: number; state: ContainerState };
 export interface Resource {
   metadata: Metadata;
   spec: Record<string, unknown>;
-  status?: { startTime?: string; phase?: string; active?: number; failed?: number; succeeded?: number; conditions?: { type: string; status: string }[]; containerStatuses?: ContainerStatus[]; initContainerStatuses?: ContainerStatus[] };
+  status?: { startTime?: string; completionTime?: string; completedIndexes?: string; failedIndexes?: string; phase?: string; active?: number; failed?: number; succeeded?: number; ready?: number; terminating?: number; uncountedTerminatedPods?: { succeeded?: string[]; failed?: string[] }; conditions?: { type: string; status: string; reason?: string; message?: string; lastProbeTime?: string; lastTransitionTime?: string }[]; containerStatuses?: ContainerStatus[]; initContainerStatuses?: ContainerStatus[] };
 }
 export interface ProbeConfig {
   jobName: string; jobUid: string; jobResourceVersion: string;
@@ -133,6 +133,23 @@ function configValid(config: ProbeConfig): void {
   if (!/^mtc-cpa-work-directio-[a-z0-9-]+$/.test(config.jobName) || !/^[a-f0-9-]{36}$/.test(config.jobUid) || !/^\d+$/.test(config.jobResourceVersion) || config.pvcUid !== PVC_UID || !/^\d+$/.test(config.pvcResourceVersion)) throw new Error("INVALID_CONFIG_IDENTITY");
 }
 
+function initiallySuspendedUnused(job: Resource): boolean {
+  const status = job.status;
+  if (job.metadata.generation !== 1 || job.spec.suspend !== true || job.metadata.deletionTimestamp) return false;
+  if (!status) return true;
+  if (status.startTime !== undefined || status.completionTime !== undefined || status.completedIndexes !== undefined || status.failedIndexes !== undefined) return false;
+  if ([status.active, status.failed, status.succeeded, status.ready, status.terminating].some((count) => count !== undefined && count !== 0)) return false;
+  const uncounted = status.uncountedTerminatedPods;
+  if (uncounted !== undefined && (!uncounted || Object.keys(uncounted).some((key) => key !== "succeeded" && key !== "failed") || [uncounted.succeeded, uncounted.failed].some((uids) => uids !== undefined && (!Array.isArray(uids) || uids.length !== 0)))) return false;
+  const conditions = status.conditions;
+  if (conditions === undefined) return true;
+  if (!Array.isArray(conditions)) return false;
+  if (conditions.length === 0) return true;
+  if (conditions.length !== 1) return false;
+  const initial = conditions[0];
+  return initial?.type === "Suspended" && initial.status === "True" && initial.reason === "JobSuspended" && initial.message === "Job suspended";
+}
+
 export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resource, policy: Resource, clock: ProbeClock = realClock()) {
   configValid(config);
   const b = config.budgets;
@@ -173,7 +190,7 @@ export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resourc
     const job = await resource(jobPath, preflightDeadline);
     identity(job, config.jobName, config.jobUid, config.jobResourceVersion);
     validateJobControls(job.spec, config.jobUid, plan.spec);
-    if (job.metadata.deletionTimestamp || job.spec.suspend !== true || job.status?.startTime || job.status?.active || job.status?.failed || job.status?.succeeded || job.status?.conditions?.length) throw new Error("ATTEMPT_ALREADY_USED");
+    if (!initiallySuspendedUnused(job)) throw new Error("ATTEMPT_ALREADY_USED");
     if (job.spec.backoffLimit !== 0 || job.spec.activeDeadlineSeconds !== b.totalMs / 1000 || (job.spec.parallelism ?? 1) !== 1 || (job.spec.completions ?? 1) !== 1 || !subset((job.spec.template as { metadata: unknown }).metadata, (plan.spec.template as { metadata: unknown }).metadata)) throw new Error("JOB_BUDGET_MISMATCH");
     validatePodSpec((job.spec.template as { spec: Record<string, unknown> }).spec, expectedPod);
     const pvc = await resource(pvcPath, preflightDeadline);
