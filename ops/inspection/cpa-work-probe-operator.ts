@@ -35,7 +35,8 @@ const realClock = (): ProbeClock => {
   return { now: () => wall + performance.now() - mono, sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)), cancelled: () => cancelled };
 };
 export class ApiFailure extends Error {
-  constructor(readonly statusCode: number) { super(statusCode === 404 ? "NOT_FOUND" : "API_FAILED"); }
+  readonly statusCode: number;
+  constructor(statusCode: number) { super(statusCode === 404 ? "NOT_FOUND" : "API_FAILED"); this.statusCode = statusCode; }
 }
 
 // Transport exposes only the local Unix socket, never TCP or a credential read.
