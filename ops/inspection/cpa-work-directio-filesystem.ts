@@ -16,7 +16,7 @@ function openDirectory(root, create) {
     let prior = absent(path), created = false;
     if (!prior && create) { mkdirSync(path, {mode:0o700}); prior = lstatSync(path); created = true; }
     if (!prior || !prior.isDirectory() || prior.isSymbolicLink()) fail();
-    directory = openSync(path, constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW);
+    directory = openSync(path, (create && !created ? 0x200000 : constants.O_RDONLY)|constants.O_DIRECTORY|constants.O_NOFOLLOW);
     if (!same(prior, fstatSync(directory))) fail();
     // Set ownership only on this newly created original directory; never repair.
     if (created) { fchownSync(directory, 10001, 10001); fsyncSync(parent); }

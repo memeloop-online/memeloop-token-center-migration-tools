@@ -81,7 +81,7 @@ test("review-only target probe uses pinned dd direct I/O under 128Mi/250m, never
   const init = pod.initContainers[0];
   const initialization = spawnSync("docker", ["run", "--rm", "--network", "none", "--read-only", "--cap-drop", "ALL", "--cap-add", "CHOWN", "--security-opt", "no-new-privileges", "--user", "0:0", "--volume", `${root}:/destination:rw`, "--entrypoint", init.command[0], init.image, ...init.command.slice(1), ...init.args], { encoding: "utf8", timeout: 10000 });
   assert.equal(initialization.status, 0, initialization.stderr);
-  assert.ok(initialization.stdout.includes("SYNTHETIC_ABSENT"));
+  assert.ok(initialization.stdout.includes("DIRECTORY_READY"));
   writeFileSync(retained, "preserve old partial", { flag: "wx" });
   let passed = false;
   try {

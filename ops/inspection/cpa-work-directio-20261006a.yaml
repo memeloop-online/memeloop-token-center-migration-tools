@@ -66,7 +66,7 @@ spec:
                   let prior = absent(path), created = false;
                   if (!prior && create) { mkdirSync(path, {mode:0o700}); prior = lstatSync(path); created = true; }
                   if (!prior || !prior.isDirectory() || prior.isSymbolicLink()) fail();
-                  directory = openSync(path, constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW);
+                  directory = openSync(path, (create && !created ? 0x200000 : constants.O_RDONLY)|constants.O_DIRECTORY|constants.O_NOFOLLOW);
                   if (!same(prior, fstatSync(directory))) fail();
                   // Set ownership only on this newly created original directory; never repair.
                   if (created) { fchownSync(directory, 10001, 10001); fsyncSync(parent); }
@@ -109,7 +109,9 @@ spec:
                   console.log('SYNTHETIC_ABSENT');
                 } finally { closeSync(handle.directory); closeSync(handle.parent); }
               }
-              initialize('/destination');
+              const h = openDirectory('/destination', true);
+              h.check(); closeSync(h.directory); closeSync(h.parent);
+              console.log('DIRECTORY_READY');
           resources:
             requests: {cpu: 10m, memory: 16Mi}
             limits: {cpu: 100m, memory: 64Mi}
@@ -147,7 +149,7 @@ spec:
                   let prior = absent(path), created = false;
                   if (!prior && create) { mkdirSync(path, {mode:0o700}); prior = lstatSync(path); created = true; }
                   if (!prior || !prior.isDirectory() || prior.isSymbolicLink()) fail();
-                  directory = openSync(path, constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW);
+                  directory = openSync(path, (create && !created ? 0x200000 : constants.O_RDONLY)|constants.O_DIRECTORY|constants.O_NOFOLLOW);
                   if (!same(prior, fstatSync(directory))) fail();
                   // Set ownership only on this newly created original directory; never repair.
                   if (created) { fchownSync(directory, 10001, 10001); fsyncSync(parent); }
@@ -193,6 +195,7 @@ spec:
               import {spawnSync} from 'node:child_process';
               import {statfsSync} from 'node:fs';
               if (process.getuid() !== 10001 || process.getgid() !== 10001) fail();
+              initialize('/destination');
               const handle = openDirectory('/destination', false);
               let fd, created;
               const dd = (args) => {
