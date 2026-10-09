@@ -20,7 +20,7 @@ const podPath = `${ns}/pods/probe-pod`;
 
 function fixture(mode: "late" | "startup" | "exec" | "total" | "init" | "replacement" | "job-replacement" | "pvc-replacement" | "stale" | "cleanup-timeout" | "post-log-replacement" = "late") {
   let now = epoch, step = 0, enabled = false, jobGone = false, podGone = false, cleanupStarted = false, staleInjected = false;
-  let job: Resource = { ...structuredClone(reviewedPlan), metadata: { name: config.jobName, namespace: "cliproxyapi", uid: config.jobUid, resourceVersion: "1" } };
+  let job: Resource = { ...structuredClone(reviewedPlan), metadata: { name: config.jobName, namespace: "cliproxyapi", uid: config.jobUid, resourceVersion: "1", generation: 1 } };
   const pvc: Resource = { metadata: { name: "mtc-cpa-recovery-work-20261005", namespace: "cliproxyapi", uid: config.pvcUid, resourceVersion: "3" }, spec: { volumeName: `pvc-${config.pvcUid}` }, status: { phase: "Bound" } };
   let pod: Resource | null = null;
   const operations: { method: string; path: string; body?: unknown; timeout: number }[] = [];
@@ -113,6 +113,88 @@ test("preflight RV mismatch never unsuspends or cleans any resource", async () =
 });
 
 type PodSpec = Record<string, unknown>;
+const initialSuspended = { type: "Suspended", status: "True", reason: "JobSuspended", message: "Job suspended", lastProbeTime: new Date(epoch).toISOString(), lastTransitionTime: new Date(epoch).toISOString() };
+
+test("initial controller Suspended=True condition permits exactly one unsuspend and guarded cleanup", async () => {
+  const f = fixture();
+  const api: ProbeApi = { call: async (method, path, timeout, body) => {
+    const data = await f.api.call(method, path, timeout, body);
+    if (method === "GET" && path === jobPath && (data as Resource).spec.suspend === true) {
+      (data as Resource).status = { active: 0, failed: 0, succeeded: 0, ready: 0, terminating: 0, uncountedTerminatedPods: { succeeded: [], failed: [] }, conditions: [structuredClone(initialSuspended)] };
+    }
+    return data;
+  } };
+  const receipt = await runProbe(config, api, reviewedPlan, reviewedPolicy, f.clock);
+  assert.equal(receipt.status, "COMPLETE"); assert.equal(receipt.passed, true);
+  assert.equal(receipt.bytes, 1024 ** 3); assert.equal(receipt.cleanup.complete, true);
+  assert.equal(f.operations.filter((op) => op.method === "PATCH").length, 1);
+  assert.equal(f.operations.filter((op) => op.method === "DELETE").length, 2);
+  console.log(JSON.stringify({ fixture: "initial-suspended", status: receipt.status, patches: 1, deletes: 2, cleanup: "confirmed" }));
+});
+
+test("suspension misuse, terminal and reused histories reject with zero PATCH/DELETE", async () => {
+  const vectors: [string, (job: Resource) => void][] = [
+    ["previously unsuspended generation", (job) => { job.metadata.generation = 2; }],
+    ["resumed generation", (job) => { job.metadata.generation = 3; }],
+    ["missing generation", (job) => { delete job.metadata.generation; }],
+    ["not suspended", (job) => { job.spec.suspend = false; }],
+    ["deleting Job", (job) => { job.metadata.deletionTimestamp = new Date(epoch).toISOString(); }],
+    ["Suspended False", (job) => { job.status!.conditions![0]!.status = "False"; }],
+    ["Suspended Unknown", (job) => { job.status!.conditions![0]!.status = "Unknown"; }],
+    ["resumed reason", (job) => { job.status!.conditions![0]!.reason = "JobResumed"; }],
+    ["missing suspension reason", (job) => { delete job.status!.conditions![0]!.reason; }],
+    ["missing suspension message", (job) => { delete job.status!.conditions![0]!.message; }],
+    ["contradictory message", (job) => { job.status!.conditions![0]!.message = "Job resumed"; }],
+    ["duplicate Suspended", (job) => { job.status!.conditions!.push(structuredClone(initialSuspended)); }],
+    ...["Complete", "Failed", "FailureTarget", "SuccessCriteriaMet", "UnknownHistory"].flatMap((type): [string, (job: Resource) => void][] => [
+      [type + " True history", (job) => { job.status!.conditions!.push({ type, status: "True" }); }],
+      [type + " False history", (job) => { job.status!.conditions!.push({ type, status: "False" }); }],
+      [type + " sole condition", (job) => { job.status!.conditions = [{ type, status: "True" }]; }],
+    ]),
+    ["prior start", (job) => { job.status!.startTime = new Date(epoch).toISOString(); }],
+    ["prior completion", (job) => { job.status!.completionTime = new Date(epoch).toISOString(); }],
+    ["active Pod", (job) => { job.status!.active = 1; }],
+    ["failed Pod", (job) => { job.status!.failed = 1; }],
+    ["succeeded Pod", (job) => { job.status!.succeeded = 1; }],
+    ["ready Pod", (job) => { job.status!.ready = 1; }],
+    ["terminating Pod", (job) => { job.status!.terminating = 1; }],
+    ["completed indexes", (job) => { job.status!.completedIndexes = "0"; }],
+    ["failed indexes", (job) => { job.status!.failedIndexes = "0"; }],
+    ["uncounted success", (job) => { job.status!.uncountedTerminatedPods = { succeeded: ["prior-pod"] }; }],
+    ["uncounted failure", (job) => { job.status!.uncountedTerminatedPods = { failed: ["prior-pod"] }; }],
+  ];
+  for (const [name, mutate] of vectors) {
+    const f = fixture();
+    const api: ProbeApi = { call: async (method, path, timeout, body) => {
+      const data = await f.api.call(method, path, timeout, body);
+      if (method === "GET" && path === jobPath) {
+        const job = data as Resource; job.status = { conditions: [structuredClone(initialSuspended)] }; mutate(job);
+      }
+      return data;
+    } };
+    const receipt = await runProbe(config, api, reviewedPlan, reviewedPolicy, f.clock);
+    assert.equal(receipt.status, "ATTEMPT_ALREADY_USED", name);
+    assert.equal(receipt.passed, false, name); assert.equal(receipt.bytes, null, name); assert.equal(receipt.attemptStartedAt, null, name);
+    assert.equal(f.operations.filter((op) => op.method === "PATCH").length, 0, name);
+    assert.equal(f.operations.filter((op) => op.method === "DELETE").length, 0, name);
+    console.log(JSON.stringify({ fixture: "initial-suspended-reject", name, status: receipt.status, patches: 0, deletes: 0 }));
+  }
+});
+
+test("initial Suspended condition never permits an existing owned Pod", async () => {
+  const f = fixture();
+  const api: ProbeApi = { call: async (method, path, timeout, body) => {
+    const data = await f.api.call(method, path, timeout, body);
+    if (method === "GET" && path === jobPath) (data as Resource).status = { conditions: [structuredClone(initialSuspended)] };
+    if (method === "GET" && path.includes("/pods?")) return { items: [{ metadata: { name: "probe-pod", namespace: "cliproxyapi", uid: "22222222-2222-4222-8222-222222222222", resourceVersion: "10", labels: { "memeloop.io/cpa-work-probe": "directio-20261006a" }, ownerReferences: [{ kind: "Job", controller: true, uid: config.jobUid }] }, spec: structuredClone((reviewedPlan.spec.template as { spec: PodSpec }).spec) }] };
+    return data;
+  } };
+  const receipt = await runProbe(config, api, reviewedPlan, reviewedPolicy, f.clock);
+  assert.equal(receipt.status, "ATTEMPT_ALREADY_USED");
+  assert.equal(receipt.passed, false); assert.equal(receipt.bytes, null); assert.equal(receipt.attemptStartedAt, null);
+  assert.equal(f.operations.some((op) => op.method !== "GET"), false);
+});
+
 function template(job: Resource): PodSpec { return (job.spec.template as { spec: PodSpec }).spec; }
 function context(spec: PodSpec, role: "containers" | "initContainers"): Record<string, unknown> {
   return (spec[role] as Record<string, unknown>[])[0]!.securityContext as Record<string, unknown>;
@@ -178,8 +260,10 @@ test("N1 normal Kubernetes defaults and inherited reviewed security remain accep
   const api: ProbeApi = { call: async (method, path, timeout, body) => {
     const data = await f.api.call(method, path, timeout, body);
     if (method === "GET") {
-      if (path === jobPath || path === podPath) normalDefaults(data as Resource);
-      else if (path.includes("/pods?")) for (const pod of (data as { items: Resource[] }).items) normalDefaults(pod);
+      if (path === jobPath || path === podPath) {
+        normalDefaults(data as Resource);
+        if (path === jobPath && (data as Resource).spec.suspend === true) (data as Resource).status = { conditions: [structuredClone(initialSuspended)] };
+      } else if (path.includes("/pods?")) for (const pod of (data as { items: Resource[] }).items) normalDefaults(pod);
     }
     return data;
   } };
