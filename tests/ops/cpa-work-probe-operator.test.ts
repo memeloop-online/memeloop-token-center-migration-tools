@@ -115,6 +115,103 @@ test("preflight RV mismatch never unsuspends or cleans any resource", async () =
 type PodSpec = Record<string, unknown>;
 const initialSuspended = { type: "Suspended", status: "True", reason: "JobSuspended", message: "Job suspended", lastProbeTime: new Date(epoch).toISOString(), lastTransitionTime: new Date(epoch).toISOString() };
 
+const serializedDenySpec = {
+  podSelector: { matchLabels: { "memeloop.io/cpa-work-probe": "directio-20261006a" } },
+  policyTypes: ["Ingress", "Egress"],
+};
+
+test("deny policy accepts actual API omitted and empty rule arrays with one PATCH and guarded cleanup", async () => {
+  const vectors: [string, Record<string, unknown>][] = [
+    ["actual 14:45 API spec", structuredClone(serializedDenySpec)],
+    ["explicit empty rules", { ...structuredClone(serializedDenySpec), ingress: [], egress: [] }],
+    ["omitted ingress", { ...structuredClone(serializedDenySpec), egress: [] }],
+    ["omitted egress", { ...structuredClone(serializedDenySpec), ingress: [] }],
+  ];
+  for (const [name, spec] of vectors) {
+    const f = fixture();
+    const api: ProbeApi = { call: async (method, path, timeout, body) => {
+      const data = await f.api.call(method, path, timeout, body);
+      if (method === "GET" && path.includes("networkpolicies/")) (data as Resource).spec = structuredClone(spec);
+      if (method === "GET" && path === jobPath && (data as Resource).spec.suspend === true) {
+        (data as Resource).status = { ready: 0, terminating: 0, uncountedTerminatedPods: {}, conditions: [structuredClone(initialSuspended)] };
+      }
+      return data;
+    } };
+    const receipt = await runProbe(config, api, reviewedPlan, reviewedPolicy, f.clock);
+    assert.equal(receipt.status, "COMPLETE", name); assert.equal(receipt.passed, true, name);
+    assert.equal(receipt.bytes, 1024 ** 3, name); assert.equal(receipt.cleanup.complete, true, name);
+    assert.equal(f.operations.filter((op) => op.method === "PATCH").length, 1, name);
+    assert.deepEqual(f.operations.filter((op) => op.method === "DELETE").map((op) => op.path), [jobPath, podPath], name);
+    console.log(JSON.stringify({ fixture: "deny-normalization-accept", name, status: receipt.status, patches: 1, deletes: 2 }));
+  }
+});
+
+test("deny policy rejects nonempty, malformed, extra and changed selector or type paths with zero PATCH/DELETE", async () => {
+  const vectors: [string, (spec: Record<string, unknown>) => void][] = [
+    ...["ingress", "egress"].flatMap((key): [string, (spec: Record<string, unknown>) => void][] => [
+      [key + " allow all", (spec) => { spec[key] = [{}]; }],
+      [key + " peer rule", (spec) => { spec[key] = [{ [key === "ingress" ? "from" : "to"]: [{ podSelector: {} }] }]; }],
+      [key + " port rule", (spec) => { spec[key] = [{ ports: [{ port: 443 }] }]; }],
+      [key + " null", (spec) => { spec[key] = null; }],
+      [key + " object", (spec) => { spec[key] = {}; }],
+      [key + " string", (spec) => { spec[key] = ""; }],
+      [key + " undefined", (spec) => { spec[key] = undefined; }],
+    ]),
+    ["missing selector", (spec) => { delete spec.podSelector; }],
+    ["all Pods selector", (spec) => { spec.podSelector = {}; }],
+    ["different selector", (spec) => { spec.podSelector = { matchLabels: { app: "other" } }; }],
+    ["extra selector expression", (spec) => { (spec.podSelector as Record<string, unknown>).matchExpressions = []; }],
+    ["missing policy types", (spec) => { delete spec.policyTypes; }],
+    ["ingress only", (spec) => { spec.policyTypes = ["Ingress"]; }],
+    ["egress only", (spec) => { spec.policyTypes = ["Egress"]; }],
+    ["reordered policy types", (spec) => { spec.policyTypes = ["Egress", "Ingress"]; }],
+    ["extra policy type", (spec) => { spec.policyTypes = ["Ingress", "Egress", "Unknown"]; }],
+    ["extra spec field", (spec) => { spec.unknown = []; }],
+  ];
+  for (const [name, mutate] of vectors) {
+    const f = fixture();
+    const api: ProbeApi = { call: async (method, path, timeout, body) => {
+      const data = await f.api.call(method, path, timeout, body);
+      if (method === "GET" && path.includes("networkpolicies/")) {
+        const policy = data as Resource; policy.spec = structuredClone(serializedDenySpec); mutate(policy.spec);
+      }
+      return data;
+    } };
+    const receipt = await runProbe(config, api, reviewedPlan, reviewedPolicy, f.clock);
+    assert.equal(receipt.status, "NETWORK_DENY_MISMATCH", name);
+    assert.equal(receipt.passed, false, name); assert.equal(receipt.bytes, null, name); assert.equal(receipt.attemptStartedAt, null, name);
+    assert.equal(f.operations.filter((op) => op.method === "PATCH").length, 0, name);
+    assert.equal(f.operations.filter((op) => op.method === "DELETE").length, 0, name);
+    console.log(JSON.stringify({ fixture: "deny-normalization-reject", name, status: receipt.status, patches: 0, deletes: 0 }));
+  }
+});
+
+test("API omitted deny rules retain used Job and Pod ownership gates with zero PATCH/DELETE", async () => {
+  for (const mode of ["used Job", "existing owned Pod", "foreign Pod"] as const) {
+    const f = fixture();
+    const api: ProbeApi = { call: async (method, path, timeout, body) => {
+      const data = await f.api.call(method, path, timeout, body);
+      if (method === "GET" && path.includes("networkpolicies/")) (data as Resource).spec = structuredClone(serializedDenySpec);
+      if (method === "GET" && path === jobPath) {
+        const job = data as Resource;
+        job.status = { ready: 0, terminating: 0, uncountedTerminatedPods: {}, conditions: [structuredClone(initialSuspended)] };
+        if (mode === "used Job") job.metadata.generation = 2;
+      }
+      if (method === "GET" && path.includes("/pods?") && mode !== "used Job") return { items: [{
+        metadata: { name: "probe-pod", namespace: "cliproxyapi", uid: "22222222-2222-4222-8222-222222222222", resourceVersion: "10", labels: { "memeloop.io/cpa-work-probe": "directio-20261006a" }, ownerReferences: [{ kind: "Job", controller: true, uid: mode === "foreign Pod" ? "33333333-3333-4333-8333-333333333333" : config.jobUid }] },
+        spec: structuredClone((reviewedPlan.spec.template as { spec: PodSpec }).spec),
+      }] };
+      return data;
+    } };
+    const receipt = await runProbe(config, api, reviewedPlan, reviewedPolicy, f.clock);
+    assert.equal(receipt.status, mode === "foreign Pod" ? "POD_OWNERSHIP_REJECTED" : "ATTEMPT_ALREADY_USED", mode);
+    assert.equal(receipt.passed, false, mode); assert.equal(receipt.bytes, null, mode); assert.equal(receipt.attemptStartedAt, null, mode);
+    assert.equal(f.operations.filter((op) => op.method === "PATCH").length, 0, mode);
+    assert.equal(f.operations.filter((op) => op.method === "DELETE").length, 0, mode);
+    console.log(JSON.stringify({ fixture: "deny-normalization-gates", name: mode, status: receipt.status, patches: 0, deletes: 0 }));
+  }
+});
+
 test("initial controller Suspended=True condition permits exactly one unsuspend and guarded cleanup", async () => {
   const f = fixture();
   const api: ProbeApi = { call: async (method, path, timeout, body) => {

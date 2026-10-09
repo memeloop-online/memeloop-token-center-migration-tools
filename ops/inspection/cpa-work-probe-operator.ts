@@ -79,6 +79,16 @@ function reviewedDefaults(actual: Record<string, unknown>, expected: Record<stri
   }
   return isDeepStrictEqual(normalized, expected);
 }
+function denyPolicyMatches(actual: Record<string, unknown>, expected: Record<string, unknown>): boolean {
+  for (const spec of [actual, expected]) {
+    if (!spec || typeof spec !== "object" || Array.isArray(spec)) return false;
+    for (const key of ["ingress", "egress"]) {
+      const rules = spec[key];
+      if (Object.hasOwn(spec, key) && (!Array.isArray(rules) || rules.length !== 0)) return false;
+    }
+  }
+  return isDeepStrictEqual({ ...actual, ingress: [], egress: [] }, { ...expected, ingress: [], egress: [] });
+}
 function securityContext(actual: unknown, expected: unknown, defaults: Record<string, unknown>): boolean {
   if (!actual || typeof actual !== "object" || Array.isArray(actual) || !expected || typeof expected !== "object" || Array.isArray(expected)) return false;
   const normalized = structuredClone(actual) as Record<string, unknown>;
@@ -197,7 +207,7 @@ export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resourc
     identity(pvc, CLAIM, config.pvcUid, config.pvcResourceVersion);
     if (pvc.metadata.deletionTimestamp || pvc.status?.phase !== "Bound" || pvc.spec.volumeName !== `pvc-${PVC_UID}`) throw new Error("PVC_NOT_BOUND");
     const deny = await resource(POLICY, preflightDeadline);
-    if (!isDeepStrictEqual(deny.spec, policy.spec)) throw new Error("NETWORK_DENY_MISMATCH");
+    if (!denyPolicyMatches(deny.spec, policy.spec)) throw new Error("NETWORK_DENY_MISMATCH");
     await capture(preflightDeadline);
     if (pod) throw new Error("ATTEMPT_ALREADY_USED");
     if (clock.cancelled()) throw new Error("CANCELLED");
