@@ -32,7 +32,7 @@ const realClock = (): ProbeClock => {
   let cancelled = false;
   const cancel = () => { cancelled = true; };
   process.once("SIGTERM", cancel); process.once("SIGINT", cancel);
-  return { now: () => wall + performance.now() - mono, sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)), cancelled: () => cancelled };
+  return { now: () => wall + Math.ceil(performance.now() - mono) + 1, sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)), cancelled: () => cancelled };
 };
 export class ApiFailure extends Error {
   readonly statusCode: number;
@@ -75,13 +75,14 @@ function subset(actual: unknown, expected: unknown): boolean {
 function validatePodSpec(actual: Record<string, unknown>, expected: Record<string, unknown>): void {
   if (!subset(actual, expected) || ["hostNetwork", "hostPID", "hostIPC", "shareProcessNamespace"].some((key) => actual[key] === true)) throw new Error("UNSAFE_POD_SPEC");
   if (!isDeepStrictEqual(actual.volumes, expected.volumes)) throw new Error("UNSAFE_VOLUMES");
+  if (!isDeepStrictEqual(actual.securityContext, expected.securityContext)) throw new Error("UNSAFE_SECURITY_CONTEXT");
   for (const key of ["containers", "initContainers"]) {
     const containers = actual[key] as Record<string, unknown>[];
     const reviewed = expected[key] as Record<string, unknown>[];
     for (let i = 0; i < containers.length; i++) {
       const container = containers[i]!;
       const allowed = new Set([...Object.keys(reviewed[i]!), "imagePullPolicy", "terminationMessagePath", "terminationMessagePolicy"]);
-      if (Object.keys(container).some((field) => !allowed.has(field)) || !isDeepStrictEqual(container.volumeMounts, reviewed[i]!.volumeMounts)) throw new Error("UNSAFE_CONTAINER_SPEC");
+      if (Object.keys(container).some((field) => !allowed.has(field)) || !isDeepStrictEqual(container.volumeMounts, reviewed[i]!.volumeMounts) || !isDeepStrictEqual(container.securityContext, reviewed[i]!.securityContext) || !isDeepStrictEqual(container.resources, reviewed[i]!.resources)) throw new Error("UNSAFE_CONTAINER_SPEC");
     }
   }
   if (actual.ephemeralContainers !== undefined) throw new Error("UNSAFE_CONTAINER_SPEC");
