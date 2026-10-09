@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { parseAllDocuments } from "yaml";
 import { PROBE_BUDGET, probeBudget, type ProbeObservation } from "../../ops/inspection/cpa-work-probe-budget.ts";
 import "./cpa-work-probe-operator.test.ts";
+import { DIRECTIO_FILESYSTEM } from "../../ops/inspection/cpa-work-directio-filesystem.ts";
 
 test("independent startup and execution budgets, fresh observations and total-priority clocks", () => {
   const identity = { jobUid: "job-uid", podUid: "pod-uid", pvcUid: "pvc-uid" };
@@ -109,7 +110,7 @@ test("review-only target probe uses pinned dd direct I/O under 128Mi/250m, never
 test("reusable original directory handles absence, empty and owned 0644 leftover, rejects malicious entries and replacement", () => {
   assert.equal(process.env.GITHUB_ACTIONS, "true");
   assert.equal(process.getuid!(), 0);
-  const helper = readFileSync("ops/inspection/cpa-work-directio-filesystem.js", "utf8");
+  const helper = DIRECTIO_FILESYSTEM;
   const [, job] = parseAllDocuments(readFileSync("ops/inspection/cpa-work-directio-20261006a.yaml", "utf8")).map((doc) => doc.toJSON());
   for (const role of ["initContainers", "containers"]) assert.ok(job.spec.template.spec[role][0].args[0].startsWith(helper));
   for (const mode of ["missing", "empty", "leftover", "symlink-dir", "symlink-file", "hardlink", "foreign", "unrelated", "dir-replacement", "file-replacement"]) {

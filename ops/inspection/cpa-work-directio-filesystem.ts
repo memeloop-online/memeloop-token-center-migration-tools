@@ -1,4 +1,5 @@
-// Embedded verbatim in both manifest commands: pinned runtime needs no new image.
+// One reviewed source string, embedded verbatim in the pinned manifest commands.
+export const DIRECTIO_FILESYSTEM = `// Embedded verbatim in both manifest commands: pinned runtime needs no new image.
 import { lstatSync, openSync, fstatSync, readdirSync, mkdirSync, fchownSync, fsyncSync, closeSync, unlinkSync, constants } from 'node:fs';
 const directoryName = 'perf-directio-20261006a', fileName = 'probe.bin';
 const same = (a, b) => a && b && a.dev === b.dev && a.ino === b.ino;
@@ -11,7 +12,7 @@ function openDirectory(root, create) {
   let directory;
   try {
     if (!same(before, fstatSync(parent))) fail();
-    const path = `/proc/self/fd/${parent}/${directoryName}`;
+    const path = \`/proc/self/fd/\${parent}/\${directoryName}\`;
     let prior = absent(path), created = false;
     if (!prior && create) { mkdirSync(path, {mode:0o700}); prior = lstatSync(path); created = true; }
     if (!prior || !prior.isDirectory() || prior.isSymbolicLink()) fail();
@@ -25,7 +26,7 @@ function openDirectory(root, create) {
       if (!same(before, lstatSync(root)) || !same(stat, absent(path))) fail();
     };
     check();
-    return {parent, directory, check, file:`/proc/self/fd/${directory}/${fileName}`};
+    return {parent, directory, check, file:\`/proc/self/fd/\${directory}/\${fileName}\`};
   } catch (error) { if (directory !== undefined) closeSync(directory); closeSync(parent); throw error; }
 }
 function ownedFile(stat) {
@@ -50,11 +51,12 @@ function removeKnown(handle, expected) {
 function initialize(root) {
   const handle = openDirectory(root, true);
   try {
-    const entries = readdirSync(`/proc/self/fd/${handle.directory}`);
+    const entries = readdirSync(\`/proc/self/fd/\${handle.directory}\`);
     if (entries.length > 1 || entries.some((name) => name !== fileName)) fail();
     if (entries.length) { const stat = lstatSync(handle.file); ownedFile(stat); removeKnown(handle, stat); console.log('SYNTHETIC_REMOVED'); }
     handle.check();
-    if (readdirSync(`/proc/self/fd/${handle.directory}`).length || absent(handle.file)) fail();
+    if (readdirSync(\`/proc/self/fd/\${handle.directory}\`).length || absent(handle.file)) fail();
     console.log('SYNTHETIC_ABSENT');
   } finally { closeSync(handle.directory); closeSync(handle.parent); }
 }
+`;
