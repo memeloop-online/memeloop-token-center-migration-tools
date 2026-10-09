@@ -55,6 +55,12 @@ spec:
               const same = (a, b) => a && b && a.dev === b.dev && a.ino === b.ino;
               const fail = () => { throw new Error('DIRECTIO_PATH_REJECTED'); };
               const absent = (path) => lstatSync(path, {throwIfNoEntry:false});
+              function reportFailure(error) {
+                const reviewed = ['DIRECTIO_PATH_REJECTED', 'DIRECTIO_DD_FAILED', 'DIRECTIO_SPACE'];
+                const category = error instanceof Error && reviewed.includes(error.message) ? error.message : 'DIRECTIO_FILESYSTEM_FAILED';
+                console.error(category);
+                process.exitCode = 1;
+              }
               function openDirectory(root, create, metadataOnly = false) {
                 const before = lstatSync(root);
                 if (!before.isDirectory() || before.isSymbolicLink()) fail();
@@ -109,9 +115,11 @@ spec:
                   console.log('SYNTHETIC_ABSENT');
                 } finally { closeSync(handle.directory); closeSync(handle.parent); }
               }
-              const h = openDirectory('/destination', true, true);
-              h.check(); closeSync(h.directory); closeSync(h.parent);
-              console.log('DIRECTORY_READY');
+              try {
+                const h = openDirectory('/destination', true, true);
+                h.check(); closeSync(h.directory); closeSync(h.parent);
+                console.log('DIRECTORY_READY');
+              } catch (error) { reportFailure(error); }
           resources:
             requests: {cpu: 10m, memory: 16Mi}
             limits: {cpu: 100m, memory: 64Mi}
@@ -138,6 +146,12 @@ spec:
               const same = (a, b) => a && b && a.dev === b.dev && a.ino === b.ino;
               const fail = () => { throw new Error('DIRECTIO_PATH_REJECTED'); };
               const absent = (path) => lstatSync(path, {throwIfNoEntry:false});
+              function reportFailure(error) {
+                const reviewed = ['DIRECTIO_PATH_REJECTED', 'DIRECTIO_DD_FAILED', 'DIRECTIO_SPACE'];
+                const category = error instanceof Error && reviewed.includes(error.message) ? error.message : 'DIRECTIO_FILESYSTEM_FAILED';
+                console.error(category);
+                process.exitCode = 1;
+              }
               function openDirectory(root, create, metadataOnly = false) {
                 const before = lstatSync(root);
                 if (!before.isDirectory() || before.isSymbolicLink()) fail();
@@ -194,34 +208,36 @@ spec:
               }
               import {spawnSync} from 'node:child_process';
               import {statfsSync} from 'node:fs';
-              if (process.getuid() !== 10001 || process.getgid() !== 10001) fail();
-              initialize('/destination');
-              const handle = openDirectory('/destination', false);
-              let fd, created;
-              const dd = (args) => {
-                const result = spawnSync('dd', args, {stdio:['ignore','inherit','inherit',fd]});
-                if (result.status !== 0) throw new Error('DIRECTIO_DD_FAILED');
-              };
               try {
-                handle.check();
-                if (readdirSync(`/proc/self/fd/${handle.directory}`).length) fail();
-                const space = statfsSync('/destination');
-                if (space.bavail * space.bsize < 22020096 * 1024) throw new Error('DIRECTIO_SPACE');
-                fd = openSync(handle.file, constants.O_RDWR|constants.O_CREAT|constants.O_EXCL|constants.O_NOFOLLOW, 0o644);
-                created = fstatSync(fd); ownedFile(created); handle.check();
-                console.log('WRITE_START ' + new Date().toISOString());
-                dd(['if=/dev/urandom','of=/proc/self/fd/3','bs=4M','count=256','iflag=fullblock','oflag=direct','conv=notrunc,fsync']);
-                if (fstatSync(fd).size !== 1073741824) fail();
-                console.log('READ_START ' + new Date().toISOString());
-                dd(['if=/proc/self/fd/3','of=/dev/null','bs=4M','count=256','iflag=direct']);
-                removeKnown(handle, created); created = undefined;
-                console.log('SYNTHETIC_ABSENT');
-                console.log('DIRECTIO_COMPLETE ' + new Date().toISOString());
-              } finally {
-                if (created) removeKnown(handle, created);
-                if (fd !== undefined) closeSync(fd);
-                closeSync(handle.directory); closeSync(handle.parent);
-              }
+                if (process.getuid() !== 10001 || process.getgid() !== 10001) fail();
+                initialize('/destination');
+                const handle = openDirectory('/destination', false);
+                let fd, created;
+                const dd = (args) => {
+                  const result = spawnSync('dd', args, {stdio:['ignore','ignore','ignore',fd]});
+                  if (result.status !== 0) throw new Error('DIRECTIO_DD_FAILED');
+                };
+                try {
+                  handle.check();
+                  if (readdirSync(`/proc/self/fd/${handle.directory}`).length) fail();
+                  const space = statfsSync('/destination');
+                  if (space.bavail * space.bsize < 22020096 * 1024) throw new Error('DIRECTIO_SPACE');
+                  fd = openSync(handle.file, constants.O_RDWR|constants.O_CREAT|constants.O_EXCL|constants.O_NOFOLLOW, 0o644);
+                  created = fstatSync(fd); ownedFile(created); handle.check();
+                  console.log('WRITE_START ' + new Date().toISOString());
+                  dd(['if=/dev/urandom','of=/proc/self/fd/3','bs=4M','count=256','iflag=fullblock','oflag=direct','conv=notrunc,fsync']);
+                  if (fstatSync(fd).size !== 1073741824) fail();
+                  console.log('READ_START ' + new Date().toISOString());
+                  dd(['if=/proc/self/fd/3','of=/dev/null','bs=4M','count=256','iflag=direct']);
+                  removeKnown(handle, created); created = undefined;
+                  console.log('SYNTHETIC_ABSENT');
+                  console.log('DIRECTIO_COMPLETE ' + new Date().toISOString());
+                } finally {
+                  if (created) removeKnown(handle, created);
+                  if (fd !== undefined) closeSync(fd);
+                  closeSync(handle.directory); closeSync(handle.parent);
+                }
+              } catch (error) { reportFailure(error); }
           resources:
             requests: {cpu: 50m, memory: 48Mi, ephemeral-storage: 16Mi}
             limits: {cpu: 250m, memory: 128Mi, ephemeral-storage: 32Mi}

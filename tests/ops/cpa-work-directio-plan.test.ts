@@ -141,3 +141,33 @@ test("reusable original directory handles absence, empty and owned 0644 leftover
     } finally { rmSync(root,{recursive:true,force:true}); }
   }
 });
+
+
+test("manifest entrypoints reject native and custom failures with finite output and nonzero exit", () => {
+  assert.equal(process.env.GITHUB_ACTIONS, "true");
+  const [, job] = parseAllDocuments(readFileSync("ops/inspection/cpa-work-directio-20261006a.yaml", "utf8")).map((doc) => doc.toJSON());
+  for (const role of ["initContainers", "containers"]) {
+    const command = job.spec.template.spec[role][0].args[0] as string;
+    for (const [name, action, expected] of [
+      ["native-open", "openSync('/private-cpa30-not-present/raw-path-marker', constants.O_RDONLY);", "DIRECTIO_FILESYSTEM_FAILED"],
+      ["native-list", "readdirSync('/private-cpa30-not-present/raw-path-marker');", "DIRECTIO_FILESYSTEM_FAILED"],
+      ["native-unlink", "unlinkSync('/private-cpa30-not-present/raw-path-marker');", "DIRECTIO_FILESYSTEM_FAILED"],
+      ["access-denied", "throw Object.assign(new Error('raw-path-marker secret-native-message'), {code:'EACCES'});", "DIRECTIO_FILESYSTEM_FAILED"],
+      ["unknown-message", "throw new Error('raw-path-marker secret-native-message');", "DIRECTIO_FILESYSTEM_FAILED"],
+      ["path", "fail();", "DIRECTIO_PATH_REJECTED"],
+      ["dd", "throw new Error('DIRECTIO_DD_FAILED');", "DIRECTIO_DD_FAILED"],
+      ["space", "throw new Error('DIRECTIO_SPACE');", "DIRECTIO_SPACE"],
+    ] as const) {
+      // Keep the exact manifest outer catch; substitute only its action body.
+      const actionStart = command.lastIndexOf("\ntry {\n");
+      const catchStart = command.lastIndexOf("} catch (error) { reportFailure(error); }");
+      assert.ok(actionStart >= 0 && catchStart > actionStart, role);
+      const script = command.slice(0, actionStart) + "\ntry {\n" + action + "\n" + command.slice(catchStart);
+      const result = spawnSync(process.execPath,["--input-type=module","-e",script],{encoding:"utf8",timeout:5000});
+      assert.equal(result.status,1,role+":"+name);
+      assert.equal(result.stdout,"",role+":"+name);
+      assert.equal(result.stderr,expected+"\n",role+":"+name);
+      for (const forbidden of ["raw-path-marker", "secret-native-message", "node:fs", "Error:", " at "]) assert.ok(!result.stderr.includes(forbidden),role+":"+name+":"+forbidden);
+    }
+  }
+});

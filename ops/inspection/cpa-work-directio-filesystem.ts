@@ -5,6 +5,12 @@ const directoryName = 'perf-directio-20261006a', fileName = 'probe.bin';
 const same = (a, b) => a && b && a.dev === b.dev && a.ino === b.ino;
 const fail = () => { throw new Error('DIRECTIO_PATH_REJECTED'); };
 const absent = (path) => lstatSync(path, {throwIfNoEntry:false});
+function reportFailure(error) {
+  const reviewed = ['DIRECTIO_PATH_REJECTED', 'DIRECTIO_DD_FAILED', 'DIRECTIO_SPACE'];
+  const category = error instanceof Error && reviewed.includes(error.message) ? error.message : 'DIRECTIO_FILESYSTEM_FAILED';
+  console.error(category);
+  process.exitCode = 1;
+}
 function openDirectory(root, create, metadataOnly = false) {
   const before = lstatSync(root);
   if (!before.isDirectory() || before.isSymbolicLink()) fail();
