@@ -16,6 +16,10 @@ kind: Job
 metadata:
   name: mtc-cpa-work-directio-20261006a
   namespace: cliproxyapi
+  annotations:
+    memeloop.io/startup-budget-seconds: "60"
+    memeloop.io/exec-budget-seconds: "165"
+    memeloop.io/overall-budget-seconds: "175"
 spec:
   suspend: true
   backoffLimit: 0

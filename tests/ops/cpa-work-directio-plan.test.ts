@@ -5,6 +5,37 @@ import { chownSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync,
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseAllDocuments } from "yaml";
+import { PROBE_BUDGET, probeBudget, type ProbeObservation } from "../../ops/inspection/cpa-work-probe-budget.ts";
+
+test("mount/startup and exec clocks remain separate under the unchanged total cap", () => {
+  const identity = { jobUid: "job-uid", podUid: "pod-uid", pvcUid: "pvc-uid" };
+  const start = Date.parse("2026-10-09T09:00:00Z");
+  const at = (seconds: number) => new Date(start + seconds * 1000).toISOString();
+  const pending: ProbeObservation = { ...identity, ownerUid: identity.jobUid, claimName: "mtc-cpa-recovery-work-20261005", jobStartedAt: at(0), initFailed: false, state: { waiting: { reason: "ContainerCreating" } }, writeStarted: false, complete: false };
+  const late = probeBudget(pending, identity, start + 61_000);
+  assert.equal(late.status, "STARTUP_DEADLINE");
+  assert.equal(late.bytes, null);
+  assert.equal(late.execElapsedMs, null);
+  assert.equal(late.execDeadline, null);
+  assert.equal(late.stopRequired, true);
+  assert.deepEqual(late.cleanupIdentity, identity);
+  assert.equal(probeBudget({ ...pending, initFailed: true }, identity, start + 10_000).status, "STARTUP_FAILED");
+  const running = { ...pending, state: { running: { startedAt: at(50) } } };
+  const begun = probeBudget(running, identity, start + 51_000);
+  assert.equal(begun.status, "EXECUTING");
+  assert.equal(begun.execElapsedMs, 1000);
+  assert.equal(begun.execDeadline, start + 50_000 + PROBE_BUDGET.execMs);
+  assert.equal(probeBudget(running, identity, start + 175_000).status, "TOTAL_DEADLINE");
+  assert.equal(probeBudget({ ...running, state: { running: { startedAt: at(0) } } }, identity, start + 165_000).status, "EXEC_DEADLINE");
+  const done = { ...running, writeStarted: true, complete: true, state: { terminated: { startedAt: at(50), finishedAt: at(90), exitCode: 0 } } };
+  assert.equal(probeBudget(done, identity, start + 100_000).status, "COMPLETE");
+  assert.equal(probeBudget(done, identity, start + 100_000).bytes, 1024 ** 3);
+  assert.equal(probeBudget({ ...done, complete: false, state: { terminated: { startedAt: at(50), finishedAt: at(90), exitCode: 1 } } }, identity, start + 100_000).status, "EXEC_FAILED");
+  assert.throws(() => probeBudget({ ...done, writeStarted: false }, identity, start + 100_000), /MISSING_WRITE_START/);
+  assert.throws(() => probeBudget(pending, { ...identity, podUid: "replacement" }, start + 1000), /IDENTITY_MISMATCH/);
+  assert.throws(() => probeBudget({ ...pending, ownerUid: "other-job" }, identity, start + 1000), /TARGET_MISMATCH/);
+  assert.throws(() => probeBudget({ ...pending, claimName: "frozen-original" }, identity, start + 1000), /TARGET_MISMATCH/);
+});
 
 test("review-only target probe uses pinned dd direct I/O under 128Mi/250m, never another file", { timeout: 210000 }, () => {
   assert.equal(process.env.GITHUB_ACTIONS, "true");
@@ -15,6 +46,9 @@ test("review-only target probe uses pinned dd direct I/O under 128Mi/250m, never
   assert.equal(job.spec.suspend, true);
   assert.equal(job.spec.backoffLimit, 0);
   assert.equal(job.spec.activeDeadlineSeconds + job.spec.template.spec.terminationGracePeriodSeconds, 180);
+  assert.equal(Number(job.metadata.annotations["memeloop.io/startup-budget-seconds"]) * 1000, PROBE_BUDGET.startupMs);
+  assert.equal(Number(job.metadata.annotations["memeloop.io/exec-budget-seconds"]) * 1000, PROBE_BUDGET.execMs);
+  assert.equal(job.spec.activeDeadlineSeconds * 1000, PROBE_BUDGET.totalMs);
   const pod = job.spec.template.spec;
   assert.equal(pod.nodeSelector["kubernetes.io/hostname"], "sansheng-hv");
   assert.equal(pod.automountServiceAccountToken, false);
