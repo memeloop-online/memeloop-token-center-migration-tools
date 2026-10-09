@@ -360,6 +360,9 @@ export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resourc
       stage = "CLEANUP_JOB";
       try {
         const job = await resource(jobPath, deadline); identity(job, config.jobName, config.jobUid);
+        validateJobControls(job.spec, config.jobUid, plan.spec);
+        if (job.spec.activeDeadlineSeconds !== b.totalMs / 1000 || job.spec.backoffLimit !== 0) throw new Error("JOB_CHANGED");
+        validatePodSpec((job.spec.template as { spec: Record<string, unknown> }).spec, expectedPod);
         await call("DELETE", jobPath, deadline, { apiVersion: "v1", kind: "DeleteOptions", propagationPolicy: "Orphan", gracePeriodSeconds: 5, preconditions: { uid: config.jobUid, resourceVersion: job.metadata.resourceVersion } });
         cleanup.jobDeleted = true;
       } catch (error) { if (error instanceof ApiFailure && error.statusCode === 404) cleanup.jobDeleted = true; else cleanup.errors.push("JOB_STOP_UNCONFIRMED"); }
