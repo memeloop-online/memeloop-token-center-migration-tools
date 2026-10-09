@@ -439,7 +439,7 @@ test("diagnostics retain observation GET and separate ambiguous cleanup DELETE w
   assert.equal(cleanup.method, "DELETE"); assert.equal(cleanup.stage, "CLEANUP_JOB");
   assert.equal(cleanup.category, "REQUEST_DEADLINE"); assert.equal(cleanup.acknowledgement, "UNKNOWN");
   assert.equal(deletes, 1); assert.equal(f.operations.filter((op) => op.method === "PATCH").length, 1);
-  assert.deepEqual(receipt.cleanup.errors, ["JOB_STOP_UNCONFIRMED"]);
+  assert.deepEqual(receipt.cleanup.errors, ["JOB_STOP_UNCONFIRMED", "POD_STOP_SKIPPED_JOB_UNCONFIRMED"]);
   assert.deepEqual(receipt.budgets, PROBE_BUDGET);
   const diagnosticText = JSON.stringify(receipt.apiDiagnostics);
   for (const privateValue of [config.jobName, config.jobUid, config.pvcUid, "/apis/", "/api/", "preconditions", "headers", "body"]) assert.ok(!diagnosticText.includes(privateValue), privateValue);
