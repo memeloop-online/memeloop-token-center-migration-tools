@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { createServer } from "node:http";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -925,7 +926,7 @@ test("caller supervisor force-stop is finite and finally runs after a wait rejec
     const work = superviseProbe(process, async () => { cleaned = true; return true; }, () => now, epoch);
     if (rejected) await assert.rejects(work, /WAIT_FAILED/); else { const result = await work; assert.equal(result.forcedStop, true); }
     assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
-    assert.equal(now, epoch + 515_000); assert.equal(cleaned, false); // no new cleanup allocation beyond outer cap
+    assert.equal(now, epoch + (rejected ? 35_000 : 515_000)); assert.equal(cleaned, false); // no new cleanup allocation beyond outer cap
   }
 });
 
@@ -978,4 +979,27 @@ test("failed spawn is observed without bypassing caller finally cleanup", { time
   const result = await superviseProbe(observer, async () => { cleaned = true; return false; }, now, wall);
   assert.ok(result.exit); assert.equal(result.exit.receipt, null); assert.equal(cleaned, true);
   assert.equal(result.cleanupComplete, false);
+});
+
+
+test("an error on a running child never fabricates operator exit", async () => {
+  const child = new EventEmitter() as ChildProcess;
+  Object.assign(child, { pid: 42, exitCode: null, signalCode: null, kill: () => true });
+  const observer = observeProbeProcess(child, () => null, Date.now);
+  child.emit("error", new Error("KILL_FAILED"));
+  assert.equal(await observer.waitUntil(Date.now() + 1), null);
+  child.emit("close", 0, null);
+  assert.ok(await observer.waitUntil(Date.now() + 1000));
+});
+
+test("early cancellation allows only the existing 30s cleanup and 5s grace before force-stop", async () => {
+  let now = epoch + 1000; const waits: number[] = [], signals: string[] = [];
+  const controller = new AbortController(); controller.abort();
+  const process: ProbeProcess = { signal: (signal) => { signals.push(signal); }, waitUntil: async (deadline, signal) => {
+    waits.push(deadline); if (!signal?.aborted) now = deadline; return null;
+  } };
+  const result = await superviseProbe(process, async () => { throw new Error("expired cleanup must not restart"); }, () => now, epoch, controller.signal);
+  assert.deepEqual(waits, [epoch + 480_000, epoch + 36_000]);
+  assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]); assert.equal(result.cleanupComplete, false);
+  assert.equal(result.cleanupDeadline, epoch + 31_000);
 });

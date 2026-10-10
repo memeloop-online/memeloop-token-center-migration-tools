@@ -20,7 +20,7 @@ export function observeProbeProcess(child: ChildProcess, readReceipt: () => Life
       exit = { finishedAt: now(), receipt }; resolve(exit);
     };
     // Failed spawn emits error asynchronously; never let it bypass caller finally.
-    child.on("error", finish);
+    child.on("error", () => { if (child.pid === undefined) finish(); });
     if (child.exitCode !== null || child.signalCode !== null) finish();
     else child.once("close", finish);
   });
@@ -50,6 +50,7 @@ export async function superviseProbe(process: ProbeProcess, cleanup: (deadline: 
   const executionDeadline = start + PROBE_BUDGET.totalMs;
   const outerDeadline = executionDeadline + PROBE_BUDGET.cleanupMs + 5_000;
   let exit: ProbeExit | null = null, forcedStop = false, cleanupComplete = false;
+  let stopStartedAt: string | null = null;
   let deadline = outerDeadline;
   try {
     exit = await process.waitUntil(executionDeadline, signal);
@@ -57,14 +58,16 @@ export async function superviseProbe(process: ProbeProcess, cleanup: (deadline: 
     // Also runs when the wait fails: signal first, allow finally cleanup, then kill.
     try {
       if (!exit) {
+        const stop = now();
+        stopStartedAt = new Date(stop).toISOString();
         process.signal("SIGTERM");
-        exit = await process.waitUntil(outerDeadline);
+        exit = await process.waitUntil(Math.min(outerDeadline, stop + PROBE_BUDGET.cleanupMs + 5_000));
         if (!exit) { process.signal("SIGKILL"); forcedStop = true; }
       }
     } finally {
       const entry = now();
       // Explicit operator cleanup entry wins; older receipts use operator end.
-      deadline = cleanupDeadline(entry, exit?.receipt?.cleanup?.startedAt, exit?.finishedAt, outerDeadline);
+      deadline = cleanupDeadline(entry, exit?.receipt?.cleanup?.startedAt ?? (!exit ? stopStartedAt : null), exit?.finishedAt, outerDeadline);
       const controller = new AbortController();
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {

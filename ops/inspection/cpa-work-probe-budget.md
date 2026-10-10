@@ -100,7 +100,9 @@ Cleanup receipts now expose `cleanup.startedAt` and `cleanup.deadline`, captured
 at the actual operator finally entry. The tracked `cpa-work-probe-lifecycle.ts`
 module supervises an already launched operator using its explicit original
 launch timestamp (delayed supervision never resets it): wait at most 480s, SIGTERM first,
-allow operator finally cleanup, and SIGKILL only at the fixed 515s outer cap.
+allow operator finally cleanup for at most 30s plus 5s grace, and SIGKILL
+within the fixed 515s outer cap. Early cancellation uses the same 30s plus 5s
+from its TERM boundary, without renewing caller cleanup after a forced stop.
 Caller cleanup also runs in finally. It uses the explicit operator cleanup entry
 when present, otherwise the observed operator end (or actual cleanup entry if
 no operator end is available), capped by the same outer deadline. Init/main
