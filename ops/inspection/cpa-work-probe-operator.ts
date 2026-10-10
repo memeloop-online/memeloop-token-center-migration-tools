@@ -51,7 +51,7 @@ function transportCategory(error: unknown, fallback: "REQUEST_ERROR_OTHER" | "RE
   return typeof code === "string" && Object.hasOwn(categories, code) ? categories[code]! : fallback;
 }
 type ApiStage = "PREFLIGHT" | "UNSUSPEND" | "OBSERVATION" | "CLEANUP_CAPTURE" | "CLEANUP_JOB" | "CLEANUP_POD" | "CLEANUP_ABSENCE";
-type ApiResource = "JOB" | "PVC" | "DENY_POLICY" | "OWNED_POD_LIST" | "OWNED_POD" | "DIRECTIO_LOG" | "UNRECOGNIZED";
+type ApiResource = "JOB" | "PVC" | "DENY_POLICY" | "PVC_CONSUMER_LIST" | "OWNED_POD_LIST" | "OWNED_POD" | "DIRECTIO_LOG" | "UNRECOGNIZED";
 type ApiCallDiagnostic = { method: "GET" | "PATCH" | "DELETE"; resource: ApiResource; stage: ApiStage; httpStatus: number | null; startedAt: string; finishedAt: string; timeoutMs: number; requestIssued: boolean; acknowledgement: "NOT_APPLICABLE" | "NOT_ISSUED" | "REJECTED_4XX" | "RESPONSE_RECEIVED" | "UNKNOWN" };
 
 // Transport exposes only the local Unix socket, never TCP or a credential read.
@@ -187,6 +187,7 @@ export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resourc
   const jobPath = `${JOBS}/${config.jobName}`;
   const pvcPath = `${CORE}/persistentvolumeclaims/${CLAIM}`;
   const podsPath = `${CORE}/pods?labelSelector=${encodeURIComponent(`batch.kubernetes.io/controller-uid=${config.jobUid}`)}`;
+  const consumersPath = `${CORE}/pods`;
   const expectedPod = (plan.spec.template as { spec: Record<string, unknown> }).spec;
   const expectedLabels = (plan.spec.template as { metadata: { labels: Record<string, string> } }).metadata.labels;
   if (plan.spec.activeDeadlineSeconds !== b.totalMs / 1000 || plan.spec.backoffLimit !== 0 || expectedPod.activeDeadlineSeconds !== b.totalMs / 1000) throw new Error("PLAN_BUDGET_MISMATCH");
@@ -198,8 +199,8 @@ export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resourc
   const cleanup = { complete: false, jobDeleted: false, podDeleted: false, errors: [] as string[] };
   let stage: ApiStage = "PREFLIGHT";
   const apiDiagnostics = { lastSuccessfulCall: null as ApiCallDiagnostic | null, failures: [] as (ApiCallDiagnostic & { category: string; previousSuccessfulCall: ApiCallDiagnostic | null })[] };
-  const resourceKind = (path: string): ApiResource => path === jobPath ? "JOB" : path === pvcPath ? "PVC" : path === POLICY ? "DENY_POLICY" : path === podsPath ? "OWNED_POD_LIST" : pod && path === `${CORE}/pods/${pod.metadata.name}` ? "OWNED_POD" : pod && path === `${CORE}/pods/${pod.metadata.name}/log?container=directio&limitBytes=4096&tailLines=100` ? "DIRECTIO_LOG" : "UNRECOGNIZED";
-  const call = async (method: "GET" | "PATCH" | "DELETE", path: string, deadline: number, body?: unknown) => {
+  const resourceKind = (path: string): ApiResource => path === jobPath ? "JOB" : path === pvcPath ? "PVC" : path === POLICY ? "DENY_POLICY" : path === consumersPath ? "PVC_CONSUMER_LIST" : path === podsPath ? "OWNED_POD_LIST" : pod && path === `${CORE}/pods/${pod.metadata.name}` ? "OWNED_POD" : pod && path === `${CORE}/pods/${pod.metadata.name}/log?container=directio&limitBytes=4096&tailLines=100` ? "DIRECTIO_LOG" : "UNRECOGNIZED";
+  const callOnce = async (method: "GET" | "PATCH" | "DELETE", path: string, deadline: number, body?: unknown) => {
     const started = clock.now(), remaining = deadline - started;
     const timeoutMs = Math.min(b.apiMs, Math.max(0, remaining));
     let issued = false, responded = false;
@@ -220,6 +221,17 @@ export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resourc
       throw error;
     }
   };
+  const call = async (method: "GET" | "PATCH" | "DELETE", path: string, deadline: number, body?: unknown) => {
+    for (let attempt = 1; ; attempt++) {
+      try { return await callOnce(method, path, deadline, body); }
+      catch (error) {
+        const transient = error instanceof ApiFailure ? [502, 503, 504].includes(error.statusCode)
+          : error instanceof ApiTransportFailure && ["SOCKET_RESET", "REQUEST_DEADLINE", "SOCKET_TIMEOUT", "RESPONSE_ABORTED"].includes(error.category);
+        if (method !== "GET" || !transient || attempt >= 3 || clock.cancelled() || deadline - clock.now() <= b.pollMs) throw error;
+        await clock.sleep(b.pollMs);
+      }
+    }
+  };
   const resource = async (path: string, deadline: number) => await call("GET", path, deadline) as Resource;
   const capture = async (deadline: number) => {
     const items = listItems(await call("GET", podsPath, deadline));
@@ -232,6 +244,11 @@ export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resourc
       validatePodSpec(found.spec, expectedPod);
       pod = found;
     } else if (pod) throw new Error("POD_LOST");
+  };
+  const exclusiveConsumers = async (deadline: number) => {
+    const consumers = listItems(await call("GET", consumersPath, deadline)).filter((item) =>
+      (item.spec.volumes as { persistentVolumeClaim?: { claimName?: string } }[] | undefined)?.some((volume) => volume.persistentVolumeClaim?.claimName === CLAIM));
+    if (consumers.some((item) => !owned(item, config.jobUid) || item.metadata.deletionTimestamp) || consumers.length > 1) throw new Error("PVC_CONSUMER_CONFLICT");
   };
   try {
     const preflightDeadline = clock.now() + b.freshnessMs;
@@ -246,6 +263,7 @@ export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resourc
     if (pvc.metadata.deletionTimestamp || pvc.status?.phase !== "Bound" || pvc.spec.volumeName !== `pvc-${PVC_UID}`) throw new Error("PVC_NOT_BOUND");
     const deny = await resource(POLICY, preflightDeadline);
     if (!denyPolicyMatches(deny.spec, policy.spec)) throw new Error("NETWORK_DENY_MISMATCH");
+    await exclusiveConsumers(preflightDeadline);
     await capture(preflightDeadline);
     if (pod) throw new Error("ATTEMPT_ALREADY_USED");
     if (clock.cancelled()) throw new Error("CANCELLED");
@@ -279,6 +297,7 @@ export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resourc
       const currentPvc = await resource(pvcPath, readDeadline);
       identity(currentPvc, CLAIM, config.pvcUid);
       if (currentPvc.metadata.deletionTimestamp || currentPvc.status?.phase !== "Bound" || currentPvc.spec.volumeName !== `pvc-${PVC_UID}`) throw new Error("PVC_CHANGED");
+      await exclusiveConsumers(readDeadline);
       await capture(readDeadline);
       if (pod) {
         const captured: Resource = pod;
@@ -312,6 +331,7 @@ export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resourc
         const afterLogs = await resource(`${CORE}/pods/${currentPod!.metadata.name}`, readDeadline);
         identity(afterLogs, currentPod!.metadata.name, currentPod!.metadata.uid, currentPod!.metadata.resourceVersion);
         if (!owned(afterLogs, config.jobUid)) throw new Error("POD_OWNERSHIP_REJECTED");
+        validatePodSpec(afterLogs.spec, expectedPod);
       }
       const observation: ProbeObservation = {
         jobUid: currentJob.metadata.uid, jobResourceVersion: currentJob.metadata.resourceVersion,
@@ -340,6 +360,9 @@ export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resourc
       stage = "CLEANUP_JOB";
       try {
         const job = await resource(jobPath, deadline); identity(job, config.jobName, config.jobUid);
+        validateJobControls(job.spec, config.jobUid, plan.spec);
+        if (job.spec.activeDeadlineSeconds !== b.totalMs / 1000 || job.spec.backoffLimit !== 0) throw new Error("JOB_CHANGED");
+        validatePodSpec((job.spec.template as { spec: Record<string, unknown> }).spec, expectedPod);
         await call("DELETE", jobPath, deadline, { apiVersion: "v1", kind: "DeleteOptions", propagationPolicy: "Orphan", gracePeriodSeconds: 5, preconditions: { uid: config.jobUid, resourceVersion: job.metadata.resourceVersion } });
         cleanup.jobDeleted = true;
       } catch (error) { if (error instanceof ApiFailure && error.statusCode === 404) cleanup.jobDeleted = true; else cleanup.errors.push("JOB_STOP_UNCONFIRMED"); }

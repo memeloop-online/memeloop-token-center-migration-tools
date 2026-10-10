@@ -72,6 +72,7 @@ function fixture(mode: "late" | "startup" | "exec" | "total" | "init" | "replace
     }
     if (path.includes("persistentvolumeclaims/")) return structuredClone(enabled && mode === "pvc-replacement" ? { ...pvc, metadata: { ...pvc.metadata, uid: "other-pvc" } } : pvc);
     if (path.includes("networkpolicies/")) return structuredClone(reviewedPolicy);
+    if (path === `${ns}/pods`) { updatePod(); return { items: pod && !podGone ? [structuredClone(pod)] : [] }; }
     updatePod();
     if (path.includes("/log?")) {
       if (mode === "post-log-replacement" && pod) pod.metadata.uid = "33333333-3333-4333-8333-333333333333";
@@ -423,8 +424,10 @@ test("diagnostics retain observation GET and separate ambiguous cleanup DELETE w
     if (method === "PATCH") patched = true;
     return value;
   } };
-  const receipt = await runProbe(config, api, reviewedPlan, reviewedPolicy, f.clock);
-  assert.equal(receipt.status, "API_TRANSPORT_FAILED"); assert.equal(receipt.bytes, null);
+  let firstSleep = true;
+  const clock: ProbeClock = { ...f.clock, sleep: async (ms) => { if (firstSleep) { firstSleep = false; f.setNow(f.now() + ms); } else await f.clock.sleep(ms); } };
+  const receipt = await runProbe(config, api, reviewedPlan, reviewedPolicy, clock);
+  assert.equal(receipt.status, "COMPLETE"); assert.equal(receipt.passed, false);
   const [read, cleanup] = receipt.apiDiagnostics.failures;
   assert.ok(read && cleanup);
   assert.equal(read.method, "GET"); assert.equal(read.stage, "OBSERVATION"); assert.equal(read.resource, "JOB");
@@ -436,7 +439,7 @@ test("diagnostics retain observation GET and separate ambiguous cleanup DELETE w
   assert.equal(cleanup.method, "DELETE"); assert.equal(cleanup.stage, "CLEANUP_JOB");
   assert.equal(cleanup.category, "REQUEST_DEADLINE"); assert.equal(cleanup.acknowledgement, "UNKNOWN");
   assert.equal(deletes, 1); assert.equal(f.operations.filter((op) => op.method === "PATCH").length, 1);
-  assert.deepEqual(receipt.cleanup.errors, ["JOB_STOP_UNCONFIRMED"]);
+  assert.deepEqual(receipt.cleanup.errors, ["JOB_STOP_UNCONFIRMED", "POD_STOP_SKIPPED_JOB_UNCONFIRMED"]);
   assert.deepEqual(receipt.budgets, PROBE_BUDGET);
   const diagnosticText = JSON.stringify(receipt.apiDiagnostics);
   for (const privateValue of [config.jobName, config.jobUid, config.pvcUid, "/apis/", "/api/", "preconditions", "headers", "body"]) assert.ok(!diagnosticText.includes(privateValue), privateValue);
@@ -535,4 +538,52 @@ test("real CLI decision entry uses Unix HTTP and guarded startup-failure cleanup
   } finally {
     await new Promise<void>((resolveClosed) => server.close(() => resolveClosed())); rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("GET-only recovery keeps three-call cap, original phase deadline and permanent rejection", async () => {
+  for (const mode of ["reset", "deadline", "502", "503", "504", "cap", "403", "json", "phase-deadline", "replacement", "spec-mismatch", "cleanup-deadline"] as const) {
+    const f = fixture(); let patched = false, failed = 0, retrySleep = false, deletes = 0, cleanupStart = 0;
+    const recoveryClock: ProbeClock = { ...f.clock, sleep: async (ms) => {
+      if (retrySleep) { f.setNow(f.now() + ms); retrySleep = false; }
+      else await f.clock.sleep(ms);
+    } };
+    const api: ProbeApi = { call: async (method, path, timeout, body) => {
+      if (method === "PATCH") patched = true;
+      if (method === "DELETE") { deletes++; if (!cleanupStart) cleanupStart = f.now(); }
+      if (method === "GET" && patched && path === jobPath && deletes === 0 && (failed === 0 || mode === "cap" && failed < 3)) {
+        failed++; retrySleep = true;
+        if (mode === "phase-deadline") f.setNow(epoch + PROBE_BUDGET.startupMs - 500);
+        if (mode === "403") throw new ApiFailure(403);
+        if (mode === "json") throw new ApiTransportFailure("API_JSON_INVALID", "JSON_INVALID", 200);
+        if (["502", "503", "504"].includes(mode)) throw new ApiFailure(Number(mode));
+        throw new ApiTransportFailure("API_TRANSPORT_FAILED", mode === "deadline" ? "REQUEST_DEADLINE" : "SOCKET_RESET", null);
+      }
+      if (mode === "cleanup-deadline" && deletes && method === "GET" && path === jobPath) {
+        f.setNow(cleanupStart + PROBE_BUDGET.cleanupMs - 500);
+        throw new ApiFailure(503);
+      }
+      const value = await f.api.call(method, path, timeout, body);
+      if (method === "GET" && path === jobPath && patched && deletes === 0 && failed && mode === "replacement") (value as Resource).metadata.uid = "replacement";
+      if (method === "GET" && path === jobPath && patched && deletes === 0 && failed && mode === "spec-mismatch") ((value as Resource).spec.template as {spec: Record<string, unknown>}).spec.hostNetwork = true;
+      return value;
+    } };
+    const receipt = await runProbe(config, api, reviewedPlan, reviewedPolicy, recoveryClock);
+    const recovered = ["reset", "deadline", "502", "503", "504"].includes(mode);
+    assert.equal(receipt.passed, recovered, mode);
+    assert.equal(f.operations.filter((op) => op.method === "PATCH").length, 1, mode);
+    assert.ok(deletes <= 2, mode);
+    assert.equal(failed, mode === "cap" ? 3 : 1, mode);
+    assert.equal(receipt.apiDiagnostics.failures[0]?.stage, "OBSERVATION", mode);
+    assert.ok(receipt.apiDiagnostics.failures.every((entry) => entry.timeoutMs <= 2000), mode);
+    if (mode === "phase-deadline") assert.ok(f.now() <= epoch + PROBE_BUDGET.startupMs + PROBE_BUDGET.cleanupMs);
+    if (mode === "cleanup-deadline") { assert.equal(receipt.cleanup.complete,false); assert.ok(f.now() <= cleanupStart + PROBE_BUDGET.cleanupMs); }
+  }
+});
+
+test("proven PVC rejects a conflicting consumer before any mutation", async () => {
+  const f = fixture();
+  const api: ProbeApi = { call: async (method,path,timeout,body) => path === `${ns}/pods` ? {items:[{metadata:{name:"foreign",namespace:"cliproxyapi",uid:"other",resourceVersion:"1"},spec:{volumes:[{persistentVolumeClaim:{claimName:"mtc-cpa-recovery-work-20261005"}}]}}]} : f.api.call(method,path,timeout,body) };
+  const receipt = await runProbe(config,api,reviewedPlan,reviewedPolicy,f.clock);
+  assert.equal(receipt.status,"PVC_CONSUMER_CONFLICT"); assert.equal(receipt.passed,false);
+  assert.equal(f.operations.some((op) => op.method !== "GET"),false);
 });

@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { spawnSync } from "node:child_process";
-import { chownSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chownSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, lstatSync, symlinkSync, linkSync, renameSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseAllDocuments } from "yaml";
 import { PROBE_BUDGET, probeBudget, type ProbeObservation } from "../../ops/inspection/cpa-work-probe-budget.ts";
 import "./cpa-work-probe-operator.test.ts";
+import { DIRECTIO_FILESYSTEM } from "../../ops/inspection/cpa-work-directio-filesystem.ts";
 
 test("independent startup and execution budgets, fresh observations and total-priority clocks", () => {
   const identity = { jobUid: "job-uid", podUid: "pod-uid", pvcUid: "pvc-uid" };
@@ -70,15 +71,19 @@ test("review-only target probe uses pinned dd direct I/O under 128Mi/250m, never
   assert.deepEqual(pod.volumes, [{ name: "destination", persistentVolumeClaim: { claimName: "mtc-cpa-recovery-work-20261005" } }]);
   const runtime = pod.containers[0];
   assert.deepEqual(runtime.resources.limits, { cpu: "250m", memory: "128Mi", "ephemeral-storage": "32Mi" });
-  assert.ok(runtime.args[0].includes("oflag=direct conv=notrunc,fsync"));
+  assert.ok(runtime.args[0].includes("oflag=direct") && runtime.args[0].includes("conv=notrunc,fsync"));
   assert.ok(runtime.args[0].includes("iflag=direct"));
   const root = mkdtempSync(join(tmpdir(), "cpa-directio-gha-"));
   chmodSync(root, 0o755);
   const directory = join(root, "perf-directio-20261006a");
   const name = `cpa-directio-${process.pid}-${Date.now()}`;
   const retained = join(root, "old.partial");
-  mkdirSync(directory, { mode: 0o700 });
-  chownSync(directory, 10001, 10001);
+  const init = pod.initContainers[0];
+  const initialization = spawnSync("docker", ["run", "--rm", "--network", "none", "--read-only", "--cap-drop", "ALL", "--cap-add", "CHOWN", "--security-opt", "no-new-privileges", "--user", "0:0", "--volume", `${root}:/destination:rw`, "--entrypoint", init.command[0], init.image, ...init.command.slice(1), ...init.args], { encoding: "utf8", timeout: 10000 });
+  assert.equal(initialization.status, 0, initialization.stderr);
+  assert.ok(initialization.stdout.includes("DIRECTORY_READY"));
+  const reuse = spawnSync("docker", ["run", "--rm", "--network", "none", "--read-only", "--cap-drop", "ALL", "--cap-add", "CHOWN", "--security-opt", "no-new-privileges", "--user", "0:0", "--volume", `${root}:/destination:rw`, "--entrypoint", init.command[0], init.image, ...init.command.slice(1), ...init.args], { encoding: "utf8", timeout: 10000 });
+  assert.equal(reuse.status, 0, reuse.stderr);
   writeFileSync(retained, "preserve old partial", { flag: "wx" });
   let passed = false;
   try {
@@ -100,5 +105,69 @@ test("review-only target probe uses pinned dd direct I/O under 128Mi/250m, never
     spawnSync("docker", ["rm", "--force", name], { stdio: "ignore" });
     if (process.env.RUNNER_TEMP) writeFileSync(join(process.env.RUNNER_TEMP, "cpa-work-directio-command-result.json"), JSON.stringify({ passed, image: runtime.image, testedCommit: process.env.GITHUB_SHA, bytes: 1024 ** 3 }) + "\n");
     rmSync(root, { recursive: true });
+  }
+});
+
+
+test("reusable original directory handles absence, empty and owned 0644 leftover, rejects malicious entries and replacement", () => {
+  assert.equal(process.env.GITHUB_ACTIONS, "true");
+  assert.equal(process.getuid!(), 0);
+  const helper = DIRECTIO_FILESYSTEM;
+  const [, job] = parseAllDocuments(readFileSync("ops/inspection/cpa-work-directio-20261006a.yaml", "utf8")).map((doc) => doc.toJSON());
+  for (const role of ["initContainers", "containers"]) assert.ok(job.spec.template.spec[role][0].args[0].startsWith(helper));
+  for (const mode of ["missing", "empty", "leftover", "symlink-dir", "symlink-file", "hardlink", "foreign", "unrelated", "dir-replacement", "file-replacement"]) {
+    const root = mkdtempSync(join(tmpdir(), "cpa-init-fixture-"));
+    const directory = join(root, "perf-directio-20261006a"), file = join(directory, "probe.bin"), retained = join(root, "old.partial");
+    writeFileSync(retained, "retained", {flag:"wx"});
+    try {
+      if (mode === "symlink-dir") symlinkSync(root, directory);
+      else if (mode !== "missing") { mkdirSync(directory, {mode:0o700}); chownSync(directory,10001,10001); }
+      if (["leftover", "hardlink", "foreign", "file-replacement"].includes(mode)) { writeFileSync(file,"synthetic",{mode:0o644}); if (mode !== "foreign") chownSync(file,10001,10001); }
+      if (mode === "symlink-file") symlinkSync(retained,file);
+      if (mode === "hardlink") linkSync(file,join(root,"alias"));
+      if (mode === "unrelated") writeFileSync(join(directory,"old.partial"),"real data");
+      const injection = mode === "dir-replacement" ? `const h = openDirectory(${JSON.stringify(root)}, false); renameSync(${JSON.stringify(directory)},${JSON.stringify(directory + "-held")}); mkdirSync(${JSON.stringify(directory)}, {mode:0o700}); h.check();`
+        : mode === "file-replacement" ? `const h = openDirectory(${JSON.stringify(root)}, false); const original = lstatSync(h.file); renameSync(h.file,${JSON.stringify(join(directory,"saved"))}); writeFileSync(h.file,'unrelated'); chownSync(h.file,10001,10001); removeKnown(h, original);`
+        : `initialize(${JSON.stringify(root)});`;
+      const result = spawnSync(process.execPath,["--input-type=module","-e", helper + "\nimport {renameSync, writeFileSync, chownSync} from 'node:fs';\n" + injection],{encoding:"utf8",timeout:5000});
+      const valid = ["missing","empty","leftover"].includes(mode);
+      assert.equal(result.status === 0, valid, mode + result.stderr);
+      assert.equal(readFileSync(retained,"utf8"),"retained");
+      if (valid) { assert.equal(lstatSync(directory).uid,10001); assert.deepEqual(readdirSync(directory),[]); assert.ok(result.stdout.includes("SYNTHETIC_ABSENT")); }
+      if (mode === "leftover") assert.ok(result.stdout.includes("SYNTHETIC_REMOVED"));
+      if (mode === "file-replacement") assert.equal(readFileSync(file,"utf8"),"unrelated");
+      if (mode === "hardlink") assert.equal(readFileSync(join(root,"alias"),"utf8"),"synthetic");
+      if (mode === "unrelated") assert.equal(readFileSync(join(directory,"old.partial"),"utf8"),"real data");
+    } finally { rmSync(root,{recursive:true,force:true}); }
+  }
+});
+
+
+test("manifest entrypoints reject native and custom failures with finite output and nonzero exit", () => {
+  assert.equal(process.env.GITHUB_ACTIONS, "true");
+  const [, job] = parseAllDocuments(readFileSync("ops/inspection/cpa-work-directio-20261006a.yaml", "utf8")).map((doc) => doc.toJSON());
+  for (const role of ["initContainers", "containers"]) {
+    const command = job.spec.template.spec[role][0].args[0] as string;
+    for (const [name, action, expected] of [
+      ["native-open", "openSync('/private-cpa30-not-present/raw-path-marker', constants.O_RDONLY);", "DIRECTIO_FILESYSTEM_FAILED"],
+      ["native-list", "readdirSync('/private-cpa30-not-present/raw-path-marker');", "DIRECTIO_FILESYSTEM_FAILED"],
+      ["native-unlink", "unlinkSync('/private-cpa30-not-present/raw-path-marker');", "DIRECTIO_FILESYSTEM_FAILED"],
+      ["access-denied", "throw Object.assign(new Error('raw-path-marker secret-native-message'), {code:'EACCES'});", "DIRECTIO_FILESYSTEM_FAILED"],
+      ["unknown-message", "throw new Error('raw-path-marker secret-native-message');", "DIRECTIO_FILESYSTEM_FAILED"],
+      ["path", "fail();", "DIRECTIO_PATH_REJECTED"],
+      ["dd", "throw new Error('DIRECTIO_DD_FAILED');", "DIRECTIO_DD_FAILED"],
+      ["space", "throw new Error('DIRECTIO_SPACE');", "DIRECTIO_SPACE"],
+    ] as const) {
+      // Keep the exact manifest outer catch; substitute only its action body.
+      const actionStart = command.lastIndexOf("\ntry {\n");
+      const catchStart = command.lastIndexOf("} catch (error) { reportFailure(error); }");
+      assert.ok(actionStart >= 0 && catchStart > actionStart, role);
+      const script = command.slice(0, actionStart) + "\ntry {\n" + action + "\n" + command.slice(catchStart);
+      const result = spawnSync(process.execPath,["--input-type=module","-e",script],{encoding:"utf8",timeout:5000});
+      assert.equal(result.status,1,role+":"+name);
+      assert.equal(result.stdout,"",role+":"+name);
+      assert.equal(result.stderr,expected+"\n",role+":"+name);
+      for (const forbidden of ["raw-path-marker", "secret-native-message", "node:fs", "Error:", " at "]) assert.ok(!result.stderr.includes(forbidden),role+":"+name+":"+forbidden);
+    }
   }
 });
