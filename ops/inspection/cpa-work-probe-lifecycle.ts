@@ -14,10 +14,13 @@ export function observeProbeProcess(child: ChildProcess, readReceipt: () => Life
   let exit: ProbeExit | null = null;
   const completion = new Promise<ProbeExit>((resolve) => {
     const finish = () => {
+      if (exit) return;
       let receipt: LifecycleReceipt | null = null;
       try { receipt = readReceipt(); } catch { /* finally cleanup still runs */ }
       exit = { finishedAt: now(), receipt }; resolve(exit);
     };
+    // Failed spawn emits error asynchronously; never let it bypass caller finally.
+    child.on("error", finish);
     if (child.exitCode !== null || child.signalCode !== null) finish();
     else child.once("close", finish);
   });
@@ -41,8 +44,9 @@ export function observeProbeProcess(child: ChildProcess, readReceipt: () => Life
 
 // Callers use this tracked lifecycle instead of inferring cleanup from Pod status.
 // now must use the same monotonic epoch clock as the process adapter.
-export async function superviseProbe(process: ProbeProcess, cleanup: (deadline: number, signal: AbortSignal) => Promise<boolean>, now: () => number, signal?: AbortSignal) {
-  const start = now();
+export async function superviseProbe(process: ProbeProcess, cleanup: (deadline: number, signal: AbortSignal) => Promise<boolean>, now: () => number, startedAt: number, signal?: AbortSignal) {
+  if (!Number.isFinite(startedAt) || startedAt > now()) throw new Error("INVALID_OPERATOR_START");
+  const start = startedAt;
   const executionDeadline = start + PROBE_BUDGET.totalMs;
   const outerDeadline = executionDeadline + PROBE_BUDGET.cleanupMs + 5_000;
   let exit: ProbeExit | null = null, forcedStop = false, cleanupComplete = false;

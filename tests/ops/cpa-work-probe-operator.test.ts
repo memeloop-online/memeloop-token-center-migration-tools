@@ -909,7 +909,7 @@ test("caller supervisor signals first, uses explicit cleanup boundary and keeps 
   } };
   const result = await superviseProbe(process, async (deadline) => {
     assert.deepEqual(signals, ["SIGTERM"]); assert.equal(deadline, epoch + 510_000); return true;
-  }, () => now);
+  }, () => now, epoch);
   assert.deepEqual(waits, [epoch + 480_000, epoch + 515_000]);
   assert.equal(result.cleanupComplete, true); assert.equal(result.outerDeadline, epoch + 515_000);
 });
@@ -922,7 +922,7 @@ test("caller supervisor force-stop is finite and finally runs after a wait rejec
       if (rejected && waits === 1) throw new Error("WAIT_FAILED");
       now = deadline; return null;
     } };
-    const work = superviseProbe(process, async () => { cleaned = true; return true; }, () => now);
+    const work = superviseProbe(process, async () => { cleaned = true; return true; }, () => now, epoch);
     if (rejected) await assert.rejects(work, /WAIT_FAILED/); else { const result = await work; assert.equal(result.forcedStop, true); }
     assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
     assert.equal(now, epoch + 515_000); assert.equal(cleaned, false); // no new cleanup allocation beyond outer cap
@@ -935,7 +935,7 @@ test("caller finally cleanup after a failed wait uses operator end for older rec
     if (++waits === 1) throw new Error("WAIT_FAILED");
     now += 1000; return { finishedAt: now, receipt: null };
   } };
-  await assert.rejects(superviseProbe(process, async (deadline) => { cleaned = true; assert.equal(deadline, epoch + 31_000); return true; }, () => now), /WAIT_FAILED/);
+  await assert.rejects(superviseProbe(process, async (deadline) => { cleaned = true; assert.equal(deadline, epoch + 31_000); return true; }, () => now, epoch), /WAIT_FAILED/);
   assert.equal(cleaned, true); assert.deepEqual(signals, ["SIGTERM"]);
 });
 
@@ -958,4 +958,24 @@ test("process adapter wait is bounded and cancellation preserves later exit obse
     observer.signal("SIGTERM");
     const exit = await observer.waitUntil(Date.now() + 2000); assert.ok(exit); assert.equal(exit.receipt, null);
   } finally { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); }
+});
+
+
+test("delayed caller supervision never resets the original launch clock", async () => {
+  let now = epoch + 60_000; const waits: number[] = [], signals: string[] = [];
+  const process: ProbeProcess = { signal: (signal) => { signals.push(signal); }, waitUntil: async (deadline) => { waits.push(deadline); now = deadline; return null; } };
+  const result = await superviseProbe(process, async () => true, () => now, epoch);
+  assert.deepEqual(waits, [epoch + 480_000, epoch + 515_000]);
+  assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]); assert.equal(result.outerDeadline, epoch + 515_000);
+});
+
+test("failed spawn is observed without bypassing caller finally cleanup", { timeout: 5000 }, async () => {
+  assert.equal(process.env.GITHUB_ACTIONS, "true");
+  const wall = Date.now(), mono = performance.now(); const now = () => wall + performance.now() - mono;
+  const child = spawn("/nonexistent-cpa-fixture-operator", [], { stdio: "ignore" });
+  const observer = observeProbeProcess(child, () => null, now);
+  let cleaned = false;
+  const result = await superviseProbe(observer, async () => { cleaned = true; return false; }, now, wall);
+  assert.ok(result.exit); assert.equal(result.exit.receipt, null); assert.equal(cleaned, true);
+  assert.equal(result.cleanupComplete, false);
 });
