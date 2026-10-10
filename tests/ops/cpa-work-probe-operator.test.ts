@@ -943,7 +943,7 @@ test("caller hanging cleanup is aborted without extending its explicit deadline"
   const now = epoch + 30_000;
   const process: ProbeProcess = { signal: () => { throw new Error("unexpected signal"); }, waitUntil: async () => ({ finishedAt: now, receipt: { cleanup: { startedAt: new Date(epoch + 1).toISOString() } } }) };
   let aborted = false;
-  const result = await superviseProbe(process, async (_deadline, signal) => new Promise<boolean>((resolve) => { signal.addEventListener("abort", () => { aborted = true; resolve(false); }, { once: true }); }), () => now);
+  const result = await superviseProbe(process, async (_deadline, signal) => new Promise<boolean>((resolve) => { signal.addEventListener("abort", () => { aborted = true; resolve(false); }, { once: true }); }), () => now, epoch);
   assert.equal(result.cleanupComplete, false); assert.equal(aborted, true); assert.equal(result.cleanupDeadline, now + 1);
 });
 
