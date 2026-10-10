@@ -592,14 +592,171 @@ function withConsumers(f: ReturnType<typeof fixture>, consumers: Resource[]): Pr
 }
 
 test("four supplied terminal PVC references coexist with one successful owned probe", async () => {
+  // Exact sanitized status shape from the 05:20 terminal-consumer receipt.
+  // No restartCount or other optional status fields are invented for this evidence.
   const historical = [
-    foreignConsumer("mtc-cpa-copy-destination-inspect-20261005", { phase: "Succeeded" }),
-    foreignConsumer("mtc-cpa-copy-destination-inspect-20261005b", { phase: "Succeeded", containerStatuses: [], initContainerStatuses: [], ephemeralContainerStatuses: [] }),
-    foreignConsumer("mtc-cpa-recovery-copy-20261005-4mz8q", { phase: "Failed", initContainerStatuses: [{ name: "copy-init", restartCount: 0, state: { terminated: { finishedAt: new Date(epoch).toISOString(), exitCode: 1 } } }] }),
-    foreignConsumer("mtc-cpa-recovery-copy-20261005-r2-62tt6", { phase: "Failed", containerStatuses: [{ name: "copy", restartCount: 0, state: { terminated: { finishedAt: new Date(epoch).toISOString(), exitCode: 1 } } }], ephemeralContainerStatuses: [{ name: "debug", restartCount: 0, state: { terminated: { finishedAt: new Date(epoch).toISOString(), exitCode: 0 } } }] }),
-  ];
-  const suppliedUids = ["13eec83e-c09c-4649-8792-6908df9d1cb6", "b94d92c1-29a4-474b-a559-5f77c1090408", "bdd35434-e245-4a56-94eb-06f4dd1cface", "2532863b-36e5-4a20-b89f-9260b4c8a4a7"];
-  historical.forEach((pod, index) => { pod.metadata.uid = suppliedUids[index]!; });
+    {
+      "metadata": {
+        "name": "mtc-cpa-copy-destination-inspect-20261005",
+        "namespace": "cliproxyapi",
+        "uid": "13eec83e-c09c-4649-8792-6908df9d1cb6",
+        "resourceVersion": "72426988"
+      },
+      "spec": {
+        "volumes": [
+          {
+            "persistentVolumeClaim": {
+              "claimName": "mtc-cpa-recovery-work-20261005"
+            }
+          }
+        ]
+      },
+      "status": {
+        "phase": "Succeeded",
+        "containerStatuses": [
+          {
+            "name": "inspect",
+            "state": {
+              "terminated": {
+                "exitCode": 0,
+                "finishedAt": "2026-10-05T18:10:31Z",
+                "reason": "Completed",
+                "startedAt": "2026-10-05T18:10:30Z"
+              }
+            }
+          }
+        ],
+        "initContainerStatuses": [],
+        "ephemeralContainerStatuses": []
+      }
+    },
+    {
+      "metadata": {
+        "name": "mtc-cpa-copy-destination-inspect-20261005b",
+        "namespace": "cliproxyapi",
+        "uid": "b94d92c1-29a4-474b-a559-5f77c1090408",
+        "resourceVersion": "72429427"
+      },
+      "spec": {
+        "volumes": [
+          {
+            "persistentVolumeClaim": {
+              "claimName": "mtc-cpa-recovery-work-20261005"
+            }
+          }
+        ]
+      },
+      "status": {
+        "phase": "Succeeded",
+        "containerStatuses": [
+          {
+            "name": "inspect",
+            "state": {
+              "terminated": {
+                "exitCode": 0,
+                "finishedAt": "2026-10-05T18:14:41Z",
+                "reason": "Completed",
+                "startedAt": "2026-10-05T18:14:41Z"
+              }
+            }
+          }
+        ],
+        "initContainerStatuses": [],
+        "ephemeralContainerStatuses": []
+      }
+    },
+    {
+      "metadata": {
+        "name": "mtc-cpa-recovery-copy-20261005-4mz8q",
+        "namespace": "cliproxyapi",
+        "uid": "bdd35434-e245-4a56-94eb-06f4dd1cface",
+        "resourceVersion": "72423323"
+      },
+      "spec": {
+        "volumes": [
+          {
+            "persistentVolumeClaim": {
+              "claimName": "mtc-cpa-recovery-work-20261005"
+            }
+          }
+        ]
+      },
+      "status": {
+        "phase": "Failed",
+        "containerStatuses": [
+          {
+            "name": "verified-copy",
+            "state": {
+              "waiting": {
+                "reason": "PodInitializing"
+              }
+            }
+          }
+        ],
+        "initContainerStatuses": [
+          {
+            "name": "create-new-private-destination",
+            "state": {
+              "terminated": {
+                "exitCode": 1,
+                "finishedAt": "2026-10-05T18:04:22Z",
+                "reason": "Error",
+                "startedAt": "2026-10-05T18:04:21Z"
+              }
+            }
+          }
+        ],
+        "ephemeralContainerStatuses": []
+      }
+    },
+    {
+      "metadata": {
+        "name": "mtc-cpa-recovery-copy-20261005-r2-62tt6",
+        "namespace": "cliproxyapi",
+        "uid": "2532863b-36e5-4a20-b89f-9260b4c8a4a7",
+        "resourceVersion": "72445061"
+      },
+      "spec": {
+        "volumes": [
+          {
+            "persistentVolumeClaim": {
+              "claimName": "mtc-cpa-recovery-work-20261005"
+            }
+          }
+        ]
+      },
+      "status": {
+        "phase": "Failed",
+        "containerStatuses": [
+          {
+            "name": "verified-copy",
+            "state": {
+              "terminated": {
+                "exitCode": 1,
+                "finishedAt": "2026-10-05T18:41:48Z",
+                "reason": "Error",
+                "startedAt": "2026-10-05T18:21:33Z"
+              }
+            }
+          }
+        ],
+        "initContainerStatuses": [
+          {
+            "name": "create-new-private-destination",
+            "state": {
+              "terminated": {
+                "exitCode": 0,
+                "finishedAt": "2026-10-05T18:21:32Z",
+                "reason": "Completed",
+                "startedAt": "2026-10-05T18:21:32Z"
+              }
+            }
+          }
+        ],
+        "ephemeralContainerStatuses": []
+      }
+    }
+  ] as unknown as Resource[];
   const original = structuredClone(historical);
   for (const deleting of [false, true]) {
     const references = structuredClone(historical);
@@ -616,6 +773,25 @@ test("four supplied terminal PVC references coexist with one successful owned pr
   assert.deepEqual(historical, original);
 });
 
+test("terminal waiting containers need no specific reason, name or optional status fields", async () => {
+  for (const phase of ["Succeeded", "Failed"]) {
+    for (const field of ["containerStatuses", "initContainerStatuses", "ephemeralContainerStatuses"] as const) {
+      for (const waiting of [{}, { reason: "UnrelatedWaitingReason" }, { reason: "PodInitializing" }]) {
+        for (const deleting of [false, true]) {
+          const consumer = foreignConsumer("arbitrary-terminal-name", { phase, [field]: [{ state: { waiting } }] } as Resource["status"]);
+          if (deleting) consumer.metadata.deletionTimestamp = new Date(epoch).toISOString();
+          const f = fixture();
+          const receipt = await runProbe(config, withConsumers(f, [consumer]), reviewedPlan, reviewedPolicy, f.clock);
+          assert.equal(receipt.status, "COMPLETE"); assert.equal(receipt.passed, true);
+          assert.equal(f.operations.filter((op) => op.method === "PATCH").length, 1);
+          assert.deepEqual(f.operations.filter((op) => op.method === "DELETE").map((op) => op.path), [jobPath, podPath]);
+          console.log(JSON.stringify({ fixture: "terminal-waiting-accept", phase, field, waiting, deleting, status: receipt.status, patches: 1, deletes: 2 }));
+        }
+      }
+    }
+  }
+});
+
 test("active, missing and ambiguous PVC consumers reject before any mutation", async () => {
   const vectors: [string, Resource["status"]][] = [
     ["missing status", undefined], ["missing phase", {}],
@@ -625,11 +801,10 @@ test("active, missing and ambiguous PVC consumers reject before any mutation", a
     for (const field of ["containerStatuses", "initContainerStatuses", "ephemeralContainerStatuses"] as const) {
       for (const [name, state] of [
         ["running", { running: { startedAt: new Date(epoch).toISOString() } }],
-        ["waiting", { waiting: { reason: "PodInitializing" } }],
         ["unknown", {}],
         ["contradictory", { running: { startedAt: new Date(epoch).toISOString() }, terminated: { finishedAt: new Date(epoch).toISOString(), exitCode: 0 } }],
       ] as const) vectors.push([`${phase}/${field}/${name}`, { phase, [field]: [{ name: "foreign", restartCount: 0, state }] }]);
-      for (const malformed of [null, {}, [null], [{ name: "foreign" }], [{ state: { terminated: null } }]]) {
+      for (const malformed of [null, {}, [null], [{ name: "foreign" }], [{ state: { terminated: null } }], [{ state: { waiting: null } }], [{ state: { waiting: {}, terminated: {} } }]]) {
         vectors.push([`${phase}/${field}/malformed-${JSON.stringify(malformed)}`, { phase, [field]: malformed } as unknown as Resource["status"]]);
       }
     }

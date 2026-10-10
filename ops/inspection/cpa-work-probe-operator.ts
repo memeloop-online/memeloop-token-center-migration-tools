@@ -163,12 +163,13 @@ function activePvcConsumer(pod: Resource): boolean {
   const status = pod.status;
   if (status?.phase !== "Succeeded" && status?.phase !== "Failed") return true;
   // Kubernetes terminal phases mean all containers stopped and will not restart.
-  // Optional status lists need not exist, but contradictory or ambiguous states
-  // must retain the conflict, including init/ephemeral containers and deleting Pods.
+  // A failed init may leave never-started containers waiting in a terminal Pod.
+  // Optional lists need not exist; running or unknown states still conflict.
   return [status.containerStatuses, status.initContainerStatuses, status.ephemeralContainerStatuses].some((statuses) =>
     statuses !== undefined && (!Array.isArray(statuses) || statuses.some((container) => {
       const state = container?.state;
-      return !state || typeof state.terminated !== "object" || state.terminated === null || Array.isArray(state.terminated) || Object.keys(state).some((key) => key !== "terminated");
+      return !state || Object.keys(state).length !== 1 || !Object.entries(state).every(([key, value]) =>
+        (key === "terminated" || key === "waiting") && value !== null && typeof value === "object" && !Array.isArray(value));
     })));
 }
 function configValid(config: ProbeConfig): void {
