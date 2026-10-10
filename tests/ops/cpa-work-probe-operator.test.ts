@@ -580,10 +580,89 @@ test("GET-only recovery keeps three-call cap, original phase deadline and perman
   }
 });
 
-test("proven PVC rejects a conflicting consumer before any mutation", async () => {
+const claimName = "mtc-cpa-recovery-work-20261005";
+function foreignConsumer(name: string, status?: Resource["status"]): Resource {
+  return { metadata: { name, namespace: "cliproxyapi", uid: `historical-${name}`, resourceVersion: "1" }, spec: { volumes: [{ persistentVolumeClaim: { claimName } }] }, ...(status === undefined ? {} : { status }) };
+}
+function withConsumers(f: ReturnType<typeof fixture>, consumers: Resource[]): ProbeApi {
+  return { call: async (method, path, timeout, body) => {
+    const value = await f.api.call(method, path, timeout, body);
+    return method === "GET" && path === `${ns}/pods` ? { items: [...(value as { items: Resource[] }).items, ...structuredClone(consumers)] } : value;
+  } };
+}
+
+test("four supplied terminal PVC references coexist with one successful owned probe", async () => {
+  const historical = [
+    foreignConsumer("mtc-cpa-copy-destination-inspect-20261005", { phase: "Succeeded" }),
+    foreignConsumer("mtc-cpa-copy-destination-inspect-20261005b", { phase: "Succeeded", containerStatuses: [], initContainerStatuses: [], ephemeralContainerStatuses: [] }),
+    foreignConsumer("mtc-cpa-recovery-copy-20261005-4mz8q", { phase: "Failed", initContainerStatuses: [{ name: "copy-init", restartCount: 0, state: { terminated: { finishedAt: new Date(epoch).toISOString(), exitCode: 1 } } }] }),
+    foreignConsumer("mtc-cpa-recovery-copy-20261005-r2-62tt6", { phase: "Failed", containerStatuses: [{ name: "copy", restartCount: 0, state: { terminated: { finishedAt: new Date(epoch).toISOString(), exitCode: 1 } } }], ephemeralContainerStatuses: [{ name: "debug", restartCount: 0, state: { terminated: { finishedAt: new Date(epoch).toISOString(), exitCode: 0 } } }] }),
+  ];
+  const suppliedUids = ["13eec83e-c09c-4649-8792-6908df9d1cb6", "b94d92c1-29a4-474b-a559-5f77c1090408", "bdd35434-e245-4a56-94eb-06f4dd1cface", "2532863b-36e5-4a20-b89f-9260b4c8a4a7"];
+  historical.forEach((pod, index) => { pod.metadata.uid = suppliedUids[index]!; });
+  const original = structuredClone(historical);
+  for (const deleting of [false, true]) {
+    const references = structuredClone(historical);
+    if (deleting) for (const pod of references) pod.metadata.deletionTimestamp = new Date(epoch).toISOString();
+    const f = fixture();
+    const receipt = await runProbe(config, withConsumers(f, references), reviewedPlan, reviewedPolicy, f.clock);
+    assert.equal(receipt.status, "COMPLETE"); assert.equal(receipt.passed, true);
+    assert.equal(receipt.bytes, 1024 ** 3); assert.equal(receipt.cleanup.complete, true);
+    assert.equal(f.operations.filter((op) => op.method === "PATCH").length, 1);
+    assert.deepEqual(f.operations.filter((op) => op.method === "DELETE").map((op) => op.path), [jobPath, podPath]);
+    assert.ok(f.operations.every((op) => !references.some((pod) => op.path.includes(pod.metadata.name))));
+    console.log(JSON.stringify({ fixture: "terminal-consumers-accept", historical: 4, deleting, status: receipt.status, patches: 1, deletes: 2 }));
+  }
+  assert.deepEqual(historical, original);
+});
+
+test("active, missing and ambiguous PVC consumers reject before any mutation", async () => {
+  const vectors: [string, Resource["status"]][] = [
+    ["missing status", undefined], ["missing phase", {}],
+    ...["Pending", "Running", "Unknown", "", "Unrecognized"].map((phase): [string, Resource["status"]] => [phase || "empty phase", { phase }]),
+  ];
+  for (const phase of ["Succeeded", "Failed"]) {
+    for (const field of ["containerStatuses", "initContainerStatuses", "ephemeralContainerStatuses"] as const) {
+      for (const [name, state] of [
+        ["running", { running: { startedAt: new Date(epoch).toISOString() } }],
+        ["waiting", { waiting: { reason: "PodInitializing" } }],
+        ["unknown", {}],
+        ["contradictory", { running: { startedAt: new Date(epoch).toISOString() }, terminated: { finishedAt: new Date(epoch).toISOString(), exitCode: 0 } }],
+      ] as const) vectors.push([`${phase}/${field}/${name}`, { phase, [field]: [{ name: "foreign", restartCount: 0, state }] }]);
+      for (const malformed of [null, {}, [null], [{ name: "foreign" }], [{ state: { terminated: null } }]]) {
+        vectors.push([`${phase}/${field}/malformed-${JSON.stringify(malformed)}`, { phase, [field]: malformed } as unknown as Resource["status"]]);
+      }
+    }
+  }
+  for (const [name, status] of vectors) {
+    for (const deleting of [false, true]) {
+      const consumer = foreignConsumer("foreign", status);
+      if (deleting) consumer.metadata.deletionTimestamp = new Date(epoch).toISOString();
+      const f = fixture();
+      const receipt = await runProbe(config, withConsumers(f, [consumer]), reviewedPlan, reviewedPolicy, f.clock);
+      assert.equal(receipt.status, "PVC_CONSUMER_CONFLICT", name); assert.equal(receipt.passed, false, name);
+      assert.equal(receipt.attemptStartedAt, null, name); assert.equal(receipt.podUid, null, name); assert.equal(receipt.bytes, null, name);
+      assert.equal(f.operations.filter((op) => op.method === "PATCH").length, 0, name);
+      assert.equal(f.operations.filter((op) => op.method === "DELETE").length, 0, name);
+      console.log(JSON.stringify({ fixture: "terminal-consumers-reject", name, deleting, status: receipt.status, patches: 0, deletes: 0 }));
+    }
+  }
+});
+
+test("active cross-PVC consumers are ignored and deleting owned consumers remain conflicts", async () => {
+  const foreign = foreignConsumer("other-claim", { phase: "Running" });
+  foreign.spec.volumes = [{ persistentVolumeClaim: { claimName: "unrelated-pvc" } }];
+  foreign.metadata.deletionTimestamp = new Date(epoch).toISOString();
   const f = fixture();
-  const api: ProbeApi = { call: async (method,path,timeout,body) => path === `${ns}/pods` ? {items:[{metadata:{name:"foreign",namespace:"cliproxyapi",uid:"other",resourceVersion:"1"},spec:{volumes:[{persistentVolumeClaim:{claimName:"mtc-cpa-recovery-work-20261005"}}]}}]} : f.api.call(method,path,timeout,body) };
-  const receipt = await runProbe(config,api,reviewedPlan,reviewedPolicy,f.clock);
-  assert.equal(receipt.status,"PVC_CONSUMER_CONFLICT"); assert.equal(receipt.passed,false);
-  assert.equal(f.operations.some((op) => op.method !== "GET"),false);
+  const receipt = await runProbe(config, withConsumers(f, [foreign]), reviewedPlan, reviewedPolicy, f.clock);
+  assert.equal(receipt.passed, true); assert.equal(receipt.cleanup.complete, true);
+  assert.equal(f.operations.filter((op) => op.method === "PATCH").length, 1);
+  assert.deepEqual(f.operations.filter((op) => op.method === "DELETE").map((op) => op.path), [jobPath, podPath]);
+  const owned = foreignConsumer("deleting-owned", { phase: "Running" });
+  owned.metadata.ownerReferences = [{ kind: "Job", controller: true, uid: config.jobUid }];
+  owned.metadata.deletionTimestamp = new Date(epoch).toISOString();
+  const g = fixture();
+  const rejected = await runProbe(config, withConsumers(g, [owned]), reviewedPlan, reviewedPolicy, g.clock);
+  assert.equal(rejected.status, "PVC_CONSUMER_CONFLICT");
+  assert.equal(g.operations.filter((op) => op.method !== "GET").length, 0);
 });

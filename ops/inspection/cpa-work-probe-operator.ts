@@ -19,7 +19,7 @@ type ContainerStatus = { name: string; restartCount: number; state: ContainerSta
 export interface Resource {
   metadata: Metadata;
   spec: Record<string, unknown>;
-  status?: { startTime?: string; completionTime?: string; completedIndexes?: string; failedIndexes?: string; phase?: string; active?: number; failed?: number; succeeded?: number; ready?: number; terminating?: number; uncountedTerminatedPods?: { succeeded?: string[]; failed?: string[] }; conditions?: { type: string; status: string; reason?: string; message?: string; lastProbeTime?: string; lastTransitionTime?: string }[]; containerStatuses?: ContainerStatus[]; initContainerStatuses?: ContainerStatus[] };
+  status?: { startTime?: string; completionTime?: string; completedIndexes?: string; failedIndexes?: string; phase?: string; active?: number; failed?: number; succeeded?: number; ready?: number; terminating?: number; uncountedTerminatedPods?: { succeeded?: string[]; failed?: string[] }; conditions?: { type: string; status: string; reason?: string; message?: string; lastProbeTime?: string; lastTransitionTime?: string }[]; containerStatuses?: ContainerStatus[]; initContainerStatuses?: ContainerStatus[]; ephemeralContainerStatuses?: ContainerStatus[] };
 }
 export interface ProbeConfig {
   jobName: string; jobUid: string; jobResourceVersion: string;
@@ -159,6 +159,18 @@ function listItems(value: unknown): Resource[] {
   if (!Array.isArray(items)) throw new Error("INVALID_POD_LIST");
   return items;
 }
+function activePvcConsumer(pod: Resource): boolean {
+  const status = pod.status;
+  if (status?.phase !== "Succeeded" && status?.phase !== "Failed") return true;
+  // Kubernetes terminal phases mean all containers stopped and will not restart.
+  // Optional status lists need not exist, but contradictory or ambiguous states
+  // must retain the conflict, including init/ephemeral containers and deleting Pods.
+  return [status.containerStatuses, status.initContainerStatuses, status.ephemeralContainerStatuses].some((statuses) =>
+    statuses !== undefined && (!Array.isArray(statuses) || statuses.some((container) => {
+      const state = container?.state;
+      return !state || typeof state.terminated !== "object" || state.terminated === null || Array.isArray(state.terminated) || Object.keys(state).some((key) => key !== "terminated");
+    })));
+}
 function configValid(config: ProbeConfig): void {
   validateBudgets(config.budgets);
   if (!/^mtc-cpa-work-directio-[a-z0-9-]+$/.test(config.jobName) || !/^[a-f0-9-]{36}$/.test(config.jobUid) || !/^\d+$/.test(config.jobResourceVersion) || config.pvcUid !== PVC_UID || !/^\d+$/.test(config.pvcResourceVersion)) throw new Error("INVALID_CONFIG_IDENTITY");
@@ -247,7 +259,7 @@ export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resourc
   };
   const exclusiveConsumers = async (deadline: number) => {
     const consumers = listItems(await call("GET", consumersPath, deadline)).filter((item) =>
-      (item.spec.volumes as { persistentVolumeClaim?: { claimName?: string } }[] | undefined)?.some((volume) => volume.persistentVolumeClaim?.claimName === CLAIM));
+      (item.spec.volumes as { persistentVolumeClaim?: { claimName?: string } }[] | undefined)?.some((volume) => volume.persistentVolumeClaim?.claimName === CLAIM) && activePvcConsumer(item));
     if (consumers.some((item) => !owned(item, config.jobUid) || item.metadata.deletionTimestamp) || consumers.length > 1) throw new Error("PVC_CONSUMER_CONFLICT");
   };
   try {
