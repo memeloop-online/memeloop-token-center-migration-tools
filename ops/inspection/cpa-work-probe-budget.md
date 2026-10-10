@@ -35,7 +35,7 @@ Execution starts only at the directio container's actual startedAt; that value
 is pinned, never inferred from Ready or Job age, and cannot reset the clock.
 Timestamp bounds, terminal Job/Pod/init states, all resource versions and
 bounded collection duration are checked. Logs come only from that exact Pod's
-directio container, followed by UID/RV revalidation; only successful terminated
+directio container, followed by UID, owner, spec and policy-label revalidation; only successful terminated
 write/read completion produces bytes. Unknown or failed startup uses null,
 never 0B throughput. Stale/missing/invalid/replaced observations fail closed.
 Total deadline has priority; terminalCause remains a separate diagnostic.
@@ -88,3 +88,25 @@ Historical receipts are evidence only; live decisions always come from fresh
 API reads, not an observation file. GHA exercises operator decisions and the
 real CLI against a local fake API, plus the existing real DirectIO command on
 scratch disk. None of these establish cluster mount/copy/import acceptance.
+
+Across polls and around log reads, resourceVersion may change through normal
+status updates. It remains required observation metadata and an exact fresh
+PATCH/DELETE precondition, but is not immutable Pod identity. UID, namespace,
+name, controller owner, reviewed spec, PVC binding and policy labels remain
+fail-closed gates. The observation before the log GET is retained; a later
+status update is evaluated on the next bounded poll, without resetting clocks.
+
+Cleanup receipts now expose `cleanup.startedAt` and `cleanup.deadline`, captured
+at the actual operator finally entry. The tracked `cpa-work-probe-lifecycle.ts`
+module supervises an already launched operator: wait at most 480s, SIGTERM first,
+allow operator finally cleanup, and SIGKILL only at the fixed 515s outer cap.
+Caller cleanup also runs in finally. It uses the explicit operator cleanup entry
+when present, otherwise the observed operator end (or actual cleanup entry if
+no operator end is available), capped by the same outer deadline. Init/main
+container termination times, decision times and API diagnostic times never
+anchor cleanup. An exhausted window is not renewed. Cleanup callbacks receive
+an absolute deadline and abort signal and must honor both for each API call;
+2s API/three transient GET attempts/no mutation retry remain unchanged.
+This module has no executable entrypoint and performs no operator launch,
+resource creation, probe, import or volume operation. Temporary callers should
+use `observeProbeProcess`/`superviseProbe` rather than copy timestamp heuristics.
