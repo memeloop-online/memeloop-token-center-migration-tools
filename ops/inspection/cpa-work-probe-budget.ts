@@ -64,3 +64,11 @@ export function probeBudget(o: ProbeObservation, identity: ProbeIdentity, now: n
     bytes: status === "COMPLETE" ? 1_073_741_824 : null,
     stopRequired: !["STARTING", "EXECUTING"].includes(status), cleanupIdentity: identity };
 }
+
+// Only explicit lifecycle boundaries can anchor cleanup. Container timestamps,
+// diagnostic GET times and decision deadlines are deliberately not inputs.
+export function cleanupDeadline(entry: number, operatorCleanupStartedAt?: string | null, operatorFinishedAt?: number, outerDeadline = Infinity): number {
+  const anchor = operatorCleanupStartedAt != null ? timestamp(operatorCleanupStartedAt) : operatorFinishedAt ?? entry;
+  if (!Number.isFinite(entry) || !Number.isFinite(anchor) || anchor > entry || Number.isNaN(outerDeadline)) throw new Error("INVALID_CLEANUP_BOUNDARY");
+  return Math.min(anchor + PROBE_BUDGET.cleanupMs, outerDeadline);
+}

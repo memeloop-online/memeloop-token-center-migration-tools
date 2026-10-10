@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { parseAllDocuments } from "yaml";
 import { invokedAsEntrypoint } from "../lib/invoked-as-entrypoint.ts";
-import { PROBE_BUDGET, probeBudget, timestamp, validateBudgets, type ContainerState, type ProbeBudgets, type ProbeObservation } from "./cpa-work-probe-budget.ts";
+import { PROBE_BUDGET, cleanupDeadline, probeBudget, timestamp, validateBudgets, type ContainerState, type ProbeBudgets, type ProbeObservation } from "./cpa-work-probe-budget.ts";
 
 const NS = "cliproxyapi";
 const CLAIM = "mtc-cpa-recovery-work-20261005";
@@ -209,7 +209,7 @@ export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resourc
   let result: ReturnType<typeof probeBudget> | null = null;
   let status = "PREFLIGHT_REJECTED";
   let execStartedAt: string | null = null;
-  const cleanup = { complete: false, jobDeleted: false, podDeleted: false, errors: [] as string[] };
+  const cleanup = { complete: false, jobDeleted: false, podDeleted: false, startedAt: null as string | null, deadline: null as number | null, errors: [] as string[] };
   let stage: ApiStage = "PREFLIGHT";
   const apiDiagnostics = { lastSuccessfulCall: null as ApiCallDiagnostic | null, failures: [] as (ApiCallDiagnostic & { category: string; previousSuccessfulCall: ApiCallDiagnostic | null })[] };
   const resourceKind = (path: string): ApiResource => path === jobPath ? "JOB" : path === pvcPath ? "PVC" : path === POLICY ? "DENY_POLICY" : path === consumersPath ? "PVC_CONSUMER_LIST" : path === podsPath ? "OWNED_POD_LIST" : pod && path === `${CORE}/pods/${pod.metadata.name}` ? "OWNED_POD" : pod && path === `${CORE}/pods/${pod.metadata.name}/log?container=directio&limitBytes=4096&tailLines=100` ? "DIRECTIO_LOG" : "UNRECOGNIZED";
@@ -342,9 +342,12 @@ export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resourc
         if (typeof data !== "string") throw new Error("INVALID_LOG_RESPONSE");
         logs = data;
         const afterLogs = await resource(`${CORE}/pods/${currentPod!.metadata.name}`, readDeadline);
-        identity(afterLogs, currentPod!.metadata.name, currentPod!.metadata.uid, currentPod!.metadata.resourceVersion);
+        // Status writes legitimately change RV between the log GET and this GET.
+        // RV is a mutation precondition, not the identity of a running Pod.
+        identity(afterLogs, currentPod!.metadata.name, currentPod!.metadata.uid);
         if (!owned(afterLogs, config.jobUid)) throw new Error("POD_OWNERSHIP_REJECTED");
         validatePodSpec(afterLogs.spec, expectedPod);
+        if (!subset(afterLogs.metadata.labels, expectedLabels)) throw new Error("NETWORK_LABEL_MISMATCH");
       }
       const observation: ProbeObservation = {
         jobUid: currentJob.metadata.uid, jobResourceVersion: currentJob.metadata.resourceVersion,
@@ -366,7 +369,10 @@ export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resourc
     status = attempted && clock.now() >= attemptStart + b.totalMs ? "TOTAL_DEADLINE" : attempted && clock.now() >= phaseDeadline ? phaseDeadline === attemptStart + b.startupMs ? "STARTUP_DEADLINE" : "EXEC_DEADLINE" : error instanceof Error && /^[A-Z_]+$/.test(error.message) ? error.message : "OBSERVATION_REJECTED";
   } finally {
     if (attempted) {
-      const deadline = clock.now() + b.cleanupMs;
+      const entry = clock.now();
+      cleanup.startedAt = new Date(entry).toISOString();
+      const deadline = cleanupDeadline(entry);
+      cleanup.deadline = deadline;
       // Capture only the original controller's unique Pod if PATCH failed before adoption.
       stage = "CLEANUP_CAPTURE";
       if (!pod) { try { await capture(deadline); } catch { cleanup.errors.push("POD_CAPTURE_UNCONFIRMED"); } }

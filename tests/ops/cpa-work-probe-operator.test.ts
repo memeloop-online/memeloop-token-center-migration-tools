@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { createServer } from "node:http";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseAllDocuments } from "yaml";
-import { PROBE_BUDGET } from "../../ops/inspection/cpa-work-probe-budget.ts";
+import { PROBE_BUDGET, cleanupDeadline } from "../../ops/inspection/cpa-work-probe-budget.ts";
+import { superviseProbe, observeProbeProcess, type ProbeProcess } from "../../ops/inspection/cpa-work-probe-lifecycle.ts";
 import { ApiFailure, ApiTransportFailure, unixApi, runProbe, type ProbeApi, type ProbeClock, type ProbeConfig, type Resource } from "../../ops/inspection/cpa-work-probe-operator.ts";
 
 const [policy, plan] = parseAllDocuments(readFileSync("ops/inspection/cpa-work-directio-20261006a.yaml", "utf8")).map((doc) => doc.toJSON() as Resource);
@@ -18,8 +20,8 @@ const ns = "/api/v1/namespaces/cliproxyapi";
 const jobPath = `/apis/batch/v1/namespaces/cliproxyapi/jobs/${config.jobName}`;
 const podPath = `${ns}/pods/probe-pod`;
 
-function fixture(mode: "late" | "startup" | "exec" | "total" | "init" | "replacement" | "job-replacement" | "pvc-replacement" | "stale" | "cleanup-timeout" | "post-log-replacement" = "late") {
-  let now = epoch, step = 0, enabled = false, jobGone = false, podGone = false, cleanupStarted = false, staleInjected = false;
+function fixture(mode: "late" | "startup" | "exec" | "total" | "init" | "replacement" | "job-replacement" | "pvc-replacement" | "stale" | "cleanup-timeout" | "post-log-replacement" | "post-log-rv" = "late") {
+  let now = epoch, step = 0, enabled = false, jobGone = false, podGone = false, cleanupStarted = false, staleInjected = false, postLogRead = false;
   let job: Resource = { ...structuredClone(reviewedPlan), metadata: { name: config.jobName, namespace: "cliproxyapi", uid: config.jobUid, resourceVersion: "1", generation: 1 } };
   const pvc: Resource = { metadata: { name: "mtc-cpa-recovery-work-20261005", namespace: "cliproxyapi", uid: config.pvcUid, resourceVersion: "3" }, spec: { volumeName: `pvc-${config.pvcUid}` }, status: { phase: "Bound" } };
   let pod: Resource | null = null;
@@ -75,6 +77,7 @@ function fixture(mode: "late" | "startup" | "exec" | "total" | "init" | "replace
     if (path === `${ns}/pods`) { updatePod(); return { items: pod && !podGone ? [structuredClone(pod)] : [] }; }
     updatePod();
     if (path.includes("/log?")) {
+      if (mode === "post-log-rv") postLogRead = true;
       if (mode === "post-log-replacement" && pod) pod.metadata.uid = "33333333-3333-4333-8333-333333333333";
       return step >= 3 ? "WRITE_START 2026-10-09T10:03:00Z\nDIRECTIO_COMPLETE 2026-10-09T10:05:44Z\n" : "WRITE_START 2026-10-09T10:03:00Z\n";
     }
@@ -82,6 +85,10 @@ function fixture(mode: "late" | "startup" | "exec" | "total" | "init" | "replace
     if (path.includes("/pods?")) return { items: pod && !podGone ? [structuredClone(pod)] : [] };
     assert.equal(path, podPath);
     if (!pod || podGone) throw new ApiFailure(404);
+    if (mode === "post-log-rv" && postLogRead) {
+      pod.metadata.resourceVersion = String(100 + step);
+      pod.status!.conditions = [{ type: "Ready", status: "True" }]; postLogRead = false;
+    }
     return structuredClone(pod);
   } };
   return { api, clock, operations, now: () => now, setNow: (value: number) => { now = value; } };
@@ -840,4 +847,159 @@ test("active cross-PVC consumers are ignored and deleting owned consumers remain
   const rejected = await runProbe(config, withConsumers(g, [owned]), reviewedPlan, reviewedPolicy, g.clock);
   assert.equal(rejected.status, "PVC_CONSUMER_CONFLICT");
   assert.equal(g.operations.filter((op) => op.method !== "GET").length, 0);
+});
+
+
+test("normal Pod RV/status updates across the log GET continue with pinned immutable identity", async () => {
+  const f = fixture("post-log-rv");
+  const receipt = await runProbe(config, f.api, reviewedPlan, reviewedPolicy, f.clock);
+  assert.equal(receipt.status, "COMPLETE"); assert.equal(receipt.passed, true);
+  assert.equal(receipt.cleanup.startedAt, new Date(epoch + 344_000).toISOString());
+  assert.equal(receipt.cleanup.deadline, epoch + 374_000);
+  assert.equal(f.operations.filter((op) => op.method === "PATCH").length, 1);
+});
+
+test("post-log UID, owner, spec and policy label changes still reject", async () => {
+  for (const change of ["uid", "owner", "spec", "label"] as const) {
+    const f = fixture(); let afterLog = false;
+    const api: ProbeApi = { call: async (method, path, timeout, body) => {
+      const value = await f.api.call(method, path, timeout, body);
+      if (path.includes("/log?")) afterLog = true;
+      else if (method === "GET" && path === podPath && afterLog) {
+        const pod = value as Resource;
+        if (change === "uid") pod.metadata.uid = "33333333-3333-4333-8333-333333333333";
+        if (change === "owner") pod.metadata.ownerReferences = [];
+        if (change === "spec") pod.spec.volumes = [];
+        if (change === "label") pod.metadata.labels = {};
+        pod.metadata.resourceVersion = "999"; afterLog = false;
+      }
+      return value;
+    } };
+    const receipt = await runProbe(config, api, reviewedPlan, reviewedPolicy, f.clock);
+    assert.equal(receipt.passed, false, change); assert.equal(receipt.bytes, null, change);
+    assert.equal(receipt.status, { uid: "IDENTITY_MISMATCH", owner: "POD_OWNERSHIP_REJECTED", spec: "UNSAFE_POD_SPEC", label: "NETWORK_LABEL_MISMATCH" }[change]);
+  }
+});
+
+test("old init termination cannot consume cleanup and explicit cleanup entry cannot reset", async () => {
+  const f = fixture();
+  const api: ProbeApi = { call: async (method, path, timeout, body) => {
+    const value = await f.api.call(method, path, timeout, body);
+    const pods = path.includes("/pods?") || path === `${ns}/pods` ? (value as { items: Resource[] }).items : path === podPath ? [value as Resource] : [];
+    for (const pod of pods) {
+      pod.status ??= {};
+      pod.status.initContainerStatuses = [{ name: "exclusive-probe-directory", restartCount: 0, state: { terminated: { startedAt: new Date(epoch).toISOString(), finishedAt: new Date(epoch + 1000).toISOString(), exitCode: 0 } } }];
+    }
+    return value;
+  } };
+  const receipt = await runProbe(config, api, reviewedPlan, reviewedPolicy, f.clock);
+  assert.equal(receipt.passed, true);
+  assert.equal(receipt.cleanup.deadline, epoch + 374_000);
+  assert.equal(cleanupDeadline(epoch + 350_000, receipt.cleanup.startedAt, epoch + 349_000), epoch + 374_000);
+  assert.equal(cleanupDeadline(epoch + 350_000, null, epoch + 349_000), epoch + 379_000);
+  assert.throws(() => cleanupDeadline(epoch, new Date(epoch + 1).toISOString()), /INVALID_CLEANUP_BOUNDARY/);
+});
+
+test("caller supervisor signals first, uses explicit cleanup boundary and keeps 515s cap", async () => {
+  let now = epoch; const signals: string[] = [], waits: number[] = [];
+  const process: ProbeProcess = { signal: (signal) => { signals.push(signal); }, waitUntil: async (deadline) => {
+    waits.push(deadline);
+    if (waits.length === 1) { now = deadline; return null; }
+    now = epoch + 485_000;
+    return { finishedAt: now, receipt: { cleanup: { startedAt: new Date(epoch + 480_000).toISOString() } } };
+  } };
+  const result = await superviseProbe(process, async (deadline) => {
+    assert.deepEqual(signals, ["SIGTERM"]); assert.equal(deadline, epoch + 510_000); return true;
+  }, () => now, epoch);
+  assert.deepEqual(waits, [epoch + 480_000, epoch + 515_000]);
+  assert.equal(result.cleanupComplete, true); assert.equal(result.outerDeadline, epoch + 515_000);
+});
+
+test("caller supervisor force-stop is finite and finally runs after a wait rejection", async () => {
+  for (const rejected of [false, true]) {
+    let now = epoch, waits = 0, cleaned = false; const signals: string[] = [];
+    const process: ProbeProcess = { signal: (signal) => { signals.push(signal); }, waitUntil: async (deadline) => {
+      waits++;
+      if (rejected && waits === 1) throw new Error("WAIT_FAILED");
+      now = deadline; return null;
+    } };
+    const work = superviseProbe(process, async () => { cleaned = true; return true; }, () => now, epoch);
+    if (rejected) await assert.rejects(work, /WAIT_FAILED/); else { const result = await work; assert.equal(result.forcedStop, true); }
+    assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
+    assert.equal(now, epoch + (rejected ? 35_000 : 515_000)); assert.equal(cleaned, false); // no new cleanup allocation beyond outer cap
+  }
+});
+
+test("caller finally cleanup after a failed wait uses operator end for older receipts", async () => {
+  let now = epoch, waits = 0, cleaned = false; const signals: string[] = [];
+  const process: ProbeProcess = { signal: (signal) => { signals.push(signal); }, waitUntil: async () => {
+    if (++waits === 1) throw new Error("WAIT_FAILED");
+    now += 1000; return { finishedAt: now, receipt: null };
+  } };
+  await assert.rejects(superviseProbe(process, async (deadline) => { cleaned = true; assert.equal(deadline, epoch + 31_000); return true; }, () => now, epoch), /WAIT_FAILED/);
+  assert.equal(cleaned, true); assert.deepEqual(signals, ["SIGTERM"]);
+});
+
+test("caller hanging cleanup is aborted without extending its explicit deadline", async () => {
+  const now = epoch + 30_000;
+  const process: ProbeProcess = { signal: () => { throw new Error("unexpected signal"); }, waitUntil: async () => ({ finishedAt: now, receipt: { cleanup: { startedAt: new Date(epoch + 1).toISOString() } } }) };
+  let aborted = false;
+  const result = await superviseProbe(process, async (_deadline, signal) => new Promise<boolean>((resolve) => { signal.addEventListener("abort", () => { aborted = true; resolve(false); }, { once: true }); }), () => now, epoch);
+  assert.equal(result.cleanupComplete, false); assert.equal(aborted, true); assert.equal(result.cleanupDeadline, now + 1);
+});
+
+test("process adapter wait is bounded and cancellation preserves later exit observation", { timeout: 5000 }, async () => {
+  assert.equal(process.env.GITHUB_ACTIONS, "true");
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  const observer = observeProbeProcess(child, () => null, Date.now);
+  try {
+    assert.equal(await observer.waitUntil(Date.now() + 10), null);
+    const controller = new AbortController(); controller.abort();
+    assert.equal(await observer.waitUntil(Date.now() + 1000, controller.signal), null);
+    observer.signal("SIGTERM");
+    const exit = await observer.waitUntil(Date.now() + 2000); assert.ok(exit); assert.equal(exit.receipt, null);
+  } finally { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); }
+});
+
+
+test("delayed caller supervision never resets the original launch clock", async () => {
+  let now = epoch + 60_000; const waits: number[] = [], signals: string[] = [];
+  const process: ProbeProcess = { signal: (signal) => { signals.push(signal); }, waitUntil: async (deadline) => { waits.push(deadline); now = deadline; return null; } };
+  const result = await superviseProbe(process, async () => true, () => now, epoch);
+  assert.deepEqual(waits, [epoch + 480_000, epoch + 515_000]);
+  assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]); assert.equal(result.outerDeadline, epoch + 515_000);
+});
+
+test("failed spawn is observed without bypassing caller finally cleanup", { timeout: 5000 }, async () => {
+  assert.equal(process.env.GITHUB_ACTIONS, "true");
+  const wall = Date.now(), mono = performance.now(); const now = () => wall + performance.now() - mono;
+  const child = spawn("/nonexistent-cpa-fixture-operator", [], { stdio: "ignore" });
+  const observer = observeProbeProcess(child, () => null, now);
+  let cleaned = false;
+  const result = await superviseProbe(observer, async () => { cleaned = true; return false; }, now, wall);
+  assert.ok(result.exit); assert.equal(result.exit.receipt, null); assert.equal(cleaned, true);
+  assert.equal(result.cleanupComplete, false);
+});
+
+
+test("an error on a running child never fabricates operator exit", async () => {
+  const child = new EventEmitter() as ChildProcess;
+  Object.assign(child, { pid: 42, exitCode: null, signalCode: null, kill: () => true });
+  const observer = observeProbeProcess(child, () => null, Date.now);
+  child.emit("error", new Error("KILL_FAILED"));
+  assert.equal(await observer.waitUntil(Date.now() + 1), null);
+  child.emit("close", 0, null);
+  assert.ok(await observer.waitUntil(Date.now() + 1000));
+});
+
+test("early cancellation allows only the existing 30s cleanup and 5s grace before force-stop", async () => {
+  let now = epoch + 1000; const waits: number[] = [], signals: string[] = [];
+  const controller = new AbortController(); controller.abort();
+  const process: ProbeProcess = { signal: (signal) => { signals.push(signal); }, waitUntil: async (deadline, signal) => {
+    waits.push(deadline); if (!signal?.aborted) now = deadline; return null;
+  } };
+  const result = await superviseProbe(process, async () => { throw new Error("expired cleanup must not restart"); }, () => now, epoch, controller.signal);
+  assert.deepEqual(waits, [epoch + 480_000, epoch + 36_000]);
+  assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]); assert.equal(result.cleanupComplete, false);
+  assert.equal(result.cleanupDeadline, epoch + 31_000);
 });
