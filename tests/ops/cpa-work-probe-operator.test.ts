@@ -9,7 +9,8 @@ import { join, resolve } from "node:path";
 import { parseAllDocuments } from "yaml";
 import { PROBE_BUDGET, cleanupDeadline } from "../../ops/inspection/cpa-work-probe-budget.ts";
 import { superviseProbe, observeProbeProcess, type ProbeProcess } from "../../ops/inspection/cpa-work-probe-lifecycle.ts";
-import { ApiFailure, ApiTransportFailure, unixApi, runProbe, type ProbeApi, type ProbeClock, type ProbeConfig, type Resource } from "../../ops/inspection/cpa-work-probe-operator.ts";
+import { ApiFailure, ApiTransportFailure, unixApi, runProbe, probeJournal, readProbeJournal, type ProbeApi, type ProbeClock, type ProbeConfig, type Resource } from "../../ops/inspection/cpa-work-probe-operator.ts";
+import { cleanupOwnedProbe, runSupervised } from "../../ops/inspection/cpa-work-probe-supervised.ts";
 
 const [policy, plan] = parseAllDocuments(readFileSync("ops/inspection/cpa-work-directio-20261006a.yaml", "utf8")).map((doc) => doc.toJSON() as Resource);
 assert.ok(policy && plan);
@@ -1002,4 +1003,189 @@ test("early cancellation allows only the existing 30s cleanup and 5s grace befor
   assert.deepEqual(waits, [epoch + 480_000, epoch + 36_000]);
   assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]); assert.equal(result.cleanupComplete, false);
   assert.equal(result.cleanupDeadline, epoch + 31_000);
+});
+
+test("supervised caller cleanup adopts only the exact own Job UID and deletes nothing foreign", async () => {
+  const ops: { method: string; path: string }[] = [];
+  const foreign = { metadata: { name: config.jobName, namespace: "cliproxyapi", uid: "33333333-3333-4333-8333-333333333333", resourceVersion: "9" }, spec: {} };
+  const api: ProbeApi = { call: async (method, path, timeout) => { ops.push({ method, path }); assert.ok(timeout > 0 && timeout <= PROBE_BUDGET.apiMs); return path.includes("/pods?") ? { items: [] } : structuredClone(foreign); } };
+  const journal = probeJournal(config); journal.state.attempted = true;
+  const done = await cleanupOwnedProbe(api, config, Date.now() + 30_000, new AbortController().signal, journal, reviewedPlan);
+  assert.equal(done, false);
+  assert.ok(ops.length > 0); assert.ok(ops.every((op) => op.method === "GET"));
+});
+
+test("supervised caller cleanup deletes own Job and owned Pod once then confirms absence", async () => {
+  let job: Resource | null = { ...structuredClone(reviewedPlan), metadata: { name: config.jobName, namespace: "cliproxyapi", uid: config.jobUid, resourceVersion: "7" } };
+  let pod: Resource | null = { metadata: { name: "probe-pod", namespace: "cliproxyapi", uid: "22222222-2222-4222-8222-222222222222", resourceVersion: "11", labels: { "memeloop.io/cpa-work-probe": "directio-20261006a" }, ownerReferences: [{ kind: "Job", controller: true, uid: config.jobUid }] }, spec: structuredClone((reviewedPlan.spec.template as { spec: Record<string, unknown> }).spec) };
+  const ops: { method: string; path: string; body?: { propagationPolicy?: string; gracePeriodSeconds?: number; preconditions?: unknown } }[] = [];
+  const api: ProbeApi = { call: async (method, path, timeout, body) => {
+    ops.push({ method, path, body: body as never });
+    assert.ok(timeout > 0 && timeout <= PROBE_BUDGET.apiMs);
+    if (method === "DELETE") {
+      const options = body as { propagationPolicy?: string; gracePeriodSeconds: number; preconditions: { uid: string; resourceVersion: string } };
+      assert.equal(options.gracePeriodSeconds, 5);
+      if (path === jobPath) { assert.equal(options.propagationPolicy, "Orphan"); assert.deepEqual(options.preconditions, { uid: config.jobUid, resourceVersion: "7" }); job = null; return {}; }
+      assert.equal(path, podPath); assert.deepEqual(options.preconditions, { uid: "22222222-2222-4222-8222-222222222222", resourceVersion: "11" }); pod = null; return {};
+    }
+    if (path === jobPath) { if (!job) throw new ApiFailure(404); return structuredClone(job); }
+    if (path === podPath) { if (!pod) throw new ApiFailure(404); return structuredClone(pod); }
+    if (path.includes("/pods?")) return { items: pod ? [structuredClone(pod)] : [] };
+    throw new Error("UNEXPECTED_PATH");
+  } };
+  const journal = probeJournal(config); journal.state.attempted = true;
+  const done = await cleanupOwnedProbe(api, config, Date.now() + 30_000, new AbortController().signal, journal, reviewedPlan);
+  assert.equal(done, true);
+  assert.equal(ops.filter((op) => op.method === "DELETE").length, 2);
+});
+
+test("supervised caller cleanup honors an aborted signal without any API call", async () => {
+  let calls = 0;
+  const api: ProbeApi = { call: async () => { calls++; return { items: [] }; } };
+  const controller = new AbortController(); controller.abort();
+  const journal = probeJournal(config); journal.state.attempted = true;
+  const done = await cleanupOwnedProbe(api, config, Date.now() + 30_000, controller.signal, journal, reviewedPlan);
+  assert.equal(done, false); assert.equal(calls, 0);
+});
+
+test("invalid supervised config rejects before socket access and every API call", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "cpa-invalid-supervised-"));
+  try {
+    for (const invalid of [{ jobName: "unrelated-job", jobUid: config.jobUid }, { ...config, pvcUid: "foreign" }, { ...config, jobResourceVersion: 1 }, { ...config, budgets: { ...PROBE_BUDGET, totalMs: PROBE_BUDGET.totalMs + 1 } }]) {
+      const input = join(directory, "config.json"); writeFileSync(input, JSON.stringify(invalid), { mode: 0o600 });
+      await assert.rejects(runSupervised(["--execute-authorized-target-only", input, "--api-socket", join(directory, "missing.sock")]), (error: unknown) => error instanceof Error && !error.message.includes("ENOENT"));
+      let calls = 0;
+      const api: ProbeApi = { call: async () => { calls++; throw new Error("UNEXPECTED_API"); } };
+      const journal = probeJournal(invalid as ProbeConfig); journal.state.attempted = true;
+      assert.equal(await cleanupOwnedProbe(api, invalid as ProbeConfig, Date.now() + 30_000, new AbortController().signal, journal, reviewedPlan), false);
+      assert.equal(calls, 0);
+    }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("missing or unacquired attempt journal authorizes no caller API", async () => {
+  let calls = 0;
+  const api: ProbeApi = { call: async () => { calls++; throw new Error("UNEXPECTED_API"); } };
+  for (const journal of [undefined, probeJournal(config)]) {
+    assert.equal(await cleanupOwnedProbe(api, config, Date.now() + 30_000, new AbortController().signal, journal, reviewedPlan), false);
+  }
+  assert.equal(calls, 0);
+});
+
+test("malformed Job or Pod identity never issues a cleanup DELETE", async () => {
+  for (const kind of ["Job", "Pod"] as const) {
+    for (const field of ["name", "namespace", "uid", "resourceVersion"] as const) {
+      for (const malformed of [undefined, "", 12, {}]) {
+        const job = { ...structuredClone(reviewedPlan), metadata: { name: config.jobName, namespace: "cliproxyapi", uid: config.jobUid, resourceVersion: "7" } };
+        const pod = { metadata: { name: "probe-pod", namespace: "cliproxyapi", uid: "22222222-2222-4222-8222-222222222222", resourceVersion: "11", labels: { "memeloop.io/cpa-work-probe": "directio-20261006a" }, ownerReferences: [{ kind: "Job", controller: true, uid: config.jobUid }] }, spec: structuredClone((reviewedPlan.spec.template as { spec: Record<string, unknown> }).spec) };
+        const target = kind === "Job" ? job : pod;
+        Object.assign(target.metadata, { [field]: malformed });
+        let deletes = 0;
+        const api: ProbeApi = { call: async (method, path) => {
+          if (method === "DELETE") { deletes++; throw new Error("UNEXPECTED_DELETE"); }
+          return path.includes("/pods?") ? { items: kind === "Pod" ? [pod] : [] } : job;
+        } };
+        const journal = probeJournal(config); journal.state.attempted = true;
+        assert.equal(await cleanupOwnedProbe(api, config, Date.now() + 30_000, new AbortController().signal, journal, reviewedPlan), false, `${kind}/${field}/${JSON.stringify(malformed)}`);
+        assert.equal(deletes, 0);
+      }
+    }
+  }
+});
+
+test("parent never replays child issued or unknown Job and Pod DELETE, including after journal reload", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "cpa-attempt-reload-"));
+  try {
+    for (const target of [jobPath, podPath]) {
+      for (const failure of [new ApiFailure(409), new ApiTransportFailure("API_TRANSPORT_FAILED", "SOCKET_RESET", null)]) {
+        const journalPath = join(directory, "attempt.json");
+        const journal = probeJournal(config, journalPath), f = fixture();
+        const deletes: string[] = [];
+        const api: ProbeApi = { call: async (method, path, timeout, body) => {
+          if (method === "DELETE") { deletes.push(path); if (path === target) throw failure; }
+          return f.api.call(method, path, timeout, body);
+        } };
+        const receipt = await runProbe(config, api, reviewedPlan, reviewedPolicy, f.clock, journal);
+        assert.equal(receipt.cleanup.complete, false);
+        assert.equal(deletes.filter((path) => path === target).length, 1);
+        const reloaded = readProbeJournal(config, journalPath);
+        assert.equal(reloaded.state.deletes.find((entry) => entry.path === target)?.acknowledged, false);
+        const before = [...deletes];
+        assert.equal(await cleanupOwnedProbe(api, config, f.now() + PROBE_BUDGET.cleanupMs, new AbortController().signal, reloaded, reviewedPlan, f.now), false);
+        assert.deepEqual(deletes, before);
+      }
+    }
+    const journal = probeJournal(config, join(directory, "attempt.json"));
+    journal.state.attempted = true; journal.state.deletes.push({ path: jobPath, acknowledged: false }); journal.save();
+    let calls = 0;
+    const api: ProbeApi = { call: async () => { calls++; throw new Error("UNEXPECTED_API"); } };
+    assert.equal(await cleanupOwnedProbe(api, config, Date.now() + 30_000, new AbortController().signal, readProbeJournal(config, join(directory, "attempt.json")), reviewedPlan), false);
+    assert.equal(calls, 0);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("definitive child PATCH rejection grants no parent cleanup attempt", async () => {
+  const journal = probeJournal(config), f = fixture();
+  const api: ProbeApi = { call: async (method, path, timeout, body) => {
+    if (method === "PATCH") throw new ApiFailure(409);
+    return f.api.call(method, path, timeout, body);
+  } };
+  await runProbe(config, api, reviewedPlan, reviewedPolicy, f.clock, journal);
+  assert.equal(journal.state.attempted, false);
+  const before = f.operations.length;
+  assert.equal(await cleanupOwnedProbe(api, config, f.now() + PROBE_BUDGET.cleanupMs, new AbortController().signal, journal, reviewedPlan, f.now), false);
+  assert.equal(f.operations.length, before);
+});
+
+test("supervised CLI rejects missing authorization without cluster access", { timeout: 10_000 }, async () => {
+  const result = await new Promise<{ code: number | null; stdout: string }>((resolveExit, reject) => {
+    const child = spawn(process.execPath, [resolve("ops/inspection/cpa-work-probe-supervised.ts")], { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    const timer = setTimeout(() => { child.kill("SIGKILL"); reject(new Error("CLI_TEST_DEADLINE")); }, 8_000);
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.on("error", reject); child.on("exit", (code) => { clearTimeout(timer); resolveExit({ code, stdout }); });
+  });
+  assert.equal(result.code, 1);
+  assert.equal(JSON.parse(result.stdout).status, "SUPERVISOR_REJECTED");
+});
+
+test("supervised CLI launches the operator once, supervises it and confirms owned cleanup, no cluster", { timeout: 30_000 }, async () => {
+  assert.equal(process.env.GITHUB_ACTIONS, "true");
+  const directory = mkdtempSync(join(tmpdir(), "cpa-supervised-cli-"));
+  const socket = join(directory, "api.sock"), input = join(directory, "config.json");
+  writeFileSync(input, JSON.stringify(config), { mode: 0o600 });
+  const f = fixture("init");
+  const server = createServer(async (req, res) => {
+    try {
+      const chunks: Buffer[] = []; for await (const chunk of req) chunks.push(Buffer.from(chunk));
+      const text = Buffer.concat(chunks).toString("utf8");
+      f.setNow(Date.now());
+      const data = await f.api.call(req.method as "GET" | "PATCH" | "DELETE", req.url!, PROBE_BUDGET.apiMs, text ? JSON.parse(text) : undefined);
+      res.setHeader("Content-Type", "application/json"); res.end(JSON.stringify(data));
+    } catch (error) { res.statusCode = error instanceof ApiFailure ? error.statusCode : 500; res.end("{}"); }
+  });
+  try {
+    await new Promise<void>((resolveListening, reject) => { server.once("error", reject); server.listen(socket, resolveListening); });
+    const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolveExit, reject) => {
+      const child = spawn(process.execPath, [resolve("ops/inspection/cpa-work-probe-supervised.ts"), "--execute-authorized-target-only", input, "--api-socket", socket], { stdio: ["ignore", "pipe", "pipe"] });
+      let stdout = "", stderr = "";
+      const timer = setTimeout(() => { child.kill("SIGKILL"); reject(new Error("CLI_TEST_DEADLINE")); }, 20_000);
+      child.stdout.on("data", (chunk) => { stdout += chunk; }); child.stderr.on("data", (chunk) => { stderr += chunk; });
+      child.on("error", reject); child.on("exit", (code) => { clearTimeout(timer); resolveExit({ code, stdout, stderr }); });
+    });
+    assert.equal(result.code, 1, result.stderr);
+    const receipt = JSON.parse(result.stdout);
+    assert.equal(receipt.status, "SUPERVISED_FAILED");
+    assert.equal(receipt.operator.status, "STARTUP_FAILED");
+    assert.equal(receipt.operator.cleanup.complete, true);
+    assert.equal(receipt.forcedStop, false);
+    assert.equal(receipt.cleanupComplete, true);
+    assert.ok(receipt.exit && Number.isFinite(receipt.exit.finishedAt));
+    assert.equal(f.operations.filter((op) => op.method === "PATCH").length, 1);
+    // Once the operator's own guarded deletes confirmed absence, the
+    // supervisor's caller cleanup adds zero further deletions.
+    assert.equal(f.operations.filter((op) => op.method === "DELETE").length, 2);
+  } finally {
+    await new Promise<void>((resolveClosed) => server.close(() => resolveClosed())); rmSync(directory, { recursive: true, force: true });
+  }
 });

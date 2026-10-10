@@ -1,6 +1,6 @@
 import { request } from "node:http";
 import { spawn } from "node:child_process";
-import { lstatSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { lstatSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
@@ -82,7 +82,7 @@ export function unixApi(socketPath: string): ProbeApi {
 }
 
 function identity(resource: Resource, name: string, uid: string, rv?: string): void {
-  if (!resource?.metadata || resource.metadata.name !== name || resource.metadata.namespace !== NS || resource.metadata.uid !== uid || !resource.metadata.resourceVersion || rv !== undefined && resource.metadata.resourceVersion !== rv) throw new Error("IDENTITY_MISMATCH");
+  if (!resource?.metadata || typeof name !== "string" || !/^[a-z0-9][a-z0-9.-]*$/.test(name) || typeof uid !== "string" || !uid || resource.metadata.name !== name || resource.metadata.namespace !== NS || resource.metadata.uid !== uid || typeof resource.metadata.resourceVersion !== "string" || !/^\d+$/.test(resource.metadata.resourceVersion) || rv !== undefined && resource.metadata.resourceVersion !== rv) throw new Error("IDENTITY_MISMATCH");
 }
 function owned(pod: Resource, jobUid: string): boolean {
   const controllers = pod.metadata.ownerReferences?.filter((owner) => owner.controller) ?? [];
@@ -172,9 +172,143 @@ function activePvcConsumer(pod: Resource): boolean {
         (key === "terminated" || key === "waiting") && value !== null && typeof value === "object" && !Array.isArray(value));
     })));
 }
-function configValid(config: ProbeConfig): void {
+export function configValid(config: ProbeConfig): void {
+  if (!config || typeof config !== "object" || [config.jobName, config.jobUid, config.jobResourceVersion, config.pvcUid, config.pvcResourceVersion].some((value) => typeof value !== "string")) throw new Error("INVALID_CONFIG_IDENTITY");
   validateBudgets(config.budgets);
   if (!/^mtc-cpa-work-directio-[a-z0-9-]+$/.test(config.jobName) || !/^[a-f0-9-]{36}$/.test(config.jobUid) || !/^\d+$/.test(config.jobResourceVersion) || config.pvcUid !== PVC_UID || !/^\d+$/.test(config.pvcResourceVersion)) throw new Error("INVALID_CONFIG_IDENTITY");
+}
+
+type ProbeCleanup = { complete: boolean; jobDeleted: boolean; podDeleted: boolean; startedAt: string | null; deadline: number | null; errors: string[] };
+export interface ProbeAttempt {
+  config: ProbeConfig;
+  attempted: boolean;
+  pod: Resource | null;
+  cleanup: ProbeCleanup;
+  deletes: { path: string; acknowledged: boolean }[];
+}
+export interface ProbeJournal { state: ProbeAttempt; save(): void }
+export function probeJournal(config: ProbeConfig, path?: string): ProbeJournal {
+  const state: ProbeAttempt = { config, attempted: false, pod: null, cleanup: { complete: false, jobDeleted: false, podDeleted: false, startedAt: null, deadline: null, errors: [] }, deletes: [] };
+  return { state, save: () => {
+    if (!path) return;
+    writeFileSync(`${path}.next`, JSON.stringify(state), { mode: 0o600 });
+    renameSync(`${path}.next`, path);
+  } };
+}
+export function readProbeJournal(config: ProbeConfig, path: string): ProbeJournal {
+  const file = lstatSync(path);
+  if (!file.isFile() || file.uid !== process.getuid?.() || (file.mode & 0o077) !== 0 || file.size > 1024 * 1024) throw new Error("JOURNAL_REJECTED");
+  const state = JSON.parse(readFileSync(path, "utf8")) as ProbeAttempt;
+  if (!state || !isDeepStrictEqual(state.config, config) || typeof state.attempted !== "boolean" || !state.cleanup) throw new Error("JOURNAL_REJECTED");
+  if ([state.cleanup.complete, state.cleanup.jobDeleted, state.cleanup.podDeleted].some((value) => typeof value !== "boolean") || !Array.isArray(state.cleanup.errors) || state.cleanup.errors.some((value) => typeof value !== "string")) throw new Error("JOURNAL_REJECTED");
+  if (state.cleanup.startedAt !== null && (typeof state.cleanup.startedAt !== "string" || !Number.isFinite(Date.parse(state.cleanup.startedAt))) || state.cleanup.deadline !== null && (typeof state.cleanup.deadline !== "number" || !Number.isFinite(state.cleanup.deadline))) throw new Error("JOURNAL_REJECTED");
+  if (state.pod !== null && (!state.pod || typeof state.pod !== "object") || !Array.isArray(state.deletes) || state.deletes.some((entry) => !entry || typeof entry.path !== "string" || typeof entry.acknowledged !== "boolean")) throw new Error("JOURNAL_REJECTED");
+  const journal = probeJournal(config, path);
+  Object.assign(journal.state, state);
+  return journal;
+}
+type ProbeCall = (method: "GET" | "PATCH" | "DELETE", path: string, deadline: number, body?: unknown) => Promise<unknown>;
+async function retryProbeRead(callOnce: ProbeCall, clock: ProbeClock, budgets: ProbeBudgets, method: "GET" | "PATCH" | "DELETE", path: string, deadline: number, body?: unknown): Promise<unknown> {
+  for (let attempt = 1; ; attempt++) {
+    try { return await callOnce(method, path, deadline, body); }
+    catch (error) {
+      const transient = error instanceof ApiFailure ? [502, 503, 504].includes(error.statusCode)
+        : error instanceof ApiTransportFailure && ["SOCKET_RESET", "REQUEST_DEADLINE", "SOCKET_TIMEOUT", "RESPONSE_ABORTED"].includes(error.category);
+      if (method !== "GET" || !transient || attempt >= 3 || clock.cancelled() || deadline - clock.now() <= budgets.pollMs) throw error;
+      await clock.sleep(budgets.pollMs);
+    }
+  }
+}
+async function captureProbePod(config: ProbeConfig, plan: Resource, pod: Resource | null, call: ProbeCall, deadline: number): Promise<Resource | null> {
+  const items = listItems(await call("GET", `${CORE}/pods?labelSelector=${encodeURIComponent(`batch.kubernetes.io/controller-uid=${config.jobUid}`)}`, deadline));
+  for (const item of items) identity(item, item?.metadata?.name, item?.metadata?.uid);
+  if (items.length > 1 || items.some((item) => !owned(item, config.jobUid))) throw new Error("POD_OWNERSHIP_REJECTED");
+  const found = items[0];
+  if (!found) { if (pod) throw new Error("POD_LOST"); return null; }
+  if (pod && (pod.metadata.uid !== found.metadata.uid || pod.metadata.name !== found.metadata.name)) throw new Error("POD_REPLACED");
+  identity(found, found.metadata.name, pod?.metadata.uid ?? found.metadata.uid);
+  const template = plan.spec.template as { metadata: { labels: Record<string, string> }; spec: Record<string, unknown> };
+  if (!subset(found.metadata.labels, template.metadata.labels)) throw new Error("NETWORK_LABEL_MISMATCH");
+  validatePodSpec(found.spec, template.spec);
+  return found;
+}
+export async function cleanupProbe(config: ProbeConfig, api: ProbeApi, plan: Resource, journal: ProbeJournal, clock: ProbeClock, deadline: number, operatorCall?: ProbeCall, setStage: (stage: ApiStage) => void = () => {}): Promise<boolean> {
+  configValid(config);
+  const state = journal.state, cleanup = state.cleanup, b = config.budgets;
+  if (!isDeepStrictEqual(state.config, config) || !state.attempted || clock.cancelled() || clock.now() >= deadline) return false;
+  if (cleanup.complete) return true;
+  if (cleanup.errors.length || state.deletes.some((entry) => !entry.acknowledged)) return false;
+  if (state.pod) identity(state.pod, state.pod.metadata?.name, state.pod.metadata?.uid);
+  const jobPath = `${JOBS}/${config.jobName}`;
+  const podsPath = `${CORE}/pods?labelSelector=${encodeURIComponent(`batch.kubernetes.io/controller-uid=${config.jobUid}`)}`;
+  const expectedPod = (plan.spec.template as { spec: Record<string, unknown> }).spec;
+  const callOnce: ProbeCall = async (method, path, limit, body) => {
+    const remaining = limit - clock.now();
+    if (clock.cancelled() || remaining <= 0) throw new Error("READ_DEADLINE");
+    const value = await api.call(method, path, Math.min(b.apiMs, remaining), body);
+    if (clock.cancelled() || clock.now() > limit) throw new Error("READ_DEADLINE");
+    return value;
+  };
+  const call: ProbeCall = async (method, path, limit, body) => {
+    if (clock.cancelled() || clock.now() >= limit) throw new Error("READ_DEADLINE");
+    return operatorCall ? operatorCall(method, path, limit, body) : retryProbeRead(callOnce, clock, b, method, path, limit, body);
+  };
+  const resource = async (path: string) => await call("GET", path, deadline) as Resource;
+  const remove = async (path: string, body: unknown) => {
+    if (state.deletes.some((entry) => entry.path === path)) return;
+    if (clock.cancelled() || clock.now() >= deadline) throw new Error("READ_DEADLINE");
+    const entry = { path, acknowledged: false };
+    state.deletes.push(entry); journal.save();
+    await call("DELETE", path, deadline, body);
+    entry.acknowledged = true; journal.save();
+  };
+  if (cleanup.startedAt === null) cleanup.startedAt = new Date(clock.now()).toISOString();
+  cleanup.deadline = deadline; journal.save();
+  setStage("CLEANUP_CAPTURE");
+  if (!state.pod) {
+    try { state.pod = await captureProbePod(config, plan, null, call, deadline); journal.save(); }
+    catch { cleanup.errors.push("POD_CAPTURE_UNCONFIRMED"); journal.save(); return false; }
+  }
+  setStage("CLEANUP_JOB");
+  try {
+    const job = await resource(jobPath); identity(job, config.jobName, config.jobUid);
+    validateJobControls(job.spec, config.jobUid, plan.spec);
+    if (job.spec.activeDeadlineSeconds !== b.totalMs / 1000 || job.spec.backoffLimit !== 0) throw new Error("JOB_CHANGED");
+    validatePodSpec((job.spec.template as { spec: Record<string, unknown> }).spec, expectedPod);
+    await remove(jobPath, { apiVersion: "v1", kind: "DeleteOptions", propagationPolicy: "Orphan", gracePeriodSeconds: 5, preconditions: { uid: config.jobUid, resourceVersion: job.metadata.resourceVersion } });
+    cleanup.jobDeleted = true;
+  } catch (error) { if (error instanceof ApiFailure && error.statusCode === 404) cleanup.jobDeleted = true; else cleanup.errors.push("JOB_STOP_UNCONFIRMED"); }
+  const originalPod = state.pod;
+  if (originalPod && cleanup.jobDeleted) {
+    setStage("CLEANUP_POD");
+    try {
+      identity(originalPod, originalPod.metadata.name, originalPod.metadata.uid);
+      const exact = await resource(`${CORE}/pods/${originalPod.metadata.name}`);
+      identity(exact, originalPod.metadata.name, originalPod.metadata.uid);
+      const controllers = exact.metadata.ownerReferences?.filter((owner) => owner.controller) ?? [];
+      if (controllers.length && !owned(exact, config.jobUid)) throw new Error("POD_OWNER_CHANGED");
+      validatePodSpec(exact.spec, expectedPod);
+      await remove(`${CORE}/pods/${originalPod.metadata.name}`, { apiVersion: "v1", kind: "DeleteOptions", gracePeriodSeconds: 5, preconditions: { uid: originalPod.metadata.uid, resourceVersion: exact.metadata.resourceVersion } });
+      cleanup.podDeleted = true;
+    } catch (error) { if (error instanceof ApiFailure && error.statusCode === 404) cleanup.podDeleted = true; else cleanup.errors.push("POD_STOP_UNCONFIRMED"); }
+  } else if (originalPod) cleanup.errors.push("POD_STOP_SKIPPED_JOB_UNCONFIRMED");
+  else cleanup.podDeleted = cleanup.errors.length === 0;
+  if (cleanup.jobDeleted && cleanup.podDeleted && !cleanup.errors.length) {
+    setStage("CLEANUP_ABSENCE");
+    try {
+      for (;;) {
+        let gone = true;
+        for (const path of [jobPath, ...(originalPod ? [`${CORE}/pods/${originalPod.metadata.name}`] : [])]) {
+          try { await resource(path); gone = false; } catch (error) { if (!(error instanceof ApiFailure && error.statusCode === 404)) throw error; }
+        }
+        if (listItems(await call("GET", podsPath, deadline)).length) gone = false;
+        if (gone) { cleanup.complete = true; break; }
+        await clock.sleep(Math.min(b.pollMs, Math.max(0, deadline - clock.now())));
+      }
+    } catch { cleanup.errors.push("CLEANUP_DEADLINE_OR_UNCONFIRMED"); }
+  }
+  journal.save();
+  return cleanup.complete;
 }
 
 function initiallySuspendedUnused(job: Resource): boolean {
@@ -194,7 +328,7 @@ function initiallySuspendedUnused(job: Resource): boolean {
   return initial?.type === "Suspended" && initial.status === "True" && initial.reason === "JobSuspended" && initial.message === "Job suspended";
 }
 
-export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resource, policy: Resource, clock: ProbeClock = realClock()) {
+export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resource, policy: Resource, clock: ProbeClock = realClock(), journal: ProbeJournal = probeJournal(config)) {
   configValid(config);
   const b = config.budgets;
   const jobPath = `${JOBS}/${config.jobName}`;
@@ -209,7 +343,7 @@ export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resourc
   let result: ReturnType<typeof probeBudget> | null = null;
   let status = "PREFLIGHT_REJECTED";
   let execStartedAt: string | null = null;
-  const cleanup = { complete: false, jobDeleted: false, podDeleted: false, startedAt: null as string | null, deadline: null as number | null, errors: [] as string[] };
+  const cleanup = journal.state.cleanup;
   let stage: ApiStage = "PREFLIGHT";
   const apiDiagnostics = { lastSuccessfulCall: null as ApiCallDiagnostic | null, failures: [] as (ApiCallDiagnostic & { category: string; previousSuccessfulCall: ApiCallDiagnostic | null })[] };
   const resourceKind = (path: string): ApiResource => path === jobPath ? "JOB" : path === pvcPath ? "PVC" : path === POLICY ? "DENY_POLICY" : path === consumersPath ? "PVC_CONSUMER_LIST" : path === podsPath ? "OWNED_POD_LIST" : pod && path === `${CORE}/pods/${pod.metadata.name}` ? "OWNED_POD" : pod && path === `${CORE}/pods/${pod.metadata.name}/log?container=directio&limitBytes=4096&tailLines=100` ? "DIRECTIO_LOG" : "UNRECOGNIZED";
@@ -223,6 +357,7 @@ export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resourc
       acknowledgement: method === "GET" ? "NOT_APPLICABLE" : !issued ? "NOT_ISSUED" : responded ? "RESPONSE_RECEIVED" : error instanceof ApiFailure && error.statusCode >= 400 && error.statusCode < 500 ? "REJECTED_4XX" : "UNKNOWN" });
     try {
       if (remaining <= 0) throw new Error("READ_DEADLINE");
+      if (method === "PATCH") { journal.state.attempted = true; journal.save(); }
       issued = true; // Transport invoked; this does not prove delivery to the API server.
       const value = await api.call(method, path, timeoutMs, body);
       responded = true;
@@ -235,28 +370,12 @@ export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resourc
     }
   };
   const call = async (method: "GET" | "PATCH" | "DELETE", path: string, deadline: number, body?: unknown) => {
-    for (let attempt = 1; ; attempt++) {
-      try { return await callOnce(method, path, deadline, body); }
-      catch (error) {
-        const transient = error instanceof ApiFailure ? [502, 503, 504].includes(error.statusCode)
-          : error instanceof ApiTransportFailure && ["SOCKET_RESET", "REQUEST_DEADLINE", "SOCKET_TIMEOUT", "RESPONSE_ABORTED"].includes(error.category);
-        if (method !== "GET" || !transient || attempt >= 3 || clock.cancelled() || deadline - clock.now() <= b.pollMs) throw error;
-        await clock.sleep(b.pollMs);
-      }
-    }
+    return retryProbeRead(callOnce, clock, b, method, path, deadline, body);
   };
   const resource = async (path: string, deadline: number) => await call("GET", path, deadline) as Resource;
   const capture = async (deadline: number) => {
-    const items = listItems(await call("GET", podsPath, deadline));
-    if (items.length > 1 || items.some((item) => !owned(item, config.jobUid))) throw new Error("POD_OWNERSHIP_REJECTED");
-    const found = items[0];
-    if (found) {
-      if (pod && (pod.metadata.uid !== found.metadata.uid || pod.metadata.name !== found.metadata.name)) throw new Error("POD_REPLACED");
-      identity(found, found.metadata.name, pod?.metadata.uid ?? found.metadata.uid);
-      if (!subset(found.metadata.labels, expectedLabels)) throw new Error("NETWORK_LABEL_MISMATCH");
-      validatePodSpec(found.spec, expectedPod);
-      pod = found;
-    } else if (pod) throw new Error("POD_LOST");
+    pod = await captureProbePod(config, plan, pod, call, deadline);
+    journal.state.pod = pod; journal.save();
   };
   const exclusiveConsumers = async (deadline: number) => {
     const consumers = listItems(await call("GET", consumersPath, deadline)).filter((item) =>
@@ -293,7 +412,9 @@ export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resourc
     } catch (error) {
       // A definitive rejected PATCH acquires no attempt. Never stop another
       // actor's conflicting mutation. Transport/5xx ambiguity still cleans up.
-      if (error instanceof ApiFailure && error.statusCode >= 400 && error.statusCode < 500) attempted = false;
+      if (!journal.state.attempted || error instanceof ApiFailure && error.statusCode >= 400 && error.statusCode < 500) {
+        attempted = false; journal.state.attempted = false; journal.save();
+      }
       throw error;
     }
     for (;;) {
@@ -373,47 +494,9 @@ export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resourc
       cleanup.startedAt = new Date(entry).toISOString();
       const deadline = cleanupDeadline(entry);
       cleanup.deadline = deadline;
-      // Capture only the original controller's unique Pod if PATCH failed before adoption.
-      stage = "CLEANUP_CAPTURE";
-      if (!pod) { try { await capture(deadline); } catch { cleanup.errors.push("POD_CAPTURE_UNCONFIRMED"); } }
-      stage = "CLEANUP_JOB";
-      try {
-        const job = await resource(jobPath, deadline); identity(job, config.jobName, config.jobUid);
-        validateJobControls(job.spec, config.jobUid, plan.spec);
-        if (job.spec.activeDeadlineSeconds !== b.totalMs / 1000 || job.spec.backoffLimit !== 0) throw new Error("JOB_CHANGED");
-        validatePodSpec((job.spec.template as { spec: Record<string, unknown> }).spec, expectedPod);
-        await call("DELETE", jobPath, deadline, { apiVersion: "v1", kind: "DeleteOptions", propagationPolicy: "Orphan", gracePeriodSeconds: 5, preconditions: { uid: config.jobUid, resourceVersion: job.metadata.resourceVersion } });
-        cleanup.jobDeleted = true;
-      } catch (error) { if (error instanceof ApiFailure && error.statusCode === 404) cleanup.jobDeleted = true; else cleanup.errors.push("JOB_STOP_UNCONFIRMED"); }
-      const originalPod = pod as Resource | null;
-      if (originalPod && cleanup.jobDeleted) {
-        stage = "CLEANUP_POD";
-        try {
-          const exact = await resource(`${CORE}/pods/${originalPod.metadata.name}`, deadline);
-          identity(exact, originalPod.metadata.name, originalPod.metadata.uid);
-          const controllers = exact.metadata.ownerReferences?.filter((owner) => owner.controller) ?? [];
-          if (controllers.length && !owned(exact, config.jobUid)) throw new Error("POD_OWNER_CHANGED");
-          validatePodSpec(exact.spec, expectedPod);
-          await call("DELETE", `${CORE}/pods/${originalPod.metadata.name}`, deadline, { apiVersion: "v1", kind: "DeleteOptions", gracePeriodSeconds: 5, preconditions: { uid: originalPod.metadata.uid, resourceVersion: exact.metadata.resourceVersion } });
-          cleanup.podDeleted = true;
-        } catch (error) { if (error instanceof ApiFailure && error.statusCode === 404) cleanup.podDeleted = true; else cleanup.errors.push("POD_STOP_UNCONFIRMED"); }
-      } else if (originalPod) cleanup.errors.push("POD_STOP_SKIPPED_JOB_UNCONFIRMED");
-      else cleanup.podDeleted = cleanup.errors.length === 0;
-      if (cleanup.jobDeleted && cleanup.podDeleted && !cleanup.errors.length) {
-        stage = "CLEANUP_ABSENCE";
-        try {
-          for (;;) {
-            let gone = true;
-            for (const path of [jobPath, ...(originalPod ? [`${CORE}/pods/${originalPod.metadata.name}`] : [])]) {
-              try { await resource(path, deadline); gone = false; } catch (error) { if (!(error instanceof ApiFailure && error.statusCode === 404)) throw error; }
-            }
-            // Also reject late orphan creation; never delete an unrecorded Pod.
-            if (listItems(await call("GET", podsPath, deadline)).length) gone = false;
-            if (gone) { cleanup.complete = true; break; }
-            await clock.sleep(Math.min(b.pollMs, Math.max(0, deadline - clock.now())));
-          }
-        } catch { cleanup.errors.push("CLEANUP_DEADLINE_OR_UNCONFIRMED"); }
-      }
+      journal.state.pod = pod; journal.save();
+      await cleanupProbe(config, api, plan, journal, { ...clock, cancelled: () => false }, deadline, call, (value) => { stage = value; });
+      pod = journal.state.pod;
     }
   }
   return { status, passed: status === "COMPLETE" && cleanup.complete, bytes: status === "COMPLETE" ? result?.bytes ?? null : null, budgets: b, attemptStartedAt: attempted ? new Date(attemptStart).toISOString() : null,
@@ -445,7 +528,12 @@ if (invokedAsEntrypoint("cpa-work-probe-operator", import.meta.url)) {
     const socket = lstatSync(socketPath);
     const parent = lstatSync(dirname(socketPath));
     if (!socket.isSocket() || socket.uid !== process.getuid?.() || !parent.isDirectory() || parent.uid !== process.getuid?.() || (parent.mode & 0o077) !== 0) throw new Error("UNSAFE_API_SOCKET");
-    const receipt = await runProbe(config, unixApi(socketPath), plan, policy);
+    const journalPath = process.env.CPA_PROBE_ATTEMPT_JOURNAL;
+    if (journalPath) {
+      const parent = lstatSync(dirname(journalPath));
+      if (!parent.isDirectory() || parent.uid !== process.getuid?.() || (parent.mode & 0o077) !== 0) throw new Error("JOURNAL_REJECTED");
+    }
+    const receipt = await runProbe(config, unixApi(socketPath), plan, policy, undefined, probeJournal(config, journalPath));
     console.log(JSON.stringify(receipt)); process.exitCode = receipt.passed ? 0 : 1;
   } catch { console.log(JSON.stringify({ status: "OPERATOR_REJECTED", passed: false, bytes: null, cleanup: { complete: false } })); process.exitCode = 1; }
   finally {

@@ -113,3 +113,40 @@ an absolute deadline and abort signal and must honor both for each API call;
 This module has no executable entrypoint and performs no operator launch,
 resource creation, probe, import or volume operation. Temporary callers should
 use `observeProbeProcess`/`superviseProbe` rather than copy timestamp heuristics.
+
+`cpa-work-probe-supervised.ts` is the thinnest such executable caller. It is
+invoked with the operator's exact argument contract, with `--api-socket`
+mandatory because caller cleanup shares the caller-owned Unix socket:
+
+```sh
+node ops/inspection/cpa-work-probe-supervised.ts \
+  --execute-authorized-target-only <private-config.json> --api-socket <path>
+```
+
+It records the original launch clock immediately before spawning the reviewed
+operator once with unchanged arguments, forwards SIGTERM/SIGINT as an abort
+signal, and delegates every deadline, signal-first, forced-stop and cleanup
+boundary decision to `superviseProbe`. Both processes use the operator's full
+`configValid` gate and shared `cleanupProbe`, including reviewed Job/Pod specs,
+unique controller ownership, runtime name/namespace/UID/resourceVersion checks,
+guarded Orphan Job deletion and bounded absence confirmation.
+
+The supervisor creates a private attempt journal directory and passes its
+file path through `CPA_PROBE_ATTEMPT_JOURNAL`; operator arguments stay unchanged.
+The operator atomically records attempt acquisition before invoking PATCH,
+clears acquisition on definitive PATCH 4xx rejection, and records each DELETE
+before invoking the transport. Pod adoption and the original cleanup entry
+and deadline are also journaled. Parent cleanup requires this journal to match
+the fully validated config; missing/unacquired journals grant no API access.
+An issued DELETE with unknown acknowledgement, failed cleanup or malformed
+journal stays unconfirmed and cannot be replayed by the parent. Acknowledged
+deletions may be observed for absence within the original window, never reissued.
+Completed operator cleanup requires no additional parent API calls.
+
+Each DELETE retains exact UID/resourceVersion preconditions and 5s grace.
+Malformed capture identities stop cleanup before any DELETE. Identity mismatch,
+transport failure, abort or deadline expiry fails closed without increasing
+the original 2s API, three transient GET, 30s cleanup or 515s outer budgets.
+Cleanup never touches the PVC, PV, deny policy, foreign or unrecorded resources,
+and the entrypoint exits nonzero unless the operator passed and caller cleanup
+completed without a forced stop. The private journal is removed on exit.
