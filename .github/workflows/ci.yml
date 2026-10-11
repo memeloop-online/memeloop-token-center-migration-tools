@@ -74,7 +74,7 @@ jobs:
       - name: Verify isolated mTLS frozen-copy transport
         run: node --test tests/ops/cpa-stream.test.ts
 
-      - name: Verify fixed same-node profile, CLI rejection and identity isolation
+      - name: Verify fixed profiles, CLI rejection and identity isolation
         run: node --test tests/ops/cpa-stream-profiles.test.ts
 
       - name: Check fixed stream runtime without cluster access
@@ -103,6 +103,7 @@ jobs:
           path: |
             ${{ runner.temp }}/cpa-stream-bounded-result.json
             ${{ runner.temp }}/cpa-stream-same-node-bounded-result.json
+            ${{ runner.temp }}/cpa-stream-versetensor-bounded-result.json
             ${{ runner.temp }}/cpa-work-directio-command-result.json
           if-no-files-found: ignore
           retention-days: 14

@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { spawnSync } from "node:child_process";
+import { X509Certificate } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, rmSync } from "node:fs";
+import { parseAllDocuments } from "yaml";
 import { COPY, SAME_NODE_COPY, VERSETENSOR_COPY, STREAM_PROFILES, profileCommand, requirePlacement, streamResourceName, validateEndpoint, validateIdentity, type Identity } from "../../ops/lib/cpa-stream.ts";
 import { job, policies } from "../../ops/cpa-stream-resources.ts";
 
@@ -99,27 +101,58 @@ test("actual main and staging CLI fail closed on wrong node, run, endpoint and u
   }
 });
 
-test("same-node identities use a new private RAM run and reject original/diagnostic SANs", () => {
-  const directory = `/dev/shm/${SAME_NODE_COPY.run}`;
+for (const profile of ["same-node", "versetensor"] as const) test(`${profile} identities use a new private RAM run and reject every other profile SAN`, () => {
+  const selected = STREAM_PROFILES[profile].plan;
+  const directory = `/dev/shm/${selected.run}`;
   let owned = false;
   try {
-    const generated = spawnSync(process.execPath, ["ops/cpa-stream-identity.ts", "create-same-node"], { encoding: "utf8" });
+    const generated = spawnSync(process.execPath, ["ops/cpa-stream-identity.ts", `create-${profile}`], { encoding: "utf8", timeout: 60000 });
     assert.equal(generated.status, 0, generated.stderr);
     owned = true;
-    assert.equal(JSON.parse(generated.stdout).run, SAME_NODE_COPY.run);
+    assert.equal(JSON.parse(generated.stdout).run, selected.run);
     for (const role of ["reader", "receiver"] as const) {
       const identity = JSON.parse(readFileSync(`${directory}/${role}.json`, "utf8")) as Identity;
-      validateIdentity(identity, role, SAME_NODE_COPY.run);
-      for (const profile of ["original", "diagnostic"] as const) assert.throws(() => validateIdentity(identity, role, STREAM_PROFILES[profile].plan.run), /IDENTITY_ROLE/);
+      validateIdentity(identity, role, selected.run);
+      const peerRole = role === "reader" ? "receiver" : "reader";
+      const peer = JSON.parse(readFileSync(`${directory}/${peerRole}.json`, "utf8")) as Identity;
+      assert.equal(identity.peerFingerprint, new X509Certificate(peer.cert).fingerprint256);
+      assert.throws(() => validateIdentity(identity, peerRole, selected.run), /IDENTITY_ROLE/);
+      for (const other of ["original", "diagnostic", "same-node", "versetensor"] as const) {
+        if (other !== profile) assert.throws(() => validateIdentity(identity, role, STREAM_PROFILES[other].plan.run), /IDENTITY_ROLE/);
+      }
       assert.equal(lstatSync(`${directory}/${role}.json`).mode & 0o777, 0o600);
       assert.equal(generated.stdout.includes(identity.key), false);
       assert.equal(existsSync(`${directory}/${role}.key`), false);
     }
     assert.equal(existsSync(`${directory}/ca.key`), false);
-    const repeated = spawnSync(process.execPath, ["ops/cpa-stream-identity.ts", "create-same-node"], { encoding: "utf8" });
+    const repeated = spawnSync(process.execPath, ["ops/cpa-stream-identity.ts", `create-${profile}`], { encoding: "utf8", timeout: 60000 });
     assert.equal(repeated.status, 1);
     assert.equal(repeated.stderr.trim(), "EEXIST");
   } finally { if (owned) rmSync(directory, { recursive: true }); }
+});
+
+test("the dedicated 52Gi work claim covers payload plus unchanged 20GiB reserve", () => {
+  const documents = parseAllDocuments(readFileSync("ops/inspection/cpa-work-versetensor-20261011.yaml", "utf8"));
+  assert.equal(documents.length, 2);
+  const [storageClass, claim] = documents.map((document) => document.toJSON());
+  assert.equal(storageClass.kind, "StorageClass");
+  assert.equal(storageClass.metadata.name, "mtc-cpa-work-versetensor-20261011");
+  assert.equal(storageClass.allowVolumeExpansion, true);
+  assert.equal(storageClass.provisioner, "driver.longhorn.io");
+  assert.equal(storageClass.reclaimPolicy, "Retain");
+  assert.equal(storageClass.parameters.numberOfReplicas, "1");
+  assert.equal(storageClass.parameters.nodeSelector, "storage-tier-mtc-work-versetensor");
+  assert.equal(storageClass.parameters.diskSelector, "storage-tier-mtc-work-versetensor");
+  assert.equal(claim.kind, "PersistentVolumeClaim");
+  assert.equal(claim.metadata.namespace, "cliproxyapi");
+  assert.equal(claim.metadata.name, STREAM_PROFILES.versetensor.targetClaim);
+  assert.equal(claim.spec.storageClassName, storageClass.metadata.name);
+  assert.equal(claim.spec.resources.requests.storage, "52Gi");
+  assert.deepEqual(claim.spec.accessModes, ["ReadWriteOnce"]);
+  assert.equal(VERSETENSOR_COPY.reserveBytes, 20 * 1024 ** 3);
+  assert.equal(VERSETENSOR_COPY.size + VERSETENSOR_COPY.reserveBytes, 51680235520);
+  assert.ok(48 * 1024 ** 3 < VERSETENSOR_COPY.size + VERSETENSOR_COPY.reserveBytes);
+  assert.ok(52 * 1024 ** 3 > VERSETENSOR_COPY.size + VERSETENSOR_COPY.reserveBytes);
 });
 
 test("versetensor profile pins receiver to versetensor-hv with the independent work claim and exact isolated NP", () => {
