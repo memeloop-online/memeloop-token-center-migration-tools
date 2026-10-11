@@ -108,6 +108,7 @@ export function requireCopy(condition: unknown, code: string): asserts condition
 const nativeFailureCodes = new Set([
   "EACCES", "EPERM", "ENOENT", "EEXIST", "EIO", "ENOSPC", "EROFS", "EMFILE", "ENFILE", "ELOOP",
   "ECONNREFUSED", "ECONNRESET", "ECONNABORTED", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "EPIPE", "EADDRINUSE", "ENOBUFS",
+  "ERR_STREAM_DESTROYED", "ERR_STREAM_WRITE_AFTER_END",
   "CERT_HAS_EXPIRED", "CERT_NOT_YET_VALID", "DEPTH_ZERO_SELF_SIGNED_CERT", "SELF_SIGNED_CERT_IN_CHAIN", "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
   "ERR_TLS_CERT_ALTNAME_INVALID", "ERR_TLS_HANDSHAKE_TIMEOUT", "ERR_TLS_CERT_SIGNATURE_ALGORITHM_UNSUPPORTED",
   "ERR_SSL_TLSV1_ALERT_UNKNOWN_CA", "ERR_SSL_SSLV3_ALERT_BAD_CERTIFICATE", "ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED",
@@ -119,6 +120,49 @@ export function safeFailure(error: unknown): string {
   if (nativeCode && nativeFailureCodes.has(nativeCode)) return nativeCode;
   const code = error instanceof Error ? error.message : "";
   return nativeFailureCodes.has(code) || /^[A-Z][A-Z_]{1,60}$/.test(code) ? code : "COPY_FAILED";
+}
+
+type SocketContext = { role: "reader" | "receiver"; transferPhase: string; bytes: number; idleMs: number };
+type TimerSource = "socket-idle" | "reader-total" | "receiver-total";
+type FailureContext = { role?: "reader" | "receiver"; transferPhase?: string; bytes?: number; timeoutSource?: TimerSource; timeoutMs?: number };
+const socketContexts = new WeakMap<TLSSocket, SocketContext>();
+const failureContexts = new WeakMap<Error, FailureContext>();
+
+export function safeFailureDetails(error: unknown): { causeCode?: string; syscall?: string; timeoutSource?: TimerSource; timeoutMs?: number; transferPhase?: string; confirmedBytes?: number; receivedBytes?: number } {
+  const details: ReturnType<typeof safeFailureDetails> = {};
+  let current = error;
+  for (let depth = 0; depth < 4 && current instanceof Error; depth++) {
+    const native = current as NodeJS.ErrnoException;
+    if (native.code && nativeFailureCodes.has(native.code)) details.causeCode = native.code;
+    if (native.syscall && ["write", "read", "connect", "shutdown"].includes(native.syscall)) details.syscall = native.syscall;
+    const context = failureContexts.get(current);
+    if (context) {
+      if (context.timeoutSource) details.timeoutSource = context.timeoutSource;
+      if (context.timeoutMs !== undefined) details.timeoutMs = context.timeoutMs;
+      if (context.transferPhase) details.transferPhase = context.transferPhase;
+      if (context.bytes !== undefined) {
+        if (context.role === "reader") details.confirmedBytes = context.bytes;
+        if (context.role === "receiver") details.receivedBytes = context.bytes;
+      }
+    }
+    current = current.cause;
+  }
+  return details;
+}
+
+function trackSocket(socket: TLSSocket, transferPhase: string, bytes?: number): void {
+  const context = socketContexts.get(socket);
+  if (context) {
+    context.transferPhase = transferPhase;
+    if (bytes !== undefined) context.bytes = bytes;
+  }
+}
+
+function timeoutError(socket: TLSSocket | undefined, code: string, timeoutSource: TimerSource, timeoutMs: number): Error {
+  const error = new Error(code);
+  const context = socket ? socketContexts.get(socket) : undefined;
+  failureContexts.set(error, { role: context?.role, transferPhase: context?.transferPhase, bytes: context?.bytes, timeoutSource, timeoutMs });
+  return error;
 }
 
 export function validateEndpoint(address: string, profile: StreamProfile = "original"): string {
@@ -194,7 +238,13 @@ export class Wire {
 }
 
 async function write(socket: TLSSocket, body: Buffer): Promise<void> {
-  await new Promise<void>((resolve, reject) => socket.write(body, (error) => error ? reject(new Error("STREAM_WRITE")) : resolve()));
+  await new Promise<void>((resolve, reject) => socket.write(body, (error) => {
+    if (!error) { resolve(); return; }
+    const failure = new Error("STREAM_WRITE", { cause: error });
+    const context = socketContexts.get(socket);
+    if (context) failureContexts.set(failure, { ...context });
+    reject(failure);
+  }));
 }
 
 export async function frame(socket: TLSSocket, kind: number, body: Buffer): Promise<void> {
@@ -247,6 +297,7 @@ async function throttle(plan: CopyPlan, started: number, copied: number): Promis
 }
 
 export async function sendFile(socket: TLSSocket, plan: CopyPlan, started: number): Promise<Receipt> {
+  trackSocket(socket, "source-ready", 0);
   const wire = new Wire(socket);
   requireCopy((await wire.take(8)).equals(Buffer.from("CPA00001")), "PROTOCOL_READY");
   console.log(JSON.stringify({ stage: "source-ready" }));
@@ -264,6 +315,7 @@ export async function sendFile(socket: TLSSocket, plan: CopyPlan, started: numbe
       checkBudget(plan, started, copied);
       const segment = Math.floor(copied / plan.chunk) + 1;
       let phaseStarted = performance.now();
+      trackSocket(socket, "source-read-hash");
       segmentTrace(plan, "reader", segment, "frame-start", transferStarted, phaseStarted);
       const { bytesRead } = await source.read(buffer, 0, Math.min(buffer.length, plan.size - copied), null);
       requireCopy(bytesRead > 0, "SOURCE_TRUNCATED");
@@ -272,14 +324,18 @@ export async function sendFile(socket: TLSSocket, plan: CopyPlan, started: numbe
       digest.update(data);
       segmentTrace(plan, "reader", segment, "read-hash", transferStarted, phaseStarted);
       phaseStarted = performance.now();
+      trackSocket(socket, "source-throttle");
       await throttle(plan, transferStarted, copied + bytesRead);
       segmentTrace(plan, "reader", segment, "throttle", transferStarted, phaseStarted);
       phaseStarted = performance.now();
+      trackSocket(socket, "frame-write");
       await frame(socket, 1, data);
       segmentTrace(plan, "reader", segment, "frame-write", transferStarted, phaseStarted);
       copied += bytesRead;
       phaseStarted = performance.now();
+      trackSocket(socket, "ack-read");
       requireCopy((await wire.take(8)).equals(countBuffer(copied)), "ACK_MISMATCH");
+      trackSocket(socket, "ack-read", copied);
       segmentTrace(plan, "reader", segment, "ack-read", transferStarted, phaseStarted);
       if (performance.now() - reported >= 10000) {
         console.log(JSON.stringify({ stage: "source-stream", confirmedBytes: copied }));
@@ -291,9 +347,13 @@ export async function sendFile(socket: TLSSocket, plan: CopyPlan, started: numbe
     requireCopy(digest.digest("hex") === plan.sha256, "SOURCE_HASH_MISMATCH");
   } finally { await source.close(); }
   socket.setTimeout(plan.verifyMs + plan.idleMs);
+  const context = socketContexts.get(socket);
+  if (context) context.idleMs = plan.verifyMs + plan.idleMs;
+  trackSocket(socket, "seal-write");
   await frame(socket, 2, Buffer.concat([countBuffer(copied), Buffer.from(plan.sha256, "hex")]));
   socket.end();
   const receiptStarted = performance.now();
+  trackSocket(socket, "receipt-read");
   segmentTrace(plan, "reader", 0, "receipt-start", started, receiptStarted);
   const reply = await wire.frame();
   requireCopy(reply.kind === 3 && reply.body.length <= 2048, "RECEIPT_FRAME");
@@ -333,6 +393,7 @@ export async function verifyDestination(plan: CopyPlan, file: string, signal?: A
 }
 
 export async function receiveFile(socket: TLSSocket, plan: CopyPlan, signal?: AbortSignal): Promise<Receipt> {
+  trackSocket(socket, "destination-preflight", 0);
   const directory = await lstat(plan.destination);
   requireCopy(directory.isDirectory() && !directory.isSymbolicLink() && directory.uid === plan.uid && directory.gid === plan.gid && (directory.mode & 0o7777) === 0o700, "DESTINATION_NOT_PRIVATE");
   requireCopy((await readdir(plan.destination)).length === 0, "DESTINATION_NOT_EMPTY");
@@ -351,10 +412,12 @@ export async function receiveFile(socket: TLSSocket, plan: CopyPlan, signal?: Ab
   const transferStarted = performance.now();
   try {
     requireCopy(!signal?.aborted, "TRANSFER_CANCELLED");
+    trackSocket(socket, "ready-write");
     await write(socket, Buffer.from("CPA00001"));
     while (copied < plan.size) {
       const segment = Math.floor(copied / plan.chunk) + 1;
       let phaseStarted = performance.now();
+      trackSocket(socket, "frame-read");
       segmentTrace(plan, "receiver", segment, "frame-start", transferStarted, phaseStarted);
       const message = await wire.frame();
       segmentTrace(plan, "receiver", segment, "frame-read", transferStarted, phaseStarted);
@@ -362,6 +425,7 @@ export async function receiveFile(socket: TLSSocket, plan: CopyPlan, signal?: Ab
       requireCopy(message.kind === 1 && message.body.length > 0 && message.body.length <= plan.chunk && copied + message.body.length <= plan.size, "DATA_FRAME");
       if (plan.run === SEGMENTED_DIAGNOSTIC.run) requireCopy(message.body.length === COPY.chunk, "SYNTHETIC_SEGMENT_SIZE");
       phaseStarted = performance.now();
+      trackSocket(socket, "destination-write-hash");
       let written = 0;
       while (written < message.body.length) {
         const { bytesWritten } = await output.write(message.body, written, message.body.length - written);
@@ -370,24 +434,31 @@ export async function receiveFile(socket: TLSSocket, plan: CopyPlan, signal?: Ab
       }
       digest.update(message.body);
       copied += message.body.length;
+      trackSocket(socket, "destination-throttle", copied);
       segmentTrace(plan, "receiver", segment, "write-hash", transferStarted, phaseStarted);
       phaseStarted = performance.now();
+      trackSocket(socket, "ack-write");
       await throttle(plan, transferStarted, copied);
       segmentTrace(plan, "receiver", segment, "throttle", transferStarted, phaseStarted);
       phaseStarted = performance.now();
       await write(socket, countBuffer(copied));
       segmentTrace(plan, "receiver", segment, "ack-write", transferStarted, phaseStarted);
     }
+    trackSocket(socket, "seal-read");
     const seal = await wire.frame();
     requireCopy(seal.kind === 2 && seal.body.equals(Buffer.concat([countBuffer(plan.size), Buffer.from(plan.sha256, "hex")])), "SOURCE_SEAL");
     await wire.eof();
     requireCopy(digest.digest("hex") === plan.sha256, "STREAM_HASH_MISMATCH");
     requireCopy(!signal?.aborted, "TRANSFER_CANCELLED");
     const syncStarted = performance.now();
+    trackSocket(socket, "destination-fsync");
     await output.sync();
     segmentTrace(plan, "receiver", 0, "fsync", transferStarted, syncStarted);
   } finally { await output.close(); }
   socket.setTimeout(plan.verifyMs + plan.idleMs);
+  const context = socketContexts.get(socket);
+  if (context) context.idleMs = plan.verifyMs + plan.idleMs;
+  trackSocket(socket, "destination-verify");
   const verifyStarted = performance.now();
   await verifyDestination(plan, partial, signal);
   segmentTrace(plan, "receiver", 0, "verify", transferStarted, verifyStarted);
@@ -406,14 +477,20 @@ export async function receiveFile(socket: TLSSocket, plan: CopyPlan, signal?: Ab
     await link(receiptPath, `${plan.destination}/copy-receipt.json`);
     await directoryFile.sync();
   } finally { await directoryFile.close(); }
+  trackSocket(socket, "receipt-write");
   await frame(socket, 3, Buffer.from(JSON.stringify(receipt)));
   await new Promise<void>((resolve) => socket.end(resolve));
   return receipt;
 }
 
-function watchSocket(socket: TLSSocket, idleMs: number): void {
-  socket.setTimeout(idleMs, () => socket.destroy(new Error("IDLE_DEADLINE")));
-  socket.on("error", () => {});
+function watchSocket(socket: TLSSocket, idleMs: number, role: "reader" | "receiver"): void {
+  socketContexts.set(socket, { role, transferPhase: role === "reader" ? "tls-connect" : "peer-authorized", bytes: 0, idleMs });
+  socket.setTimeout(idleMs, () => socket.destroy(timeoutError(socket, "IDLE_DEADLINE", "socket-idle", socketContexts.get(socket)!.idleMs)));
+  socket.on("error", (error) => {
+    const context = socketContexts.get(socket);
+    if (context && !failureContexts.has(error)) failureContexts.set(error, { ...context });
+    console.error(JSON.stringify({ stage: "socket-error", role, failure: safeFailure(error), ...safeFailureDetails(error) }));
+  });
   socket.setNoDelay(true);
 }
 
@@ -422,8 +499,8 @@ export async function runReader(plan: CopyPlan, identity: Identity, host: string
   const started = performance.now();
   const socket = connect({ host, port: plan.port, ca: identity.ca, cert: identity.cert, key: identity.key, servername: identityName("receiver", plan.run), minVersion: "TLSv1.3", rejectUnauthorized: true });
   socket.allowHalfOpen = true;
-  watchSocket(socket, plan.idleMs);
-  const deadline = setTimeout(() => socket.destroy(new Error("TOTAL_DEADLINE")), plan.totalMs);
+  watchSocket(socket, plan.idleMs, "reader");
+  const deadline = setTimeout(() => socket.destroy(timeoutError(socket, "TOTAL_DEADLINE", "reader-total", plan.totalMs)), plan.totalMs);
   let stage = "reader-tls-connect";
   try {
     await new Promise<void>((resolve, reject) => {
@@ -435,7 +512,7 @@ export async function runReader(plan: CopyPlan, identity: Identity, host: string
     stage = "reader-stream";
     return await sendFile(socket, plan, started);
   } catch (error) {
-    console.error(JSON.stringify({ stage, failure: safeFailure(error) }));
+    console.error(JSON.stringify({ stage, failure: safeFailure(error), ...safeFailureDetails(error) }));
     throw error;
   } finally { clearTimeout(deadline); socket.destroy(); }
 }
@@ -454,10 +531,10 @@ export function startReceiver(plan: CopyPlan, identity: Identity, host: string):
       authorize(socket, identity, identityName("reader", plan.run));
       claim = true;
       active = socket;
-      watchSocket(socket, plan.idleMs);
+      watchSocket(socket, plan.idleMs, "receiver");
       socket.on("error", () => cancellation.abort());
       server.close();
-      void receiveFile(socket, plan, cancellation.signal).then(succeed, (error: unknown) => { socket.destroy(); fail(new Error(safeFailure(error))); });
+      void receiveFile(socket, plan, cancellation.signal).then(succeed, (error: unknown) => { socket.destroy(); fail(new Error(safeFailure(error), { cause: error })); });
     } catch (error) {
       console.error(JSON.stringify({ stage: "receiver-peer-authorization", failure: safeFailure(error) }));
       socket.destroy();
@@ -465,8 +542,8 @@ export function startReceiver(plan: CopyPlan, identity: Identity, host: string):
   });
   server.maxConnections = 1;
   server.on("tlsClientError", (error) => console.error(JSON.stringify({ stage: "receiver-tls-handshake", failure: safeFailure(error) })));
-  server.on("error", (error) => fail(new Error(safeFailure(error))));
-  const deadline = setTimeout(() => { cancellation.abort(); active?.destroy(); server.close(); fail(new Error("TOTAL_DEADLINE")); }, plan.totalMs);
+  server.on("error", (error) => fail(new Error(safeFailure(error), { cause: error })));
+  const deadline = setTimeout(() => { const error = timeoutError(active, "TOTAL_DEADLINE", "receiver-total", plan.totalMs); cancellation.abort(); active?.destroy(); server.close(); fail(error); }, plan.totalMs);
   const listening = new Promise<number>((resolve, reject) => {
     server.once("error", reject);
     server.listen(plan.port, host, () => {

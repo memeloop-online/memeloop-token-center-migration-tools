@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { createServer as createTcpServer } from "node:net";
 import { connect, type TLSSocket } from "node:tls";
 import { setTimeout as pause } from "node:timers/promises";
-import { COPY, Wire, checkBudget, frame, identityName, requireReadOnlyMount, runReader, safeFailure, startReceiver, validateEndpoint, validateIdentity, verifyDestination, type CopyPlan, type Identity } from "../../ops/lib/cpa-stream.ts";
+import { COPY, Wire, checkBudget, frame, identityName, requireReadOnlyMount, runReader, safeFailure, safeFailureDetails, startReceiver, validateEndpoint, validateIdentity, verifyDestination, type CopyPlan, type Identity } from "../../ops/lib/cpa-stream.ts";
 import { job, policies } from "../../ops/cpa-stream-resources.ts";
 
 const identityDirectory = "/dev/shm/cpa-stream-20261005a";
@@ -78,6 +78,46 @@ test("native failure diagnostics preserve allowlisted codes without paths, keys,
   assert.equal(safeFailure(new Error(sensitive)), "COPY_FAILED");
   assert.equal(safeFailure({ message: sensitive, code: "ECONNREFUSED" }), "COPY_FAILED");
   assert.equal(safeFailure(new Error("SOURCE_HASH_MISMATCH")), "SOURCE_HASH_MISMATCH");
+});
+
+test("write callbacks preserve actual cause and allowlisted syscall without raw error data or guessed timeout", async () => {
+  const native = Object.assign(new Error(`peer path /identity/bundle.json ${readerIdentity.key}`), { code: "ECONNRESET", syscall: "write", address: "10.42.8.135", payload: "private" });
+  const socket = { write: (_body: Buffer, callback: (error: Error) => void) => callback(native) } as unknown as TLSSocket;
+  await assert.rejects(frame(socket, 1, Buffer.alloc(16)), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal(error.message, "STREAM_WRITE");
+    assert.equal(error.cause, native);
+    assert.deepEqual(safeFailureDetails(error), { causeCode: "ECONNRESET", syscall: "write" });
+    assert.deepEqual(safeFailureDetails(new Error("STREAM_WRITE", { cause: error })), { causeCode: "ECONNRESET", syscall: "write" });
+    const safe = JSON.stringify(safeFailureDetails(error));
+    for (const value of [native.message, readerIdentity.key, native.address, native.payload]) assert.equal(safe.includes(value), false);
+    return true;
+  });
+  assert.deepEqual(safeFailureDetails(Object.assign(new Error("private"), { code: "PRIVATE_CODE", syscall: "/private/path", timeoutSource: "socket-idle", timeoutMs: 60000 })), {});
+});
+
+test("actual idle and total deadline callbacks preserve known timer origins through receiver wrapping", async () => {
+  for (const timer of ["idle", "total"] as const) {
+    const sample = fixture({ idleMs: timer === "idle" ? 80 : 1000, totalMs: timer === "idle" ? 2000 : 250 });
+    const receiver = startReceiver(sample.plan, receiverIdentity, "127.0.0.1");
+    const outcome = receiver.completion.catch((error: unknown) => error);
+    let socket: TLSSocket | undefined;
+    try {
+      socket = await peer(await receiver.listening);
+      const wire = new Wire(socket);
+      await wire.take(8);
+      const error = await outcome;
+      assert.ok(error instanceof Error);
+      assert.equal(safeFailure(error), timer === "idle" ? "IDLE_DEADLINE" : "TOTAL_DEADLINE");
+      const details = safeFailureDetails(error);
+      assert.equal(details.timeoutSource, timer === "idle" ? "socket-idle" : "receiver-total");
+      assert.equal(details.timeoutMs, timer === "idle" ? sample.plan.idleMs : sample.plan.totalMs);
+      assert.equal(details.receivedBytes, 0);
+      assert.equal(details.transferPhase, "frame-read");
+      assert.equal(details.confirmedBytes, undefined);
+      assert.equal(details.causeCode, undefined);
+    } finally { socket?.destroy(); receiver.close(); sample.cleanup(); }
+  }
 });
 
 test("sequentially consumed frames reuse bounded body storage rather than relying on external-buffer GC", async () => {
