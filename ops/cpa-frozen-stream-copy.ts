@@ -1,6 +1,6 @@
 import { readFile, writeFile, open, statfs } from "node:fs/promises";
 import { setTimeout as pause } from "node:timers/promises";
-import { COPY, STREAM_PROFILES, loadIdentity, profileCommand, requireCopy, requirePlacement, requireReadOnlyMount, runReader, safeFailure, startReceiver, validateEndpoint, validateIdentity, type Identity } from "./lib/cpa-stream.ts";
+import { COPY, STREAM_PROFILES, loadIdentity, profileCommand, requireCopy, requirePlacement, requireReadOnlyMount, runReader, safeFailure, safeFailureDetails, startReceiver, validateEndpoint, validateIdentity, type Identity } from "./lib/cpa-stream.ts";
 
 let phase = "preflight";
 let run: string = COPY.run;
@@ -75,7 +75,7 @@ async function main(): Promise<void> {
 }
 
 void main().catch(async (error: unknown) => {
-  const result = JSON.stringify({ run, passed: false, phase, failure: safeFailure(error) });
+  const result = JSON.stringify({ run, passed: false, phase, failure: safeFailure(error), ...safeFailureDetails(error) });
   if (!process.argv[2]?.startsWith("stage-")) await writeFile("/dev/termination-log", result).catch(() => {});
   console.error(result);
   process.exitCode = 1;
