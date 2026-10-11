@@ -122,6 +122,10 @@ jobs:
           node ops/cpa-stream-resources.ts same-node-policies > "$RUNNER_TEMP/cpa-stream-review/same-node-policies.yaml"
           node ops/cpa-stream-resources.ts same-node-receiver > "$RUNNER_TEMP/cpa-stream-review/same-node-receiver.yaml"
           CPA_RECEIVER_IP=10.42.2.254 node ops/cpa-stream-resources.ts same-node-reader > "$RUNNER_TEMP/cpa-stream-review/same-node-reader-EXAMPLE-IP-NOT-FOR-APPLY.yaml"
+          node ops/cpa-stream-resources.ts versetensor-code > "$RUNNER_TEMP/cpa-stream-review/versetensor-code.yaml"
+          node ops/cpa-stream-resources.ts versetensor-policies > "$RUNNER_TEMP/cpa-stream-review/versetensor-policies.yaml"
+          node ops/cpa-stream-resources.ts versetensor-receiver > "$RUNNER_TEMP/cpa-stream-review/versetensor-receiver.yaml"
+          CPA_RECEIVER_IP=10.42.8.254 node ops/cpa-stream-resources.ts versetensor-reader > "$RUNNER_TEMP/cpa-stream-review/versetensor-reader-EXAMPLE-IP-NOT-FOR-APPLY.yaml"
           cp ops/inspection/cpa-work-directio-20261006a.yaml "$RUNNER_TEMP/cpa-stream-review/target-only-directio-SUSPENDED-NOT-APPROVED.yaml"
           (cd "$RUNNER_TEMP/cpa-stream-review" && sha256sum *.yaml > SHA256SUMS)
 
