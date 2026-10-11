@@ -21,9 +21,16 @@ const ns = "/api/v1/namespaces/cliproxyapi";
 const jobPath = `/apis/batch/v1/namespaces/cliproxyapi/jobs/${config.jobName}`;
 const podPath = `${ns}/pods/probe-pod`;
 
-function fixture(mode: "late" | "startup" | "exec" | "total" | "init" | "replacement" | "job-replacement" | "pvc-replacement" | "stale" | "cleanup-timeout" | "post-log-replacement" | "post-log-rv" = "late") {
+function fixture(mode: "late" | "startup" | "exec" | "total" | "init" | "replacement" | "job-replacement" | "pvc-replacement" | "stale" | "cleanup-timeout" | "post-log-replacement" | "post-log-rv" | "status-rv" = "late") {
   let now = epoch, step = 0, enabled = false, jobGone = false, podGone = false, cleanupStarted = false, staleInjected = false, postLogRead = false;
   let job: Resource = { ...structuredClone(reviewedPlan), metadata: { name: config.jobName, namespace: "cliproxyapi", uid: config.jobUid, resourceVersion: "1", generation: 1 } };
+  if (mode === "status-rv") {
+    // The controller's initial Suspended status write between the caller's
+    // create acknowledgement and the operator preflight bumps RV without
+    // changing identity, spec or generation.
+    job.metadata.resourceVersion = "2";
+    job.status = { ready: 0, terminating: 0, uncountedTerminatedPods: {}, conditions: [structuredClone(initialSuspended)] };
+  }
   const pvc: Resource = { metadata: { name: "mtc-cpa-recovery-work-20261005", namespace: "cliproxyapi", uid: config.pvcUid, resourceVersion: "3" }, spec: { volumeName: `pvc-${config.pvcUid}` }, status: { phase: "Bound" } };
   let pod: Resource | null = null;
   const operations: { method: string; path: string; body?: unknown; timeout: number }[] = [];
@@ -48,8 +55,8 @@ function fixture(mode: "late" | "startup" | "exec" | "total" | "init" | "replace
     assert.ok(!path.includes("secrets") && !path.includes("persistentvolumes/"));
     if (method === "PATCH") {
       assert.equal(path, jobPath);
-      assert.deepEqual(body, [{ op: "test", path: "/metadata/uid", value: config.jobUid }, { op: "test", path: "/metadata/resourceVersion", value: "1" }, { op: "test", path: "/spec/suspend", value: true }, { op: "replace", path: "/spec/suspend", value: false }]);
-      enabled = true; job.spec.suspend = false; job.metadata.resourceVersion = "2";
+      assert.deepEqual(body, [{ op: "test", path: "/metadata/uid", value: config.jobUid }, { op: "test", path: "/metadata/resourceVersion", value: job.metadata.resourceVersion }, { op: "test", path: "/spec/suspend", value: true }, { op: "replace", path: "/spec/suspend", value: false }]);
+      enabled = true; job.spec.suspend = false; job.metadata.resourceVersion = String(Number(job.metadata.resourceVersion) + 1);
       return structuredClone(job);
     }
     if (method === "DELETE") {
@@ -113,12 +120,44 @@ test("operator startup, exec and total deadlines terminate with null bytes and b
   }
 });
 
-test("preflight RV mismatch never unsuspends or cleans any resource", async () => {
+test("controller Suspended status write that only bumps Job RV passes preflight and CAS pins the observed RV", async () => {
+  const f = fixture("status-rv");
+  const receipt = await runProbe(config, f.api, reviewedPlan, reviewedPolicy, f.clock);
+  assert.equal(receipt.status, "COMPLETE"); assert.equal(receipt.passed, true);
+  assert.equal(receipt.bytes, 1024 ** 3); assert.equal(receipt.cleanup.complete, true);
+  const patches = f.operations.filter((op) => op.method === "PATCH");
+  assert.equal(patches.length, 1);
+  assert.deepEqual((patches[0]!.body as { op: string; path: string; value: unknown }[])[1], { op: "test", path: "/metadata/resourceVersion", value: "2" });
+  assert.deepEqual(f.operations.filter((op) => op.method === "DELETE").map((op) => op.path), [jobPath, podPath]);
+});
+
+test("caller-observed Job and PVC RV staleness alone is not an identity failure", async () => {
   const f = fixture();
-  const receipt = await runProbe({ ...config, jobResourceVersion: "999" }, f.api, reviewedPlan, reviewedPolicy, f.clock);
-  assert.equal(receipt.status, "IDENTITY_MISMATCH");
-  assert.equal(receipt.bytes, null);
-  assert.equal(f.operations.some((op) => op.method !== "GET"), false);
+  const receipt = await runProbe({ ...config, jobResourceVersion: "999", pvcResourceVersion: "999" }, f.api, reviewedPlan, reviewedPolicy, f.clock);
+  assert.equal(receipt.status, "COMPLETE"); assert.equal(receipt.passed, true);
+  assert.equal(f.operations.filter((op) => op.method === "PATCH").length, 1);
+  assert.deepEqual(f.operations.filter((op) => op.method === "DELETE").map((op) => op.path), [jobPath, podPath]);
+});
+
+test("RV drift never masks UID, tenant, spec or generation changes and rejection stays mutation-free", async () => {
+  const vectors: [string, (job: Resource) => void, string][] = [
+    ["uid", (job) => { job.metadata.uid = "33333333-3333-4333-8333-333333333333"; }, "IDENTITY_MISMATCH"],
+    ["tenant", (job) => { job.metadata.namespace = "other-tenant"; }, "IDENTITY_MISMATCH"],
+    ["spec", (job) => { job.spec.backoffLimit = 1; }, "JOB_BUDGET_MISMATCH"],
+    ["generation", (job) => { job.metadata.generation = 2; }, "ATTEMPT_ALREADY_USED"],
+  ];
+  for (const [name, mutate, expected] of vectors) {
+    const f = fixture("status-rv");
+    const api: ProbeApi = { call: async (method, path, timeout, body) => {
+      const data = await f.api.call(method, path, timeout, body);
+      if (method === "GET" && path === jobPath && (data as Resource).spec.suspend === true) mutate(data as Resource);
+      return data;
+    } };
+    const receipt = await runProbe(config, api, reviewedPlan, reviewedPolicy, f.clock);
+    assert.equal(receipt.status, expected, name);
+    assert.equal(receipt.passed, false, name); assert.equal(receipt.bytes, null, name); assert.equal(receipt.attemptStartedAt, null, name);
+    assert.equal(f.operations.some((op) => op.method !== "GET"), false, name);
+  }
 });
 
 type PodSpec = Record<string, unknown>;
