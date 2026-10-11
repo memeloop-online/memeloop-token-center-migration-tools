@@ -66,7 +66,7 @@ test("review-only target probe uses pinned dd direct I/O under 128Mi/250m, never
   assert.ok(PROBE_BUDGET.totalMs >= PROBE_BUDGET.startupMs + PROBE_BUDGET.execMs + PROBE_BUDGET.freshnessMs + PROBE_BUDGET.pollMs);
   assert.equal(job.spec.template.spec.activeDeadlineSeconds, job.spec.activeDeadlineSeconds);
   const pod = job.spec.template.spec;
-  assert.equal(pod.nodeSelector["kubernetes.io/hostname"], "sansheng-hv");
+  assert.equal(pod.nodeSelector["kubernetes.io/hostname"], "versetensor-hv");
   assert.equal(pod.automountServiceAccountToken, false);
   assert.deepEqual(pod.volumes, [{ name: "destination", persistentVolumeClaim: { claimName: "mtc-cpa-recovery-work-versetensor-20261011" } }]);
   const runtime = pod.containers[0];
