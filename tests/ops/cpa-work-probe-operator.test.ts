@@ -31,7 +31,7 @@ function fixture(mode: "late" | "startup" | "exec" | "total" | "init" | "replace
     job.metadata.resourceVersion = "2";
     job.status = { ready: 0, terminating: 0, uncountedTerminatedPods: {}, conditions: [structuredClone(initialSuspended)] };
   }
-  const pvc: Resource = { metadata: { name: "mtc-cpa-recovery-work-20261005", namespace: "cliproxyapi", uid: config.pvcUid, resourceVersion: "3" }, spec: { volumeName: `pvc-${config.pvcUid}` }, status: { phase: "Bound" } };
+  const pvc: Resource = { metadata: { name: "mtc-cpa-recovery-work-versetensor-20261011", namespace: "cliproxyapi", uid: config.pvcUid, resourceVersion: "3" }, spec: { volumeName: `pvc-${config.pvcUid}` }, status: { phase: "Bound" } };
   let pod: Resource | null = null;
   const operations: { method: string; path: string; body?: unknown; timeout: number }[] = [];
   const times = mode === "startup" ? [300_000] : mode === "exec" ? [180_000, 345_000] : mode === "total" ? [480_000] : [180_000, 180_001, 344_000];
@@ -107,7 +107,7 @@ test("operator starts once, adopts Pod after unsuspend and preserves full exec b
   assert.equal(receipt.status, "COMPLETE"); assert.equal(receipt.passed, true);
   assert.equal(receipt.decision?.execDeadline, epoch + 345_000);
   assert.equal(receipt.decision?.execElapsedMs, 164_000);
-  assert.equal(receipt.bytes, 1024 ** 3); assert.equal(receipt.cleanup.complete, true);
+  assert.equal(receipt.bytes, 256 * 1024 ** 2); assert.equal(receipt.cleanup.complete, true);
   assert.equal(f.operations.filter((op) => op.method === "PATCH").length, 1);
   assert.deepEqual(f.operations.filter((op) => op.method === "DELETE").map((op) => op.path), [jobPath, podPath]);
 });
@@ -124,7 +124,7 @@ test("controller Suspended status write that only bumps Job RV passes preflight 
   const f = fixture("status-rv");
   const receipt = await runProbe(config, f.api, reviewedPlan, reviewedPolicy, f.clock);
   assert.equal(receipt.status, "COMPLETE"); assert.equal(receipt.passed, true);
-  assert.equal(receipt.bytes, 1024 ** 3); assert.equal(receipt.cleanup.complete, true);
+  assert.equal(receipt.bytes, 256 * 1024 ** 2); assert.equal(receipt.cleanup.complete, true);
   const patches = f.operations.filter((op) => op.method === "PATCH");
   assert.equal(patches.length, 1);
   assert.deepEqual((patches[0]!.body as { op: string; path: string; value: unknown }[])[1], { op: "test", path: "/metadata/resourceVersion", value: "2" });
@@ -187,7 +187,7 @@ test("deny policy accepts actual API omitted and empty rule arrays with one PATC
     } };
     const receipt = await runProbe(config, api, reviewedPlan, reviewedPolicy, f.clock);
     assert.equal(receipt.status, "COMPLETE", name); assert.equal(receipt.passed, true, name);
-    assert.equal(receipt.bytes, 1024 ** 3, name); assert.equal(receipt.cleanup.complete, true, name);
+    assert.equal(receipt.bytes, 256 * 1024 ** 2, name); assert.equal(receipt.cleanup.complete, true, name);
     assert.equal(f.operations.filter((op) => op.method === "PATCH").length, 1, name);
     assert.deepEqual(f.operations.filter((op) => op.method === "DELETE").map((op) => op.path), [jobPath, podPath], name);
     console.log(JSON.stringify({ fixture: "deny-normalization-accept", name, status: receipt.status, patches: 1, deletes: 2 }));
@@ -271,7 +271,7 @@ test("initial controller Suspended=True condition permits exactly one unsuspend 
   } };
   const receipt = await runProbe(config, api, reviewedPlan, reviewedPolicy, f.clock);
   assert.equal(receipt.status, "COMPLETE"); assert.equal(receipt.passed, true);
-  assert.equal(receipt.bytes, 1024 ** 3); assert.equal(receipt.cleanup.complete, true);
+  assert.equal(receipt.bytes, 256 * 1024 ** 2); assert.equal(receipt.cleanup.complete, true);
   assert.equal(f.operations.filter((op) => op.method === "PATCH").length, 1);
   assert.equal(f.operations.filter((op) => op.method === "DELETE").length, 2);
   console.log(JSON.stringify({ fixture: "initial-suspended", status: receipt.status, patches: 1, deletes: 2, cleanup: "confirmed" }));
@@ -627,7 +627,7 @@ test("GET-only recovery keeps three-call cap, original phase deadline and perman
   }
 });
 
-const claimName = "mtc-cpa-recovery-work-20261005";
+const claimName = "mtc-cpa-recovery-work-versetensor-20261011";
 function foreignConsumer(name: string, status?: Resource["status"]): Resource {
   return { metadata: { name, namespace: "cliproxyapi", uid: `historical-${name}`, resourceVersion: "1" }, spec: { volumes: [{ persistentVolumeClaim: { claimName } }] }, ...(status === undefined ? {} : { status }) };
 }
@@ -653,7 +653,7 @@ test("four supplied terminal PVC references coexist with one successful owned pr
         "volumes": [
           {
             "persistentVolumeClaim": {
-              "claimName": "mtc-cpa-recovery-work-20261005"
+              "claimName": "mtc-cpa-recovery-work-versetensor-20261011"
             }
           }
         ]
@@ -688,7 +688,7 @@ test("four supplied terminal PVC references coexist with one successful owned pr
         "volumes": [
           {
             "persistentVolumeClaim": {
-              "claimName": "mtc-cpa-recovery-work-20261005"
+              "claimName": "mtc-cpa-recovery-work-versetensor-20261011"
             }
           }
         ]
@@ -723,7 +723,7 @@ test("four supplied terminal PVC references coexist with one successful owned pr
         "volumes": [
           {
             "persistentVolumeClaim": {
-              "claimName": "mtc-cpa-recovery-work-20261005"
+              "claimName": "mtc-cpa-recovery-work-versetensor-20261011"
             }
           }
         ]
@@ -767,7 +767,7 @@ test("four supplied terminal PVC references coexist with one successful owned pr
         "volumes": [
           {
             "persistentVolumeClaim": {
-              "claimName": "mtc-cpa-recovery-work-20261005"
+              "claimName": "mtc-cpa-recovery-work-versetensor-20261011"
             }
           }
         ]
@@ -811,7 +811,7 @@ test("four supplied terminal PVC references coexist with one successful owned pr
     const f = fixture();
     const receipt = await runProbe(config, withConsumers(f, references), reviewedPlan, reviewedPolicy, f.clock);
     assert.equal(receipt.status, "COMPLETE"); assert.equal(receipt.passed, true);
-    assert.equal(receipt.bytes, 1024 ** 3); assert.equal(receipt.cleanup.complete, true);
+    assert.equal(receipt.bytes, 256 * 1024 ** 2); assert.equal(receipt.cleanup.complete, true);
     assert.equal(f.operations.filter((op) => op.method === "PATCH").length, 1);
     assert.deepEqual(f.operations.filter((op) => op.method === "DELETE").map((op) => op.path), [jobPath, podPath]);
     assert.ok(f.operations.every((op) => !references.some((pod) => op.path.includes(pod.metadata.name))));

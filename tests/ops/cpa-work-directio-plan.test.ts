@@ -13,7 +13,7 @@ test("independent startup and execution budgets, fresh observations and total-pr
   const identity = { jobUid: "job-uid", podUid: "pod-uid", pvcUid: "pvc-uid" };
   const start = Date.parse("2026-10-09T09:00:00Z");
   const at = (seconds: number) => new Date(start + seconds * 1000).toISOString();
-  const pending: ProbeObservation = { ...identity, jobResourceVersion: "1", podResourceVersion: "2", pvcResourceVersion: "3", ownerUid: identity.jobUid, claimName: "mtc-cpa-recovery-work-20261005", attemptStartedAt: at(0), collectionStartedAt: at(0), observedAt: at(0), initFailed: false, jobFailed: false, podPhase: "Pending", state: null, writeStarted: false, complete: false };
+  const pending: ProbeObservation = { ...identity, jobResourceVersion: "1", podResourceVersion: "2", pvcResourceVersion: "3", ownerUid: identity.jobUid, claimName: "mtc-cpa-recovery-work-versetensor-20261011", attemptStartedAt: at(0), collectionStartedAt: at(0), observedAt: at(0), initFailed: false, jobFailed: false, podPhase: "Pending", state: null, writeStarted: false, complete: false };
   const evaluate = (o: ProbeObservation, seconds: number) => probeBudget({ ...o, collectionStartedAt: at(seconds), observedAt: at(seconds) }, identity, start + seconds * 1000);
   const late = evaluate(pending, 300);
   assert.equal(late.status, "STARTUP_DEADLINE");
@@ -38,7 +38,7 @@ test("independent startup and execution budgets, fresh observations and total-pr
   assert.equal(evaluate({ ...running, state: { running: { startedAt: at(0) } } }, 165).status, "EXEC_DEADLINE");
   const done = { ...running, podPhase: "Succeeded", writeStarted: true, complete: true, state: { terminated: { startedAt: at(180), finishedAt: at(344), exitCode: 0 } } };
   assert.equal(evaluate(done, 344).status, "COMPLETE");
-  assert.equal(evaluate(done, 344).bytes, 1024 ** 3);
+  assert.equal(evaluate(done, 344).bytes, 256 * 1024 ** 2);
   assert.equal(evaluate({ ...done, complete: false, state: { terminated: { startedAt: at(180), finishedAt: at(344), exitCode: 1 } } }, 344).status, "EXEC_FAILED");
   assert.throws(() => evaluate({ ...done, writeStarted: false }, 344), /MISSING_WRITE_START/);
   assert.throws(() => probeBudget(running, identity, start + 181_000), /STALE_OBSERVATION/);
@@ -68,7 +68,7 @@ test("review-only target probe uses pinned dd direct I/O under 128Mi/250m, never
   const pod = job.spec.template.spec;
   assert.equal(pod.nodeSelector["kubernetes.io/hostname"], "sansheng-hv");
   assert.equal(pod.automountServiceAccountToken, false);
-  assert.deepEqual(pod.volumes, [{ name: "destination", persistentVolumeClaim: { claimName: "mtc-cpa-recovery-work-20261005" } }]);
+  assert.deepEqual(pod.volumes, [{ name: "destination", persistentVolumeClaim: { claimName: "mtc-cpa-recovery-work-versetensor-20261011" } }]);
   const runtime = pod.containers[0];
   assert.deepEqual(runtime.resources.limits, { cpu: "250m", memory: "128Mi", "ephemeral-storage": "32Mi" });
   assert.ok(runtime.args[0].includes("oflag=direct") && runtime.args[0].includes("conv=notrunc,fsync"));
@@ -100,10 +100,10 @@ test("review-only target probe uses pinned dd direct I/O under 128Mi/250m, never
     assert.equal(existsSync(join(directory, "probe.bin")), false);
     assert.equal(readFileSync(retained, "utf8"), "preserve old partial");
     passed = true;
-    console.log(JSON.stringify({ passed, image: runtime.image, testedCommit: process.env.GITHUB_SHA, bytes: 1024 ** 3, stdout: result.stdout, stderr: result.stderr }));
+    console.log(JSON.stringify({ passed, image: runtime.image, testedCommit: process.env.GITHUB_SHA, bytes: 256 * 1024 ** 2, stdout: result.stdout, stderr: result.stderr }));
   } finally {
     spawnSync("docker", ["rm", "--force", name], { stdio: "ignore" });
-    if (process.env.RUNNER_TEMP) writeFileSync(join(process.env.RUNNER_TEMP, "cpa-work-directio-command-result.json"), JSON.stringify({ passed, image: runtime.image, testedCommit: process.env.GITHUB_SHA, bytes: 1024 ** 3 }) + "\n");
+    if (process.env.RUNNER_TEMP) writeFileSync(join(process.env.RUNNER_TEMP, "cpa-work-directio-command-result.json"), JSON.stringify({ passed, image: runtime.image, testedCommit: process.env.GITHUB_SHA, bytes: 256 * 1024 ** 2 }) + "\n");
     rmSync(root, { recursive: true });
   }
 });

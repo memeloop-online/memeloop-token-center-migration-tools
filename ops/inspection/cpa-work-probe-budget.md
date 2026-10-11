@@ -1,6 +1,13 @@
 This source adds a target-only operator for a separately authorized runtime
 window. Source, CI and peer review are not permission to execute it. The plan
 stays suspended; no source PVC, copy, backup, import or volume deletion is added.
+The current target is the independent versetensor work PVC
+mtc-cpa-recovery-work-versetensor-20261011 (probe node versetensor-hv). The
+bounded synthetic probe is 256MiB (dd bs=4M count=64) with a matching
+5.25GiB free-space gate; the original five PVC/PV pairs are never mounted,
+written or deleted. The new PVC UID is not pinned in source: it arrives as
+config pvcUid and is verified against the API at preflight like any other
+identity field.
 
 Reviewed source contract proposed for R2: startup 300s, execution 165s, total
 480s, cleanup 30s, API read 2s, observation freshness 10s, polling 1s. The config
