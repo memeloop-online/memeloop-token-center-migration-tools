@@ -9,8 +9,7 @@ import { invokedAsEntrypoint } from "../lib/invoked-as-entrypoint.ts";
 import { PROBE_BUDGET, cleanupDeadline, probeBudget, timestamp, validateBudgets, type ContainerState, type ProbeBudgets, type ProbeObservation } from "./cpa-work-probe-budget.ts";
 
 const NS = "cliproxyapi";
-const CLAIM = "mtc-cpa-recovery-work-20261005";
-const PVC_UID = "a5045b54-0f10-4f60-b1f5-18167620ba31";
+const CLAIM = "mtc-cpa-recovery-work-versetensor-20261011";
 const CORE = `/api/v1/namespaces/${NS}`;
 const JOBS = `/apis/batch/v1/namespaces/${NS}/jobs`;
 const POLICY = `/apis/networking.k8s.io/v1/namespaces/${NS}/networkpolicies/mtc-cpa-work-directio-20261006a`;
@@ -175,7 +174,7 @@ function activePvcConsumer(pod: Resource): boolean {
 export function configValid(config: ProbeConfig): void {
   if (!config || typeof config !== "object" || [config.jobName, config.jobUid, config.jobResourceVersion, config.pvcUid, config.pvcResourceVersion].some((value) => typeof value !== "string")) throw new Error("INVALID_CONFIG_IDENTITY");
   validateBudgets(config.budgets);
-  if (!/^mtc-cpa-work-directio-[a-z0-9-]+$/.test(config.jobName) || !/^[a-f0-9-]{36}$/.test(config.jobUid) || !/^\d+$/.test(config.jobResourceVersion) || config.pvcUid !== PVC_UID || !/^\d+$/.test(config.pvcResourceVersion)) throw new Error("INVALID_CONFIG_IDENTITY");
+  if (!/^mtc-cpa-work-directio-[a-z0-9-]+$/.test(config.jobName) || !/^[a-f0-9-]{36}$/.test(config.jobUid) || !/^\d+$/.test(config.jobResourceVersion) || !/^[a-f0-9-]{36}$/.test(config.pvcUid) || !/^\d+$/.test(config.pvcResourceVersion)) throw new Error("INVALID_CONFIG_IDENTITY");
 }
 
 type ProbeCleanup = { complete: boolean; jobDeleted: boolean; podDeleted: boolean; startedAt: string | null; deadline: number | null; errors: string[] };
@@ -396,7 +395,7 @@ export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resourc
     validatePodSpec((job.spec.template as { spec: Record<string, unknown> }).spec, expectedPod);
     const pvc = await resource(pvcPath, preflightDeadline);
     identity(pvc, CLAIM, config.pvcUid);
-    if (pvc.metadata.deletionTimestamp || pvc.status?.phase !== "Bound" || pvc.spec.volumeName !== `pvc-${PVC_UID}`) throw new Error("PVC_NOT_BOUND");
+    if (pvc.metadata.deletionTimestamp || pvc.status?.phase !== "Bound" || pvc.spec.volumeName !== `pvc-${config.pvcUid}`) throw new Error("PVC_NOT_BOUND");
     const deny = await resource(POLICY, preflightDeadline);
     if (!denyPolicyMatches(deny.spec, policy.spec)) throw new Error("NETWORK_DENY_MISMATCH");
     await exclusiveConsumers(preflightDeadline);
@@ -434,7 +433,7 @@ export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resourc
       validatePodSpec((currentJob.spec.template as { spec: Record<string, unknown> }).spec, expectedPod);
       const currentPvc = await resource(pvcPath, readDeadline);
       identity(currentPvc, CLAIM, config.pvcUid);
-      if (currentPvc.metadata.deletionTimestamp || currentPvc.status?.phase !== "Bound" || currentPvc.spec.volumeName !== `pvc-${PVC_UID}`) throw new Error("PVC_CHANGED");
+      if (currentPvc.metadata.deletionTimestamp || currentPvc.status?.phase !== "Bound" || currentPvc.spec.volumeName !== `pvc-${config.pvcUid}`) throw new Error("PVC_CHANGED");
       await exclusiveConsumers(readDeadline);
       await capture(readDeadline);
       if (pod) {

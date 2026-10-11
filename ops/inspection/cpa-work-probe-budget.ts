@@ -33,7 +33,7 @@ export function probeBudget(o: ProbeObservation, identity: ProbeIdentity, now: n
   }
   if (o.jobUid !== identity.jobUid || !identity.jobUid || o.pvcUid !== identity.pvcUid || !identity.pvcUid || o.podUid !== identity.podUid) throw new Error("IDENTITY_MISMATCH");
   if (!o.jobResourceVersion || !o.pvcResourceVersion || o.podUid !== null && (!o.podResourceVersion || o.ownerUid !== identity.jobUid)) throw new Error("RESOURCE_IDENTITY_MISSING");
-  if (o.claimName !== "mtc-cpa-recovery-work-20261005") throw new Error("TARGET_MISMATCH");
+  if (o.claimName !== "mtc-cpa-recovery-work-versetensor-20261011") throw new Error("TARGET_MISMATCH");
   const start = timestamp(o.attemptStartedAt);
   const collection = timestamp(o.collectionStartedAt);
   const observed = timestamp(o.observedAt);
@@ -61,7 +61,7 @@ export function probeBudget(o: ProbeObservation, identity: ProbeIdentity, now: n
   else status = execStart === null ? "STARTING" : "EXECUTING";
   return { status, terminalCause, startupDeadline, execDeadline, totalDeadline,
     execElapsedMs: execStart === null ? null : (finished ?? now) - execStart,
-    bytes: status === "COMPLETE" ? 1_073_741_824 : null,
+    bytes: status === "COMPLETE" ? 268_435_456 : null,
     stopRequired: !["STARTING", "EXECUTING"].includes(status), cleanupIdentity: identity };
 }
 
