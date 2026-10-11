@@ -75,7 +75,7 @@ jobs:
         run: node --test tests/ops/cpa-stream.test.ts
 
       - name: Verify fixed profiles, CLI rejection and identity isolation
-        run: node --test tests/ops/cpa-stream-profiles.test.ts
+        run: node --test tests/ops/cpa-stream-profiles.test.ts tests/ops/cpa-stream-observation.test.ts
 
       - name: Check fixed stream runtime without cluster access
         run: |
