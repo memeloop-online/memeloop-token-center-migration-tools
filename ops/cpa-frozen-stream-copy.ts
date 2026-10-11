@@ -8,14 +8,14 @@ let run: string = COPY.run;
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   if (args.length === 1 && args[0] === "--help") {
-    console.log("cpa-frozen-stream-copy [stage-][same-node-|diagnostic-|versetensor-]reader|receiver; fixed profiles/paths, RAM-only diagnostic, one-use mTLS, no path/URL overrides");
+    console.log("cpa-frozen-stream-copy [stage-][same-node-|diagnostic-|versetensor-|segmented-]reader|receiver; fixed profiles/paths, RAM-only diagnostic, one-use mTLS, no path/URL overrides");
     return;
   }
   requireCopy(args.length === 1, "ARGUMENTS");
   const staging = args[0]!.startsWith("stage-");
   const { profile, command: role } = profileCommand(staging ? args[0]!.slice(6) : args[0]!);
   requireCopy(role === "reader" || role === "receiver", "ARGUMENTS");
-  const diagnostic = profile === "diagnostic";
+  const diagnostic = profile === "diagnostic" || profile === "segmented";
   const plan = STREAM_PROFILES[profile].plan;
   run = plan.run;
   requirePlacement(role, profile, process.env.NODE_NAME, process.env.POD_NAME);

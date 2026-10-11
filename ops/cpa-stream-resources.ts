@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { stringify } from "yaml";
-import { COPY, MEMORY_DIAGNOSTIC, STREAM_PROFILES, profileCommand, requireCopy, safeFailure, streamResourceName, validateEndpoint, type StreamProfile } from "./lib/cpa-stream.ts";
+import { COPY, STREAM_PROFILES, profileCommand, requireCopy, safeFailure, streamResourceName, validateEndpoint, type StreamProfile } from "./lib/cpa-stream.ts";
 
 const namespace = "cliproxyapi";
 const image = "ghcr.io/memeloop-online/memeloop-token-center-migration-tools@sha256:348c6ef444e1744798a0ec0d13ca394a8dd413e5fb7d1fe277b7f52684892126";
@@ -15,15 +15,15 @@ const labels = (role: string, profile: StreamProfile) => ({ "memeloop.io/cpa-str
 export function job(role: "reader" | "receiver", receiverIp?: string, profile: StreamProfile = "original"): unknown {
   if (role === "reader") validateEndpoint(receiverIp ?? "", profile);
   const plan = STREAM_PROFILES[profile].plan;
-  const diagnostic = profile === "diagnostic";
+  const diagnostic = profile === "diagnostic" || profile === "segmented";
   const receiver = role === "receiver";
   const destination = receiver ? [{ name: "destination", mountPath: "/destination" }] : [];
-  const privateDirectory = receiver ? `mkdirSync('${plan.destination}', {mode:0o700}); chownSync('${plan.destination}',10001,10001); const parentDirectory = openSync('/destination', constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW); try { fsyncSync(parentDirectory); } finally { closeSync(parentDirectory); }` : diagnostic ? `writeFileSync('/source/archive.sqlite', Buffer.alloc(${MEMORY_DIAGNOSTIC.size},71), {flag:'wx',mode:0o400}); chownSync('/source/archive.sqlite',10001,10001);` : "";
+  const privateDirectory = receiver ? `mkdirSync('${plan.destination}', {mode:0o700}); chownSync('${plan.destination}',10001,10001); const parentDirectory = openSync('/destination', constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW); try { fsyncSync(parentDirectory); } finally { closeSync(parentDirectory); }` : diagnostic ? `writeFileSync('/source/archive.sqlite', Buffer.alloc(${plan.size},71), {flag:'wx',mode:0o400}); chownSync('/source/archive.sqlite',10001,10001);` : "";
   return {
     apiVersion: "batch/v1", kind: "Job",
     metadata: { name: streamResourceName(role, profile), namespace, labels: labels(role, profile), annotations: { "memeloop.io/tool-sha256": codeHash } },
     spec: {
-      suspend: true, backoffLimit: 0, activeDeadlineSeconds: 1800,
+      suspend: true, backoffLimit: 0, activeDeadlineSeconds: profile === "segmented" ? 120 : 1800,
       template: { metadata: { labels: labels(role, profile) }, spec: {
         restartPolicy: "Never", terminationGracePeriodSeconds: 10, automountServiceAccountToken: false, enableServiceLinks: false,
         nodeSelector: { "kubernetes.io/hostname": receiver ? STREAM_PROFILES[profile].receiverNode : "sansheng-hv" },
@@ -50,7 +50,7 @@ export function job(role: "reader" | "receiver", receiverIp?: string, profile: S
         volumes: [
           { name: "identity", emptyDir: { medium: "Memory", sizeLimit: "4Mi" } },
           { name: "code", configMap: { name: streamResourceName("code", profile), defaultMode: 0o444, items: [{ key: "cpa-frozen-stream-copy.ts", path: "cpa-frozen-stream-copy.ts" }, { key: "cpa-stream.ts", path: "lib/cpa-stream.ts" }] } },
-          diagnostic ? { name: receiver ? "destination" : "source", emptyDir: { medium: "Memory", sizeLimit: "8Mi" } } : receiver ? { name: "destination", persistentVolumeClaim: { claimName: STREAM_PROFILES[profile].targetClaim } } : { name: "source", persistentVolumeClaim: { claimName: "mtc-session-archive-v08-live-clone-20260919a", readOnly: true } },
+          diagnostic ? { name: receiver ? "destination" : "source", emptyDir: { medium: "Memory", sizeLimit: profile === "segmented" ? "32Mi" : "8Mi" } } : receiver ? { name: "destination", persistentVolumeClaim: { claimName: STREAM_PROFILES[profile].targetClaim } } : { name: "source", persistentVolumeClaim: { claimName: "mtc-session-archive-v08-live-clone-20260919a", readOnly: true } },
         ],
       } },
     },
@@ -63,7 +63,7 @@ export function policies(profile: StreamProfile = "original"): unknown[] {
     metadata: { name: streamResourceName(role, profile), namespace },
     spec: {
       podSelector: { matchLabels: labels(role, profile) }, policyTypes: ["Ingress", "Egress"],
-      ingress: role === "reader" ? [] : [{ from: profile === "versetensor" ? [{ ipBlock: { cidr: "100.64.0.6/32" } }] : [{ podSelector: { matchLabels: labels("reader", profile) } }], ports: [{ protocol: "TCP", port: COPY.port }] }],
+      ingress: role === "reader" ? [] : [{ from: profile === "versetensor" || profile === "segmented" ? [{ ipBlock: { cidr: "100.64.0.6/32" } }] : [{ podSelector: { matchLabels: labels("reader", profile) } }], ports: [{ protocol: "TCP", port: COPY.port }] }],
       egress: role === "receiver" ? [] : [{ to: [{ podSelector: { matchLabels: labels("receiver", profile) } }], ports: [{ protocol: "TCP", port: COPY.port }] }],
     },
   }));
@@ -71,7 +71,7 @@ export function policies(profile: StreamProfile = "original"): unknown[] {
 
 function main(): void {
   const args = process.argv.slice(2);
-  if (args.length === 1 && args[0] === "--help") { console.log("cpa-stream-resources [same-node-|diagnostic-|versetensor-]code|policies|reader|receiver; renders only, fixed resources, reader requires CPA_RECEIVER_IP"); return; }
+  if (args.length === 1 && args[0] === "--help") { console.log("cpa-stream-resources [same-node-|diagnostic-|versetensor-|segmented-]code|policies|reader|receiver; renders only, fixed resources, reader requires CPA_RECEIVER_IP"); return; }
   requireCopy(args.length === 1, "ARGUMENTS");
   const { profile, command } = profileCommand(args[0]!);
   let documents: unknown[];
