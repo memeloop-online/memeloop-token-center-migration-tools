@@ -153,7 +153,10 @@ test("a refused connection reports its phase and errno without opening source or
   const diagnostic = mock.method(console, "error", () => {});
   try {
     await assert.rejects(runReader({ ...sample.plan, port: address.port, source: join(sample.root, "missing-source") }, readerIdentity, "127.0.0.1"), { code: "ECONNREFUSED" });
-    assert.deepEqual(diagnostic.mock.calls.map((call) => JSON.parse(String(call.arguments[0]))), [{ stage: "reader-tls-connect", failure: "ECONNREFUSED" }]);
+    assert.deepEqual(diagnostic.mock.calls.map((call) => JSON.parse(String(call.arguments[0]))), [
+      { stage: "socket-error", role: "reader", failure: "ECONNREFUSED", causeCode: "ECONNREFUSED", syscall: "connect", transferPhase: "tls-connect", confirmedBytes: 0 },
+      { stage: "reader-tls-connect", failure: "ECONNREFUSED", causeCode: "ECONNREFUSED", syscall: "connect", transferPhase: "tls-connect", confirmedBytes: 0 },
+    ]);
     assert.deepEqual(readdirSync(sample.plan.destination), []);
   } finally { diagnostic.mock.restore(); sample.cleanup(); }
 });
