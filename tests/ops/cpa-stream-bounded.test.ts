@@ -6,7 +6,7 @@ import { chownSync, chmodSync, closeSync, fsyncSync, lstatSync, mkdirSync, mkdte
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { setTimeout as pause } from "node:timers/promises";
-import { COPY, SAME_NODE_COPY, streamResourceName } from "../../ops/lib/cpa-stream.ts";
+import { COPY, STREAM_PROFILES, streamResourceName } from "../../ops/lib/cpa-stream.ts";
 
 const image = "ghcr.io/memeloop-online/memeloop-token-center-migration-tools@sha256:348c6ef444e1744798a0ec0d13ca394a8dd413e5fb7d1fe277b7f52684892126";
 const maximumMemory = 128 * 1024 ** 2;
@@ -32,11 +32,12 @@ async function command(binary: string, args: string[], timeout = 30000): Promise
   });
 }
 
-for (const profile of ["original", "same-node"] as const) test(`${profile}: two isolated 128Mi/no-swap containers stream 256Mi with bounded read-ahead under receiver backpressure`, { timeout: 480000 }, async () => {
+for (const profile of ["original", "same-node", "versetensor"] as const) test(`${profile}: two isolated 128Mi/no-swap containers stream 256Mi with bounded read-ahead under receiver backpressure`, { timeout: 480000 }, async () => {
   assert.equal(process.env.GITHUB_ACTIONS, "true", "GHA only; do not run this test locally");
   assert.equal(process.getuid!(), 0, "GHA fixture ownership setup requires root, not privileged role containers");
-  const sameNode = profile === "same-node";
-  const selected = sameNode ? SAME_NODE_COPY : COPY;
+  const staged = profile !== "original";
+  const selected = STREAM_PROFILES[profile].plan;
+  const subnet = STREAM_PROFILES[profile].receiverSubnet;
   const identityDirectory = `/dev/shm/${selected.run}`;
   const root = mkdtempSync(join(tmpdir(), "cpa-bounded-fixture-"));
   const network = `cpa-fixture-${process.pid}-${Date.now()}`;
@@ -48,7 +49,7 @@ for (const profile of ["original", "same-node"] as const) test(`${profile}: two 
   const report: Record<string, unknown> = { passed: false, profile, run: selected.run, testedCommit: process.env.GITHUB_SHA, bytes: 256 * 1024 ** 2 };
   try {
     await command("docker", ["pull", image], 120000);
-    await command(process.execPath, ["ops/cpa-stream-identity.ts", sameNode ? "create-same-node" : "create"]);
+    await command(process.execPath, ["ops/cpa-stream-identity.ts", staged ? `create-${profile}` : "create"]);
     ownIdentity = true;
     for (const role of ["reader", "receiver"]) chownSync(`${identityDirectory}/${role}.json`, 10001, 10001);
     const sourceRoot = join(root, "source");
@@ -77,22 +78,22 @@ for (const profile of ["original", "same-node"] as const) test(`${profile}: two 
     const expected = { size: 256 * 1024 ** 2, sha256: digest.digest("hex") };
     const metadata = join(root, "fixture.json");
     writeFileSync(metadata, JSON.stringify(expected), { flag: "wx", mode: 0o644 });
-    await command("docker", ["network", "create", "--internal", ...(sameNode ? ["--subnet", "10.42.2.0/24"] : []), network]);
+    await command("docker", ["network", "create", "--internal", ...(staged ? ["--subnet", `${subnet}.0/24`] : []), network]);
     ownNetwork = true;
     const launch = async (role: "reader" | "receiver", name: string) => {
       names.push(name);
       await command("docker", [
         "run", "--detach", "--name", name, "--network", network, "--network-alias", role,
-        ...(sameNode ? ["--ip", role === "receiver" ? "10.42.2.2" : "10.42.2.3", "--env", "CPA_GHA_PROFILE=same-node", "--env", "NODE_NAME=sansheng-hv", "--env", `POD_NAME=${streamResourceName(role, profile)}-gha`, "--env", `POD_IP=${role === "receiver" ? "10.42.2.2" : "10.42.2.3"}`, "--env", "CPA_RECEIVER_IP=10.42.2.2", "--tmpfs", "/identity:rw,noexec,nosuid,size=4m,uid=10001,gid=10001,mode=0700"] : []),
+        ...(staged ? ["--ip", `${subnet}.${role === "receiver" ? "2" : "3"}`, "--env", `CPA_GHA_PROFILE=${profile}`, "--env", `NODE_NAME=${role === "reader" ? "sansheng-hv" : STREAM_PROFILES[profile].receiverNode}`, "--env", `POD_NAME=${streamResourceName(role, profile)}-gha`, "--env", `POD_IP=${subnet}.${role === "receiver" ? "2" : "3"}`, "--env", `CPA_RECEIVER_IP=${subnet}.2`, "--tmpfs", "/identity:rw,noexec,nosuid,size=4m,uid=10001,gid=10001,mode=0700"] : []),
         "--memory", "128m", "--memory-swap", "128m", "--cpus", "0.25", "--pids-limit", "64",
         "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--user", "10001:10001",
-        "--env", "CPA_GHA_FIXTURE=1", "--entrypoint", sameNode ? "sh" : "node",
+        "--env", "CPA_GHA_FIXTURE=1", "--entrypoint", staged ? "sh" : "node",
         "--mount", `type=bind,source=${resolve("ops")},target=/tool/ops,readonly`,
         "--mount", `type=bind,source=${resolve("tests/ops/cpa-stream-bounded-role.ts")},target=/tool/tests/ops/cpa-stream-bounded-role.ts,readonly`,
         "--mount", `type=bind,source=${metadata},target=/fixture.json,readonly`,
         "--mount", `type=bind,source=${identityDirectory}/${role}.json,target=/identity.json,readonly`,
         "--mount", role === "reader" ? `type=bind,source=${sourceRoot},target=/source,readonly` : `type=bind,source=${workRoot},target=/destination`,
-        image, ...(sameNode ? ["-ec", `node /tool/ops/cpa-frozen-stream-copy.ts stage-same-node-${role} < /identity.json; exec node /tool/tests/ops/cpa-stream-bounded-role.ts ${role}`] : ["/tool/tests/ops/cpa-stream-bounded-role.ts", role]),
+        image, ...(staged ? ["-ec", `node /tool/ops/cpa-frozen-stream-copy.ts stage-${profile}-${role} < /identity.json; exec node /tool/tests/ops/cpa-stream-bounded-role.ts ${role}`] : ["/tool/tests/ops/cpa-stream-bounded-role.ts", role]),
       ]);
     };
     await launch("receiver", receiverName);
@@ -159,7 +160,7 @@ for (const profile of ["original", "same-node"] as const) test(`${profile}: two 
     report.maxReadAhead = maxReadAhead;
     console.log(JSON.stringify({ passed: true, bytes: expected.size, readSpanMs: readSpan, maxReadAhead, roles: results.map(({ role, maxRSS, memoryPeak }) => ({ role, maxRSS, memoryPeak })) }));
   } finally {
-    if (process.env.RUNNER_TEMP) writeFileSync(join(process.env.RUNNER_TEMP, sameNode ? "cpa-stream-same-node-bounded-result.json" : "cpa-stream-bounded-result.json"), JSON.stringify(report) + "\n", { mode: 0o644 });
+    if (process.env.RUNNER_TEMP) writeFileSync(join(process.env.RUNNER_TEMP, staged ? `cpa-stream-${profile}-bounded-result.json` : "cpa-stream-bounded-result.json"), JSON.stringify(report) + "\n", { mode: 0o644 });
     for (const name of names) await command("docker", ["rm", "--force", name]).catch(() => {});
     if (ownNetwork) await command("docker", ["network", "rm", network]).catch(() => {});
     if (ownIdentity) rmSync(identityDirectory, { recursive: true });

@@ -1,0 +1,31 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: mtc-cpa-work-versetensor-20261011
+allowVolumeExpansion: true
+provisioner: driver.longhorn.io
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
+parameters:
+  dataEngine: v1
+  dataLocality: disabled
+  disableRevisionCounter: "true"
+  diskSelector: storage-tier-mtc-work-versetensor
+  fsType: xfs
+  nodeSelector: storage-tier-mtc-work-versetensor
+  numberOfReplicas: "1"
+  replicaAutoBalance: disabled
+  staleReplicaTimeout: "30"
+  unmapMarkSnapChainRemoved: ignored
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mtc-cpa-recovery-work-versetensor-20261011
+  namespace: cliproxyapi
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: mtc-cpa-work-versetensor-20261011
+  resources:
+    requests:
+      storage: 52Gi

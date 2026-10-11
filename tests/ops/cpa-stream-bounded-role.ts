@@ -1,5 +1,5 @@
 import { readFileSync, readdirSync, readlinkSync, lstatSync } from "node:fs";
-import { COPY, SAME_NODE_COPY, loadIdentity, requireCopy, requirePlacement, requireReadOnlyMount, runReader, safeFailure, startReceiver, validateEndpoint, type CopyPlan, type Identity } from "../../ops/lib/cpa-stream.ts";
+import { COPY, STREAM_PROFILES, loadIdentity, requireCopy, requirePlacement, requireReadOnlyMount, runReader, safeFailure, startReceiver, validateEndpoint, type CopyPlan, type Identity } from "../../ops/lib/cpa-stream.ts";
 
 async function main(): Promise<void> {
   requireCopy(process.env.CPA_GHA_FIXTURE === "1", "GHA_FIXTURE_ONLY");
@@ -7,11 +7,12 @@ async function main(): Promise<void> {
   requireCopy(process.argv.length === 3 && (role === "reader" || role === "receiver"), "FIXTURE_ROLE");
   const fixture = JSON.parse(readFileSync("/fixture.json", "utf8")) as { size: number; sha256: string };
   requireCopy(fixture.size === 256 * 1024 ** 2 && /^[a-f0-9]{64}$/.test(fixture.sha256), "FIXTURE_METADATA");
-  const sameNode = process.env.CPA_GHA_PROFILE === "same-node";
-  const selected = sameNode ? SAME_NODE_COPY : COPY;
-  const identity = sameNode ? await loadIdentity(role, selected.run) : JSON.parse(readFileSync("/identity.json", "utf8")) as Identity;
-  if (sameNode) requirePlacement(role, "same-node", process.env.NODE_NAME, process.env.POD_NAME);
-  const endpoint = sameNode ? validateEndpoint("10.42.2.2", "same-node") : role === "reader" ? "receiver" : "0.0.0.0";
+  const profile = process.env.CPA_GHA_PROFILE === "versetensor" ? "versetensor" : process.env.CPA_GHA_PROFILE === "same-node" ? "same-node" : "original";
+  const selected = STREAM_PROFILES[profile].plan;
+  const staged = profile !== "original";
+  const identity = staged ? await loadIdentity(role, selected.run) : JSON.parse(readFileSync("/identity.json", "utf8")) as Identity;
+  if (staged) requirePlacement(role, profile, process.env.NODE_NAME, process.env.POD_NAME);
+  const endpoint = staged ? validateEndpoint(`${STREAM_PROFILES[profile].receiverSubnet}.2`, profile) : role === "reader" ? "receiver" : "0.0.0.0";
   const plan: CopyPlan = { ...selected, ...fixture, totalMs: 300000, verifyMs: 120000, reserveBytes: 0, rate: role === "receiver" ? 8 * 1024 ** 2 : COPY.rate };
   const memoryLimit = Number(readFileSync("/sys/fs/cgroup/memory.max", "utf8").trim());
   const swapLimit = Number(readFileSync("/sys/fs/cgroup/memory.swap.max", "utf8").trim());
