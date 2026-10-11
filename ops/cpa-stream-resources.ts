@@ -63,7 +63,7 @@ export function policies(profile: StreamProfile = "original"): unknown[] {
     metadata: { name: streamResourceName(role, profile), namespace },
     spec: {
       podSelector: { matchLabels: labels(role, profile) }, policyTypes: ["Ingress", "Egress"],
-      ingress: role === "reader" ? [] : [{ from: [{ podSelector: { matchLabels: labels("reader", profile) } }], ports: [{ protocol: "TCP", port: COPY.port }] }],
+      ingress: role === "reader" ? [] : [{ from: profile === "versetensor" ? [{ ipBlock: { cidr: "100.64.0.6/32" } }] : [{ podSelector: { matchLabels: labels("reader", profile) } }], ports: [{ protocol: "TCP", port: COPY.port }] }],
       egress: role === "receiver" ? [] : [{ to: [{ podSelector: { matchLabels: labels("receiver", profile) } }], ports: [{ protocol: "TCP", port: COPY.port }] }],
     },
   }));

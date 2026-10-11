@@ -13,7 +13,7 @@ test("same-node profile changes only run/destination and keeps the original budg
   assert.equal(COPY.destination, "/destination/recovery-stream-20261005a");
   assert.deepEqual(profileCommand("same-node-reader"), { profile: "same-node", command: "reader" });
   assert.deepEqual(profileCommand("diagnostic-receiver"), { profile: "diagnostic", command: "receiver" });
-  assert.deepEqual(VERSETENSOR_COPY, { ...COPY, run: "cpa-stream-versetensor-20261011a", destination: "/destination/recovery-stream-versetensor-20261011a" });
+  assert.deepEqual(VERSETENSOR_COPY, { ...COPY, run: "cpa-stream-versetensor-20261011b", destination: "/destination/recovery-stream-versetensor-20261011b" });
   assert.deepEqual(profileCommand("versetensor-reader"), { profile: "versetensor", command: "reader" });
   assert.deepEqual(profileCommand("reader"), { profile: "original", command: "reader" });
 });
@@ -113,6 +113,7 @@ for (const profile of ["same-node", "versetensor"] as const) test(`${profile} id
     for (const role of ["reader", "receiver"] as const) {
       const identity = JSON.parse(readFileSync(`${directory}/${role}.json`, "utf8")) as Identity;
       validateIdentity(identity, role, selected.run);
+      if (profile === "versetensor") assert.throws(() => validateIdentity(identity, role, "cpa-stream-versetensor-20261011a"), /IDENTITY_ROLE/);
       const peerRole = role === "reader" ? "receiver" : "reader";
       const peer = JSON.parse(readFileSync(`${directory}/${peerRole}.json`, "utf8")) as Identity;
       assert.equal(identity.peerFingerprint, new X509Certificate(peer.cert).fingerprint256);
@@ -164,7 +165,7 @@ test("versetensor profile pins receiver to versetensor-hv with the independent w
   assert.equal(STREAM_PROFILES["same-node"].targetClaim, "mtc-cpa-recovery-work-20261005");
   for (const role of ["reader", "receiver"] as const) {
     const rendered = JSON.parse(JSON.stringify(job(role, "10.42.8.65", "versetensor")));
-    assert.equal(rendered.metadata.name, `mtc-cpa-stream-versetensor-${role}-20261011a`);
+    assert.equal(rendered.metadata.name, `mtc-cpa-stream-versetensor-${role}-20261011b`);
     assert.equal(rendered.spec.suspend, true);
     assert.equal(rendered.spec.backoffLimit, 0);
     assert.equal(rendered.spec.activeDeadlineSeconds, 1800);
@@ -176,15 +177,39 @@ test("versetensor profile pins receiver to versetensor-hv with the independent w
     assert.deepEqual(pod.volumes.filter((volume: any) => volume.persistentVolumeClaim).map((volume: any) => volume.persistentVolumeClaim), [role === "reader" ? { claimName: "mtc-session-archive-v08-live-clone-20260919a", readOnly: true } : { claimName: "mtc-cpa-recovery-work-versetensor-20261011" }]);
     assert.ok(pod.volumes.every((volume: any) => !volume.secret && !volume.hostPath));
     assert.throws(() => job("reader", "10.42.2.65", "versetensor"));
+    assert.throws(() => requirePlacement(role, "versetensor", role === "reader" ? "sansheng-hv" : "versetensor-hv", `mtc-cpa-stream-versetensor-${role}-20261011a-fixture`), /POD_IDENTITY/);
   }
   const renderedPolicies = JSON.parse(JSON.stringify(policies("versetensor")));
-  assert.deepEqual(renderedPolicies.map((policy: any) => policy.metadata.name), ["mtc-cpa-stream-versetensor-reader-20261011a", "mtc-cpa-stream-versetensor-receiver-20261011a"]);
+  assert.deepEqual(renderedPolicies.map((policy: any) => policy.metadata.name), ["mtc-cpa-stream-versetensor-reader-20261011b", "mtc-cpa-stream-versetensor-receiver-20261011b"]);
   for (const policy of renderedPolicies) {
-    assert.deepEqual(policy.spec.podSelector.matchLabels["memeloop.io/cpa-stream-run"], "cpa-stream-versetensor-20261011a");
+    assert.deepEqual(policy.spec.podSelector.matchLabels["memeloop.io/cpa-stream-run"], "cpa-stream-versetensor-20261011b");
     assert.equal(policy.spec.policyTypes.length, 2);
   }
   assert.deepEqual(renderedPolicies[0].spec.ingress, []);
-  assert.deepEqual(renderedPolicies[0].spec.egress, [{ to: [{ podSelector: { matchLabels: { "memeloop.io/cpa-stream-run": "cpa-stream-versetensor-20261011a", "app.kubernetes.io/name": "cpa-stream-receiver" } } }], ports: [{ protocol: "TCP", port: 18443 }] }]);
+  assert.deepEqual(renderedPolicies[0].spec.egress, [{ to: [{ podSelector: { matchLabels: { "memeloop.io/cpa-stream-run": "cpa-stream-versetensor-20261011b", "app.kubernetes.io/name": "cpa-stream-receiver" } } }], ports: [{ protocol: "TCP", port: 18443 }] }]);
   assert.deepEqual(renderedPolicies[1].spec.egress, []);
-  assert.equal(renderedPolicies[1].spec.ingress[0].ports[0].port, 18443);
+  assert.deepEqual(renderedPolicies[1].spec.ingress, [{ from: [{ ipBlock: { cidr: "100.64.0.6/32" } }], ports: [{ protocol: "TCP", port: 18443 }] }]);
+});
+
+test("the actual policy generator and CLI restrict the SNAT exception to the versetensor receiver", () => {
+  for (const profile of ["original", "diagnostic", "same-node", "versetensor"] as const) {
+    const selected = STREAM_PROFILES[profile];
+    const roleLabels = (role: string) => ({ "memeloop.io/cpa-stream-run": selected.plan.run, "app.kubernetes.io/name": `cpa-stream-${role}` });
+    const expected = (["reader", "receiver"] as const).map((role) => ({
+      apiVersion: "networking.k8s.io/v1", kind: "NetworkPolicy",
+      metadata: { name: streamResourceName(role, profile), namespace: "cliproxyapi" },
+      spec: {
+        podSelector: { matchLabels: roleLabels(role) }, policyTypes: ["Ingress", "Egress"],
+        ingress: role === "reader" ? [] : [{ from: profile === "versetensor" ? [{ ipBlock: { cidr: "100.64.0.6/32" } }] : [{ podSelector: { matchLabels: roleLabels("reader") } }], ports: [{ protocol: "TCP", port: 18443 }] }],
+        egress: role === "receiver" ? [] : [{ to: [{ podSelector: { matchLabels: roleLabels("receiver") } }], ports: [{ protocol: "TCP", port: 18443 }] }],
+      },
+    }));
+    assert.deepEqual(policies(profile), expected);
+    const command = profile === "original" ? "policies" : `${profile}-policies`;
+    const rendered = spawnSync(process.execPath, ["ops/cpa-stream-resources.ts", command], { encoding: "utf8", timeout: 10000 });
+    assert.equal(rendered.status, 0, rendered.stderr);
+    const documents = parseAllDocuments(rendered.stdout);
+    assert.ok(documents.every((document) => document.errors.length === 0));
+    assert.deepEqual(documents.map((document) => document.toJSON()), expected);
+  }
 });
