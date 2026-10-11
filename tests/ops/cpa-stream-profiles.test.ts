@@ -19,7 +19,7 @@ test("same-node profile changes only run/destination and keeps the original budg
 });
 
 test("placement and endpoints cannot cross profiles or accept broad network exceptions", () => {
-  for (const profile of ["original", "diagnostic", "same-node", "versetensor"] as const) {
+  for (const profile of ["original", "diagnostic", "same-node", "versetensor", "segmented"] as const) {
     const selected = STREAM_PROFILES[profile];
     for (const suffix of ["2", "65", "254"]) assert.equal(validateEndpoint(`${selected.receiverSubnet}.${suffix}`, profile), `${selected.receiverSubnet}.${suffix}`);
     for (const invalid of ["0", "1", "255", "256", "02", "2:18443", "2\n"]) assert.throws(() => validateEndpoint(`${selected.receiverSubnet}.${invalid}`, profile));
@@ -29,7 +29,7 @@ test("placement and endpoints cannot cross profiles or accept broad network exce
       const pod = `${streamResourceName(role, profile)}-fixture`;
       requirePlacement(role, profile, role === "reader" ? "sansheng-hv" : selected.receiverNode, pod);
       assert.throws(() => requirePlacement(role, profile, "haixia", pod), /NODE_PLACEMENT/);
-      for (const other of ["original", "diagnostic", "same-node", "versetensor"] as const) {
+      for (const other of ["original", "diagnostic", "same-node", "versetensor", "segmented"] as const) {
         if (other !== profile) assert.throws(() => requirePlacement(role, profile, role === "reader" ? "sansheng-hv" : selected.receiverNode, `${streamResourceName(role, other)}-fixture`), /POD_IDENTITY/);
       }
     }
@@ -38,7 +38,7 @@ test("placement and endpoints cannot cross profiles or accept broad network exce
 
 test("same-node resources keep source double RO, work-only receiver and exact isolated NP", () => {
   const names = new Set<string>();
-  for (const profile of ["original", "diagnostic", "same-node", "versetensor"] as const) {
+  for (const profile of ["original", "diagnostic", "same-node", "versetensor", "segmented"] as const) {
     for (const role of ["reader", "receiver", "code"] as const) {
       const name = streamResourceName(role, profile);
       assert.equal(names.has(name), false);
@@ -101,7 +101,7 @@ test("actual main and staging CLI fail closed on wrong node, run, endpoint and u
   }
 });
 
-for (const profile of ["same-node", "versetensor"] as const) test(`${profile} identities use a new private RAM run and reject every other profile SAN`, () => {
+for (const profile of ["same-node", "versetensor", "segmented"] as const) test(`${profile} identities use a new private RAM run and reject every other profile SAN`, () => {
   const selected = STREAM_PROFILES[profile].plan;
   const directory = `/dev/shm/${selected.run}`;
   let owned = false;
@@ -118,7 +118,7 @@ for (const profile of ["same-node", "versetensor"] as const) test(`${profile} id
       const peer = JSON.parse(readFileSync(`${directory}/${peerRole}.json`, "utf8")) as Identity;
       assert.equal(identity.peerFingerprint, new X509Certificate(peer.cert).fingerprint256);
       assert.throws(() => validateIdentity(identity, peerRole, selected.run), /IDENTITY_ROLE/);
-      for (const other of ["original", "diagnostic", "same-node", "versetensor"] as const) {
+      for (const other of ["original", "diagnostic", "same-node", "versetensor", "segmented"] as const) {
         if (other !== profile) assert.throws(() => validateIdentity(identity, role, STREAM_PROFILES[other].plan.run), /IDENTITY_ROLE/);
       }
       assert.equal(lstatSync(`${directory}/${role}.json`).mode & 0o777, 0o600);
@@ -192,7 +192,7 @@ test("versetensor profile pins receiver to versetensor-hv with the independent w
 });
 
 test("the actual policy generator and CLI restrict the SNAT exception to the versetensor receiver", () => {
-  for (const profile of ["original", "diagnostic", "same-node", "versetensor"] as const) {
+  for (const profile of ["original", "diagnostic", "same-node", "versetensor", "segmented"] as const) {
     const selected = STREAM_PROFILES[profile];
     const roleLabels = (role: string) => ({ "memeloop.io/cpa-stream-run": selected.plan.run, "app.kubernetes.io/name": `cpa-stream-${role}` });
     const expected = (["reader", "receiver"] as const).map((role) => ({
@@ -200,7 +200,7 @@ test("the actual policy generator and CLI restrict the SNAT exception to the ver
       metadata: { name: streamResourceName(role, profile), namespace: "cliproxyapi" },
       spec: {
         podSelector: { matchLabels: roleLabels(role) }, policyTypes: ["Ingress", "Egress"],
-        ingress: role === "reader" ? [] : [{ from: profile === "versetensor" ? [{ ipBlock: { cidr: "100.64.0.6/32" } }] : [{ podSelector: { matchLabels: roleLabels("reader") } }], ports: [{ protocol: "TCP", port: 18443 }] }],
+        ingress: role === "reader" ? [] : [{ from: profile === "versetensor" || profile === "segmented" ? [{ ipBlock: { cidr: "100.64.0.6/32" } }] : [{ podSelector: { matchLabels: roleLabels("reader") } }], ports: [{ protocol: "TCP", port: 18443 }] }],
         egress: role === "receiver" ? [] : [{ to: [{ podSelector: { matchLabels: roleLabels("receiver") } }], ports: [{ protocol: "TCP", port: 18443 }] }],
       },
     }));

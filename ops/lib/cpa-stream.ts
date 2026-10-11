@@ -44,16 +44,35 @@ export const VERSETENSOR_COPY = Object.freeze({
   destination: "/destination/recovery-stream-versetensor-20261011b",
 });
 
+function syntheticHash(): string {
+  const digest = createHash("sha256");
+  const buffer = Buffer.alloc(COPY.chunk, 71);
+  for (let index = 0; index < 4; index++) digest.update(buffer);
+  return digest.digest("hex");
+}
+
+export const SEGMENTED_DIAGNOSTIC = Object.freeze({
+  ...COPY,
+  run: "cpa-stream-segmented-20261011a",
+  destination: "/destination/recovery-segmented-20261011a",
+  size: 4 * COPY.chunk,
+  sha256: syntheticHash(),
+  reserveBytes: 0,
+  totalMs: 120000,
+  verifyMs: 20000,
+});
+
 export const STREAM_PROFILES = Object.freeze({
   original: Object.freeze({ plan: COPY, receiverNode: "westlake", receiverSubnet: "10.42.3", prefix: "mtc-cpa-stream", suffix: "20261005a", targetClaim: "mtc-cpa-recovery-work-20261005" }),
   diagnostic: Object.freeze({ plan: MEMORY_DIAGNOSTIC, receiverNode: "westlake", receiverSubnet: "10.42.3", prefix: "mtc-cpa-stream-diagnostic", suffix: "20261006a", targetClaim: "mtc-cpa-recovery-work-20261005" }),
+  segmented: Object.freeze({ plan: SEGMENTED_DIAGNOSTIC, receiverNode: "versetensor-hv", receiverSubnet: "10.42.8", prefix: "mtc-cpa-stream-segmented", suffix: "20261011a", targetClaim: "" }),
   "same-node": Object.freeze({ plan: SAME_NODE_COPY, receiverNode: "sansheng-hv", receiverSubnet: "10.42.2", prefix: "mtc-cpa-stream-local", suffix: "20261006a", targetClaim: "mtc-cpa-recovery-work-20261005" }),
   versetensor: Object.freeze({ plan: VERSETENSOR_COPY, receiverNode: "versetensor-hv", receiverSubnet: "10.42.8", prefix: "mtc-cpa-stream-versetensor", suffix: "20261011b", targetClaim: "mtc-cpa-recovery-work-versetensor-20261011" }),
 });
 export type StreamProfile = keyof typeof STREAM_PROFILES;
 
 export function profileCommand(argument: string): { profile: StreamProfile; command: string } {
-  for (const profile of ["same-node", "diagnostic", "versetensor"] as const) {
+  for (const profile of ["same-node", "diagnostic", "versetensor", "segmented"] as const) {
     if (argument.startsWith(`${profile}-`)) return { profile, command: argument.slice(profile.length + 1) };
   }
   return { profile: "original", command: argument };
@@ -72,6 +91,15 @@ export function requirePlacement(role: "reader" | "receiver", profile: StreamPro
 export type CopyPlan = { -readonly [Key in keyof typeof COPY]: (typeof COPY)[Key] extends number ? number : string };
 export type Identity = { ca: string; cert: string; key: string; peerFingerprint: string };
 export type Receipt = { run: string; passed: true; bytes: number; sha256: string; sourceVerified: true; destinationVerified: true };
+
+type SegmentPhase = "frame-start" | "read-hash" | "throttle" | "frame-write" | "ack-read" | "frame-read" | "write-hash" | "ack-write" | "fsync" | "verify" | "receipt-start" | "receipt-read";
+
+function segmentTrace(plan: CopyPlan, role: "reader" | "receiver", segment: number, phase: SegmentPhase, origin: number, started: number): void {
+  if (plan.run !== SEGMENTED_DIAGNOSTIC.run) return;
+  requireCopy(plan.size === SEGMENTED_DIAGNOSTIC.size && plan.chunk === COPY.chunk && segment >= 0 && segment <= 4, "TRACE_SCOPE");
+  const now = performance.now();
+  console.log(JSON.stringify({ stage: "segment-trace", run: plan.run, role, segment, phase, elapsedMs: Math.round((now - origin) * 1000) / 1000, durationMs: Math.round((now - started) * 1000) / 1000 }));
+}
 
 export function requireCopy(condition: unknown, code: string): asserts condition {
   if (!condition) throw new Error(code);
@@ -234,14 +262,25 @@ export async function sendFile(socket: TLSSocket, plan: CopyPlan, started: numbe
     let reported = transferStarted;
     while (copied < plan.size) {
       checkBudget(plan, started, copied);
+      const segment = Math.floor(copied / plan.chunk) + 1;
+      let phaseStarted = performance.now();
+      segmentTrace(plan, "reader", segment, "frame-start", transferStarted, phaseStarted);
       const { bytesRead } = await source.read(buffer, 0, Math.min(buffer.length, plan.size - copied), null);
       requireCopy(bytesRead > 0, "SOURCE_TRUNCATED");
+      if (plan.run === SEGMENTED_DIAGNOSTIC.run) requireCopy(bytesRead === COPY.chunk, "SYNTHETIC_SEGMENT_SIZE");
       const data = buffer.subarray(0, bytesRead);
       digest.update(data);
+      segmentTrace(plan, "reader", segment, "read-hash", transferStarted, phaseStarted);
+      phaseStarted = performance.now();
       await throttle(plan, transferStarted, copied + bytesRead);
+      segmentTrace(plan, "reader", segment, "throttle", transferStarted, phaseStarted);
+      phaseStarted = performance.now();
       await frame(socket, 1, data);
+      segmentTrace(plan, "reader", segment, "frame-write", transferStarted, phaseStarted);
       copied += bytesRead;
+      phaseStarted = performance.now();
       requireCopy((await wire.take(8)).equals(countBuffer(copied)), "ACK_MISMATCH");
+      segmentTrace(plan, "reader", segment, "ack-read", transferStarted, phaseStarted);
       if (performance.now() - reported >= 10000) {
         console.log(JSON.stringify({ stage: "source-stream", confirmedBytes: copied }));
         reported = performance.now();
@@ -254,11 +293,14 @@ export async function sendFile(socket: TLSSocket, plan: CopyPlan, started: numbe
   socket.setTimeout(plan.verifyMs + plan.idleMs);
   await frame(socket, 2, Buffer.concat([countBuffer(copied), Buffer.from(plan.sha256, "hex")]));
   socket.end();
+  const receiptStarted = performance.now();
+  segmentTrace(plan, "reader", 0, "receipt-start", started, receiptStarted);
   const reply = await wire.frame();
   requireCopy(reply.kind === 3 && reply.body.length <= 2048, "RECEIPT_FRAME");
   const receipt = JSON.parse(reply.body.toString("utf8")) as Receipt;
   requireCopy(receipt.run === plan.run && receipt.passed === true && receipt.bytes === plan.size && receipt.sha256 === plan.sha256 && receipt.sourceVerified === true && receipt.destinationVerified === true, "RECEIPT_MISMATCH");
   await wire.eof();
+  segmentTrace(plan, "reader", 0, "receipt-read", started, receiptStarted);
   return receipt;
 }
 
@@ -311,9 +353,15 @@ export async function receiveFile(socket: TLSSocket, plan: CopyPlan, signal?: Ab
     requireCopy(!signal?.aborted, "TRANSFER_CANCELLED");
     await write(socket, Buffer.from("CPA00001"));
     while (copied < plan.size) {
+      const segment = Math.floor(copied / plan.chunk) + 1;
+      let phaseStarted = performance.now();
+      segmentTrace(plan, "receiver", segment, "frame-start", transferStarted, phaseStarted);
       const message = await wire.frame();
+      segmentTrace(plan, "receiver", segment, "frame-read", transferStarted, phaseStarted);
       requireCopy(!signal?.aborted, "TRANSFER_CANCELLED");
       requireCopy(message.kind === 1 && message.body.length > 0 && message.body.length <= plan.chunk && copied + message.body.length <= plan.size, "DATA_FRAME");
+      if (plan.run === SEGMENTED_DIAGNOSTIC.run) requireCopy(message.body.length === COPY.chunk, "SYNTHETIC_SEGMENT_SIZE");
+      phaseStarted = performance.now();
       let written = 0;
       while (written < message.body.length) {
         const { bytesWritten } = await output.write(message.body, written, message.body.length - written);
@@ -322,18 +370,27 @@ export async function receiveFile(socket: TLSSocket, plan: CopyPlan, signal?: Ab
       }
       digest.update(message.body);
       copied += message.body.length;
+      segmentTrace(plan, "receiver", segment, "write-hash", transferStarted, phaseStarted);
+      phaseStarted = performance.now();
       await throttle(plan, transferStarted, copied);
+      segmentTrace(plan, "receiver", segment, "throttle", transferStarted, phaseStarted);
+      phaseStarted = performance.now();
       await write(socket, countBuffer(copied));
+      segmentTrace(plan, "receiver", segment, "ack-write", transferStarted, phaseStarted);
     }
     const seal = await wire.frame();
     requireCopy(seal.kind === 2 && seal.body.equals(Buffer.concat([countBuffer(plan.size), Buffer.from(plan.sha256, "hex")])), "SOURCE_SEAL");
     await wire.eof();
     requireCopy(digest.digest("hex") === plan.sha256, "STREAM_HASH_MISMATCH");
     requireCopy(!signal?.aborted, "TRANSFER_CANCELLED");
+    const syncStarted = performance.now();
     await output.sync();
+    segmentTrace(plan, "receiver", 0, "fsync", transferStarted, syncStarted);
   } finally { await output.close(); }
   socket.setTimeout(plan.verifyMs + plan.idleMs);
+  const verifyStarted = performance.now();
   await verifyDestination(plan, partial, signal);
+  segmentTrace(plan, "receiver", 0, "verify", transferStarted, verifyStarted);
   requireCopy(!signal?.aborted, "TRANSFER_CANCELLED");
   const receipt: Receipt = { run: plan.run, passed: true, bytes: copied, sha256: plan.sha256, sourceVerified: true, destinationVerified: true };
   const receiptPath = `${plan.destination}/copy-receipt.pending.json`;
