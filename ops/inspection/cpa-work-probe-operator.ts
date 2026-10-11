@@ -385,13 +385,17 @@ export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resourc
   try {
     const preflightDeadline = clock.now() + b.freshnessMs;
     const job = await resource(jobPath, preflightDeadline);
-    identity(job, config.jobName, config.jobUid, config.jobResourceVersion);
+    // Identity is exact UID/name/namespace plus the reviewed spec and
+    // generation gates below. Status writes legitimately bump RV (the job
+    // controller's initial Suspended condition), so RV is never an identity
+    // gate; the fresh observed RV is enforced by the PATCH compare-and-set.
+    identity(job, config.jobName, config.jobUid);
     validateJobControls(job.spec, config.jobUid, plan.spec);
     if (!initiallySuspendedUnused(job)) throw new Error("ATTEMPT_ALREADY_USED");
     if (job.spec.backoffLimit !== 0 || job.spec.activeDeadlineSeconds !== b.totalMs / 1000 || (job.spec.parallelism ?? 1) !== 1 || (job.spec.completions ?? 1) !== 1 || !subset((job.spec.template as { metadata: unknown }).metadata, (plan.spec.template as { metadata: unknown }).metadata)) throw new Error("JOB_BUDGET_MISMATCH");
     validatePodSpec((job.spec.template as { spec: Record<string, unknown> }).spec, expectedPod);
     const pvc = await resource(pvcPath, preflightDeadline);
-    identity(pvc, CLAIM, config.pvcUid, config.pvcResourceVersion);
+    identity(pvc, CLAIM, config.pvcUid);
     if (pvc.metadata.deletionTimestamp || pvc.status?.phase !== "Bound" || pvc.spec.volumeName !== `pvc-${PVC_UID}`) throw new Error("PVC_NOT_BOUND");
     const deny = await resource(POLICY, preflightDeadline);
     if (!denyPolicyMatches(deny.spec, policy.spec)) throw new Error("NETWORK_DENY_MISMATCH");
@@ -405,7 +409,7 @@ export async function runProbe(config: ProbeConfig, api: ProbeApi, plan: Resourc
     try {
       await call("PATCH", jobPath, Math.min(phaseDeadline, attemptStart + b.apiMs), [
         { op: "test", path: "/metadata/uid", value: config.jobUid },
-        { op: "test", path: "/metadata/resourceVersion", value: config.jobResourceVersion },
+        { op: "test", path: "/metadata/resourceVersion", value: job.metadata.resourceVersion },
         { op: "test", path: "/spec/suspend", value: true },
         { op: "replace", path: "/spec/suspend", value: false },
       ]);

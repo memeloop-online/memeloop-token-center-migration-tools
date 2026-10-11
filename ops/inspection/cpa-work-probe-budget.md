@@ -72,6 +72,13 @@ provide a private config with jobName, jobUid, jobResourceVersion, pvcUid,
 pvcResourceVersion and the explicit budgets below. The Job must already exist
 under the reviewed target-only plan and have fresh unused identity. Node and
 Longhorn attachment/locality must be checked separately before that window.
+The config resourceVersions record the caller's launch-time observation for
+audit; they are not identity gates. Controller status writes legitimately
+change resourceVersion without changing identity. Preflight identity is exact
+UID/name/namespace plus the reviewed spec, generation and ownership gates.
+The operator re-reads both resources inside the freshness budget and the
+unsuspend PATCH compare-and-set pins the operator's own freshly observed Job
+resourceVersion; DELETE preconditions likewise use the latest observed value.
 
 ```json
 {"startupMs":300000,"execMs":165000,"totalMs":480000,"cleanupMs":30000,"apiMs":2000,"freshnessMs":10000,"pollMs":1000}
