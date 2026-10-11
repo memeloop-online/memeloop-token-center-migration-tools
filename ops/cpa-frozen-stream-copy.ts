@@ -8,7 +8,7 @@ let run: string = COPY.run;
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   if (args.length === 1 && args[0] === "--help") {
-    console.log("cpa-frozen-stream-copy [stage-][same-node-|diagnostic-]reader|receiver; fixed profiles/paths, RAM-only diagnostic, one-use mTLS, no path/URL overrides");
+    console.log("cpa-frozen-stream-copy [stage-][same-node-|diagnostic-|versetensor-]reader|receiver; fixed profiles/paths, RAM-only diagnostic, one-use mTLS, no path/URL overrides");
     return;
   }
   requireCopy(args.length === 1, "ARGUMENTS");

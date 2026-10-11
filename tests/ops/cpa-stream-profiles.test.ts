@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { spawnSync } from "node:child_process";
 import { existsSync, lstatSync, readFileSync, rmSync } from "node:fs";
-import { COPY, SAME_NODE_COPY, STREAM_PROFILES, profileCommand, requirePlacement, streamResourceName, validateEndpoint, validateIdentity, type Identity } from "../../ops/lib/cpa-stream.ts";
+import { COPY, SAME_NODE_COPY, VERSETENSOR_COPY, STREAM_PROFILES, profileCommand, requirePlacement, streamResourceName, validateEndpoint, validateIdentity, type Identity } from "../../ops/lib/cpa-stream.ts";
 import { job, policies } from "../../ops/cpa-stream-resources.ts";
 
 test("same-node profile changes only run/destination and keeps the original budgets/seal", () => {
@@ -11,11 +11,13 @@ test("same-node profile changes only run/destination and keeps the original budg
   assert.equal(COPY.destination, "/destination/recovery-stream-20261005a");
   assert.deepEqual(profileCommand("same-node-reader"), { profile: "same-node", command: "reader" });
   assert.deepEqual(profileCommand("diagnostic-receiver"), { profile: "diagnostic", command: "receiver" });
+  assert.deepEqual(VERSETENSOR_COPY, { ...COPY, run: "cpa-stream-versetensor-20261011a", destination: "/destination/recovery-stream-versetensor-20261011a" });
+  assert.deepEqual(profileCommand("versetensor-reader"), { profile: "versetensor", command: "reader" });
   assert.deepEqual(profileCommand("reader"), { profile: "original", command: "reader" });
 });
 
 test("placement and endpoints cannot cross profiles or accept broad network exceptions", () => {
-  for (const profile of ["original", "diagnostic", "same-node"] as const) {
+  for (const profile of ["original", "diagnostic", "same-node", "versetensor"] as const) {
     const selected = STREAM_PROFILES[profile];
     for (const suffix of ["2", "65", "254"]) assert.equal(validateEndpoint(`${selected.receiverSubnet}.${suffix}`, profile), `${selected.receiverSubnet}.${suffix}`);
     for (const invalid of ["0", "1", "255", "256", "02", "2:18443", "2\n"]) assert.throws(() => validateEndpoint(`${selected.receiverSubnet}.${invalid}`, profile));
@@ -25,7 +27,7 @@ test("placement and endpoints cannot cross profiles or accept broad network exce
       const pod = `${streamResourceName(role, profile)}-fixture`;
       requirePlacement(role, profile, role === "reader" ? "sansheng-hv" : selected.receiverNode, pod);
       assert.throws(() => requirePlacement(role, profile, "haixia", pod), /NODE_PLACEMENT/);
-      for (const other of ["original", "diagnostic", "same-node"] as const) {
+      for (const other of ["original", "diagnostic", "same-node", "versetensor"] as const) {
         if (other !== profile) assert.throws(() => requirePlacement(role, profile, role === "reader" ? "sansheng-hv" : selected.receiverNode, `${streamResourceName(role, other)}-fixture`), /POD_IDENTITY/);
       }
     }
@@ -34,7 +36,7 @@ test("placement and endpoints cannot cross profiles or accept broad network exce
 
 test("same-node resources keep source double RO, work-only receiver and exact isolated NP", () => {
   const names = new Set<string>();
-  for (const profile of ["original", "diagnostic", "same-node"] as const) {
+  for (const profile of ["original", "diagnostic", "same-node", "versetensor"] as const) {
     for (const role of ["reader", "receiver", "code"] as const) {
       const name = streamResourceName(role, profile);
       assert.equal(names.has(name), false);
@@ -118,4 +120,38 @@ test("same-node identities use a new private RAM run and reject original/diagnos
     assert.equal(repeated.status, 1);
     assert.equal(repeated.stderr.trim(), "EEXIST");
   } finally { if (owned) rmSync(directory, { recursive: true }); }
+});
+
+test("versetensor profile pins receiver to versetensor-hv with the independent work claim and exact isolated NP", () => {
+  const selected = STREAM_PROFILES.versetensor;
+  assert.equal(selected.receiverNode, "versetensor-hv");
+  assert.equal(selected.receiverSubnet, "10.42.8");
+  assert.equal(selected.targetClaim, "mtc-cpa-recovery-work-versetensor-20261011");
+  assert.equal(STREAM_PROFILES.original.targetClaim, "mtc-cpa-recovery-work-20261005");
+  assert.equal(STREAM_PROFILES["same-node"].targetClaim, "mtc-cpa-recovery-work-20261005");
+  for (const role of ["reader", "receiver"] as const) {
+    const rendered = JSON.parse(JSON.stringify(job(role, "10.42.8.65", "versetensor")));
+    assert.equal(rendered.metadata.name, `mtc-cpa-stream-versetensor-${role}-20261011a`);
+    assert.equal(rendered.spec.suspend, true);
+    assert.equal(rendered.spec.backoffLimit, 0);
+    assert.equal(rendered.spec.activeDeadlineSeconds, 1800);
+    const pod = rendered.spec.template.spec;
+    assert.equal(pod.nodeSelector["kubernetes.io/hostname"], role === "reader" ? "sansheng-hv" : "versetensor-hv");
+    assert.equal(pod.automountServiceAccountToken, false);
+    assert.deepEqual(pod.containers[0].command, ["node", "/tool/cpa-frozen-stream-copy.ts", `versetensor-${role}`]);
+    assert.deepEqual(pod.containers[0].resources.limits, { cpu: "250m", memory: "128Mi", "ephemeral-storage": "32Mi" });
+    assert.deepEqual(pod.volumes.filter((volume: any) => volume.persistentVolumeClaim).map((volume: any) => volume.persistentVolumeClaim), [role === "reader" ? { claimName: "mtc-session-archive-v08-live-clone-20260919a", readOnly: true } : { claimName: "mtc-cpa-recovery-work-versetensor-20261011" }]);
+    assert.ok(pod.volumes.every((volume: any) => !volume.secret && !volume.hostPath));
+    assert.throws(() => job("reader", "10.42.2.65", "versetensor"));
+  }
+  const renderedPolicies = JSON.parse(JSON.stringify(policies("versetensor")));
+  assert.deepEqual(renderedPolicies.map((policy: any) => policy.metadata.name), ["mtc-cpa-stream-versetensor-reader-20261011a", "mtc-cpa-stream-versetensor-receiver-20261011a"]);
+  for (const policy of renderedPolicies) {
+    assert.deepEqual(policy.spec.podSelector.matchLabels["memeloop.io/cpa-stream-run"], "cpa-stream-versetensor-20261011a");
+    assert.equal(policy.spec.policyTypes.length, 2);
+  }
+  assert.deepEqual(renderedPolicies[0].spec.ingress, []);
+  assert.deepEqual(renderedPolicies[0].spec.egress, [{ to: [{ podSelector: { matchLabels: { "memeloop.io/cpa-stream-run": "cpa-stream-versetensor-20261011a", "app.kubernetes.io/name": "cpa-stream-receiver" } } }], ports: [{ protocol: "TCP", port: 18443 }] }]);
+  assert.deepEqual(renderedPolicies[1].spec.egress, []);
+  assert.equal(renderedPolicies[1].spec.ingress[0].ports[0].port, 18443);
 });

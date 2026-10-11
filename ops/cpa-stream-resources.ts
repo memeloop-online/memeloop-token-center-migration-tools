@@ -50,7 +50,7 @@ export function job(role: "reader" | "receiver", receiverIp?: string, profile: S
         volumes: [
           { name: "identity", emptyDir: { medium: "Memory", sizeLimit: "4Mi" } },
           { name: "code", configMap: { name: streamResourceName("code", profile), defaultMode: 0o444, items: [{ key: "cpa-frozen-stream-copy.ts", path: "cpa-frozen-stream-copy.ts" }, { key: "cpa-stream.ts", path: "lib/cpa-stream.ts" }] } },
-          diagnostic ? { name: receiver ? "destination" : "source", emptyDir: { medium: "Memory", sizeLimit: "8Mi" } } : receiver ? { name: "destination", persistentVolumeClaim: { claimName: "mtc-cpa-recovery-work-20261005" } } : { name: "source", persistentVolumeClaim: { claimName: "mtc-session-archive-v08-live-clone-20260919a", readOnly: true } },
+          diagnostic ? { name: receiver ? "destination" : "source", emptyDir: { medium: "Memory", sizeLimit: "8Mi" } } : receiver ? { name: "destination", persistentVolumeClaim: { claimName: STREAM_PROFILES[profile].targetClaim } } : { name: "source", persistentVolumeClaim: { claimName: "mtc-session-archive-v08-live-clone-20260919a", readOnly: true } },
         ],
       } },
     },
@@ -71,7 +71,7 @@ export function policies(profile: StreamProfile = "original"): unknown[] {
 
 function main(): void {
   const args = process.argv.slice(2);
-  if (args.length === 1 && args[0] === "--help") { console.log("cpa-stream-resources [same-node-|diagnostic-]code|policies|reader|receiver; renders only, fixed resources, reader requires CPA_RECEIVER_IP"); return; }
+  if (args.length === 1 && args[0] === "--help") { console.log("cpa-stream-resources [same-node-|diagnostic-|versetensor-]code|policies|reader|receiver; renders only, fixed resources, reader requires CPA_RECEIVER_IP"); return; }
   requireCopy(args.length === 1, "ARGUMENTS");
   const { profile, command } = profileCommand(args[0]!);
   let documents: unknown[];
