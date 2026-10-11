@@ -40,15 +40,15 @@ export const SAME_NODE_COPY = Object.freeze({
 
 export const VERSETENSOR_COPY = Object.freeze({
   ...COPY,
-  run: "cpa-stream-versetensor-20261011a",
-  destination: "/destination/recovery-stream-versetensor-20261011a",
+  run: "cpa-stream-versetensor-20261011b",
+  destination: "/destination/recovery-stream-versetensor-20261011b",
 });
 
 export const STREAM_PROFILES = Object.freeze({
   original: Object.freeze({ plan: COPY, receiverNode: "westlake", receiverSubnet: "10.42.3", prefix: "mtc-cpa-stream", suffix: "20261005a", targetClaim: "mtc-cpa-recovery-work-20261005" }),
   diagnostic: Object.freeze({ plan: MEMORY_DIAGNOSTIC, receiverNode: "westlake", receiverSubnet: "10.42.3", prefix: "mtc-cpa-stream-diagnostic", suffix: "20261006a", targetClaim: "mtc-cpa-recovery-work-20261005" }),
   "same-node": Object.freeze({ plan: SAME_NODE_COPY, receiverNode: "sansheng-hv", receiverSubnet: "10.42.2", prefix: "mtc-cpa-stream-local", suffix: "20261006a", targetClaim: "mtc-cpa-recovery-work-20261005" }),
-  versetensor: Object.freeze({ plan: VERSETENSOR_COPY, receiverNode: "versetensor-hv", receiverSubnet: "10.42.8", prefix: "mtc-cpa-stream-versetensor", suffix: "20261011a", targetClaim: "mtc-cpa-recovery-work-versetensor-20261011" }),
+  versetensor: Object.freeze({ plan: VERSETENSOR_COPY, receiverNode: "versetensor-hv", receiverSubnet: "10.42.8", prefix: "mtc-cpa-stream-versetensor", suffix: "20261011b", targetClaim: "mtc-cpa-recovery-work-versetensor-20261011" }),
 });
 export type StreamProfile = keyof typeof STREAM_PROFILES;
 
