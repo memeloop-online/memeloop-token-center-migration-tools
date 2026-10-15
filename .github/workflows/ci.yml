@@ -221,8 +221,7 @@ jobs:
           retention-days: 90
 
   publish-release:
-    name: Publish immutable migration-tools release and pinned archive runtime
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    name: Verify sealed migration tools and pinned archive runtime
     needs: [verify, build-session-archive-backup]
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -455,6 +454,7 @@ jobs:
           retention-days: 90
 
       - name: Publish or verify the immutable GitHub Release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_ASSETS: ${{ runner.temp }}/migration-tools-release-assets
