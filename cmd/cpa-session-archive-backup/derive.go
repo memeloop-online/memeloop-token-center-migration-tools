@@ -20,8 +20,8 @@ import (
 	"time"
 )
 
-const digestIndexSQL = `CREATE INDEX IF NOT EXISTS mtc_records_session_request_v1 ON records(session_id COLLATE BINARY,request_id COLLATE BINARY)`
-const digestPageSQL = `SELECT request_id FROM records INDEXED BY mtc_records_session_request_v1
+const digestIndexSQL = `CREATE INDEX IF NOT EXISTS cpa_digest_records_v1 ON records(session_id COLLATE BINARY,request_id COLLATE BINARY)`
+const digestPageSQL = `SELECT request_id FROM records INDEXED BY cpa_digest_records_v1
 	WHERE session_id=? COLLATE BINARY AND request_id>? COLLATE BINARY ORDER BY request_id COLLATE BINARY LIMIT ?`
 const digestFenceSQL = `SELECT MAX(COALESCE((SELECT MAX(sequence) FROM archive_ingest_events WHERE session_id=?),0),
 	COALESCE((SELECT MAX(sequence) FROM archive_ingest_events WHERE previous_session_id=?),0))`
@@ -176,7 +176,7 @@ func prepareDigests(parent context.Context, options digestOptions, progress io.W
 		return result, err
 	}
 	var indexDefinition string
-	if err = tx.QueryRowContext(ctx, "SELECT sql FROM sqlite_schema WHERE name='mtc_records_session_request_v1'").Scan(&indexDefinition); err != nil || indexDefinition != "CREATE INDEX mtc_records_session_request_v1 ON records(session_id COLLATE BINARY,request_id COLLATE BINARY)" {
+	if err = tx.QueryRowContext(ctx, "SELECT sql FROM sqlite_schema WHERE name='cpa_digest_records_v1'").Scan(&indexDefinition); err != nil || indexDefinition != "CREATE INDEX cpa_digest_records_v1 ON records(session_id COLLATE BINARY,request_id COLLATE BINARY)" {
 		return result, errors.New("unexpected digest index")
 	}
 	workIdentity := fmt.Sprintf("%d:%d", identity.Dev, identity.Ino)
@@ -396,7 +396,7 @@ func prepareDigestChunk(ctx context.Context, tx *sql.Tx, session digestSession, 
 	}
 	if checkpoint.Records == checkpoint.Expected {
 		var remaining int
-		if err = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM records INDEXED BY mtc_records_session_request_v1 WHERE session_id=? AND request_id>?)", session.ID, checkpoint.Cursor).Scan(&remaining); err != nil {
+		if err = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM records INDEXED BY cpa_digest_records_v1 WHERE session_id=? AND request_id>?)", session.ID, checkpoint.Cursor).Scan(&remaining); err != nil {
 			return
 		}
 		if remaining != 0 {

@@ -153,7 +153,7 @@ func TestDigestPagePlanAvoidsSessionSortAndScan(t *testing.T) {
 		if strings.Contains(detail, "TEMP B-TREE") || strings.Contains(detail, "SCAN records") {
 			t.Fatal(detail)
 		}
-		found = found || strings.Contains(detail, "COVERING INDEX mtc_records_session_request_v1")
+		found = found || strings.Contains(detail, "COVERING INDEX cpa_digest_records_v1")
 	}
 	if !found || rows.Err() != nil {
 		t.Fatal("covering seek absent")
@@ -174,7 +174,7 @@ func TestDigestCheckpointCorruptionAndFenceFailClosed(t *testing.T) {
 				"fence": "UPDATE archive_ingest_clock SET sequence=4",
 				"count": "UPDATE session_summaries SET requests=4",
 				"blob": "UPDATE records SET original_ref='missing' WHERE request_id='request-000001'",
-				"invalid-index": "DROP INDEX mtc_records_session_request_v1;CREATE INDEX mtc_records_session_request_v1 ON records(started_at)",
+				"invalid-index": "DROP INDEX cpa_digest_records_v1;CREATE INDEX cpa_digest_records_v1 ON records(started_at)",
 			}
 			if _, err := database.Exec(queries[corruption]); err != nil {
 				t.Fatal(err)
@@ -238,5 +238,76 @@ func TestDigestCLIActualDispatchAndPrivateErrors(t *testing.T) {
 	stderr.Reset()
 	if code = run([]string{"prepare-digests", "--work", path, "--expected-fence", "3"}, &stdout, &stderr); code != 1 || strings.Contains(stderr.String(), path) || strings.Contains(stderr.String(), "session-a") {
 		t.Fatal("CLI failed to redact rejection")
+	}
+}
+
+type digestProgressWriter func([]byte) (int, error)
+
+func (writer digestProgressWriter) Write(value []byte) (int, error) {
+	return writer(value)
+}
+
+func TestDigestRejectsConcurrentWriterWithoutFenceUpdate(t *testing.T) {
+	path, database := digestFixture(t, 3)
+	options := digestTestOptions(path, 3)
+	options.CheckpointRecords = 1
+	mutated := false
+	writer := digestProgressWriter(func(value []byte) (int, error) {
+		if !mutated && bytes.Contains(value, []byte("DIGEST_CHECKPOINT")) {
+			if _, err := database.Exec("UPDATE records SET outcome='changed' WHERE request_id='request-000002'"); err != nil {
+				t.Fatal(err)
+			}
+			mutated = true
+		}
+		return len(value), nil
+	})
+	result, err := prepareDigests(context.Background(), options, writer)
+	if err == nil || !mutated || result.Passed || result.CommittedRecords != 1 {
+		t.Fatalf("concurrent mutation not rejected: %+v %v", result, err)
+	}
+}
+
+func TestDigestCacheBoundsEvenEmptyBlobs(t *testing.T) {
+	_, database := digestFixture(t, 1)
+	tx, err := database.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	projection := newDigestProjection()
+	for index := 0; index < 1026; index++ {
+		key := fmt.Sprintf("empty-%04d", index)
+		if _, err = tx.Exec("INSERT INTO blobs VALUES(?,'raw',?)", key, []byte{}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = projection.blob(context.Background(), tx, key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(projection.cache) != 1024 || projection.cacheBytes != 0 || projection.cache["empty-0000"] != nil {
+		t.Fatal("cache entry cap not enforced")
+	}
+}
+
+func TestDigestProjectionOptionalFieldsAndRawRoot(t *testing.T) {
+	_, database := digestFixture(t, 1)
+	if _, err := database.Exec(`INSERT INTO blobs VALUES('root','raw',?);INSERT INTO blobs VALUES('raw','raw',?);
+	UPDATE records SET original_ref='root',key_id=' key ',principal_id='principal',credential_hash='hash',requested_model='requested',model='model',outcome='ok',status_code=200,
+	metadata_json='{"n":1e-7}',facets_json='{"tag":["value"]}',response_gz=?`,
+		[]byte(`{"$cpa_blob":"raw","encoding":"raw"}`), []byte("event: raw\n\u2028"), digestGzip(t, []byte(`{"answer":true}`))); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := database.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	actual, err := newDigestProjection().record(context.Background(), tx, "session-a", "request-000000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := "{\"completed_at\":\"2026-01-02T03:04:06.000000Z\",\"credential_hash\":\"hash\",\"facets\":{\"tag\":[\"value\"]},\"key_id\":\" key \",\"metadata\":{\"n\":1e-7},\"model\":\"model\",\"outcome\":\"ok\",\"principal_id\":\"principal\",\"request\":\"event: raw\\n\\u2028\",\"request_id\":\"request-000000\",\"requested_model\":\"requested\",\"response\":{\"answer\":true},\"schema_version\":2,\"session_id\":\"session-a\",\"started_at\":\"2026-01-02T03:04:05.123456Z\",\"status_code\":200}\n"
+	if string(actual) != expected {
+		t.Fatalf("optional projection differs: %s", actual)
 	}
 }
