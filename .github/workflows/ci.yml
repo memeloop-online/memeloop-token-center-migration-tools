@@ -145,6 +145,7 @@ jobs:
 
       - name: Verify SQLite backup command
         run: |
+          gofmt -d cmd/cpa-session-archive-backup
           test -z "$(gofmt -l cmd/cpa-session-archive-backup)"
           go test ./cmd/cpa-session-archive-backup
 
@@ -190,6 +191,7 @@ jobs:
           file "$binary" | grep -- 'statically linked'
           ! readelf -l "$binary" | grep -q 'Requesting program interpreter'
           "$binary" --help | grep -- 'pages-per-step'
+          "$binary" prepare-digests --help | grep -- 'checkpoint-records'
           binary_sha256="$(sha256sum "$binary" | cut -d ' ' -f 1)"
           printf 'binary_sha256=%s\n' "$binary_sha256" >> "$GITHUB_OUTPUT"
           tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
