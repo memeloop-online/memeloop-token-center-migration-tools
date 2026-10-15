@@ -40,7 +40,7 @@ func newDigestProjection() *digestProjection {
 	return &digestProjection{cache: map[string]*list.Element{}, order: list.New()}
 }
 
-func boundedGunzip(data []byte) ([]byte, error) {
+func decodeDigestGzip(ctx context.Context, data []byte) ([]byte, error) {
 	if len(data) == 0 {
 		return nil, nil
 	}
@@ -49,7 +49,7 @@ func boundedGunzip(data []byte) ([]byte, error) {
 		return nil, err
 	}
 	defer reader.Close()
-	return io.ReadAll(reader)
+	return io.ReadAll(&digestContextReader{ctx: ctx, reader: reader})
 }
 
 func (projection *digestProjection) blob(ctx context.Context, tx *sql.Tx, key string) ([]byte, error) {
@@ -72,7 +72,7 @@ func (projection *digestProjection) blob(ctx context.Context, tx *sql.Tx, key st
 	projection.blobReads++
 	if codec == "gzip" {
 		var err error
-		data, err = boundedGunzip(data)
+		data, err = decodeDigestGzip(ctx, data)
 		if err != nil {
 			return nil, err
 		}
@@ -93,7 +93,12 @@ func (projection *digestProjection) blob(ctx context.Context, tx *sql.Tx, key st
 
 type digestRawPayload string
 
-func (projection *digestProjection) expand(ctx context.Context, tx *sql.Tx, value any, depth int, budget *int) (any, error) {
+type digestDataURL struct { media string; data []byte }
+
+type digestContextReader struct { ctx context.Context; reader io.Reader }
+func (r *digestContextReader) Read(p []byte) (int,error) { if err:=r.ctx.Err();err!=nil{return 0,err}; return r.reader.Read(p) }
+
+func (projection *digestProjection) expand(ctx context.Context, tx *sql.Tx, value any, depth int) (any, error) {
 	if depth > 64 || ctx.Err() != nil {
 		return nil, errors.New("payload depth or deadline")
 	}
@@ -101,7 +106,7 @@ func (projection *digestProjection) expand(ctx context.Context, tx *sql.Tx, valu
 	case []any:
 		for index := range item {
 			var err error
-			item[index], err = projection.expand(ctx, tx, item[index], depth+1, budget)
+			item[index], err = projection.expand(ctx, tx, item[index], depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -119,20 +124,20 @@ func (projection *digestProjection) expand(ctx context.Context, tx *sql.Tx, valu
 				return string(raw), nil
 			case "data-url":
 				media, _ := item["media_type"].(string)
-				return "data:" + media + ";base64," + base64.StdEncoding.EncodeToString(raw), nil
+				return digestDataURL{media:media,data:raw}, nil
 			case "json":
 				var nested any
 				if err = json.Unmarshal(raw, &nested); err != nil {
 					return nil, err
 				}
-				return projection.expand(ctx, tx, nested, depth+1, budget)
+				return projection.expand(ctx, tx, nested, depth+1)
 			default:
 				return nil, errors.New("unsupported payload encoding")
 			}
 		}
 		for key := range item {
 			var err error
-			item[key], err = projection.expand(ctx, tx, item[key], depth+1, budget)
+			item[key], err = projection.expand(ctx, tx, item[key], depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -153,8 +158,7 @@ func (projection *digestProjection) payload(ctx context.Context, tx *sql.Tx, ref
 		if err = json.Unmarshal(manifest, &value); err != nil {
 			return nil, err
 		}
-		budget := 0
-		expanded, expandErr := projection.expand(ctx, tx, value, 0, &budget)
+		expanded, expandErr := projection.expand(ctx, tx, value, 0)
 		if expandErr != nil {
 			return nil, expandErr
 		}
@@ -166,7 +170,7 @@ func (projection *digestProjection) payload(ctx context.Context, tx *sql.Tx, ref
  return expanded, nil
 		}
 	} else {
-		raw, err = boundedGunzip(legacy)
+		raw, err = decodeDigestGzip(ctx, legacy)
 	}
 	if err != nil || len(raw) == 0 {
 		return nil, err
@@ -256,15 +260,19 @@ func writeDigestJSON(ctx context.Context, w io.Writer, value any) error {
   return writeDigestJSON(ctx, w, string(v))
  case string:
   if err := write("\""); err != nil { return err }
-  for len(v) > 0 {
-   if err := ctx.Err(); err != nil { return err }
-   n := len(v); if n > 64*1024 { n = 64*1024; start := n-1; for start > n-4 && !utf8.RuneStart(v[start]) { start-- }; _,size := utf8.DecodeRuneInString(v[start:]); if size > 1 && start+size > n { n = start } }
-   var b bytes.Buffer
-   e := json.NewEncoder(&b); e.SetEscapeHTML(false)
-   if err := e.Encode(v[:n]); err != nil { return err }
-   data := b.Bytes(); if _, err := w.Write(data[1:len(data)-2]); err != nil { return err }; v = v[n:]
-  }
+  if err := writeDigestString(ctx,w,v); err != nil { return err }
   return write("\"")
+ case digestDataURL:
+  if err := write("\""); err != nil { return err }
+  if err := writeDigestString(ctx,w,"data:"+v.media+";base64,"); err != nil { return err }
+  encoder := base64.NewEncoder(base64.StdEncoding,w)
+  if _,err := io.Copy(encoder,&digestContextReader{ctx:ctx,reader:bytes.NewReader(v.data)}); err != nil { return err }
+  if err := encoder.Close(); err != nil { return err }; return write("\"")
+ case map[string][]string:
+  converted := make(map[string]any,len(v)); for key,item := range v { converted[key]=item }; return writeDigestJSON(ctx,w,converted)
+ case []string:
+  if v == nil { return write("null") }
+  if err:=write("[");err!=nil{return err};for i,item:=range v {if i>0 {if err:=write(",");err!=nil{return err}};if err:=writeDigestJSON(ctx,w,item);err!=nil{return err}};return write("]")
  case map[string]any:
   keys := make([]string,0,len(v)); for k := range v { keys = append(keys,k) }; sort.Strings(keys)
   if err := write("{"); err != nil { return err }
@@ -289,4 +297,16 @@ func (projection *digestProjection) writeRecord(ctx context.Context, tx *sql.Tx,
 // Retained for byte-contract fixtures; operational digest writes directly to SHA.
 func (projection *digestProjection) record(ctx context.Context, tx *sql.Tx, sessionID, requestID string) ([]byte,error) {
  var b bytes.Buffer; _,err := projection.writeRecord(ctx,tx,sessionID,requestID,&b); return b.Bytes(),err
+}
+
+func writeDigestString(ctx context.Context,w io.Writer,v string) error {
+  for len(v) > 0 {
+   if err := ctx.Err(); err != nil { return err }
+   n := len(v); if n > 64*1024 { n = 64*1024; start := n-1; for start > n-4 && !utf8.RuneStart(v[start]) { start-- }; _,size := utf8.DecodeRuneInString(v[start:]); if size > 1 && start+size > n { n = start } }
+   var b bytes.Buffer
+   e := json.NewEncoder(&b); e.SetEscapeHTML(false)
+   if err := e.Encode(v[:n]); err != nil { return err }
+   data := b.Bytes(); if _, err := w.Write(data[1:len(data)-2]); err != nil { return err }; v = v[n:]
+  }
+ return nil
 }
