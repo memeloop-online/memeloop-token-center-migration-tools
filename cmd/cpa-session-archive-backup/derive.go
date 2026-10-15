@@ -287,6 +287,35 @@ func prepareDigests(parent context.Context, options digestOptions, progress io.W
 	if actual != expected || actual != digestRecords || digestSessions != int64(len(sessions)) || checkpoints != 0 {
 		return result, errors.New("incomplete digest coverage")
 	}
+	coverageRows, err := tx.QueryContext(ctx, `SELECT actual.requests,summary.requests,digest.requests
+		FROM (SELECT session_id,count(*) AS requests FROM records INDEXED BY cpa_digest_records_v1 GROUP BY session_id COLLATE BINARY) AS actual
+		LEFT JOIN session_summaries AS summary ON summary.session_id=actual.session_id COLLATE BINARY
+		LEFT JOIN session_export_digests AS digest ON digest.session_id=actual.session_id COLLATE BINARY`)
+	if err != nil {
+		return result, err
+	}
+	var actualSessions int64
+	for coverageRows.Next() {
+		var actualCount int64
+		var summaryCount, digestCount sql.NullInt64
+		if err = coverageRows.Scan(&actualCount, &summaryCount, &digestCount); err != nil {
+			coverageRows.Close()
+			return result, err
+		}
+		if !summaryCount.Valid || !digestCount.Valid || actualCount != summaryCount.Int64 || actualCount != digestCount.Int64 {
+			coverageRows.Close()
+			return result, errors.New("inconsistent per-session digest coverage")
+		}
+		actualSessions++
+	}
+	coverageErr := coverageRows.Err()
+	coverageRows.Close()
+	if coverageErr != nil {
+		return result, coverageErr
+	}
+	if actualSessions != int64(len(sessions)) {
+		return result, errors.New("inconsistent session membership")
+	}
 	if err = tx.Commit(); err != nil {
 		return result, err
 	}

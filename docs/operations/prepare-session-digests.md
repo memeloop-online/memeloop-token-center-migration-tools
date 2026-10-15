@@ -75,6 +75,10 @@ rehashing. Partial sessions are never inserted into `session_export_digests`.
 The final chunk publishes the complete digest and removes only its own resume
 row in one transaction. Full acceptance requires every session, full record
 counts and no remaining checkpoint. No record may be omitted to meet a limit.
+Before PASS, a grouped covering-index metadata scan reconciles the actual
+record session set and each session's record count with both summaries and
+committed digests. Orphan sessions and compensating count errors reject;
+completed digests still skip payload reads and hashing.
 Payload/record limits fail closed with no PASS.
 
 Exit0 is `DIGEST_COVERAGE_PASS_NOT_SEALED`; exit3 is a bounded partial result
@@ -92,5 +96,6 @@ The existing workflow runs `go test ./cmd/cpa-session-archive-backup`; no new
 pipeline or skipped protection is introduced. Coverage includes real CLI
 dispatch, partial restart/replay, exact canonical SHA, CAS reuse, covering
 keyset plans, corrupt checkpoints, changed fences/counts and missing payloads.
-The existing static-runtime build verifies `prepare-digests --help` before
-sealing its artifact. Tests/builds run in GHA, not on migration nodes.
+The CLI dispatch test also verifies `prepare-digests --help`; the existing
+static-runtime build seals its artifact. Tests/builds run in GHA, not on
+migration nodes.

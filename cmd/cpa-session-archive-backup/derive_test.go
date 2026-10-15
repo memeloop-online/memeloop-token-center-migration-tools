@@ -131,6 +131,50 @@ func TestDigestPreparationResumesInsideSessionWithoutRehash(t *testing.T) {
 	}
 }
 
+func TestDigestCompletedCoverageRejectsInconsistentSessions(t *testing.T) {
+	for _, corruption := range []string{"orphan-record-session", "compensating-counts", "orphan-digest-session"} {
+		t.Run(corruption, func(t *testing.T) {
+			path, database := digestFixture(t, 4)
+			queries := map[string]string{
+				"orphan-record-session": "DELETE FROM records WHERE request_id IN ('request-000002','request-000003');UPDATE records SET session_id='session-b' WHERE request_id='request-000001';UPDATE session_summaries SET requests=2",
+				"compensating-counts":   "UPDATE records SET session_id='session-b' WHERE request_id<>'request-000000';UPDATE session_summaries SET requests=2;INSERT INTO session_summaries SELECT 'session-b',2,first_at,last_at FROM session_summaries WHERE session_id='session-a'",
+				"orphan-digest-session": "UPDATE session_summaries SET requests=3",
+			}
+			if _, err := database.Exec(queries[corruption]); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := database.Exec(`INSERT INTO session_export_digests
+				SELECT session_id,requests,first_at,last_at,?,CASE WHEN session_id='session-a' THEN 4 ELSE 0 END,'' FROM session_summaries`, strings.Repeat("a", 64)); err != nil {
+				t.Fatal(err)
+			}
+			if corruption == "orphan-digest-session" {
+				if _, err := database.Exec(`INSERT INTO session_export_digests VALUES('session-orphan',1,'','',?,0,'')`, strings.Repeat("a", 64)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			result, err := prepareDigests(context.Background(), digestTestOptions(path, 4), io.Discard)
+			if err == nil || result.Passed || result.CommittedRecords != 0 || result.BlobReads != 0 || result.SkippedSessions == 0 {
+				t.Fatalf("inconsistent completed coverage accepted or payload rehashed: %+v %v", result, err)
+			}
+		})
+	}
+}
+
+func TestDigestCompletedCoverageSkipsPayloadReads(t *testing.T) {
+	path, database := digestFixture(t, 2)
+	options := digestTestOptions(path, 2)
+	if result, err := prepareDigests(context.Background(), options, io.Discard); err != nil || !result.Passed {
+		t.Fatalf("initial digest failed: %+v %v", result, err)
+	}
+	if _, err := database.Exec("UPDATE records SET original_ref='unreadable-payload'"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := prepareDigests(context.Background(), options, io.Discard)
+	if err != nil || !result.Passed || result.SkippedSessions != 1 || result.CommittedRecords != 0 || result.BlobReads != 0 {
+		t.Fatalf("completed coverage read payload: %+v %v", result, err)
+	}
+}
+
 func TestDigestPagePlanAvoidsSessionSortAndScan(t *testing.T) {
 	path, database := digestFixture(t, 3)
 	options := digestTestOptions(path, 3)
@@ -224,6 +268,10 @@ func TestDigestProjectionCASMatchesOfficialBytesAndCachesBlobs(t *testing.T) {
 }
 
 func TestDigestCLIActualDispatchAndPrivateErrors(t *testing.T) {
+	var helpOutput, helpErrors bytes.Buffer
+	if code := run([]string{"prepare-digests", "--help"}, &helpOutput, &helpErrors); code != 0 || !strings.Contains(helpOutput.String(), "checkpoint-records") || helpErrors.Len() != 0 {
+		t.Fatalf("digest CLI help failed: %d %s", code, &helpErrors)
+	}
 	path, _ := digestFixture(t, 2)
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"prepare-digests", "--work", path, "--work-id", "00000000-0000-4000-8000-000000000001", "--expected-fence", "2", "--checkpoint-records", "1", "--max-records", "1"}, &stdout, &stderr)
