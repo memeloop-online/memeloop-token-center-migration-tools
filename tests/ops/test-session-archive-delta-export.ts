@@ -1117,3 +1117,18 @@ test("duplicate JSON keys and foreign session records fail closed", async () => 
     const result = await run(baseArguments(paths)); assert.equal(result.code, 2); assert.match(result.stderr, /foreign session record/);
   } finally { rmSync(paths.directory, { recursive: true, force: true }); }
 });
+
+test("SQLite export preserves a record larger than the observed 20921650 bytes through chunk resume", async () => {
+  const paths = fixture(); const source = join(paths.directory, "archive.sqlite");
+  try {
+    const rows = writeLargeArchiveSQLite(source, 2, 20_921_650);
+    const args = ["--source-sqlite", source, "--checkpoint", paths.checkpoint, "--output", paths.output,
+      "--since", "1970-01-01T00:00:00Z", "--offline-full", "--chunk-records", "1", "--max-chunks", "1"];
+    const partial = await run(args); assert.equal(partial.code, 2); assert.match(partial.stderr, /chunk budget/);
+    const resumed = await run([...args, "--resume", "--max-chunks", "0"]); assert.equal(resumed.code, 0, resumed.stderr);
+    const output = readFileSync(paths.output, "utf8").trim().split("\n").map((line) => JSON.parse(line) as RecordValue);
+    assert.equal(output[0]!.records_sha256, digestRecords(rows));
+    assert.deepEqual(output.slice(1), rows);
+    assert.equal(existsSync(`${paths.output}.spool.sqlite`), false);
+  } finally { rmSync(paths.directory, { recursive: true, force: true }); }
+});

@@ -360,3 +360,30 @@ func TestDigestProjectionOptionalFieldsAndRawRoot(t *testing.T) {
 		t.Fatalf("optional projection differs: %s", actual)
 	}
 }
+
+func TestLargeDigestCanonicalStreamingPreservesBytes(t *testing.T) {
+ value := map[string]any{"body": strings.Repeat("x",20921650), "escaped": "<>&\u2028\u2029\ufffd", "nested": []any{float64(9007199254740992),nil,true}}
+ var expected, actual bytes.Buffer
+ encoder := json.NewEncoder(&expected); encoder.SetEscapeHTML(false)
+ if err := encoder.Encode(value); err != nil { t.Fatal(err) }
+ if err := writeDigestJSON(context.Background(), &actual, value); err != nil { t.Fatal(err) }; actual.WriteByte('\n')
+ if !bytes.Equal(expected.Bytes(),actual.Bytes()) { t.Fatal("large canonical bytes changed") }
+ ctx,cancel := context.WithCancel(context.Background()); cancel()
+ if writeDigestJSON(ctx,io.Discard,value) == nil { t.Fatal("canceled record continued") }
+}
+
+func TestLargeDigestResumeAndCacheBound(t *testing.T) {
+ path, db := digestFixture(t, 2)
+ raw := []byte(`{"body":"`+strings.Repeat("x",20921650)+`"}`)
+ if _,err := db.Exec("UPDATE records SET original_request_gz=?",digestGzip(t,raw)); err != nil { t.Fatal(err) }
+ options := digestTestOptions(path,2); options.CheckpointRecords=1; options.MaxRecords=1
+ first,err := prepareDigests(context.Background(),options,io.Discard)
+ if err != nil || first.Passed || first.CommittedRecords != 1 { t.Fatalf("large checkpoint failed: %+v %v",first,err) }
+ second,err := prepareDigests(context.Background(),options,io.Discard)
+ if err != nil || !second.Passed || second.CommittedRecords != 1 { t.Fatalf("large resume failed: %+v %v",second,err) }
+ tx,err := db.Begin(); if err != nil { t.Fatal(err) }; defer tx.Rollback()
+ projection := newDigestProjection(); expected:=sha256.New()
+ for i:=0;i<2;i++ { if _,err:=projection.writeRecord(context.Background(),tx,"session-a",fmt.Sprintf("request-%06d",i),expected); err!=nil {t.Fatal(err)} }
+ var actual string; if err:=tx.QueryRow("SELECT records_sha256 FROM session_export_digests").Scan(&actual);err!=nil {t.Fatal(err)}
+ if actual!=hex.EncodeToString(expected.Sum(nil)) {t.Fatal("resumed hash differs")}
+}

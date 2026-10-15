@@ -48,9 +48,9 @@ async function main(): Promise<void> {
   const archiveSource = process.env.SESSION_ARCHIVE_IMPORT_SOURCE ?? "cpa-session-archive-v2";
   const overlap = unsignedSetting("SESSION_ARCHIVE_OVERLAP_MS", "86400000");
   const tolerance = unsignedSetting("SESSION_ARCHIVE_TIME_TOLERANCE_MS", "300000");
-  const maxLineBytes = unsignedSetting("SESSION_ARCHIVE_MAX_LINE_BYTES", "16777216");
   const maxPlanBytes = unsignedSetting("SESSION_ARCHIVE_MAX_PLAN_BYTES", "1073741824");
-  if (BigInt(maxLineBytes) > 16_777_216n) fail("SESSION_ARCHIVE_MAX_LINE_BYTES must not exceed the 16 MiB importer hard limit");
+  const maxLineBytes = unsignedSetting("SESSION_ARCHIVE_MAX_LINE_BYTES", maxPlanBytes);
+  if (BigInt(maxLineBytes) < 1024n || BigInt(maxLineBytes) > BigInt(Number.MAX_SAFE_INTEGER)) fail("SESSION_ARCHIVE_MAX_LINE_BYTES must be a safe integer of at least 1 KiB");
   const planDirectory = process.env.SESSION_ARCHIVE_PLAN_DIRECTORY ?? "/tmp";
   try {
     if (!statSync(planDirectory).isDirectory()) throw new Error("not directory");
