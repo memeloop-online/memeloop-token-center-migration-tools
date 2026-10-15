@@ -14,6 +14,9 @@ import (
 )
 
 func run(args []string, stdout, stderr io.Writer) int {
+	if len(args) > 0 && args[0] == "prepare-digests" {
+		return runDigestPreparation(args[1:], stdout, stderr)
+	}
 	return runWithClock(args, stdout, stderr, time.Now)
 }
 
