@@ -115,7 +115,12 @@
          "response": {"id":"response-1","output":[{"role":"assistant","content":"fixture answer"}]}
      });
      let missing_legacy_hash = json!({
-@@ -345,7 +354,7 @@
+@@ -341,11 +350,11 @@
+     );
+     assert_eq!(
+         archive
+-            .get(&refs.request_object)
++            .get_bounded(&refs.request_object, options(&input, false).max_line_bytes)
              .await
              .expect("request body"),
          serde_json::to_vec(

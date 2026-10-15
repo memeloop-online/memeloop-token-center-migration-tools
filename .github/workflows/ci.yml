@@ -62,11 +62,6 @@ jobs:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: npm ci --ignore-scripts --no-audit
 
-      - name: Collect canonical Go formatting from GHA
-        run: |
-          gofmt -w cmd/cpa-session-archive-backup
-          git diff -- cmd/cpa-session-archive-backup > "$RUNNER_TEMP/cpa-gofmt.patch"
-
       - name: Verify repository policy, types, and tests
         run: npm run verify
 
@@ -152,13 +147,6 @@ jobs:
         run: |
           test -z "$(gofmt -l cmd/cpa-session-archive-backup)"
           go test ./cmd/cpa-session-archive-backup
-
-      - name: Retain Go source formatting patch
-        if: always()
-        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
-        with:
-          name: cpa-gofmt-${{ github.sha }}
-          path: ${{ runner.temp }}/cpa-gofmt.patch
 
   build-session-archive-backup:
     name: Build verified SQLite backup runtime once
