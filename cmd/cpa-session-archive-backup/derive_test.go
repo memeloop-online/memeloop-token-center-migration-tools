@@ -83,7 +83,7 @@ func digestFixtureLine(index int) string {
 }
 
 func digestTestOptions(path string, count int) digestOptions {
-	return digestOptions{Work: path, ExpectedFence: int64(count), Timeout: time.Minute, CheckpointRecords: 4}
+	return digestOptions{Work: path, WorkID: "00000000-0000-4000-8000-000000000001", ExpectedFence: int64(count), Timeout: time.Minute, CheckpointRecords: 4}
 }
 
 func TestDigestPreparationResumesInsideSessionWithoutRehash(t *testing.T) {
@@ -161,7 +161,7 @@ func TestDigestPagePlanAvoidsSessionSortAndScan(t *testing.T) {
 }
 
 func TestDigestCheckpointCorruptionAndFenceFailClosed(t *testing.T) {
-	for _, corruption := range []string{"checkpoint", "fence", "count", "blob", "invalid-index"} {
+	for _, corruption := range []string{"checkpoint", "fence", "count", "blob", "invalid-index", "work-id"} {
 		t.Run(corruption, func(t *testing.T) {
 			path, database := digestFixture(t, 3)
 			options := digestTestOptions(path, 3)
@@ -170,11 +170,12 @@ func TestDigestCheckpointCorruptionAndFenceFailClosed(t *testing.T) {
 				t.Fatal(err)
 			}
 			queries := map[string]string{
-				"checkpoint": "UPDATE mtc_digest_resume_v1 SET checksum='bad'",
-				"fence": "UPDATE archive_ingest_clock SET sequence=4",
-				"count": "UPDATE session_summaries SET requests=4",
-				"blob": "UPDATE records SET original_ref='missing' WHERE request_id='request-000001'",
+				"checkpoint":    "UPDATE mtc_digest_resume_v1 SET checksum='bad'",
+				"fence":         "UPDATE archive_ingest_clock SET sequence=4",
+				"count":         "UPDATE session_summaries SET requests=4",
+				"blob":          "UPDATE records SET original_ref='missing' WHERE request_id='request-000001'",
 				"invalid-index": "DROP INDEX cpa_digest_records_v1;CREATE INDEX cpa_digest_records_v1 ON records(started_at)",
+				"work-id":       "UPDATE mtc_digest_binding_v1 SET identity='different-volume'",
 			}
 			if _, err := database.Exec(queries[corruption]); err != nil {
 				t.Fatal(err)
@@ -225,18 +226,18 @@ func TestDigestProjectionCASMatchesOfficialBytesAndCachesBlobs(t *testing.T) {
 func TestDigestCLIActualDispatchAndPrivateErrors(t *testing.T) {
 	path, _ := digestFixture(t, 2)
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"prepare-digests", "--work", path, "--expected-fence", "2", "--checkpoint-records", "1", "--max-records", "1"}, &stdout, &stderr)
+	code := run([]string{"prepare-digests", "--work", path, "--work-id", "00000000-0000-4000-8000-000000000001", "--expected-fence", "2", "--checkpoint-records", "1", "--max-records", "1"}, &stdout, &stderr)
 	if code != 3 || !strings.Contains(stdout.String(), "PARTIAL_CHECKPOINT_RETAINED") || !strings.Contains(stderr.String(), "DIGEST_CHECKPOINT") {
 		t.Fatalf("bounded CLI result: %d %s %s", code, &stdout, &stderr)
 	}
 	stdout.Reset()
 	stderr.Reset()
-	if code = run([]string{"prepare-digests", "--work", path, "--expected-fence", "2"}, &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), "DIGEST_COVERAGE_PASS_NOT_SEALED") {
+	if code = run([]string{"prepare-digests", "--work", path, "--work-id", "00000000-0000-4000-8000-000000000001", "--expected-fence", "2"}, &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), "DIGEST_COVERAGE_PASS_NOT_SEALED") {
 		t.Fatalf("resume CLI: %d %s", code, &stderr)
 	}
 	stdout.Reset()
 	stderr.Reset()
-	if code = run([]string{"prepare-digests", "--work", path, "--expected-fence", "3"}, &stdout, &stderr); code != 1 || strings.Contains(stderr.String(), path) || strings.Contains(stderr.String(), "session-a") {
+	if code = run([]string{"prepare-digests", "--work", path, "--work-id", "00000000-0000-4000-8000-000000000001", "--expected-fence", "3"}, &stdout, &stderr); code != 1 || strings.Contains(stderr.String(), path) || strings.Contains(stderr.String(), "session-a") {
 		t.Fatal("CLI failed to redact rejection")
 	}
 }

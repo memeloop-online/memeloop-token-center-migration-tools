@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"syscall"
 	"time"
 )
@@ -31,6 +32,7 @@ const digestCheckpointSchema = `CREATE TABLE IF NOT EXISTS mtc_digest_resume_v1(
 
 type digestOptions struct {
 	Work              string
+	WorkID            string
 	ExpectedFence     int64
 	Timeout           time.Duration
 	CheckpointRecords int
@@ -70,6 +72,7 @@ func runDigestPreparation(args []string, stdout, stderr io.Writer) int {
 	flags.SetOutput(stdout)
 	var options digestOptions
 	flags.StringVar(&options.Work, "work", "", "isolated writable derivative only; never the original source")
+	flags.StringVar(&options.WorkID, "work-id", "", "required operator-verified work PVC UID, stable across mounts")
 	flags.Int64Var(&options.ExpectedFence, "expected-fence", -1, "required frozen ingest fence")
 	flags.DurationVar(&options.Timeout, "timeout", 25*time.Minute, "bounded work duration, at most 30m")
 	flags.IntVar(&options.CheckpointRecords, "checkpoint-records", 64, "atomic checkpoint interval, 1..128 records")
@@ -96,7 +99,7 @@ func runDigestPreparation(args []string, stdout, stderr io.Writer) int {
 
 func prepareDigests(parent context.Context, options digestOptions, progress io.Writer) (result digestResult, err error) {
 	result.Stage = "PREFLIGHT"
-	if !filepath.IsAbs(options.Work) || options.ExpectedFence < 0 || options.Timeout <= 0 || options.Timeout > 30*time.Minute || options.CheckpointRecords < 1 || options.CheckpointRecords > 128 || options.MaxRecords < 0 {
+	if !filepath.IsAbs(options.Work) || !regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`).MatchString(options.WorkID) || options.ExpectedFence < 0 || options.Timeout <= 0 || options.Timeout > 30*time.Minute || options.CheckpointRecords < 1 || options.CheckpointRecords > 128 || options.MaxRecords < 0 {
 		return result, errInvalidArguments
 	}
 	metadata, err := os.Lstat(options.Work)
@@ -179,7 +182,7 @@ func prepareDigests(parent context.Context, options digestOptions, progress io.W
 	if err = tx.QueryRowContext(ctx, "SELECT sql FROM sqlite_schema WHERE name='cpa_digest_records_v1'").Scan(&indexDefinition); err != nil || indexDefinition != "CREATE INDEX cpa_digest_records_v1 ON records(session_id COLLATE BINARY,request_id COLLATE BINARY)" {
 		return result, errors.New("unexpected digest index")
 	}
-	workIdentity := fmt.Sprintf("%d:%d", identity.Dev, identity.Ino)
+	workIdentity := fmt.Sprintf("%s:%d", options.WorkID, identity.Ino)
 	if _, err = tx.ExecContext(ctx, "INSERT OR IGNORE INTO mtc_digest_binding_v1(id,identity,fence) VALUES(1,?,?)", workIdentity, options.ExpectedFence); err != nil {
 		return result, err
 	}
@@ -271,11 +274,11 @@ func prepareDigests(parent context.Context, options digestOptions, progress io.W
 	}
 	var actual, expected, digestRecords, digestSessions, checkpoints int64
 	for query, destination := range map[string]*int64{
-		"SELECT count(*) FROM records": &actual,
-		"SELECT coalesce(sum(requests),0) FROM session_summaries": &expected,
+		"SELECT count(*) FROM records":                                 &actual,
+		"SELECT coalesce(sum(requests),0) FROM session_summaries":      &expected,
 		"SELECT coalesce(sum(requests),0) FROM session_export_digests": &digestRecords,
-		"SELECT count(*) FROM session_export_digests": &digestSessions,
-		"SELECT count(*) FROM mtc_digest_resume_v1": &checkpoints,
+		"SELECT count(*) FROM session_export_digests":                  &digestSessions,
+		"SELECT count(*) FROM mtc_digest_resume_v1":                    &checkpoints,
 	} {
 		if err = tx.QueryRowContext(ctx, query).Scan(destination); err != nil {
 			return result, err

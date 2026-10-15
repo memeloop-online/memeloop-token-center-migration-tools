@@ -7,7 +7,8 @@ archive, production database, or unrelated volume writable for this command.
 
 ```text
 cpa-session-archive-backup prepare-digests \
-  --work /work/prepared/archive.sqlite --expected-fence 531730 \
+  --work /work/prepared/archive.sqlite --work-id <verified-work-pvc-uid> \
+  --expected-fence 531730 \
   --timeout 25m --checkpoint-records 64
 ```
 
@@ -57,7 +58,9 @@ non-symlink and single-link. An advisory lock excludes another invocation;
 the operator must also exclude collectors and other consumers. Immediate
 SQLite transactions prevent concurrent writes while chunks are read/committed.
 The frozen global ingest fence, schema version, connection data version and
-device/inode binding fail closed on observed source changes. Arbitrary edits
+operator-verified PVC UID/inode binding fail closed on observed source changes.
+The ephemeral device number is not persisted: normal CSI reattachment must not
+invalidate a checkpoint on the same PVC. Arbitrary edits
 that bypass the ingest contract between invocations are not supported.
 
 The checkpoint is private work data: SHA internal state can contain the last
