@@ -316,8 +316,8 @@ Required runtime access is:
   `1200Mi` `emptyDir` (leaving metadata/journal headroom above the 1 GiB plan
   cap) and sets `SESSION_ARCHIVE_MAX_PLAN_BYTES=1073741824`; do not put the plan
   on the source PVC or a volume shared with another pod. The binary has
-  non-overridable compile-time ceilings of 16 MiB per JSONL record and 1 GiB per
-  plan. `SESSION_ARCHIVE_MAX_LINE_BYTES` and
+  configurable operational budgets for JSONL records and disk-backed plans;
+  there is no compiled 16 MiB record or 1 GiB plan ceiling. `SESSION_ARCHIVE_MAX_LINE_BYTES` and
   `SESSION_ARCHIVE_MAX_PLAN_BYTES` may lower those limits but cannot raise them;
   oversized settings are rejected before database or object-store connections
   are opened;
