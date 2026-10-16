@@ -316,11 +316,12 @@ Required runtime access is:
   `1200Mi` `emptyDir` (leaving metadata/journal headroom above the 1 GiB plan
   cap) and sets `SESSION_ARCHIVE_MAX_PLAN_BYTES=1073741824`; do not put the plan
   on the source PVC or a volume shared with another pod. The binary has
-  non-overridable compile-time ceilings of 16 MiB per JSONL record and 1 GiB per
-  plan. `SESSION_ARCHIVE_MAX_LINE_BYTES` and
-  `SESSION_ARCHIVE_MAX_PLAN_BYTES` may lower those limits but cannot raise them;
-  oversized settings are rejected before database or object-store connections
-  are opened;
+  configurable operational budgets for JSONL records and disk-backed plans;
+  there is no compiled 16 MiB record or 1 GiB plan ceiling. `SESSION_ARCHIVE_MAX_LINE_BYTES` and
+  `SESSION_ARCHIVE_MAX_PLAN_BYTES` select the operational budgets; size the
+  pod memory and plan filesystem for those values. The wrapper defaults the line
+  budget to the configured plan budget. See [large record operations](operations/cpa-large-records.md)
+  for memory behavior and the schema127 target importer dependency;
 - the target PostgreSQL connection;
 - write/list access to the target archive S3 bucket;
 - only the target database and archive-store credentials, supplied by Secret

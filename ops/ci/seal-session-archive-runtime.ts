@@ -9,15 +9,17 @@ const output = resolve("dist/release/commands/runtime");
 const revision = execFileSync("git", ["rev-parse", "HEAD"], { cwd: source, encoding: "utf8" }).trim();
 if (revision !== archiveRuntimePin.revision
   || fileDigest(resolve(source, "Cargo.lock")) !== archiveRuntimePin.cargo_lock_sha256
-  || execFileSync("git", ["status", "--porcelain", "--untracked-files=no"], { cwd: source, encoding: "utf8" }).trim() !== ""
   || !execFileSync("rustc", ["--version"], { encoding: "utf8" }).startsWith(`rustc ${archiveRuntimePin.rust_version} `)) {
   throw new Error("archive runtime build provenance mismatch");
 }
+execFileSync(process.execPath, ["ops/ci/apply-session-archive-runtime-patch.ts", source, "--verify"]);
 mkdirSync(output, { recursive: true });
 const binary = resolve(output, "import-cpa-session-archive");
 copyFileSync(resolve(source, "target/release/import-cpa-session-archive"), binary);
 chmodSync(binary, 0o755);
-execFileSync("git", ["archive", "--format=tar", `--output=${resolve(output, "source.tar")}`, revision], { cwd: source });
+execFileSync("git", ["add", "--update"], { cwd: source });
+const sourceTree = execFileSync("git", ["write-tree"], { cwd: source, encoding: "utf8" }).trim();
+execFileSync("git", ["archive", "--format=tar", `--output=${resolve(output, "source.tar")}`, sourceTree], { cwd: source });
 writeFileSync(resolve(output, "compatibility.json"), `${JSON.stringify({
   format_version: 1,
   ...archiveRuntimePin,

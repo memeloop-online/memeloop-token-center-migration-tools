@@ -410,17 +410,16 @@ func prepareDigestChunk(ctx context.Context, tx *sql.Tx, session digestSession, 
 			err = errors.New("session cursor or deadline")
 			return
 		}
-		line, recordErr := projection.record(ctx, tx, session.ID, requestID)
+		lineBytes, recordErr := projection.writeRecord(ctx, tx, session.ID, requestID, digest)
 		if recordErr != nil {
 			err = recordErr
 			return
 		}
-		_, _ = digest.Write(line)
 		checkpoint.Cursor = requestID
 		checkpoint.Records++
-		checkpoint.Bytes += int64(len(line))
+		checkpoint.Bytes += lineBytes
 		records++
-		encoded += int64(len(line))
+		encoded += lineBytes
 	}
 	if checkpoint.Records > checkpoint.Expected {
 		err = errors.New("session overflow")

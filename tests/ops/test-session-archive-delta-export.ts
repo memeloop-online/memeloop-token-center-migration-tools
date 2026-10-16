@@ -1075,7 +1075,7 @@ test("legacy spool resume rebuilds unverifiable scratch instead of deadlocking r
     database.prepare("INSERT INTO records VALUES(?,?,?,?,?,?,1)").run(row.request_id, row.session_id, row.started_at, row.completed_at, createHash("sha256").update(encoded).digest("hex"), encoded);
     database.close(); chmodSync(spool, 0o600);
 
-    const resumed = await run([...baseArguments(paths), "--resume"]);
+    const resumed = await run([...baseArguments(paths), "--resume", "--max-line-bytes", String(16 * 1024 * 1024)]);
     assert.equal(resumed.code, 0, resumed.stderr);
     assert.match(resumed.stderr, /archive spool resume legacy_rebuild=true records_discarded=1/);
     assert.equal(state.archiveRequests.get("session-legacy"), 1);
@@ -1115,5 +1115,21 @@ test("duplicate JSON keys and foreign session records fail closed", async () => 
     state.records.set("session-a", [{ ...record("request-1", "session-foreign", "2025-01-02T01:00:00Z", "2025-01-02T01:00:01Z"), session_id: "session-foreign" }]);
     // Session summaries use the map key while the archive row asserts a foreign identity.
     const result = await run(baseArguments(paths)); assert.equal(result.code, 2); assert.match(result.stderr, /foreign session record/);
+  } finally { rmSync(paths.directory, { recursive: true, force: true }); }
+});
+
+test("SQLite export preserves a record larger than the observed 20921650 bytes through chunk resume", async () => {
+  const paths = fixture(); const source = join(paths.directory, "archive.sqlite");
+  try {
+    const rows = writeLargeArchiveSQLite(source, 2, 20_921_650);
+    const args = ["--collector-direct", "--base-url", `http://127.0.0.1:${port}`, "--private-http-host", "127.0.0.1",
+      "--source-sqlite", source, "--checkpoint", paths.checkpoint, "--output", paths.output,
+      "--since", "1970-01-01T00:00:00Z", "--offline-full", "--chunk-records", "1", "--max-chunks", "1"];
+    const partial = await run(args); assert.equal(partial.code, 2); assert.match(partial.stderr, /chunk budget/);
+    const resumed = await run([...args.slice(0, -2), "--max-chunks", "0", "--resume"]); assert.equal(resumed.code, 0, resumed.stderr);
+    const output = readFileSync(paths.output, "utf8").trim().split("\n").map((line) => JSON.parse(line) as RecordValue);
+    assert.equal(output[0]!.records_sha256, digestRecords(rows));
+    assert.deepEqual(output.slice(1), rows);
+    assert.equal(existsSync(`${paths.output}.spool.sqlite`), false);
   } finally { rmSync(paths.directory, { recursive: true, force: true }); }
 });

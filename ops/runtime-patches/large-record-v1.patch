@@ -1,0 +1,140 @@
+--- a/src/session_archive_import/mod.rs
++++ b/src/session_archive_import/mod.rs
+@@ -105,17 +105,11 @@
+     validate_name(options.tenant_external_id, "tenant external id")?;
+     validate_name(options.cpamp_source, "CPAMP source")?;
+     validate_name(options.archive_source, "archive source")?;
+-    if !(1024..=MAX_SESSION_ARCHIVE_LINE_BYTES).contains(&options.max_line_bytes) {
+-        return Err(format!(
+-            "max line bytes must be between 1 KiB and the compiled-in {} MiB hard limit",
+-            MAX_SESSION_ARCHIVE_LINE_BYTES / (1024 * 1024)
+-        ));
+-    }
+-    if !(1024 * 1024..=MAX_SESSION_ARCHIVE_PLAN_BYTES).contains(&options.max_plan_bytes) {
+-        return Err(format!(
+-            "max plan bytes must be between 1 MiB and the compiled-in {} GiB hard limit",
+-            MAX_SESSION_ARCHIVE_PLAN_BYTES / (1024 * 1024 * 1024)
+-        ));
++    if options.max_line_bytes < 1024 {
++        return Err("max line bytes must be at least 1 KiB".into());
++    }
++    if options.max_plan_bytes < 1024 * 1024 {
++        return Err("max plan bytes must be at least 1 MiB".into());
+     }
+     if options.apply && options.allow_unmapped {
+         return Err("allow-unmapped is diagnostic-only and cannot be combined with apply".into());
+--- a/src/session_archive_import/parsing.rs
++++ b/src/session_archive_import/parsing.rs
+@@ -488,13 +488,6 @@
+     reader: &mut BufReader<tokio::fs::File>,
+     maximum: usize,
+ ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+-    if maximum > MAX_SESSION_ARCHIVE_LINE_BYTES {
+-        return Err(format!(
+-            "max line bytes exceeds the compiled-in {} MiB hard limit",
+-            MAX_SESSION_ARCHIVE_LINE_BYTES / (1024 * 1024)
+-        )
+-        .into());
+-    }
+     let mut line = Vec::new();
+     loop {
+         let available = reader.fill_buf().await?;
+--- a/src/session_archive_import/tests.rs
++++ b/src/session_archive_import/tests.rs
+@@ -41,19 +41,12 @@
+                 .expect("compiled-in resource boundary must be accepted");
+         }
+ 
+-        let line_error = validate_session_archive_import_options(&validation_options(
+-            MAX_SESSION_ARCHIVE_LINE_BYTES + 1,
+-            MAX_SESSION_ARCHIVE_PLAN_BYTES,
+-        ))
+-        .expect_err("line limit must not override the compiled-in ceiling");
+-        assert!(line_error.contains("compiled-in 16 MiB hard limit"));
+-
+-        let plan_error = validate_session_archive_import_options(&validation_options(
+-            MAX_SESSION_ARCHIVE_LINE_BYTES,
+-            MAX_SESSION_ARCHIVE_PLAN_BYTES + 1,
+-        ))
+-        .expect_err("plan limit must not override the compiled-in ceiling");
+-        assert!(plan_error.contains("compiled-in 1 GiB hard limit"));
++        validate_session_archive_import_options(&validation_options(
++            20_921_650, MAX_SESSION_ARCHIVE_PLAN_BYTES + 1,
++        )).expect("operator budgets may exceed the previous compiled ceilings");
++        assert!(validate_session_archive_import_options(&validation_options(1023, 1024 * 1024)).is_err());
++        assert!(validate_session_archive_import_options(&validation_options(1024, 1024 * 1024 - 1)).is_err());
++
+     }
+ 
+     #[tokio::test]
+@@ -77,11 +70,15 @@
+             .expect_err("one byte over the line limit must fail");
+         assert!(error.to_string().contains("exceeds 1024 bytes"));
+ 
+-        let hard_limit_error =
+-            read_bounded_line(&mut over_input.reader, MAX_SESSION_ARCHIVE_LINE_BYTES + 1)
+-                .await
+-                .expect_err("bounded reader must enforce the compiled-in hard limit");
+-        assert!(hard_limit_error.to_string().contains("compiled-in 16 MiB"));
++        let large = tempfile::NamedTempFile::new().expect("large input");
++        let mut bytes = vec![b'a'; 20_921_649];
++        bytes.push(b'\n');
++        std::fs::write(large.path(), &bytes).expect("write large input");
++        let mut input = ReadOnlyInput::open(large.path()).await.expect("open large input");
++        assert_eq!(read_bounded_line(&mut input.reader, bytes.len()).await.expect("configured large line").expect("line"), bytes);
++        let mut input = ReadOnlyInput::open(large.path()).await.expect("reopen large input");
++        assert!(read_bounded_line(&mut input.reader, bytes.len() - 1).await.is_err());
++
+     }
+ 
+     #[tokio::test]
+--- a/tests/session_archive_import.rs
++++ b/tests/session_archive_import.rs
+@@ -51,6 +51,15 @@
+ 
+ #[tokio::test]
+ async fn archive_import_is_fail_closed_gap_only_and_idempotent() {
++    archive_import_fixture(false).await;
++}
++
++#[tokio::test]
++async fn large_archive_import_preserves_objects_replay_tenants_and_financial_state() {
++    archive_import_fixture(true).await;
++}
++
++async fn archive_import_fixture(large: bool) {
+     let directory = tempfile::tempdir().expect("temporary directory");
+     let database_path = directory.path().join("target.sqlite");
+     let database_url = format!("sqlite://{}?mode=rwc", database_path.display());
+@@ -153,7 +162,7 @@
+         "outcome": "succeeded",
+         "status_code": 200,
+         "facets": {"turn.id": ["turn-1"], "client": ["Codex"]},
+-        "request": {"model":"gpt-fixture","input":[{"role":"user","content":"fixture prompt"}]},
++        "request": {"model":"gpt-fixture","input":[{"role":"user","content":if large { "x".repeat(20_921_650) } else { "fixture prompt".to_owned() }}]},
+         "response": {"id":"response-1","output":[{"role":"assistant","content":"fixture answer"}]}
+     });
+     let missing_legacy_hash = json!({
+@@ -341,11 +350,11 @@
+     );
+     assert_eq!(
+         archive
+-            .get(&refs.request_object)
++            .get_bounded(&refs.request_object, options(&input, false).max_line_bytes)
+             .await
+             .expect("request body"),
+         serde_json::to_vec(
+-            &json!({"model":"gpt-fixture","input":[{"role":"user","content":"fixture prompt"}]})
++            &json!({"model":"gpt-fixture","input":[{"role":"user","content":if large { "x".repeat(20_921_650) } else { "fixture prompt".to_owned() }}]})
+         )
+         .unwrap()
+     );
+@@ -2813,7 +2822,7 @@
+         archive_source: "cpa-session-archive-v2",
+         overlap_ms: 86_400_000,
+         time_tolerance_ms: 5_000,
+-        max_line_bytes: 1024 * 1024,
++        max_line_bytes: usize::try_from(input.as_file().metadata().expect("input length").len()).expect("fixture size").max(1024),
+         max_plan_bytes: 16 * 1024 * 1024,
+         allow_unmapped: false,
+         quarantine_unknown_identities: false,

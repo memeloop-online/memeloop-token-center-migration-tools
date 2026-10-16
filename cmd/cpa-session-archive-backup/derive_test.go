@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -358,5 +359,120 @@ func TestDigestProjectionOptionalFieldsAndRawRoot(t *testing.T) {
 	expected := "{\"completed_at\":\"2026-01-02T03:04:06.000000Z\",\"credential_hash\":\"hash\",\"facets\":{\"tag\":[\"value\"]},\"key_id\":\" key \",\"metadata\":{\"n\":1e-7},\"model\":\"model\",\"outcome\":\"ok\",\"principal_id\":\"principal\",\"request\":\"event: raw\\n\\u2028\",\"request_id\":\"request-000000\",\"requested_model\":\"requested\",\"response\":{\"answer\":true},\"schema_version\":2,\"session_id\":\"session-a\",\"started_at\":\"2026-01-02T03:04:05.123456Z\",\"status_code\":200}\n"
 	if string(actual) != expected {
 		t.Fatalf("optional projection differs: %s", actual)
+	}
+}
+
+func TestLargeDigestCanonicalStreamingPreservesBytes(t *testing.T) {
+	value := map[string]any{"body": strings.Repeat("x", 20921650), "escaped": "<>&\u2028\u2029\ufffd", "nested": []any{float64(9007199254740992), nil, true}}
+	var expected, actual bytes.Buffer
+	encoder := json.NewEncoder(&expected)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDigestJSON(context.Background(), &actual, value); err != nil {
+		t.Fatal(err)
+	}
+	actual.WriteByte('\n')
+	if !bytes.Equal(expected.Bytes(), actual.Bytes()) {
+		t.Fatal("large canonical bytes changed")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if writeDigestJSON(ctx, io.Discard, value) == nil {
+		t.Fatal("canceled record continued")
+	}
+}
+
+func TestLargeDigestResumeAndCacheBound(t *testing.T) {
+	path, db := digestFixture(t, 2)
+	raw := []byte(`{"body":"` + strings.Repeat("x", 20921650) + `"}`)
+	if _, err := db.Exec("UPDATE records SET original_request_gz=?", digestGzip(t, raw)); err != nil {
+		t.Fatal(err)
+	}
+	options := digestTestOptions(path, 2)
+	options.CheckpointRecords = 1
+	options.MaxRecords = 1
+	first, err := prepareDigests(context.Background(), options, io.Discard)
+	if err != nil || first.Passed || first.CommittedRecords != 1 {
+		t.Fatalf("large checkpoint failed: %+v %v", first, err)
+	}
+	second, err := prepareDigests(context.Background(), options, io.Discard)
+	if err != nil || !second.Passed || second.CommittedRecords != 1 {
+		t.Fatalf("large resume failed: %+v %v", second, err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	projection := newDigestProjection()
+	expected := sha256.New()
+	for i := 0; i < 2; i++ {
+		if _, err := projection.writeRecord(context.Background(), tx, "session-a", fmt.Sprintf("request-%06d", i), expected); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var actual string
+	if err := tx.QueryRow("SELECT records_sha256 FROM session_export_digests").Scan(&actual); err != nil {
+		t.Fatal(err)
+	}
+	if actual != hex.EncodeToString(expected.Sum(nil)) {
+		t.Fatal("resumed hash differs")
+	}
+}
+
+func TestDigestStringChunkBoundaries(t *testing.T) {
+	for _, value := range []string{
+		strings.Repeat("x", 65535) + "界<>&\u2028\u2029",
+		strings.Repeat("x", 65534) + "😀界",
+		strings.Repeat(string([]byte{0x80}), 131075),
+		strings.Repeat("x", 65535) + string([]byte{0xe2, 0x80}) + "valid",
+	} {
+		var expected, actual bytes.Buffer
+		encoder := json.NewEncoder(&expected)
+		encoder.SetEscapeHTML(false)
+		if err := encoder.Encode(value); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeDigestJSON(context.Background(), &actual, value); err != nil {
+			t.Fatal(err)
+		}
+		actual.WriteByte('\n')
+		if !bytes.Equal(expected.Bytes(), actual.Bytes()) {
+			t.Fatal("chunk boundary changed canonical string")
+		}
+	}
+}
+
+func TestLargeCASDataURLMatchesCanonicalHashWithoutCacheRetention(t *testing.T) {
+	_, db := digestFixture(t, 1)
+	raw := bytes.Repeat([]byte{0, 127, 255}, 6973884)
+	manifest := []byte(`{"image":{"$cpa_blob":"large-image","encoding":"data-url","media_type":"image/test"}}`)
+	for key, value := range map[string][]byte{"manifest": manifest, "large-image": raw} {
+		if _, err := db.Exec("INSERT INTO blobs VALUES(?,'gzip',?)", key, digestGzip(t, value)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec("UPDATE records SET original_ref='manifest'"); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	projection := newDigestProjection()
+	actual := sha256.New()
+	if _, err := projection.writeRecord(context.Background(), tx, "session-a", "request-000000", actual); err != nil {
+		t.Fatal(err)
+	}
+	expectedLine := strings.Replace(digestFixtureLine(0), `{"html":"<>&","null":null,"number":9007199254740992}`, `{"image":"data:image/test;base64,`+base64.StdEncoding.EncodeToString(raw)+`"}`, 1)
+	expected := sha256.Sum256([]byte(expectedLine))
+	if !bytes.Equal(expected[:], actual.Sum(nil)) {
+		t.Fatal("large CAS data URL canonical hash changed")
+	}
+	if projection.cache["large-image"] != nil || projection.cacheBytes > digestBlobCacheBytes {
+		t.Fatal("large blob escaped cache budget")
 	}
 }

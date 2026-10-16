@@ -6,6 +6,7 @@ export const archiveRuntimePin = {
   repository: "memeloop-online/memeloop-token-center",
   revision: "a65097f952e174ac482abe6ff719966fa9d330cb",
   cargo_lock_sha256: "2134ac15927c1beaceed75d52e48312b6bb93db072c43df4c557cad7de23e029",
+  source_patch_sha256: "2ef3af2f7896cc6e0abadb7e0c19f5169be7d4f6151c4b07c3bb26985171a498",
   rust_version: "1.95.0",
   target: "x86_64-unknown-linux-gnu",
 } as const;
