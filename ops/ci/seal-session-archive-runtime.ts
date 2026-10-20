@@ -17,7 +17,7 @@ mkdirSync(output, { recursive: true });
 const binary = resolve(output, "import-cpa-session-archive");
 copyFileSync(resolve(source, "target/release/import-cpa-session-archive"), binary);
 chmodSync(binary, 0o755);
-execFileSync("git", ["add", "--update"], { cwd: source });
+execFileSync("git", ["add", "--all"], { cwd: source });
 const sourceTree = execFileSync("git", ["write-tree"], { cwd: source, encoding: "utf8" }).trim();
 execFileSync("git", ["archive", "--format=tar", `--output=${resolve(output, "source.tar")}`, sourceTree], { cwd: source });
 writeFileSync(resolve(output, "compatibility.json"), `${JSON.stringify({
@@ -32,7 +32,7 @@ writeFileSync(resolve(output, "compatibility.json"), `${JSON.stringify({
   minimum_glibc: "2.39",
   schema_policy: "engine-read-only-schema-precondition",
   archive_schema_versions: [1, 2],
-  source_closure_extracted: false,
+  source_closure_extracted: true,
 }, null, 2)}\n`, { mode: 0o644, flag: "wx" });
 const verifiedBinary = verifiedArchiveRuntime(binary);
 const help = execFileSync(verifiedBinary, ["--help"], { encoding: "utf8", timeout: 10000 });

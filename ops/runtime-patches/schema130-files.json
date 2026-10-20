@@ -1,0 +1,29 @@
+{
+  "format_version": 1,
+  "extracted_from_revision": "a65097f952e174ac482abe6ff719966fa9d330cb",
+  "product_revision": "63022be5856ff584191321b76f314682c8ec67bf",
+  "base_files": {
+    "src/lib.rs": "0e7ff76757642a4b58aade0b3cc8a681accdd8b52270f5e466052aacd1c92c2b",
+    "src/db/requests/mod.rs": "32aa703f28f72593e950c40606e8369bea31e6c5e2f46b8dc970e0fbe9435a34",
+    "src/db/mod.rs": "7128bedc7075ab0ea99ab32fbe0695c4589c01baaf38bb774ce3459e58edc0bb"
+  },
+  "files": {
+    "src/bin/import-cpa-session-archive.rs": "b09384d35f15be0727f55393caa9062ba00ab7cc17864a04bd0dc4310bf32ec7",
+    "src/db/mod.rs": "9a35320f65177c821396b2ac6033726812c05aa33dad161603db8ae8ca62431e",
+    "src/db/requests/mod.rs": "ad8a71aca366969558f3798b6f76561681a7f1b26afd0cd58dedb93a4120335e",
+    "src/db/requests/session_archive.rs": "35979e7e8059abed20ed451ff0fc565f9ff0e7ceec52106779b36ef7f02097c8",
+    "src/db/requests/session_archive_commit.rs": "89fc6babcbc6c37d20ccb9cc9bec5ea1b55dca5c90fd1ebed64c7e280e8eb287",
+    "src/db/requests/session_archive_quarantine.rs": "2aed98a202f7b03fad62602a3d932958e24873ffde9f8f344a02281d2fa6e918",
+    "src/db/session_archive_projection.rs": "8b2ac5bee709e6078ec70b3e3964d7eeca15d5fc399fa8832b6f9d2112502072",
+    "src/lib.rs": "a04640d5c5044aace1ec7c6fef5676ef1fb0374a57abebcc60415c9d6b24eba0",
+    "src/session_archive_import/apply.rs": "a22c0ae65075c30fccbf0e16463e4e2888fae5742b2369be2f35e0b0a099eaf4",
+    "src/session_archive_import/correlation.rs": "c0dfc4ef7b4e2d3fc6cdea552aa26c31cd26fe0a48e98eb15ca1b7d2601590bb",
+    "src/session_archive_import/mod.rs": "0ab4a67ce4739ab573ecffdff776cbbf4ec5528435a70c3331e3b8b6be140457",
+    "src/session_archive_import/parsing.rs": "60a0a33a7b9c26166e04bd1241fdbad3bbfe35d881c9130c76ba6e80a40ba208",
+    "src/session_archive_import/plan.rs": "ec65d4a75beb515df41e123e78684ea6026a0c9cc37aabc5b5270b4f9ba8806c",
+    "src/session_archive_import/tests.rs": "721302372df4ede159bb244da9f96493a6f6ad7c912f715663c00235033fdd38",
+    "tests/session_archive_import.rs": "c4ec192e090e591d7a0199df8b6787d194abc4c5dc3287b43d8fa7b3614dd868",
+    "tests/session_archive_quarantine.rs": "382ded3a6d314f9c2efa03796b9d25189f7da8fe02f699be1f3cdcef1e5c8350",
+    "tests/session_archive_unlinked.rs": "7900cbe37c5ba0b449173f7159c84aea06973c74a386288565118e8305b1af57"
+  }
+}

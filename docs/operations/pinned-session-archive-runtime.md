@@ -1,28 +1,28 @@
 # Pinned session archive import runtime
 
-This is an approved intermediate delivery boundary, **not** extraction of the
-historical Rust closure and not authorization for final cleanup or real import.
+The one-shot importer closure is owned by migration-tools and assembled against
+the pinned current product APIs in CI. This does not authorize cleanup or real import.
 
 ## Immutable source and build
 
 - Product source: `memeloop-online/memeloop-token-center`,
-  revision `a65097f952e174ac482abe6ff719966fa9d330cb`.
+  revision `63022be5856ff584191321b76f314682c8ec67bf`, target schema130.
 - Cargo.lock SHA-256:
-  `2134ac15927c1beaceed75d52e48312b6bb93db072c43df4c557cad7de23e029`.
+  `b8ba4261392b471c569affad448c83690712ad6f68751b66c846a20e4355d6b2`.
 - Rust `1.95.0`, `cargo --locked`, Ubuntu 24.04, Linux x86_64 GNU.
 - CI executes the importer unit tests and session import/quarantine/unlinked
   integration tests with an isolated PostgreSQL service, then builds only the
   `import-cpa-session-archive` release binary.
 
 Release assets include `commands/runtime/import-cpa-session-archive`,
-`compatibility.json`, and an exact tracked `source.tar` retained independently
+`compatibility.json`, and an exact assembled `source.tar` retained independently
 of future product-tree cleanup. The outer release manifest hashes all three.
 The compatibility manifest also binds binary/source bytes, revision, Cargo.lock,
 Rust version, target and CLI contract. Verify the fixed release archive and all
 outer manifest hashes **before execution**; the inner checksum manifest is not
 an independent signature or substitute for release provenance.
 
-The packager refuses dirty tracked source or source/lock/compiler drift and
+The packager refuses unexpected source changes or closure/lock/compiler drift and
 exercises the compiled CLI contract. Isolated release verification executes its
 `--help` outside the source tree and node_modules. Synthetic verifier tests
 reject missing/tampered manifest fields, changed payloads, absent executable
@@ -46,15 +46,15 @@ availability with the isolated `--help` check before supplying real inputs.
 
 Dry-run remains the default. `SESSION_ARCHIVE_APPLY=true` is an explicit write
 decision; the finalizer additionally requires its separately bound approval.
-The unchanged engine checks the target schema read-only before import, validates
+The engine checks exact target schema130 read-only before import, validates
 identity, and retains the existing gap/quarantine/provenance/replay semantics.
 This release does not implement product schema upgrades and does not relax
 import acceptance for a newer target schema.
 
-## Closure still owned by the pinned engine
+## Tools-owned closure
 
 `src/bin/import-cpa-session-archive.rs` invokes
-`Config::from_session_archive_import_env`,
+the tools-owned minimal target configuration loader,
 `Database::ensure_session_archive_import_schema`,
 `ArchiveStore::from_config`, `validate_session_archive_import_options` and
 `import_session_archive`.
@@ -67,7 +67,10 @@ checkpoint chains and tombstone preflight/apply through
 configuration, archive and error types. Extracting just the CLI file does not
 extract this closure.
 
-A later standalone crate extraction must preserve the reviewed SQL/schema and
-identity/archive semantics and pass the same SQLite/PostgreSQL tests. Retaining
-the exact source tar now prevents product cleanup from erasing the migration
-engine's fixed source, but does not itself authorize that cleanup.
+These retired one-shot modules and their regression fixtures now live in
+`ops/runtime-engine`, with PR44's large-record changes incorporated directly.
+Current conversation/prefix, archive, model and error implementations remain
+supplied by product; no old observation decoder is restored. The hash-bound
+assembly adds only module exports to three current product files in CI.
+See [the exact source plan and CI matrix](schema130-importer-closure.md).
+Retained source does not authorize production cleanup or import.

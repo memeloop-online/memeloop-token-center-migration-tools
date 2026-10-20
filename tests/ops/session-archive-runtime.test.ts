@@ -24,7 +24,7 @@ test("archive runtime rejects missing, drifted, substituted and symlinked artifa
       binary: "import-cpa-session-archive", source_archive: "source.tar",
       binary_sha256: fileDigest(binary), source_archive_sha256: fileDigest(join(directory, "source.tar")),
       cli_contract: "session-archive-import-v1", build_os: "ubuntu-24.04", minimum_glibc: "2.39",
-      schema_policy: "engine-read-only-schema-precondition", source_closure_extracted: false,
+      schema_policy: "engine-read-only-schema-precondition", source_closure_extracted: true,
       archive_schema_versions: [1, 2],
     };
     const reset = (): void => writeFileSync(manifest, JSON.stringify(value));
@@ -46,7 +46,7 @@ test("archive runtime rejects missing, drifted, substituted and symlinked artifa
     assert.equal(executed.stdout, "verified-absolute-executable");
     writeFileSync(binary, "synthetic binary bytes; never executed");
     reset();
-    for (const field of ["revision", "cargo_lock_sha256", "rust_version", "binary_sha256", "source_archive_sha256", "cli_contract", "minimum_glibc"]) {
+    for (const field of ["revision", "cargo_lock_sha256", "source_closure_sha256", "target_schema_version", "source_closure_extracted", "rust_version", "binary_sha256", "source_archive_sha256", "cli_contract", "minimum_glibc"]) {
       writeFileSync(manifest, JSON.stringify({ ...value, [field]: "tampered" }));
       assert.throws(() => verifiedArchiveRuntime(binary), /verification failed/);
     }
