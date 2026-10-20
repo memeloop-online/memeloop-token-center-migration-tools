@@ -46,6 +46,7 @@ if (process.argv[3] !== "--verify") {
   append("src/db/requests/mod.rs", `mod session_archive;
 mod session_archive_commit;
 mod session_archive_quarantine;
+pub(crate) use session_archive::valid_archive_identifier;
 pub use session_archive::*;
 pub use session_archive_commit::*;
 pub use session_archive_quarantine::*;`);

@@ -70,6 +70,13 @@ async fn schema130_precondition_rejects_missing_and_newer_versions_without_write
         .await
         .unwrap();
     assert!(db.ensure_session_archive_import_schema().await.is_err());
+    sqlx::query("INSERT INTO schema_migrations (version,name,applied_at) VALUES (0,'outside qualified range',0)")
+        .execute(&pool).await.unwrap();
+    assert!(db.ensure_session_archive_import_schema().await.is_err());
+    sqlx::query("DELETE FROM schema_migrations WHERE version=0")
+        .execute(&pool)
+        .await
+        .unwrap();
     sqlx::query("INSERT INTO schema_migrations (version,name,applied_at) VALUES (127,'fixture',0),(131,'unqualified',0)")
         .execute(&pool).await.unwrap();
     assert!(db.ensure_session_archive_import_schema().await.is_err());

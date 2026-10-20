@@ -710,7 +710,7 @@ impl Database {
             .map(|migration| migration.version)
             .unwrap_or(0);
         let row = sqlx::query(
-            "SELECT COUNT(*) AS applied, COALESCE(MAX(version), 0) AS latest FROM schema_migrations",
+            "SELECT COUNT(*) AS applied, COALESCE(MIN(version), 0) AS earliest, COALESCE(MAX(version), 0) AS latest FROM schema_migrations",
         )
         .fetch_optional(&self.pool)
         .await
@@ -725,8 +725,9 @@ impl Database {
             )
         })?;
         let applied: i64 = row.try_get("applied")?;
+        let earliest: i64 = row.try_get("earliest")?;
         let latest: i64 = row.try_get("latest")?;
-        if expected != 130 || applied != expected || latest != expected {
+        if expected != 130 || applied != expected || earliest != 1 || latest != expected {
             return Err(AppError::BadRequest(format!(
                 "target database schema is incomplete: expected migrations 1 through {expected}"
             )));

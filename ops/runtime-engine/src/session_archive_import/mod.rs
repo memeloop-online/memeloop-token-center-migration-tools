@@ -1,4 +1,5 @@
 mod apply;
+pub mod config;
 mod correlation;
 mod parsing;
 mod plan;
