@@ -1,6 +1,7 @@
 use std::sync::{Arc, OnceLock};
 
 use super::super::*;
+use crate::db::migrations::{POSTGRES_MIGRATIONS, SQLITE_MIGRATIONS};
 
 static SQLITE_SESSION_ARCHIVE_IMPORT_LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
 
