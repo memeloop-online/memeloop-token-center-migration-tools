@@ -5,11 +5,12 @@ use memeloop_token_center::{
     config::Config,
     conversation::ConversationHints,
     db::{
-        CreateKeyInput, Database, NewRequest, SessionArchiveCommitInput, SessionArchiveCorrelation,
-        SessionArchiveMatchInput,
+        CreateKeyInput, Database, FinishProxyRequest, FinishProxyRequestResult, NewRequest,
+        SessionArchiveCommitInput, SessionArchiveCorrelation, SessionArchiveMatchInput,
+        StartProxyRequest,
     },
     error::AppError,
-    model::KeyPolicy,
+    model::{KeyPolicy, RequestUsageBasis, TokenUsage},
     session_archive_import::{SessionArchiveImportOptions, import_session_archive},
 };
 use rust_decimal::Decimal;
@@ -107,6 +108,493 @@ async fn postgres_schema130_large_import_prefix_readback_replay_and_financial_st
             "CI must supply isolated PostgreSQL"
         );
     }
+}
+
+#[tokio::test]
+async fn sqlite_exact_retirement_restores_usage_membership_atomically() {
+    for prior_cluster in [false, true] {
+        exact_retirement_fixture(false, prior_cluster).await;
+    }
+}
+
+#[tokio::test]
+async fn postgres_exact_retirement_restores_usage_membership_atomically() {
+    if std::env::var("MTC_TEST_POSTGRES_URL").is_err() {
+        assert!(std::env::var("CI").is_err(), "CI requires PostgreSQL");
+        return;
+    }
+    for prior_cluster in [false, true] {
+        exact_retirement_fixture(true, prior_cluster).await;
+    }
+}
+
+async fn exact_retirement_fixture(postgres: bool, prior_cluster: bool) {
+    let directory = tempfile::tempdir().unwrap();
+    sqlx::any::install_default_drivers();
+    let database_url = if postgres {
+        let database_url = std::env::var("MTC_TEST_POSTGRES_URL").unwrap();
+        let pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
+        let schema = format!("archive_retirement_{}", Uuid::now_v7().simple());
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        let mut scoped = url::Url::parse(&database_url).unwrap();
+        scoped
+            .query_pairs_mut()
+            .append_pair("options", &format!("-csearch_path={schema}"));
+        scoped.to_string()
+    } else {
+        format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("retirement.sqlite").display()
+        )
+    };
+    let db = Database::connect(&database_url)
+        .await
+        .unwrap()
+        .with_terminal_projection_enabled(true);
+    db.migrate().await.unwrap();
+    db.ensure_session_archive_import_schema().await.unwrap();
+    let pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
+    let config = Config::for_test(database_url.clone());
+    let archive = ArchiveStore::from_config(&config).await.unwrap();
+    let tenant = "exact-retirement";
+    let source = "exact-retirement-v2";
+    let issued = db
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: tenant.into(),
+                principal_external_id: "member".into(),
+                alias: "retirement".into(),
+                currency: "USD".into(),
+                policy: KeyPolicy::default(),
+                initial_balance: Decimal::TEN,
+                idempotency_key: None,
+            },
+            config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let key = db
+        .authenticate_key(&issued.key, config.key_pepper.as_bytes())
+        .await
+        .unwrap();
+    let previous_cluster = if prior_cluster {
+        let anchor = Uuid::now_v7();
+        db.record_request_started(NewRequest {
+            request_id: anchor,
+            key_id: key.key_id,
+            tenant_id: key.tenant_id,
+            protocol: "openai-responses".into(),
+            model: "gpt-fixture".into(),
+            request_object: "memory://prior-session".into(),
+            reservation_id: Uuid::now_v7(),
+            upstream_account_id: None,
+            model_route_id: None,
+        })
+        .await
+        .unwrap();
+        Some(
+            db.record_conversation_observation(
+                &key,
+                anchor,
+                &json!({"input": [{"role": "user", "content": "prior native session"}]}),
+                &ConversationHints {
+                    session_id: Some("prior-native-session".into()),
+                    ..ConversationHints::default()
+                },
+                Some("Codex"),
+            )
+            .await
+            .unwrap()
+            .to_string(),
+        )
+    } else {
+        None
+    };
+    let previous_session = previous_cluster
+        .clone()
+        .unwrap_or_else(|| format!("unlinked:{}", key.key_id));
+    let price = db
+        .upsert_model_price("gpt-fixture", "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
+    let request_id = Uuid::now_v7();
+    let event_hash = "e".repeat(64);
+    let key_hash = "a".repeat(64);
+    let original_request = format!("gap://cpamp/{event_hash}/request");
+    let original_response = format!("gap://cpamp/{event_hash}");
+    let reservation = db
+        .start_proxy_request(StartProxyRequest {
+            request_id,
+            key: &key,
+            price: &price,
+            input_token_ceiling: 10,
+            output_token_ceiling: 10,
+            protocol: "openai-responses",
+            model: "gpt-fixture",
+            request_object: &original_request,
+            upstream_account_id: None,
+            model_route_id: None,
+        })
+        .await
+        .unwrap();
+    sqlx::query("UPDATE request_records SET conversation_cluster_id=$1 WHERE id=$2")
+        .bind(previous_cluster.as_deref())
+        .bind(request_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        db.finish_proxy_request(FinishProxyRequest {
+            terminal_cause: None,
+            usage_basis: Some(RequestUsageBasis::ProviderReported),
+            first_output_ms: None,
+            generation_duration_ms: None,
+            request_id,
+            tenant_id: key.tenant_id,
+            reservation: &reservation,
+            input_token_ceiling: 10,
+            output_token_ceiling: 10,
+            requested_service_tier: None,
+            status_code: 200,
+            duration_ms: 42,
+            usage: TokenUsage {
+                input_tokens: 7,
+                output_tokens: 3,
+                ..TokenUsage::default()
+            },
+            error_code: None,
+            response_object: &original_response,
+            routing_session_id: None,
+            routing_terminal_observed_at: None,
+            conversation: None,
+        })
+        .await
+        .unwrap(),
+        FinishProxyRequestResult::Finished {
+            cost_micros: 10,
+            ..
+        }
+    ));
+    let owner = Uuid::now_v7();
+    assert_eq!(
+        db.claim_terminal_projection_tasks(owner, 32).await.unwrap(),
+        vec![request_id]
+    );
+    assert!(
+        db.project_claimed_terminal_projection_task(owner, request_id)
+            .await
+            .unwrap()
+    );
+    assert_retirement_usage(
+        &pool,
+        request_id,
+        key.key_id,
+        previous_cluster.as_deref(),
+        &previous_session,
+    )
+    .await;
+    let financial_before = retirement_financial_state(&pool, key.account_id).await;
+    assert_eq!((financial_before.0, financial_before.1), (9_999_990, 0));
+    assert!(
+        financial_before
+            .2
+            .iter()
+            .any(|(_, kind, amount)| kind == "usage" && *amount == -10)
+    );
+    let (started_at, completed_at): (i64, i64) =
+        sqlx::query_as("SELECT created_at,completed_at FROM request_records WHERE id=$1")
+            .bind(request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    sqlx::query("INSERT INTO import_request_links (tenant_id,source,external_event_hash,external_request_id,source_key_hash,target_request_id,source_created_at,source_model,created_at) VALUES ($1,'cpamp-usage-events-v1',$2,'retired-exact',$3,$4,$5,'gpt-fixture',$5)")
+        .bind(key.tenant_id.to_string()).bind(&event_hash).bind(&key_hash)
+        .bind(request_id.to_string()).bind(started_at).execute(&pool).await.unwrap();
+    let record = json!({
+        "schema_version": 2,
+        "session_id": "archive-retirement-session",
+        "request_id": "retired-exact",
+        "started_at": rfc3339_millis(started_at),
+        "completed_at": rfc3339_millis(completed_at),
+        "credential_hash": key_hash,
+        "requested_model": "gpt-fixture",
+        "model": "gpt-fixture",
+        "outcome": "succeeded",
+        "status_code": 200,
+        "facets": {"client": ["Codex"], "session.id": ["archive-retirement-session"]},
+        "request": {"model": "gpt-fixture", "input": [{"role": "user", "content": "imported structured evidence"}]},
+        "response": {"usage": {"input_tokens": 7, "output_tokens": 3}, "output": "answer"}
+    });
+    let fingerprint = "f".repeat(64);
+    let (baseline_path, baseline_sha) = write_stable_chain_fixture(
+        directory.path(),
+        "baseline.jsonl",
+        &record,
+        &fingerprint,
+        1,
+        true,
+        None,
+        None,
+        2,
+        10,
+        Some(0),
+    );
+    let baseline_options =
+        stable_chain_options(&baseline_path, directory.path(), tenant, source, true);
+    let applied = import_session_archive(&db, &archive, &baseline_options)
+        .await
+        .unwrap();
+    assert_eq!(applied.imported, 1);
+    let archive_cluster: String =
+        sqlx::query_scalar("SELECT cluster_id FROM conversation_observations WHERE request_id=$1")
+            .bind(request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_ne!(archive_cluster, previous_session);
+    assert_retirement_usage(
+        &pool,
+        request_id,
+        key.key_id,
+        Some(&archive_cluster),
+        &archive_cluster,
+    )
+    .await;
+    assert_eq!(
+        retirement_financial_state(&pool, key.account_id).await,
+        financial_before
+    );
+    let baseline_state = stable_chain_state(&pool, key.tenant_id, source).await;
+    let delta_path = write_retirement_tombstone(
+        directory.path(),
+        &fingerprint,
+        &baseline_sha,
+        completed_at + 1_000,
+    );
+    let delta_options = stable_chain_options(&delta_path, directory.path(), tenant, source, true);
+    if postgres {
+        sqlx::query("CREATE FUNCTION reject_retirement_finalize() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.source='exact-retirement-v2' AND NEW.sequence=2 THEN RAISE EXCEPTION 'injected retirement finalization failure'; END IF; RETURN NEW; END $$")
+            .execute(&pool).await.unwrap();
+        sqlx::query("CREATE TRIGGER reject_retirement_finalize BEFORE INSERT OR UPDATE ON session_archive_snapshot_checkpoints FOR EACH ROW EXECUTE FUNCTION reject_retirement_finalize()")
+            .execute(&pool).await.unwrap();
+    } else {
+        sqlx::query("CREATE TRIGGER reject_retirement_finalize BEFORE INSERT ON session_archive_snapshot_checkpoints WHEN NEW.source='exact-retirement-v2' AND NEW.sequence=2 BEGIN SELECT RAISE(ABORT,'injected retirement finalization failure'); END")
+            .execute(&pool).await.unwrap();
+    }
+    let error = import_session_archive(&db, &archive, &delta_options)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("injected retirement finalization failure"),
+        "{error}"
+    );
+    assert_eq!(
+        stable_chain_state(&pool, key.tenant_id, source).await,
+        baseline_state
+    );
+    assert_retirement_usage(
+        &pool,
+        request_id,
+        key.key_id,
+        Some(&archive_cluster),
+        &archive_cluster,
+    )
+    .await;
+    assert_eq!(
+        retirement_financial_state(&pool, key.account_id).await,
+        financial_before
+    );
+    let retained_cluster: String =
+        sqlx::query_scalar("SELECT cluster_id FROM conversation_observations WHERE request_id=$1")
+            .bind(request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(retained_cluster, archive_cluster);
+    let drop_trigger = if postgres {
+        "DROP TRIGGER reject_retirement_finalize ON session_archive_snapshot_checkpoints"
+    } else {
+        "DROP TRIGGER reject_retirement_finalize"
+    };
+    sqlx::query(drop_trigger).execute(&pool).await.unwrap();
+    if postgres {
+        sqlx::query("DROP FUNCTION reject_retirement_finalize()")
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    import_session_archive(&db, &archive, &delta_options)
+        .await
+        .unwrap();
+    assert_retirement_usage(
+        &pool,
+        request_id,
+        key.key_id,
+        previous_cluster.as_deref(),
+        &previous_session,
+    )
+    .await;
+    assert_eq!(
+        retirement_financial_state(&pool, key.account_id).await,
+        financial_before
+    );
+    let locators: (String, Option<String>) =
+        sqlx::query_as("SELECT request_object,response_object FROM request_records WHERE id=$1")
+            .bind(request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(locators, (original_request, Some(original_response)));
+    let retired: (i64, i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM conversation_observations WHERE request_id=$1),(SELECT COUNT(*) FROM conversation_clusters WHERE id=$2),(SELECT COUNT(*) FROM session_archive_import_records WHERE target_request_id=$1),(SELECT COUNT(*) FROM session_archive_correlations WHERE target_request_id=$1)")
+        .bind(request_id.to_string()).bind(&archive_cluster).fetch_one(&pool).await.unwrap();
+    assert_eq!(retired, (0, 0, 0, 0));
+    let retired_state = stable_chain_state(&pool, key.tenant_id, source).await;
+    assert_eq!(retired_state.1.1, 2);
+    import_session_archive(&db, &archive, &delta_options)
+        .await
+        .unwrap();
+    assert_eq!(
+        stable_chain_state(&pool, key.tenant_id, source).await,
+        retired_state
+    );
+    assert_retirement_usage(
+        &pool,
+        request_id,
+        key.key_id,
+        previous_cluster.as_deref(),
+        &previous_session,
+    )
+    .await;
+    assert_eq!(
+        retirement_financial_state(&pool, key.account_id).await,
+        financial_before
+    );
+}
+
+async fn assert_retirement_usage(
+    pool: &sqlx::AnyPool,
+    request_id: Uuid,
+    key_id: Uuid,
+    expected_cluster: Option<&str>,
+    expected_session: &str,
+) {
+    let memberships: (Option<String>, String, String, i64, i64, i64) = sqlx::query_as(
+        "SELECT record.conversation_cluster_id,terminal.session_id,fact.session_id,fact.input_tokens,fact.output_tokens,fact.cost_micros FROM request_records record JOIN terminal_projection_outbox terminal ON terminal.request_id=record.id AND terminal.created_at=record.created_at JOIN request_stats_facts fact ON fact.request_id=record.id AND fact.created_at=record.created_at WHERE record.id=$1",
+    )
+    .bind(request_id.to_string()).fetch_one(pool).await.unwrap();
+    assert_eq!(
+        memberships,
+        (
+            expected_cluster.map(str::to_owned),
+            expected_session.into(),
+            expected_session.into(),
+            7,
+            3,
+            10
+        )
+    );
+    for table in [
+        "session_usage_totals",
+        "session_usage_hourly",
+        "session_usage_daily",
+    ] {
+        let rows: Vec<(String, String, i64, i64, i64, i64, i64, i64, i64, i64, i64)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT session_id,currency,requests,input_tokens,output_tokens,cached_input_tokens,cache_write_tokens,generation_units,duration_count,duration_sum_ms,cost_micros FROM {table} WHERE key_id=$1 ORDER BY session_id"
+            )))
+            .bind(key_id.to_string()).fetch_all(pool).await.unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                expected_session.into(),
+                "USD".into(),
+                1,
+                7,
+                3,
+                0,
+                0,
+                0,
+                1,
+                42,
+                10
+            )],
+            "{table} must contain exactly the authoritative contribution and no retired-session residue"
+        );
+    }
+}
+
+async fn retirement_financial_state(
+    pool: &sqlx::AnyPool,
+    account_id: Uuid,
+) -> (i64, i64, Vec<(String, String, i64)>) {
+    let (available, reserved): (i64, i64) =
+        sqlx::query_as("SELECT available_micros,reserved_micros FROM credit_accounts WHERE id=$1")
+            .bind(account_id.to_string())
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let ledger = sqlx::query_as(
+        "SELECT id,kind,amount_micros FROM ledger_entries WHERE account_id=$1 ORDER BY id",
+    )
+    .bind(account_id.to_string())
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    (available, reserved, ledger)
+}
+
+fn write_retirement_tombstone(
+    directory: &std::path::Path,
+    fingerprint: &str,
+    prior_sha: &str,
+    deleted_at_ms: i64,
+) -> std::path::PathBuf {
+    let deleted_at = chrono::DateTime::from_timestamp_millis(deleted_at_ms)
+        .unwrap()
+        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    let summary = json!({
+        "_mtc_delta_type": "session_summary", "schema_version": 2,
+        "session_id": "archive-retirement-session", "requests": 0,
+        "last_at": deleted_at, "deleted": true, "deleted_at": deleted_at
+    });
+    let input = format!("{}\n", serde_json::to_string(&summary).unwrap());
+    let canonical = format!(
+        r#"[{{"last_at":"{deleted_at}","requests":0,"session_id":"archive-retirement-session","deleted":true,"deleted_at":"{deleted_at}"}}]"#
+    );
+    let path = directory.join("retirement.jsonl");
+    std::fs::write(&path, &input).unwrap();
+    std::fs::write(
+        directory.join("retirement.jsonl.manifest.json"),
+        serde_json::to_vec(&json!({
+            "version": 3,
+            "output_file": "retirement.jsonl",
+            "output_sha256": format!("{:x}", Sha256::digest(input.as_bytes())),
+            "output_size_bytes": input.len(),
+            "source_fingerprint": fingerprint,
+            "sequence": 2,
+            "offline_full_snapshot": false,
+            "prior_output_sha256": prior_sha,
+            "prior_source_ingest_fence": "10",
+            "session_projection_protocol": "session-snapshot-cursor-v1",
+            "snapshot_schema_version": 2,
+            "source_ingest_fence": "11",
+            "tombstone_safe_after_ingest_fence": "10",
+            "session_set_sha256": format!("{:x}", Sha256::digest(canonical.as_bytes())),
+            "session_count": 1,
+            "source_projection_requests": 0,
+            "record_count": 0,
+            "deleted_session_count": 1
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    path
 }
 
 async fn archive_import_fixture(large: bool, postgres: bool) {

@@ -6,7 +6,7 @@ export const archiveRuntimePin = {
   repository: "memeloop-online/memeloop-token-center",
   revision: "63022be5856ff584191321b76f314682c8ec67bf",
   cargo_lock_sha256: "b8ba4261392b471c569affad448c83690712ad6f68751b66c846a20e4355d6b2",
-  source_closure_sha256: "3c8b68387843c40f812d7086d40cbe59a09c1cf184e01faaa41660c42500d5d7",
+  source_closure_sha256: "c2406bce8c3e0655cb4cc3542a3360b2d5175958f0947133e0ea6b0f4339a58e",
   target_schema_version: 130,
   test_fixture_repository: "memeloop-online/memeloop-token-center-example-plugins",
   test_fixture_revision: "21489f4fee6266de99fe7e258349468ce77af8bd",

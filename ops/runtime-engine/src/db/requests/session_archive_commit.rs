@@ -166,9 +166,11 @@ impl Database {
                         "archive target changed before stable reconciliation".into(),
                     ));
                 }
+                let previous_cluster: Option<String> =
+                    row.try_get("previous_conversation_cluster_id")?;
                 let updated = sqlx::query("UPDATE request_records SET request_object=$1,response_object=$2,conversation_cluster_id=$3 WHERE id=$4 AND tenant_id=$5 AND request_object=$6 AND ((response_object IS NULL AND $7 IS NULL) OR response_object=$7)")
                     .bind(previous_request.as_deref().ok_or_else(|| AppError::Conflict("legacy exact archive row lacks reversible locator provenance".into()))?).bind(previous_response.as_deref())
-                    .bind(row.try_get::<Option<String>,_>("previous_conversation_cluster_id")?).bind(&target_request_id).bind(&tenant_id)
+                    .bind(previous_cluster.as_deref()).bind(&target_request_id).bind(&tenant_id)
                     .bind(expected_request).bind(expected_response.map(String::as_str)).execute(&mut **tx).await?;
                 if updated.rows_affected() != 1 {
                     return Err(AppError::Conflict(
@@ -176,6 +178,14 @@ impl Database {
                     ));
                 }
                 if row.try_get::<i64, _>("conversation_observation_created")? != 0 {
+                    sqlx::query("UPDATE terminal_projection_outbox SET session_id=COALESCE($1,'unlinked:' || key_id) WHERE request_id=$2 AND tenant_id=$3 AND created_at=(SELECT created_at FROM request_records WHERE id=$2 AND tenant_id=$3)")
+                        .bind(previous_cluster.as_deref()).bind(&target_request_id).bind(&tenant_id)
+                        .execute(&mut **tx).await?;
+                    reclassify_request_session_in_transaction(
+                        tx,
+                        parse_uuid(target_request_id.clone())?,
+                    )
+                    .await?;
                     retire_archive_observation_in_transaction(tx, &target_request_id).await?;
                 }
                 sqlx::query("DELETE FROM session_archive_import_records WHERE tenant_id=$1 AND source=$2 AND external_request_id=$3")
