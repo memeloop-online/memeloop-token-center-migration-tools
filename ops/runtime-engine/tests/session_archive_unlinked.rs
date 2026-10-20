@@ -263,7 +263,23 @@ async fn archive_only_history_is_key_scoped_conversational_and_never_billed_twic
         )
         .await
         .expect("ordinary requests");
-    assert_eq!(ordinary.len(), 1, "archive-only stays out of request list");
+    assert_eq!(
+        ordinary.len(),
+        2,
+        "current history includes archive-only rows"
+    );
+    assert!(
+        ordinary
+            .iter()
+            .any(|request| request.request_id == cpamp_request_id)
+    );
+    let archive_history = ordinary
+        .iter()
+        .find(|request| request.request_id == target.archive_request_id)
+        .expect("archive-only history retains its stable identity");
+    assert!(!archive_history.billing.billable);
+    assert!(archive_history.billing.cost.is_none());
+    assert_eq!(archive_history.source_completed_at, Some(started_at + 900));
 
     let clusters = db
         .conversation_clusters(
