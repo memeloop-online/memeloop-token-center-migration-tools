@@ -65,6 +65,10 @@ async fn schema130_precondition_rejects_missing_and_newer_versions_without_write
     db.migrate().await.unwrap();
     db.ensure_session_archive_import_schema().await.unwrap();
     let pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
+    let baseline_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     sqlx::query("DELETE FROM schema_migrations WHERE version=127")
         .execute(&pool)
         .await
@@ -85,7 +89,7 @@ async fn schema130_precondition_rejects_missing_and_newer_versions_without_write
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(versions, (131, 131));
+    assert_eq!(versions, (baseline_count + 1, 131));
 }
 
 #[tokio::test]

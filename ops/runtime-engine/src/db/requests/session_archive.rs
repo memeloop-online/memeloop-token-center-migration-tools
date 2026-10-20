@@ -706,32 +706,26 @@ impl Database {
             DatabaseBackend::PostgreSql => POSTGRES_MIGRATIONS,
             DatabaseBackend::Sqlite => SQLITE_MIGRATIONS,
         };
-        let expected = migrations
-            .last()
+        let expected: Vec<i64> = migrations
+            .iter()
             .map(|migration| migration.version)
-            .unwrap_or(0);
-        let row = sqlx::query(
-            "SELECT COUNT(*) AS applied, COALESCE(MIN(version), 0) AS earliest, COALESCE(MAX(version), 0) AS latest FROM schema_migrations",
+            .collect();
+        let limit = i64::try_from(expected.len() + 1).map_err(|_| AppError::Internal)?;
+        let applied = sqlx::query_scalar::<_, i64>(
+            "SELECT version FROM schema_migrations ORDER BY version LIMIT $1",
         )
-        .fetch_optional(&self.pool)
+        .bind(limit)
+        .fetch_all(&self.pool)
         .await
         .map_err(|_| {
             AppError::BadRequest(
                 "target database must be migrated before session archive import".into(),
             )
-        })?
-        .ok_or_else(|| {
-            AppError::BadRequest(
-                "target database must be migrated before session archive import".into(),
-            )
         })?;
-        let applied: i64 = row.try_get("applied")?;
-        let earliest: i64 = row.try_get("earliest")?;
-        let latest: i64 = row.try_get("latest")?;
-        if expected != 130 || applied != expected || earliest != 1 || latest != expected {
-            return Err(AppError::BadRequest(format!(
-                "target database schema is incomplete: expected migrations 1 through {expected}"
-            )));
+        if expected.last() != Some(&130) || applied != expected {
+            return Err(AppError::BadRequest(
+                "target database schema differs from the pinned schema130 migration list".into(),
+            ));
         }
 
         // Reference every importer-owned relation and the post-v21 locator/source

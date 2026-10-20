@@ -12,6 +12,8 @@ CI assembles this closure into an isolated checkout of the exact product base us
 
 The tools-owned CLI reads only target DB/object-store configuration and never migrates. Its read-only precondition requires the complete exact130 migration set and importer relations, rejecting missing versions and newer131 targets. Retained source export formats are migration inputs, not a product runtime storage fallback.
 
+Version identity is compared against the product's actual migration list, not a contiguous numeric range: this exact base intentionally has no114 entry. The bounded read also rejects unexpected entries without weakening the target version check.
+
 `schema130-files.json` binds every extracted file and assembled product module to exact SHA256 bytes. The immutable product revision, Cargo.lock, closure manifest hash, compiler and target are checked before CI build and again before sealing. The retained source archive includes all extracted untracked files. Release verification rejects stale closure, substituted artifacts and a different target schema manifest.
 
 Compiling the product library tests also requires its reviewed `memeloop-token-center-example-plugins` fixture repository at `21489f4fee6266de99fe7e258349468ce77af8bd`, the same pin as the product's checkout action. CI checks that out under the ignored `.plugin-examples` directory; its identity is retained in the compatibility manifest. It is a test compile dependency, not a runtime fallback or a production plugin installation.
