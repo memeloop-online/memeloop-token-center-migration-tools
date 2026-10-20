@@ -303,11 +303,19 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v6.0.0
         with:
           repository: memeloop-online/memeloop-token-center
-          ref: a65097f952e174ac482abe6ff719966fa9d330cb
+          ref: 63022be5856ff584191321b76f314682c8ec67bf
           path: .runtime-source
           persist-credentials: false
 
-      - name: Apply canonical migration-tools large-record engine patch
+      - name: Check out the product's reviewed compile-time test fixtures
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: memeloop-online/memeloop-token-center-example-plugins
+          ref: 21489f4fee6266de99fe7e258349468ce77af8bd
+          path: .runtime-source/.plugin-examples
+          persist-credentials: false
+
+      - name: Assemble tools-owned importer closure against current product APIs
         run: node ops/ci/apply-session-archive-runtime-patch.ts .runtime-source
 
       - name: Set up locked archive engine Rust toolchain
@@ -324,10 +332,12 @@ jobs:
         working-directory: .runtime-source
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "a65097f952e174ac482abe6ff719966fa9d330cb"
-          test "$(sha256sum Cargo.lock | cut -d ' ' -f 1)" = "2134ac15927c1beaceed75d52e48312b6bb93db072c43df4c557cad7de23e029"
+          test "$(git rev-parse HEAD)" = "63022be5856ff584191321b76f314682c8ec67bf"
+          test "$(sha256sum Cargo.lock | cut -d ' ' -f 1)" = "b8ba4261392b471c569affad448c83690712ad6f68751b66c846a20e4355d6b2"
+          test -n "$MTC_TEST_POSTGRES_URL"
           cargo test --locked --lib session_archive_import::tests
-          cargo test --locked --test session_archive_import --test session_archive_quarantine --test session_archive_unlinked
+          cargo test --locked --lib db::requests::conversations::prefix_storage::tests
+          cargo test --locked --test session_archive_import --test session_archive_quarantine --test session_archive_unlinked -- --test-threads=1
           cargo build --locked --release --bin import-cpa-session-archive
 
       - name: Seal engine binary, compatibility manifest, and retained source

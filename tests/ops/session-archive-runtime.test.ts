@@ -24,7 +24,7 @@ test("archive runtime rejects missing, drifted, substituted and symlinked artifa
       binary: "import-cpa-session-archive", source_archive: "source.tar",
       binary_sha256: fileDigest(binary), source_archive_sha256: fileDigest(join(directory, "source.tar")),
       cli_contract: "session-archive-import-v1", build_os: "ubuntu-24.04", minimum_glibc: "2.39",
-      schema_policy: "engine-read-only-schema-precondition", source_closure_extracted: false,
+      schema_policy: "engine-read-only-schema-precondition", source_closure_extracted: true,
       archive_schema_versions: [1, 2],
     };
     const reset = (): void => writeFileSync(manifest, JSON.stringify(value));
@@ -46,7 +46,7 @@ test("archive runtime rejects missing, drifted, substituted and symlinked artifa
     assert.equal(executed.stdout, "verified-absolute-executable");
     writeFileSync(binary, "synthetic binary bytes; never executed");
     reset();
-    for (const field of ["revision", "cargo_lock_sha256", "rust_version", "binary_sha256", "source_archive_sha256", "cli_contract", "minimum_glibc"]) {
+    for (const field of ["revision", "cargo_lock_sha256", "source_closure_sha256", "target_schema_version", "source_closure_extracted", "rust_version", "binary_sha256", "source_archive_sha256", "cli_contract", "minimum_glibc"]) {
       writeFileSync(manifest, JSON.stringify({ ...value, [field]: "tampered" }));
       assert.throws(() => verifiedArchiveRuntime(binary), /verification failed/);
     }
@@ -92,8 +92,9 @@ test("release CI pins engine provenance and packages source without runtime buil
   const workflow = readFileSync(new URL("../../.github/workflows/ci.yml", import.meta.url), "utf8");
   assert.ok(workflow.includes(archiveRuntimePin.revision));
   assert.ok(workflow.includes(archiveRuntimePin.cargo_lock_sha256));
+  assert.ok(workflow.includes(archiveRuntimePin.test_fixture_revision));
   assert.match(workflow, /cargo build --locked --release --bin import-cpa-session-archive/);
-  assert.match(workflow, /cargo test --locked --test session_archive_import --test session_archive_quarantine --test session_archive_unlinked/);
+  assert.match(workflow, /cargo test --locked --test session_archive_import --test session_archive_quarantine --test session_archive_unlinked -- --test-threads=1/);
   assert.equal((workflow.match(/CGO_ENABLED=1 CC=musl-gcc go build/gu) ?? []).length, 1);
   assert.match(workflow, /name: session-archive-backup-runtime-\$\{\{ github\.sha \}\}/u);
   assert.equal((workflow.match(/needs\.build-session-archive-backup\.outputs\.binary_sha256/gu) ?? []).length, 3);

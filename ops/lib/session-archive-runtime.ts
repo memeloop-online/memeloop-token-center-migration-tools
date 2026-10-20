@@ -4,9 +4,12 @@ import { basename, dirname, isAbsolute, join } from "node:path";
 
 export const archiveRuntimePin = {
   repository: "memeloop-online/memeloop-token-center",
-  revision: "a65097f952e174ac482abe6ff719966fa9d330cb",
-  cargo_lock_sha256: "2134ac15927c1beaceed75d52e48312b6bb93db072c43df4c557cad7de23e029",
-  source_patch_sha256: "2ef3af2f7896cc6e0abadb7e0c19f5169be7d4f6151c4b07c3bb26985171a498",
+  revision: "63022be5856ff584191321b76f314682c8ec67bf",
+  cargo_lock_sha256: "b8ba4261392b471c569affad448c83690712ad6f68751b66c846a20e4355d6b2",
+  source_closure_sha256: "54ec2cf84a7ab2f5734c1fbad2085095c42f53d9f88da549b185b2a2f070eb54",
+  target_schema_version: 130,
+  test_fixture_repository: "memeloop-online/memeloop-token-center-example-plugins",
+  test_fixture_revision: "21489f4fee6266de99fe7e258349468ce77af8bd",
   rust_version: "1.95.0",
   target: "x86_64-unknown-linux-gnu",
 } as const;
@@ -33,7 +36,7 @@ export function verifiedArchiveRuntime(binary: string): string {
       || manifest.source_archive !== "source.tar" || manifest.cli_contract !== "session-archive-import-v1"
       || manifest.build_os !== "ubuntu-24.04" || manifest.minimum_glibc !== "2.39"
       || manifest.schema_policy !== "engine-read-only-schema-precondition"
-      || manifest.source_closure_extracted !== false
+      || manifest.source_closure_extracted !== true
       || JSON.stringify(manifest.archive_schema_versions) !== "[1,2]"
       || Object.entries(archiveRuntimePin).some(([key, value]) => manifest[key] !== value)
       || !/^[0-9a-f]{64}$/.test(String(manifest.binary_sha256))
