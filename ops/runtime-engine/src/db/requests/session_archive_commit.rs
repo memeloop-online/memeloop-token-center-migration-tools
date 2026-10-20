@@ -392,20 +392,20 @@ impl Database {
                 "stable archive tombstone is invalid".into(),
             ));
         }
-        let mut query = sqlx::QueryBuilder::<Any>::new(
-            "SELECT COUNT(*) FROM session_archive_import_records imported LEFT JOIN request_records target ON target.id=imported.target_request_id AND target.tenant_id=imported.tenant_id WHERE imported.tenant_id=",
+        let placeholders = (0..session_ids.len())
+            .map(|index| format!("${}", index + 3))
+            .collect::<Vec<_>>()
+            .join(",");
+        let statement = format!(
+            "SELECT COUNT(*) FROM session_archive_import_records imported LEFT JOIN request_records target ON target.id=imported.target_request_id AND target.tenant_id=imported.tenant_id WHERE imported.tenant_id=$1 AND imported.source=$2 AND imported.source_session_id IN ({placeholders}) AND (target.id IS NULL OR (imported.request_object IS NOT NULL AND target.request_object<>imported.request_object) OR (imported.response_object IS NOT NULL AND (target.response_object IS NULL OR target.response_object<>imported.response_object)))"
         );
-        query
-            .push_bind(tenant_id)
-            .push(" AND imported.source=")
-            .push_bind(archive_source)
-            .push(" AND imported.source_session_id IN (");
-        let mut separated = query.separated(",");
+        let mut query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(statement))
+            .bind(tenant_id)
+            .bind(archive_source);
         for session_id in session_ids {
-            separated.push_bind(session_id);
+            query = query.bind(session_id);
         }
-        separated.push_unseparated(") AND (target.id IS NULL OR (imported.request_object IS NOT NULL AND target.request_object<>imported.request_object) OR (imported.response_object IS NOT NULL AND (target.response_object IS NULL OR target.response_object<>imported.response_object)))");
-        let drifted: i64 = query.build_query_scalar().fetch_one(&self.pool).await?;
+        let drifted = query.fetch_one(&self.pool).await?;
         if drifted != 0 {
             return Err(AppError::Conflict(
                 "archive target changed before tombstone apply".into(),

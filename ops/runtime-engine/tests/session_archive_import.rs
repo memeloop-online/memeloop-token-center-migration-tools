@@ -389,9 +389,7 @@ async fn exact_retirement_fixture(postgres: bool, prior_cluster: bool) {
         .await
         .unwrap_err();
     assert!(
-        error
-            .to_string()
-            .contains("injected retirement finalization failure"),
+        matches!(error.downcast_ref::<AppError>(), Some(AppError::Internal)),
         "{error}"
     );
     assert_eq!(
