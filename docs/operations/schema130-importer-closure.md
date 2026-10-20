@@ -26,4 +26,6 @@ Compiling the product library tests also requires its reviewed `memeloop-token-c
 - Exact-observation retirement on both databases: a genuinely settled, nonzero-cost request is projected through the current terminal outbox, then imported and tombstoned. Previous-cluster and unlinked cases assert request/outbox/fact membership, exact totals/hourly/daily contributions, unchanged ledger and balances, finalization rollback and replay. Restoration reuses the product's session reclassification helper within the import transaction.
 - Locked release build: importer CLI help, packaged byte identity, complete retained source closure, compatibility manifest and existing standalone release verification.
 
+The importer integration binaries run with one test thread in CI: PostgreSQL's importer advisory lock is database-scoped, so isolated fixture schemas must not run independent imports concurrently. This changes only test scheduling; the production lock, runtime limits and no-retry behavior remain unchanged.
+
 No local build/test/install, source-volume read, import, PG write, storage placement change or production rollout is part of implementation. Placement remains a separate unresolved operational dependency. The original visible CLI root remains stopped; the parent alone updates Wiki.

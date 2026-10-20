@@ -94,7 +94,7 @@ test("release CI pins engine provenance and packages source without runtime buil
   assert.ok(workflow.includes(archiveRuntimePin.cargo_lock_sha256));
   assert.ok(workflow.includes(archiveRuntimePin.test_fixture_revision));
   assert.match(workflow, /cargo build --locked --release --bin import-cpa-session-archive/);
-  assert.match(workflow, /cargo test --locked --test session_archive_import --test session_archive_quarantine --test session_archive_unlinked/);
+  assert.match(workflow, /cargo test --locked --test session_archive_import --test session_archive_quarantine --test session_archive_unlinked -- --test-threads=1/);
   assert.equal((workflow.match(/CGO_ENABLED=1 CC=musl-gcc go build/gu) ?? []).length, 1);
   assert.match(workflow, /name: session-archive-backup-runtime-\$\{\{ github\.sha \}\}/u);
   assert.equal((workflow.match(/needs\.build-session-archive-backup\.outputs\.binary_sha256/gu) ?? []).length, 3);
