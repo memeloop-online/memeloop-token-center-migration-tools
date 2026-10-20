@@ -307,6 +307,14 @@ jobs:
           path: .runtime-source
           persist-credentials: false
 
+      - name: Check out the product's reviewed compile-time test fixtures
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: memeloop-online/memeloop-token-center-example-plugins
+          ref: 21489f4fee6266de99fe7e258349468ce77af8bd
+          path: .runtime-source/.plugin-examples
+          persist-credentials: false
+
       - name: Assemble tools-owned importer closure against current product APIs
         run: node ops/ci/apply-session-archive-runtime-patch.ts .runtime-source
 

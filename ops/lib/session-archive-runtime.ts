@@ -8,6 +8,8 @@ export const archiveRuntimePin = {
   cargo_lock_sha256: "b8ba4261392b471c569affad448c83690712ad6f68751b66c846a20e4355d6b2",
   source_closure_sha256: "d530c425c6f86edae2d167eb8f100e10463203ddda7db1b82231f0905c761236",
   target_schema_version: 130,
+  test_fixture_repository: "memeloop-online/memeloop-token-center-example-plugins",
+  test_fixture_revision: "21489f4fee6266de99fe7e258349468ce77af8bd",
   rust_version: "1.95.0",
   target: "x86_64-unknown-linux-gnu",
 } as const;

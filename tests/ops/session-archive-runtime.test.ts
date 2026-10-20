@@ -92,6 +92,7 @@ test("release CI pins engine provenance and packages source without runtime buil
   const workflow = readFileSync(new URL("../../.github/workflows/ci.yml", import.meta.url), "utf8");
   assert.ok(workflow.includes(archiveRuntimePin.revision));
   assert.ok(workflow.includes(archiveRuntimePin.cargo_lock_sha256));
+  assert.ok(workflow.includes(archiveRuntimePin.test_fixture_revision));
   assert.match(workflow, /cargo build --locked --release --bin import-cpa-session-archive/);
   assert.match(workflow, /cargo test --locked --test session_archive_import --test session_archive_quarantine --test session_archive_unlinked/);
   assert.equal((workflow.match(/CGO_ENABLED=1 CC=musl-gcc go build/gu) ?? []).length, 1);
