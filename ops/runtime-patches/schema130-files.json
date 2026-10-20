@@ -23,7 +23,7 @@
     "src/session_archive_import/parsing.rs": "60a0a33a7b9c26166e04bd1241fdbad3bbfe35d881c9130c76ba6e80a40ba208",
     "src/session_archive_import/plan.rs": "ec65d4a75beb515df41e123e78684ea6026a0c9cc37aabc5b5270b4f9ba8806c",
     "src/session_archive_import/tests.rs": "721302372df4ede159bb244da9f96493a6f6ad7c912f715663c00235033fdd38",
-    "tests/session_archive_import.rs": "22908492ada91812b14873e13e912eaad726e2ea216f15621b888265a1478475",
+    "tests/session_archive_import.rs": "9fd84f7b7e2ff2bac264a7d0d8184301fd13fab74f50bdb8356f4bd94f2e8de7",
     "tests/session_archive_quarantine.rs": "382ded3a6d314f9c2efa03796b9d25189f7da8fe02f699be1f3cdcef1e5c8350",
     "tests/session_archive_unlinked.rs": "7900cbe37c5ba0b449173f7159c84aea06973c74a386288565118e8305b1af57"
   }

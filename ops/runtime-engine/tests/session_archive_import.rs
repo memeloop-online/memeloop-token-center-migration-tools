@@ -1069,12 +1069,19 @@ async fn archive_import_fixture(large: bool, postgres: bool) {
             "2026-08-12T00:00:22Z",
         ),
     ]);
-    sqlx::query(
-        "CREATE TRIGGER inject_archive_commit_failure BEFORE INSERT ON session_archive_import_records WHEN NEW.source = 'partial-recovery-test' AND NEW.external_request_id = 'a-long-request-fails-last' BEGIN SELECT RAISE(ABORT, 'injected archive commit failure'); END",
-    )
-    .execute(&pool)
-    .await
-    .expect("install deterministic commit failure");
+    if postgres {
+        sqlx::query("CREATE FUNCTION inject_archive_commit_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.source = 'partial-recovery-test' AND NEW.external_request_id = 'a-long-request-fails-last' THEN RAISE EXCEPTION 'injected archive commit failure'; END IF; RETURN NEW; END $$")
+            .execute(&pool).await.expect("install PostgreSQL failure function");
+    }
+    let failure_trigger = if postgres {
+        "CREATE TRIGGER inject_archive_commit_failure BEFORE INSERT ON session_archive_import_records FOR EACH ROW EXECUTE FUNCTION inject_archive_commit_failure()"
+    } else {
+        "CREATE TRIGGER inject_archive_commit_failure BEFORE INSERT ON session_archive_import_records WHEN NEW.source = 'partial-recovery-test' AND NEW.external_request_id = 'a-long-request-fails-last' BEGIN SELECT RAISE(ABORT, 'injected archive commit failure'); END"
+    };
+    sqlx::query(failure_trigger)
+        .execute(&pool)
+        .await
+        .expect("install deterministic commit failure");
     let mut recovery_options = options(&recovery_input, true);
     recovery_options.archive_source = "partial-recovery-test";
     recovery_options.overlap_ms = 0;
@@ -1137,10 +1144,21 @@ async fn archive_import_fixture(large: bool, postgres: bool) {
             .expect("read recovery locators after rollback");
     assert_eq!(failed_recovery_locators, original_recovery_locators);
 
-    sqlx::query("DROP TRIGGER inject_archive_commit_failure")
+    let remove_trigger = if postgres {
+        "DROP TRIGGER inject_archive_commit_failure ON session_archive_import_records"
+    } else {
+        "DROP TRIGGER inject_archive_commit_failure"
+    };
+    sqlx::query(remove_trigger)
         .execute(&pool)
         .await
         .expect("remove deterministic commit failure");
+    if postgres {
+        sqlx::query("DROP FUNCTION inject_archive_commit_failure()")
+            .execute(&pool)
+            .await
+            .expect("remove PostgreSQL failure function");
+    }
     let recovered = import_session_archive(&db, &archive, &recovery_options)
         .await
         .expect("same sealed source atomically imports all records");
