@@ -584,7 +584,7 @@ fn write_retirement_tombstone(
             "session_projection_protocol": "session-snapshot-cursor-v1",
             "snapshot_schema_version": 2,
             "source_ingest_fence": "11",
-            "tombstone_safe_after_ingest_fence": "10",
+        "tombstone_safe_after_ingest_fence": "0",
             "session_set_sha256": format!("{:x}", Sha256::digest(canonical.as_bytes())),
             "session_count": 1,
             "source_projection_requests": 0,
