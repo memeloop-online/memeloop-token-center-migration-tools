@@ -352,7 +352,15 @@ async fn archive_only_history_is_key_scoped_conversational_and_never_billed_twic
     assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, ordinary_requests) = http_get(&state, "/self/v1/requests", &issued.key).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(ordinary_requests.as_array().map(Vec::len), Some(1));
+    assert_eq!(ordinary_requests.as_array().map(Vec::len), Some(2));
+    let archive_history = ordinary_requests
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|request| request["request_id"] == target.archive_request_id.to_string())
+        .expect("self-service history includes archive-only identity");
+    assert_eq!(archive_history["billing"]["billable"], false);
+    assert!(archive_history["billing"]["cost"].is_null());
     let internal_detail_path = format!("/internal/v1/requests/{}", target.archive_request_id);
     let (status, internal_detail) =
         http_get(&state, &internal_detail_path, &tenant_service.token).await;
