@@ -31,6 +31,7 @@ type StableChainProjectionState = (i64, i64, i64, i64, i64, i64, i64);
 type StableChainCheckpointState = (i64, i64, i64, i64, Option<i64>, i64, i64, Option<String>);
 type StableChainState = (StableChainProjectionState, StableChainCheckpointState);
 type RetirementTitleState = (Option<String>, String, i64, Option<String>, Option<i64>);
+type RetirementOperationalState = (String, String, i64, String, i64, i64, String);
 
 #[tokio::test]
 async fn session_archive_schema_precondition_is_read_only() {
@@ -57,20 +58,20 @@ async fn archive_import_is_fail_closed_gap_only_and_idempotent() {
 }
 
 #[tokio::test]
-async fn sqlite_schema132_precondition_rejects_version_and_relation_drift_without_writes() {
-    schema132_precondition_fixture(false).await;
+async fn sqlite_schema133_precondition_rejects_version_and_relation_drift_without_writes() {
+    schema133_precondition_fixture(false).await;
 }
 
 #[tokio::test]
-async fn postgres_schema132_precondition_rejects_version_and_relation_drift_without_writes() {
+async fn postgres_schema133_precondition_rejects_version_and_relation_drift_without_writes() {
     if std::env::var("MTC_TEST_POSTGRES_URL").is_err() {
         assert!(std::env::var("CI").is_err(), "CI requires PostgreSQL");
         return;
     }
-    schema132_precondition_fixture(true).await;
+    schema133_precondition_fixture(true).await;
 }
 
-async fn schema132_precondition_fixture(postgres: bool) {
+async fn schema133_precondition_fixture(postgres: bool) {
     let directory = tempfile::tempdir().unwrap();
     let database_url = if postgres {
         sqlx::any::install_default_drivers();
@@ -97,15 +98,26 @@ async fn schema132_precondition_fixture(postgres: bool) {
     db.migrate().await.unwrap();
     db.ensure_session_archive_import_schema().await.unwrap();
     let pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
+    sqlx::query("DROP TABLE proxy_operational_terminals")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM schema_migrations WHERE version=133")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_schema_rejected_without_writes(&db, &pool).await;
+    db.migrate().await.unwrap();
+    db.ensure_session_archive_import_schema().await.unwrap();
     let versions: Vec<i64> =
         sqlx::query_scalar("SELECT version FROM schema_migrations ORDER BY version")
             .fetch_all(&pool)
             .await
             .unwrap();
-    assert_eq!(versions.len(), 131);
-    assert_eq!(versions.last(), Some(&132));
+    assert_eq!(versions.len(), 132);
+    assert_eq!(versions.last(), Some(&133));
     assert!(!versions.contains(&114));
-    for missing in [127_i64, 131, 132] {
+    for missing in [127_i64, 131, 132, 133] {
         sqlx::query("DELETE FROM schema_migrations WHERE version=$1")
             .bind(missing)
             .execute(&pool)
@@ -118,7 +130,7 @@ async fn schema132_precondition_fixture(postgres: bool) {
             .await
             .unwrap();
     }
-    for unexpected in [0_i64, 114, 133] {
+    for unexpected in [0_i64, 114, 134] {
         sqlx::query("INSERT INTO schema_migrations (version,name,applied_at) VALUES ($1,'unqualified',0)")
             .bind(unexpected)
             .execute(&pool)
@@ -131,7 +143,11 @@ async fn schema132_precondition_fixture(postgres: bool) {
             .await
             .unwrap();
     }
-    for table in ["session_generated_titles", "session_response_summaries"] {
+    for table in [
+        "session_generated_titles",
+        "session_response_summaries",
+        "proxy_operational_terminals",
+    ] {
         let drift_table = format!("{table}_schema_drift_fixture");
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "ALTER TABLE {table} RENAME TO {drift_table}"
@@ -150,6 +166,8 @@ async fn schema132_precondition_fixture(postgres: bool) {
     for (table, column) in [
         ("session_generated_titles", "revision"),
         ("session_response_summaries", "session_id"),
+        ("proxy_operational_terminals", "reservation_id"),
+        ("proxy_operational_terminals", "response_object"),
     ] {
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "ALTER TABLE {table} RENAME COLUMN {column} TO schema_drift_fixture"
@@ -196,7 +214,7 @@ async fn large_archive_import_preserves_objects_replay_tenants_and_financial_sta
 }
 
 #[tokio::test]
-async fn postgres_schema132_large_import_prefix_readback_replay_and_financial_state() {
+async fn postgres_schema133_large_import_prefix_readback_replay_and_financial_state() {
     if std::env::var("MTC_TEST_POSTGRES_URL").is_ok() {
         archive_import_fixture(true, true).await;
     } else {
@@ -408,6 +426,15 @@ async fn exact_retirement_fixture(postgres: bool, prior_cluster: bool) {
             .fetch_one(&pool)
             .await
             .unwrap();
+    sqlx::query("INSERT INTO proxy_operational_terminals (request_id,request_created_at,tenant_id,key_id,account_id,reservation_id,owner_token,fence,contract_digest,receipt_id,operational_digest,status_code,stage,completed_at,duration_ms,response_object,recorded_at) SELECT id,created_at,tenant_id,key_id,$1,reservation_id,$2,$3,$4,$5,$6,200,'response_delivery',completed_at,42,response_object,completed_at FROM request_records WHERE id=$7")
+        .bind(key.account_id.to_string()).bind(Uuid::now_v7().to_string())
+        .bind(Uuid::now_v7().to_string()).bind("c".repeat(64))
+        .bind(Uuid::now_v7().to_string()).bind("d".repeat(64))
+        .bind(request_id.to_string()).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO pending_proxy_settlements (request_id,tenant_id,key_id,account_id,reservation_id,owner_token,fence,contract_digest,contract_json,state,receipt_id,receipt_digest,cost_micros,status_code,error_code,response_object,created_at,updated_at,applied_at) SELECT r.id,r.tenant_id,r.key_id,o.account_id,r.reservation_id,o.owner_token,o.fence,o.contract_digest,'{}','applied',$2,$3,r.cost_micros,r.status_code,r.error_code,r.response_object,r.created_at,r.completed_at,r.completed_at FROM request_records r JOIN proxy_operational_terminals o ON o.request_id=r.id WHERE r.id=$1")
+        .bind(request_id.to_string()).bind(Uuid::now_v7().to_string())
+        .bind("e".repeat(64)).execute(&pool).await.unwrap();
+    let operational_before = retirement_operational_state(&pool, request_id).await;
     sqlx::query("INSERT INTO import_request_links (tenant_id,source,external_event_hash,external_request_id,source_key_hash,target_request_id,source_created_at,source_model,created_at) VALUES ($1,'cpamp-usage-events-v1',$2,'retired-exact',$3,$4,$5,'gpt-fixture',$5)")
         .bind(key.tenant_id.to_string()).bind(&event_hash).bind(&key_hash)
         .bind(request_id.to_string()).bind(started_at).execute(&pool).await.unwrap();
@@ -453,6 +480,19 @@ async fn exact_retirement_fixture(postgres: bool, prior_cluster: bool) {
             .await
             .unwrap();
     assert_ne!(archive_cluster, previous_session);
+    let imported_refs = db
+        .request_archive_refs_for_tenant(tenant, request_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        imported_refs.view.operational_terminal.unwrap().financial_state,
+        memeloop_token_center::model::RequestFinancialState::Applied
+    );
+    assert!(!imported_refs.response_object.unwrap().starts_with("gap://"));
+    assert_eq!(
+        retirement_operational_state(&pool, request_id).await,
+        operational_before
+    );
     assert_retirement_usage(
         &pool,
         request_id,
@@ -519,6 +559,10 @@ async fn exact_retirement_fixture(postgres: bool, prior_cluster: bool) {
             .unwrap();
     assert_eq!(retained_cluster, archive_cluster);
     assert_eq!(
+        retirement_operational_state(&pool, request_id).await,
+        operational_before
+    );
+    assert_eq!(
         retirement_title_state(&pool, key.tenant_id, key.key_id, &archive_cluster).await,
         title_before
     );
@@ -555,7 +599,19 @@ async fn exact_retirement_fixture(postgres: bool, prior_cluster: bool) {
             .fetch_one(&pool)
             .await
             .unwrap();
+    let retired_refs = db
+        .request_archive_refs_for_tenant(tenant, request_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        retired_refs.response_object.as_deref(),
+        Some(original_response.as_str())
+    );
     assert_eq!(locators, (original_request, Some(original_response)));
+    assert_eq!(
+        retirement_operational_state(&pool, request_id).await,
+        operational_before
+    );
     let retired: (i64, i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM conversation_observations WHERE request_id=$1),(SELECT COUNT(*) FROM conversation_clusters WHERE id=$2),(SELECT COUNT(*) FROM session_archive_import_records WHERE target_request_id=$1),(SELECT COUNT(*) FROM session_archive_correlations WHERE target_request_id=$1)")
         .bind(request_id.to_string()).bind(&archive_cluster).fetch_one(&pool).await.unwrap();
     assert_eq!(retired, (0, 0, 0, 0));
@@ -590,6 +646,18 @@ async fn exact_retirement_fixture(postgres: bool, prior_cluster: bool) {
         retirement_financial_state(&pool, key.account_id).await,
         financial_before
     );
+    assert_eq!(
+        retirement_operational_state(&pool, request_id).await,
+        operational_before
+    );
+}
+
+async fn retirement_operational_state(
+    pool: &sqlx::AnyPool,
+    request_id: Uuid,
+) -> RetirementOperationalState {
+    sqlx::query_as("SELECT receipt_id,operational_digest,request_created_at,reservation_id,status_code,duration_ms,response_object FROM proxy_operational_terminals WHERE request_id=$1")
+        .bind(request_id.to_string()).fetch_one(pool).await.unwrap()
 }
 
 async fn retirement_title_state(

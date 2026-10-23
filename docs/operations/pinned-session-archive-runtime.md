@@ -6,9 +6,9 @@ the pinned current product APIs in CI. This does not authorize cleanup or real i
 ## Immutable source and build
 
 - Product source: `memeloop-online/memeloop-token-center`,
-  revision `072769105392e7d24a12dc4780fa16ab6a01d1e7`, target schema132.
+  revision `a31f28f497036b0374a37077c218505a63aecbc0`, target schema133.
 - Cargo.lock SHA-256:
-  `8bf18924e7cead74d2532d3d9674bc72101fa89fdda48d7da1b7205b2507ee30`.
+  `083e616fe14a58cde159c7ff33607389f91be4df90e5bbb7c4cbe266ddd7705a`.
 - Rust `1.95.0`, `cargo --locked`, Ubuntu 24.04, Linux x86_64 GNU.
 - CI executes the importer unit tests and session import/quarantine/unlinked
   integration tests with an isolated PostgreSQL service, then builds only the
@@ -46,7 +46,7 @@ availability with the isolated `--help` check before supplying real inputs.
 
 Dry-run remains the default. `SESSION_ARCHIVE_APPLY=true` is an explicit write
 decision; the finalizer additionally requires its separately bound approval.
-The engine checks exact target schema132 read-only before import, validates
+The engine checks exact target schema133 read-only before import, validates
 identity, and retains the existing gap/quarantine/provenance/replay semantics.
 This release does not implement product schema upgrades and does not relax
 import acceptance for a newer target schema.
@@ -72,5 +72,5 @@ These retired one-shot modules and their regression fixtures now live in
 Current conversation/prefix, archive, model and error implementations remain
 supplied by product; no old observation decoder is restored. The hash-bound
 assembly adds only module exports to three current product files in CI.
-See [the exact source plan, schema impact and CI matrix](schema132-importer-closure.md).
+See [the exact source plan, schema impact and CI matrix](schema133-importer-closure.md).
 Retained source does not authorize production cleanup or import.
