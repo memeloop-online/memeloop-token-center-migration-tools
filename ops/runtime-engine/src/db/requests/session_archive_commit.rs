@@ -1253,7 +1253,7 @@ async fn retire_archive_observation_in_transaction(
     request_id: &str,
 ) -> Result<(), AppError> {
     let observation =
-        sqlx::query("SELECT key_id,cluster_id FROM conversation_observations WHERE request_id=$1")
+        sqlx::query("SELECT observation.key_id,observation.cluster_id,cluster.tenant_id FROM conversation_observations observation JOIN conversation_clusters cluster ON cluster.id=observation.cluster_id WHERE observation.request_id=$1")
             .bind(request_id)
             .fetch_optional(&mut **tx)
             .await?;
@@ -1262,6 +1262,7 @@ async fn retire_archive_observation_in_transaction(
     };
     let key_id: String = observation.try_get("key_id")?;
     let cluster_id: String = observation.try_get("cluster_id")?;
+    let tenant_id: String = observation.try_get("tenant_id")?;
     sqlx::query("DELETE FROM conversation_edges WHERE from_observation_id IN (SELECT id FROM conversation_observations WHERE request_id=$1) OR to_observation_id IN (SELECT id FROM conversation_observations WHERE request_id=$1)")
         .bind(request_id).execute(&mut **tx).await?;
     sqlx::query("DELETE FROM conversation_observations WHERE request_id=$1")
@@ -1275,6 +1276,8 @@ async fn retire_archive_observation_in_transaction(
         .await?;
     sqlx::query("INSERT INTO conversation_key_clusters (key_id,cluster_id,explicit_session_id,updated_at,request_count,candidate_edge_count) SELECT $1,$2,MIN(observations.explicit_session_id),MAX(observations.created_at),COUNT(*),(SELECT COUNT(*) FROM conversation_edges edges JOIN conversation_observations targets ON targets.id=edges.to_observation_id JOIN conversation_observations sources ON sources.id=edges.from_observation_id AND sources.key_id=targets.key_id WHERE edges.cluster_id=$2 AND edges.relation_kind='candidate' AND targets.key_id=$1) FROM conversation_observations observations WHERE observations.key_id=$1 AND observations.cluster_id=$2 HAVING COUNT(*)>0")
         .bind(&key_id).bind(&cluster_id).execute(&mut **tx).await?;
+    sqlx::query("DELETE FROM session_generated_titles WHERE tenant_id=$1 AND key_id=$2 AND session_id=$3 AND NOT EXISTS (SELECT 1 FROM conversation_observations observation JOIN conversation_clusters cluster ON cluster.id=observation.cluster_id WHERE cluster.tenant_id=$1 AND observation.key_id=$2 AND observation.cluster_id=$3)")
+        .bind(&tenant_id).bind(&key_id).bind(&cluster_id).execute(&mut **tx).await?;
     let remaining: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM conversation_observations WHERE cluster_id=$1")
             .bind(&cluster_id)
@@ -1290,6 +1293,206 @@ async fn retire_archive_observation_in_transaction(
             .bind(&cluster_id).execute(&mut **tx).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod retirement_tests {
+    use super::*;
+    use crate::config::Config;
+
+    #[tokio::test]
+    async fn sqlite_retirement_scopes_titles_rolls_back_and_fences_old_leases() {
+        retirement_title_fixture(false).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_retirement_scopes_titles_rolls_back_and_fences_old_leases() {
+        if std::env::var("MTC_TEST_POSTGRES_URL").is_err() {
+            assert!(std::env::var("CI").is_err(), "CI requires PostgreSQL");
+            return;
+        }
+        retirement_title_fixture(true).await;
+    }
+
+    async fn retirement_title_fixture(postgres: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        sqlx::any::install_default_drivers();
+        let database_url = if postgres {
+            let database_url = std::env::var("MTC_TEST_POSTGRES_URL").unwrap();
+            let pool = AnyPool::connect(&database_url).await.unwrap();
+            let schema = format!("archive_titles_{}", Uuid::now_v7().simple());
+            sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+                .execute(&pool)
+                .await
+                .unwrap();
+            pool.close().await;
+            let mut scoped = url::Url::parse(&database_url).unwrap();
+            scoped
+                .query_pairs_mut()
+                .append_pair("options", &format!("-csearch_path={schema}"));
+            scoped.to_string()
+        } else {
+            format!(
+                "sqlite://{}?mode=rwc",
+                directory.path().join("titles.sqlite").display()
+            )
+        };
+        let db = Database::connect(&database_url).await.unwrap();
+        db.migrate().await.unwrap();
+        let config = Config::for_test(database_url);
+        let issued = db
+            .create_key(
+                CreateKeyInput {
+                    tenant_external_id: "retirement-titles".into(),
+                    principal_external_id: "member".into(),
+                    alias: "retirement-titles".into(),
+                    currency: "USD".into(),
+                    policy: KeyPolicy::default(),
+                    initial_balance: rust_decimal::Decimal::TEN,
+                    idempotency_key: None,
+                },
+                config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        let key = db
+            .authenticate_key(&issued.key, config.key_pepper.as_bytes())
+            .await
+            .unwrap();
+        let (first_request, cluster) = observation(&db, &key, "retiring").await;
+        let task = db.claim_session_title(Uuid::now_v7()).await.unwrap().unwrap();
+        assert_eq!(task.session_id, cluster);
+        let (last_request, same_cluster) = observation(&db, &key, "retiring").await;
+        assert_eq!(same_cluster, cluster);
+        let (_, active_cluster) = observation(&db, &key, "active").await;
+        assert_ne!(active_cluster, cluster);
+        db.request_session_title(key.tenant_id, Uuid::now_v7(), cluster)
+            .await
+            .unwrap();
+        db.request_session_title(Uuid::now_v7(), key.key_id, cluster)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE session_generated_titles SET title='Preserved',state='ready' WHERE NOT (tenant_id=$1 AND key_id=$2 AND session_id=$3)")
+            .bind(key.tenant_id.to_string()).bind(key.key_id.to_string()).bind(cluster.to_string())
+            .execute(&db.pool).await.unwrap();
+        let preserved = preserved_titles(&db, key.tenant_id, key.key_id, cluster).await;
+        assert_eq!(preserved.len(), 3);
+
+        let mut tx = db.begin_write_transaction().await.unwrap();
+        retire_archive_observation_in_transaction(&mut tx, &first_request.to_string())
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        db.finish_session_title(&task, Some("Still active"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.session_title(key.tenant_id, key.key_id, cluster)
+                .await
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("Still active")
+        );
+        db.request_session_title(key.tenant_id, key.key_id, cluster)
+            .await
+            .unwrap();
+        let task = db.claim_session_title(Uuid::now_v7()).await.unwrap().unwrap();
+        assert_eq!(task.session_id, cluster);
+        let mut tx = db.begin_write_transaction().await.unwrap();
+        retire_archive_observation_in_transaction(&mut tx, &last_request.to_string())
+            .await
+            .unwrap();
+        let deleted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_generated_titles WHERE tenant_id=$1 AND key_id=$2 AND session_id=$3")
+            .bind(key.tenant_id.to_string()).bind(key.key_id.to_string()).bind(cluster.to_string())
+            .fetch_one(&mut *tx).await.unwrap();
+        assert_eq!(deleted, 0);
+        tx.rollback().await.unwrap();
+        db.finish_session_title(&task, Some("Rollback kept lease"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.session_title(key.tenant_id, key.key_id, cluster)
+                .await
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("Rollback kept lease")
+        );
+        db.request_session_title(key.tenant_id, key.key_id, cluster)
+            .await
+            .unwrap();
+        let stale_task = db.claim_session_title(Uuid::now_v7()).await.unwrap().unwrap();
+        assert_eq!(stale_task.session_id, cluster);
+        let mut tx = db.begin_write_transaction().await.unwrap();
+        retire_archive_observation_in_transaction(&mut tx, &last_request.to_string())
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        for _attempt in 0..2 {
+            db.finish_session_title(&stale_task, Some("Late stale title"), None)
+                .await
+                .unwrap();
+            assert_eq!(
+                db.session_title(key.tenant_id, key.key_id, cluster)
+                    .await
+                    .unwrap()
+                    .state,
+                "unavailable"
+            );
+            let mut tx = db.begin_write_transaction().await.unwrap();
+            retire_archive_observation_in_transaction(&mut tx, &last_request.to_string())
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            assert_eq!(
+                preserved_titles(&db, key.tenant_id, key.key_id, cluster).await,
+                preserved
+            );
+        }
+    }
+
+    async fn observation(db: &Database, key: &AuthenticatedKey, session: &str) -> (Uuid, Uuid) {
+        let request_id = Uuid::now_v7();
+        db.record_request_started(NewRequest {
+            request_id,
+            key_id: key.key_id,
+            tenant_id: key.tenant_id,
+            protocol: "openai-responses".into(),
+            model: "gpt-fixture".into(),
+            request_object: "memory://retirement-title".into(),
+            reservation_id: Uuid::now_v7(),
+            upstream_account_id: None,
+            model_route_id: None,
+        })
+        .await
+        .unwrap();
+        let cluster = db
+            .record_conversation_observation(
+                key,
+                request_id,
+                &serde_json::json!({"input": [{"role": "user", "content": session}]}),
+                &ConversationHints {
+                    session_id: Some(session.into()),
+                    ..ConversationHints::default()
+                },
+                Some("Codex"),
+            )
+            .await
+            .unwrap();
+        (request_id, cluster)
+    }
+
+    async fn preserved_titles(
+        db: &Database,
+        tenant: Uuid,
+        key: Uuid,
+        session: Uuid,
+    ) -> Vec<(String, String, String, Option<String>, String, i64, Option<String>)> {
+        sqlx::query_as("SELECT tenant_id,key_id,session_id,title,state,revision,lease_owner FROM session_generated_titles WHERE NOT (tenant_id=$1 AND key_id=$2 AND session_id=$3) ORDER BY tenant_id,key_id,session_id")
+            .bind(tenant.to_string()).bind(key.to_string()).bind(session.to_string())
+            .fetch_all(&db.pool).await.unwrap()
+    }
 }
 
 async fn rebuild_archive_session_total_in_transaction(
