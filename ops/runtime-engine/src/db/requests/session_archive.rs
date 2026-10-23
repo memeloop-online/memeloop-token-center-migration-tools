@@ -722,9 +722,9 @@ impl Database {
                 "target database must be migrated before session archive import".into(),
             )
         })?;
-        if expected.last() != Some(&132) || applied != expected {
+        if expected.last() != Some(&133) || applied != expected {
             return Err(AppError::BadRequest(
-                "target database schema differs from the pinned schema132 migration list".into(),
+                "target database schema differs from the pinned schema133 migration list".into(),
             ));
         }
 
@@ -749,6 +749,16 @@ impl Database {
         .map_err(|_| {
             AppError::BadRequest(
                 "target database session reading schema is incomplete or drifted".into(),
+            )
+        })?;
+        sqlx::query(
+            "SELECT o.request_id, o.request_created_at, o.tenant_id, o.key_id, o.account_id, o.reservation_id, o.owner_token, o.fence, o.contract_digest, o.receipt_id, o.operational_digest, o.status_code, o.error_code, o.terminal_cause_code, o.stage, o.completed_at, o.duration_ms, o.first_output_ms, o.generation_duration_ms, o.response_object, o.upstream_account_id, o.model_route_id, o.recorded_at FROM proxy_operational_terminals o WHERE 1 = 0",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| {
+            AppError::BadRequest(
+                "target database operational terminal schema is incomplete or drifted".into(),
             )
         })?;
         Ok(())
