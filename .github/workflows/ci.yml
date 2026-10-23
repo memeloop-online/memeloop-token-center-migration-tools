@@ -338,6 +338,7 @@ jobs:
           cargo test --locked --lib session_archive_import::tests
           cargo test --locked --lib db::requests::conversations::prefix_storage::tests
           cargo test --locked --lib db::session_reading_lifecycle::tests
+          cargo test --locked --lib db::requests::session_archive_commit::retirement_tests
           cargo test --locked --test session_archive_import --test session_archive_quarantine --test session_archive_unlinked -- --test-threads=1
           cargo build --locked --release --bin import-cpa-session-archive
 

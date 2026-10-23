@@ -30,6 +30,7 @@ const TEST_OTHER_RECORD_DIGEST: &str =
 type StableChainProjectionState = (i64, i64, i64, i64, i64, i64, i64);
 type StableChainCheckpointState = (i64, i64, i64, i64, Option<i64>, i64, i64, Option<String>);
 type StableChainState = (StableChainProjectionState, StableChainCheckpointState);
+type RetirementTitleState = (Option<String>, String, i64, Option<String>, Option<i64>);
 
 #[tokio::test]
 async fn session_archive_schema_precondition_is_read_only() {
@@ -131,15 +132,16 @@ async fn schema132_precondition_fixture(postgres: bool) {
             .unwrap();
     }
     for table in ["session_generated_titles", "session_response_summaries"] {
+        let drift_table = format!("{table}_schema_drift_fixture");
         sqlx::query(sqlx::AssertSqlSafe(format!(
-            "ALTER TABLE {table} RENAME TO schema_drift_fixture"
+            "ALTER TABLE {table} RENAME TO {drift_table}"
         )))
         .execute(&pool)
         .await
         .unwrap();
         assert_schema_rejected_without_writes(&db, &pool).await;
         sqlx::query(sqlx::AssertSqlSafe(format!(
-            "ALTER TABLE schema_drift_fixture RENAME TO {table}"
+            "ALTER TABLE {drift_table} RENAME TO {table}"
         )))
         .execute(&pool)
         .await
@@ -464,6 +466,12 @@ async fn exact_retirement_fixture(postgres: bool, prior_cluster: bool) {
         financial_before
     );
     let baseline_state = stable_chain_state(&pool, key.tenant_id, source).await;
+    sqlx::query("UPDATE session_generated_titles SET state='running',lease_owner=$4,lease_until=$5,attempts=1 WHERE tenant_id=$1 AND key_id=$2 AND session_id=$3")
+        .bind(key.tenant_id.to_string()).bind(key.key_id.to_string()).bind(&archive_cluster)
+        .bind(Uuid::now_v7().to_string()).bind(completed_at + 86_400_000)
+        .execute(&pool).await.unwrap();
+    let title_before = retirement_title_state(&pool, key.tenant_id, key.key_id, &archive_cluster).await;
+    assert_eq!(title_before.as_ref().unwrap().1, "running");
     let delta_path = write_retirement_tombstone(
         directory.path(),
         &fingerprint,
@@ -510,6 +518,10 @@ async fn exact_retirement_fixture(postgres: bool, prior_cluster: bool) {
             .await
             .unwrap();
     assert_eq!(retained_cluster, archive_cluster);
+    assert_eq!(
+        retirement_title_state(&pool, key.tenant_id, key.key_id, &archive_cluster).await,
+        title_before
+    );
     let drop_trigger = if postgres {
         "DROP TRIGGER reject_retirement_finalize ON session_archive_snapshot_checkpoints"
     } else {
@@ -547,6 +559,11 @@ async fn exact_retirement_fixture(postgres: bool, prior_cluster: bool) {
     let retired: (i64, i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM conversation_observations WHERE request_id=$1),(SELECT COUNT(*) FROM conversation_clusters WHERE id=$2),(SELECT COUNT(*) FROM session_archive_import_records WHERE target_request_id=$1),(SELECT COUNT(*) FROM session_archive_correlations WHERE target_request_id=$1)")
         .bind(request_id.to_string()).bind(&archive_cluster).fetch_one(&pool).await.unwrap();
     assert_eq!(retired, (0, 0, 0, 0));
+    assert!(
+        retirement_title_state(&pool, key.tenant_id, key.key_id, &archive_cluster)
+            .await
+            .is_none()
+    );
     let retired_state = stable_chain_state(&pool, key.tenant_id, source).await;
     assert_eq!(retired_state.1.1, 2);
     import_session_archive(&db, &archive, &delta_options)
@@ -555,6 +572,11 @@ async fn exact_retirement_fixture(postgres: bool, prior_cluster: bool) {
     assert_eq!(
         stable_chain_state(&pool, key.tenant_id, source).await,
         retired_state
+    );
+    assert!(
+        retirement_title_state(&pool, key.tenant_id, key.key_id, &archive_cluster)
+            .await
+            .is_none()
     );
     assert_retirement_usage(
         &pool,
@@ -568,6 +590,17 @@ async fn exact_retirement_fixture(postgres: bool, prior_cluster: bool) {
         retirement_financial_state(&pool, key.account_id).await,
         financial_before
     );
+}
+
+async fn retirement_title_state(
+    pool: &sqlx::AnyPool,
+    tenant_id: Uuid,
+    key_id: Uuid,
+    session_id: &str,
+) -> Option<RetirementTitleState> {
+    sqlx::query_as("SELECT title,state,revision,lease_owner,lease_until FROM session_generated_titles WHERE tenant_id=$1 AND key_id=$2 AND session_id=$3")
+        .bind(tenant_id.to_string()).bind(key_id.to_string()).bind(session_id)
+        .fetch_optional(pool).await.unwrap()
 }
 
 async fn assert_retirement_usage(
