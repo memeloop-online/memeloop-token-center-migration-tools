@@ -56,41 +56,136 @@ async fn archive_import_is_fail_closed_gap_only_and_idempotent() {
 }
 
 #[tokio::test]
-async fn schema130_precondition_rejects_missing_and_newer_versions_without_writes() {
+async fn sqlite_schema132_precondition_rejects_version_and_relation_drift_without_writes() {
+    schema132_precondition_fixture(false).await;
+}
+
+#[tokio::test]
+async fn postgres_schema132_precondition_rejects_version_and_relation_drift_without_writes() {
+    if std::env::var("MTC_TEST_POSTGRES_URL").is_err() {
+        assert!(std::env::var("CI").is_err(), "CI requires PostgreSQL");
+        return;
+    }
+    schema132_precondition_fixture(true).await;
+}
+
+async fn schema132_precondition_fixture(postgres: bool) {
     let directory = tempfile::tempdir().unwrap();
-    let database_url = format!(
-        "sqlite://{}?mode=rwc",
-        directory.path().join("schema.sqlite").display()
-    );
+    let database_url = if postgres {
+        sqlx::any::install_default_drivers();
+        let database_url = std::env::var("MTC_TEST_POSTGRES_URL").unwrap();
+        let pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
+        let schema = format!("archive_schema_{}", Uuid::now_v7().simple());
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        let mut scoped = url::Url::parse(&database_url).unwrap();
+        scoped
+            .query_pairs_mut()
+            .append_pair("options", &format!("-csearch_path={schema}"));
+        scoped.to_string()
+    } else {
+        format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("schema.sqlite").display()
+        )
+    };
     let db = Database::connect(&database_url).await.unwrap();
     db.migrate().await.unwrap();
     db.ensure_session_archive_import_schema().await.unwrap();
     let pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
-    let baseline_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM schema_migrations WHERE version=127")
-        .execute(&pool)
-        .await
-        .unwrap();
-    assert!(db.ensure_session_archive_import_schema().await.is_err());
-    sqlx::query("INSERT INTO schema_migrations (version,name,applied_at) VALUES (0,'outside qualified range',0)")
-        .execute(&pool).await.unwrap();
-    assert!(db.ensure_session_archive_import_schema().await.is_err());
-    sqlx::query("DELETE FROM schema_migrations WHERE version=0")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("INSERT INTO schema_migrations (version,name,applied_at) VALUES (127,'fixture',0),(131,'unqualified',0)")
-        .execute(&pool).await.unwrap();
-    assert!(db.ensure_session_archive_import_schema().await.is_err());
-    let versions: (i64, i64) =
-        sqlx::query_as("SELECT COUNT(*),MAX(version) FROM schema_migrations")
-            .fetch_one(&pool)
+    let versions: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM schema_migrations ORDER BY version")
+            .fetch_all(&pool)
             .await
             .unwrap();
-    assert_eq!(versions, (baseline_count + 1, 131));
+    assert_eq!(versions.len(), 131);
+    assert_eq!(versions.last(), Some(&132));
+    assert!(!versions.contains(&114));
+    for missing in [127_i64, 131, 132] {
+        sqlx::query("DELETE FROM schema_migrations WHERE version=$1")
+            .bind(missing)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_schema_rejected_without_writes(&db, &pool).await;
+        sqlx::query("INSERT INTO schema_migrations (version,name,applied_at) VALUES ($1,'fixture',0)")
+            .bind(missing)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    for unexpected in [0_i64, 114, 133] {
+        sqlx::query("INSERT INTO schema_migrations (version,name,applied_at) VALUES ($1,'unqualified',0)")
+            .bind(unexpected)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_schema_rejected_without_writes(&db, &pool).await;
+        sqlx::query("DELETE FROM schema_migrations WHERE version=$1")
+            .bind(unexpected)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    for table in ["session_generated_titles", "session_response_summaries"] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "ALTER TABLE {table} RENAME TO schema_drift_fixture"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_schema_rejected_without_writes(&db, &pool).await;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "ALTER TABLE schema_drift_fixture RENAME TO {table}"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    for (table, column) in [
+        ("session_generated_titles", "revision"),
+        ("session_response_summaries", "session_id"),
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "ALTER TABLE {table} RENAME COLUMN {column} TO schema_drift_fixture"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_schema_rejected_without_writes(&db, &pool).await;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "ALTER TABLE {table} RENAME COLUMN schema_drift_fixture TO {column}"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    db.ensure_session_archive_import_schema().await.unwrap();
+}
+
+async fn assert_schema_rejected_without_writes(db: &Database, pool: &sqlx::AnyPool) {
+    let before: Vec<(i64, String, i64)> =
+        sqlx::query_as("SELECT version,name,applied_at FROM schema_migrations ORDER BY version")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    assert!(db.ensure_session_archive_import_schema().await.is_err());
+    let after: Vec<(i64, String, i64)> =
+        sqlx::query_as("SELECT version,name,applied_at FROM schema_migrations ORDER BY version")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    assert_eq!(after, before);
+    let archive_writes: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM session_archive_import_records), (SELECT COUNT(*) FROM session_archive_import_checkpoints)",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(archive_writes, (0, 0));
 }
 
 #[tokio::test]
@@ -99,7 +194,7 @@ async fn large_archive_import_preserves_objects_replay_tenants_and_financial_sta
 }
 
 #[tokio::test]
-async fn postgres_schema130_large_import_prefix_readback_replay_and_financial_state() {
+async fn postgres_schema132_large_import_prefix_readback_replay_and_financial_state() {
     if std::env::var("MTC_TEST_POSTGRES_URL").is_ok() {
         archive_import_fixture(true, true).await;
     } else {
@@ -888,6 +983,13 @@ async fn archive_import_fixture(large: bool, postgres: bool) {
     );
     #[cfg(unix)]
     assert_ne!(dry_run.input_inode, 0);
+    let reading_before: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM session_generated_titles), (SELECT COUNT(*) FROM session_response_summaries)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("reading jobs before apply");
+    assert_eq!(reading_before, (0, 0));
     let applied = import_session_archive(&db, &archive, &options(&input, true))
         .await
         .expect("apply import");
@@ -951,6 +1053,16 @@ async fn archive_import_fixture(large: bool, postgres: bool) {
         )
         .await
         .expect("current conversation readback");
+    let title: (Option<String>, String, i64, i64) = sqlx::query_as(
+        "SELECT title,state,revision,attempts FROM session_generated_titles WHERE tenant_id=$1 AND key_id=$2 AND session_id=$3",
+    )
+    .bind(key.tenant_id.to_string())
+    .bind(key.key_id.to_string())
+    .bind(&cluster_id)
+    .fetch_one(&pool)
+    .await
+    .expect("current product enqueues the imported session title");
+    assert_eq!(title, (None, "pending".into(), 1, 0));
     assert!(
         detail
             .requests
@@ -970,6 +1082,13 @@ async fn archive_import_fixture(large: bool, postgres: bool) {
         .expect("idempotent replay backfills exact correlation");
     assert_eq!(replay.replayed, 1);
     assert_eq!(replay.imported, 0);
+    let reading_after_replay: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM session_generated_titles), (SELECT COUNT(*) FROM session_response_summaries)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("replay does not duplicate titles or synthesize response summaries");
+    assert_eq!(reading_after_replay, (1, 0));
     let exact_correlation: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM session_archive_correlations WHERE source = 'cpa-session-archive-v2' AND external_request_id = $1 AND disposition = 'exact'",
     )

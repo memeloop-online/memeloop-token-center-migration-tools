@@ -6,7 +6,7 @@ import { archiveRuntimePin, fileDigest } from "../lib/session-archive-runtime.ts
 const source = resolve(process.argv[2] ?? ".runtime-source");
 if (process.env.GITHUB_ACTIONS !== "true") throw new Error("archive source assembly is CI-only");
 const closure = resolve("ops/runtime-engine");
-const manifestPath = resolve("ops/runtime-patches/schema130-files.json");
+const manifestPath = resolve("ops/runtime-patches/schema132-files.json");
 const git = (...args: string[]): string => execFileSync("git", args, { cwd: source, encoding: "utf8" }).trim();
 if (git("rev-parse", "HEAD") !== archiveRuntimePin.revision
   || fileDigest(resolve(source, "Cargo.lock")) !== archiveRuntimePin.cargo_lock_sha256

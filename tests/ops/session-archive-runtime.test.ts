@@ -50,6 +50,10 @@ test("archive runtime rejects missing, drifted, substituted and symlinked artifa
       writeFileSync(manifest, JSON.stringify({ ...value, [field]: "tampered" }));
       assert.throws(() => verifiedArchiveRuntime(binary), /verification failed/);
     }
+    for (const target_schema_version of [130, 131, 133]) {
+      writeFileSync(manifest, JSON.stringify({ ...value, target_schema_version }));
+      assert.throws(() => verifiedArchiveRuntime(binary), /verification failed/);
+    }
     reset();
     chmodSync(binary, 0o600);
     assert.throws(() => verifiedArchiveRuntime(binary), /verification failed/);
