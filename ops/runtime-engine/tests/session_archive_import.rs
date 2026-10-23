@@ -431,6 +431,9 @@ async fn exact_retirement_fixture(postgres: bool, prior_cluster: bool) {
         .bind(Uuid::now_v7().to_string()).bind("c".repeat(64))
         .bind(Uuid::now_v7().to_string()).bind("d".repeat(64))
         .bind(request_id.to_string()).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO pending_proxy_settlements (request_id,tenant_id,key_id,account_id,reservation_id,owner_token,fence,contract_digest,contract_json,state,receipt_id,receipt_digest,cost_micros,status_code,error_code,response_object,created_at,updated_at,applied_at) SELECT r.id,r.tenant_id,r.key_id,o.account_id,r.reservation_id,o.owner_token,o.fence,o.contract_digest,'{}','applied',$2,$3,r.cost_micros,r.status_code,r.error_code,r.response_object,r.created_at,r.completed_at,r.completed_at FROM request_records r JOIN proxy_operational_terminals o ON o.request_id=r.id WHERE r.id=$1")
+        .bind(request_id.to_string()).bind(Uuid::now_v7().to_string())
+        .bind("e".repeat(64)).execute(&pool).await.unwrap();
     let operational_before = retirement_operational_state(&pool, request_id).await;
     sqlx::query("INSERT INTO import_request_links (tenant_id,source,external_event_hash,external_request_id,source_key_hash,target_request_id,source_created_at,source_model,created_at) VALUES ($1,'cpamp-usage-events-v1',$2,'retired-exact',$3,$4,$5,'gpt-fixture',$5)")
         .bind(key.tenant_id.to_string()).bind(&event_hash).bind(&key_hash)
@@ -481,6 +484,10 @@ async fn exact_retirement_fixture(postgres: bool, prior_cluster: bool) {
         .request_archive_refs_for_tenant(tenant, request_id)
         .await
         .unwrap();
+    assert_eq!(
+        imported_refs.view.operational_terminal.unwrap().financial_state,
+        memeloop_token_center::model::RequestFinancialState::Applied
+    );
     assert!(!imported_refs.response_object.unwrap().starts_with("gap://"));
     assert_eq!(
         retirement_operational_state(&pool, request_id).await,
