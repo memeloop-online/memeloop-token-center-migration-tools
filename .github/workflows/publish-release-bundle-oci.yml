@@ -40,7 +40,6 @@ jobs:
       MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
       CHECKSUMS_SHA256: ${{ inputs.checksums_sha256 }}
       RELEASE_ASSETS: ${{ github.workspace }}/.release-assets
-      BASE_IMAGE: ghcr.io/memeloop-online/memeloop-token-center-importer@sha256:75fef96d76af5fb39851514fd89ba8e12fee394e88c7d6f5fac91a5e8ca5a429
     steps:
       - name: Check out delivery definition
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v6.0.0
@@ -84,9 +83,9 @@ jobs:
           context: ${{ env.RELEASE_ASSETS }}
           file: ${{ github.workspace }}/ops/ci/Dockerfile.release-bundle
           build-args: |
-            BASE_IMAGE=${{ env.BASE_IMAGE }}
             RELEASE_REVISION=${{ env.REVISION }}
-          tags: ghcr.io/${{ github.repository }}:release-bundle-${{ env.REVISION }}
+          platforms: linux/amd64
+          tags: ghcr.io/${{ github.repository }}:release-bundle-${{ env.REVISION }}-delivery-${{ github.sha }}
           push: true
           provenance: mode=max
           sbom: true
