@@ -450,6 +450,17 @@ jobs:
             sha256sum -c SHA256SUMS
           )
 
+      - name: Verify GNU release bundle container entrypoints
+        env:
+          RELEASE_ASSETS: ${{ runner.temp }}/migration-tools-release-assets
+        run: |
+          set -euo pipefail
+          docker build --platform linux/amd64 \
+            --build-arg "RELEASE_REVISION=$GITHUB_SHA" \
+            --file ops/ci/Dockerfile.release-bundle \
+            --tag "migration-tools-bundle-check:$GITHUB_SHA" \
+            "$RELEASE_ASSETS"
+
       - name: Upload immutable Release evidence
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.6.2
         with:
