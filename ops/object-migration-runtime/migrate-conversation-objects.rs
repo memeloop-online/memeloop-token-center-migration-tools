@@ -13,12 +13,17 @@ use uuid::Uuid;
 type Failure = Box<dyn std::error::Error + Send + Sync>;
 type Result<Value> = std::result::Result<Value, Failure>;
 
+#[path = "conversation-object-modules/locators.rs"]
+mod locators;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum Phase {
     Inventory,
     Copy,
     Verify,
     CutoverTest,
+    CopyLocators,
+    VerifyLocators,
 }
 
 #[derive(Parser)]
@@ -500,11 +505,22 @@ async fn run(args: Args) -> Result<()> {
         checkpoint: args.checkpoint,
         identity,
     };
+    if matches!(args.phase, Phase::CopyLocators | Phase::VerifyLocators) {
+        let result = runner
+            .transfer_locators(&config, args.phase == Phase::VerifyLocators)
+            .await;
+        sqlx::query("SELECT pg_advisory_unlock(70720261029)")
+            .execute(&mut *advisory)
+            .await?;
+        println!("{}", serde_json::to_string(&result?)?);
+        return Ok(());
+    }
     let result = match args.phase {
         Phase::Copy => runner.copy().await,
         Phase::Verify => runner.verify().await,
         Phase::CutoverTest => runner.cutover_test().await,
         Phase::Inventory => unreachable!(),
+        Phase::CopyLocators | Phase::VerifyLocators => unreachable!(),
     };
     sqlx::query("SELECT pg_advisory_unlock(70720261029)")
         .execute(&mut *advisory)

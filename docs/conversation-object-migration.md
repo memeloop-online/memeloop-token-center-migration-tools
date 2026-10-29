@@ -6,8 +6,15 @@ against an exact reviewed product revision and its Cargo.lock. It reuses
 
 Current executable scope: exact `semantic_atoms` body transfer and context-node
 parent/depth/hash reconstruction. This is **not yet a whole-store cutover tool**.
-Raw request records, encrypted legacy spool chunks, outbox payload snapshots,
-media indexes and imported archive records need separate verified transfer
+`copy-locators` / `verify-locators` also stream request/response objects (including
+chunked legacy inline JSON) and indexed media into tenant CAS, with independent
+source/target hash, byte, count and ordered-receipt verification. Source
+credentials use `MTC_SOURCE_S3_*` environment references; destination keeps
+existing `MTC_S3_*` configuration. These phases never replace source locators
+or delete original objects. Media bytes must match the existing index digest.
+
+Encrypted legacy spool chunks, outbox payload snapshots,
+and imported archive records still need separate verified transfer
 receipts before retiring their source tables. Do not use atom counts to claim
 complete dialogue/media migration.
 

@@ -45,6 +45,8 @@ jobs:
         run: |
           cp ops/object-migration-runtime/migrate-conversation-objects.rs .object-runtime/src/bin/
           mkdir -p .object-runtime/src/bin/conversation-object-tests
+          mkdir -p .object-runtime/src/bin/conversation-object-modules
+          cp ops/object-migration-runtime/locators.rs .object-runtime/src/bin/conversation-object-modules/
           cp ops/object-migration-runtime/conversation_object_migration_tests.rs .object-runtime/src/bin/conversation-object-tests/
           sed -i 's|path = "conversation_object_migration_tests.rs"|path = "conversation-object-tests/conversation_object_migration_tests.rs"|' .object-runtime/src/bin/migrate-conversation-objects.rs
       - name: Test exact byte transfer, resume, reconstruction and source retention

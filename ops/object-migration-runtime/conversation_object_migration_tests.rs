@@ -16,7 +16,9 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
     let pool = PgPool::connect(url.as_str()).await.unwrap();
     sqlx::raw_sql(
         "CREATE TABLE semantic_atoms(tenant_id TEXT NOT NULL, content_hash TEXT NOT NULL, content_json TEXT NOT NULL, PRIMARY KEY(tenant_id, content_hash));
-         CREATE TABLE context_nodes(tenant_id TEXT NOT NULL, node_hash TEXT NOT NULL, parent_hash TEXT, atom_hash TEXT NOT NULL, depth BIGINT NOT NULL, PRIMARY KEY(tenant_id, node_hash));",
+         CREATE TABLE context_nodes(tenant_id TEXT NOT NULL, node_hash TEXT NOT NULL, parent_hash TEXT, atom_hash TEXT NOT NULL, depth BIGINT NOT NULL, PRIMARY KEY(tenant_id, node_hash));
+         CREATE TABLE request_records(id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, request_object TEXT, response_object TEXT);
+         CREATE TABLE conversation_media_parts(tenant_id TEXT NOT NULL, turn_id TEXT NOT NULL, part_index BIGINT NOT NULL, object_locator TEXT NOT NULL, content_blake3 TEXT NOT NULL, byte_length BIGINT NOT NULL);",
     ).execute(&pool).await.unwrap();
     let tenant = Uuid::now_v7();
     let document = serde_json::json!({"role":"tool", "content":"工具\n".repeat(200000), "tool_call_id":"call-1", "unknown":[1,2,3]}).to_string();
@@ -45,6 +47,65 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
         checkpoint: directory.path().join("checkpoint.json"),
         identity: "fixture".into(),
     };
+    let source = ArchiveStore::from_config(&Config::for_test(url.to_string()))
+        .await
+        .unwrap();
+    let response = Bytes::from_static(
+        b"event: message\r\ndata: {\"tool_call_id\":\"call-1\"}\r\n\r\ndata: [DONE]\r\n\r\n",
+    );
+    source
+        .put("fixture/response", response.clone())
+        .await
+        .unwrap();
+    source
+        .put("fixture/media", Bytes::from_static(b"synthetic media"))
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO request_records VALUES ($1, $2, $3, 'fixture/response')")
+        .bind(Uuid::now_v7().to_string())
+        .bind(tenant.to_string())
+        .bind(format!("inline-json:{document}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO conversation_media_parts VALUES ($1, 'turn-1', 0, 'fixture/media', $2, 15)",
+    )
+    .bind(tenant.to_string())
+    .bind(blake3::hash(b"synthetic media").to_hex().to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let locators = runner
+        .transfer_locators_from(&source, "fixture", false)
+        .await
+        .unwrap();
+    assert!(!locators.verified);
+    let locators = runner
+        .transfer_locators_from(&source, "fixture", true)
+        .await
+        .unwrap();
+    assert!(locators.verified);
+    assert_eq!(locators.copied_rows, 3);
+    assert_eq!(
+        locators.copied_bytes,
+        document.len() as u64 + response.len() as u64 + 15
+    );
+    source
+        .put("fixture/response", Bytes::from_static(b"changed"))
+        .await
+        .unwrap();
+    assert!(
+        runner
+            .transfer_locators_from(&source, "fixture", true)
+            .await
+            .is_err()
+    );
+    let checkpoint: locators::LocatorCheckpoint = serde_json::from_reader(
+        std::fs::File::open(runner.checkpoint.with_extension("locators.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(!checkpoint.verified);
     assert!(runner.cutover_test().await.is_err());
     let copied = runner.copy().await.unwrap();
     assert_eq!(copied.copied_rows, 1);
