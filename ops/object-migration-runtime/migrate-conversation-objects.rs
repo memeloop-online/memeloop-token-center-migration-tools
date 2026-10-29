@@ -2,7 +2,6 @@ use std::{fs::OpenOptions, io::Write, path::PathBuf, process::ExitCode};
 
 use bytes::Bytes;
 use clap::{Parser, ValueEnum};
-use futures_util::StreamExt;
 use memeloop_token_center::{
     archive::{ArchiveStore, ConversationBodyReference},
     config::Config,
@@ -322,6 +321,9 @@ impl Runner {
         if !checkpoint.copied || checkpoint.cutover_rows != 0 {
             return Err("verify requires a completed copy before cutover".into());
         }
+        checkpoint.verified = false;
+        checkpoint.verified_rows = 0;
+        save_checkpoint(&self.checkpoint, &checkpoint)?;
         let mut cursor = Cursor::default();
         let mut count = 0_u64;
         let mut bytes = 0_u64;

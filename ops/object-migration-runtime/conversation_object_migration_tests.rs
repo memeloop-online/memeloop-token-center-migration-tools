@@ -1,4 +1,5 @@
 use super::*;
+use futures_util::StreamExt;
 
 #[tokio::test]
 async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body() {
