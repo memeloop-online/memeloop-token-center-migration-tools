@@ -1,0 +1,529 @@
+use std::{fs::OpenOptions, io::Write, path::PathBuf, process::ExitCode};
+
+use bytes::Bytes;
+use clap::{Parser, ValueEnum};
+use futures_util::StreamExt;
+use memeloop_token_center::{
+    archive::{ArchiveStore, ConversationBodyReference},
+    config::Config,
+};
+use serde::{Deserialize, Serialize};
+use sqlx::{PgPool, Row, postgres::PgPoolOptions};
+use uuid::Uuid;
+
+type Failure = Box<dyn std::error::Error + Send + Sync>;
+type Result<Value> = std::result::Result<Value, Failure>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum Phase {
+    Inventory,
+    Copy,
+    Verify,
+    CutoverTest,
+}
+
+#[derive(Parser)]
+#[command(about = "Checkpointed conversation object transfer; source mutation is TEST-only")]
+struct Args {
+    #[arg(long, value_enum, default_value = "inventory")]
+    phase: Phase,
+    #[arg(long)]
+    checkpoint: PathBuf,
+    #[arg(long)]
+    writers_quiesced: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct Cursor {
+    tenant_id: String,
+    content_hash: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Transfer {
+    format_version: u32,
+    identity: String,
+    cursor: Cursor,
+    source_md5: String,
+    reference: ConversationBodyReference,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Checkpoint {
+    format_version: u32,
+    identity: String,
+    cursor: Cursor,
+    copied_rows: u64,
+    copied_bytes: u64,
+    ordered_digest: String,
+    expected_rows: u64,
+    copied: bool,
+    verified_rows: u64,
+    verified_context_nodes: u64,
+    verified: bool,
+    cutover_cursor: Cursor,
+    cutover_rows: u64,
+    cutover_complete: bool,
+}
+
+struct Runner {
+    pool: PgPool,
+    target: ArchiveStore,
+    checkpoint: PathBuf,
+    identity: String,
+}
+
+fn transfer_key(identity: &str, cursor: &Cursor) -> Result<String> {
+    let tenant = Uuid::parse_str(&cursor.tenant_id)?;
+    if cursor.content_hash.len() != 64
+        || !cursor
+            .content_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("invalid content identity".into());
+    }
+    Ok(format!(
+        "migration-receipts/conversation-v1/{identity}/atoms/{tenant}/{}.json",
+        cursor.content_hash
+    ))
+}
+
+fn save_checkpoint(path: &std::path::Path, checkpoint: &Checkpoint) -> Result<()> {
+    let directory = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+    serde_json::to_writer(temporary.as_file_mut(), checkpoint)?;
+    temporary.as_file_mut().write_all(b"\n")?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path)?;
+    std::fs::File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
+fn ordered_digest(
+    previous: &str,
+    cursor: &Cursor,
+    reference: &ConversationBodyReference,
+) -> String {
+    let mut digest = blake3::Hasher::new();
+    for value in [
+        previous,
+        &cursor.tenant_id,
+        &cursor.content_hash,
+        &reference.conversation_body_v1.blake3_digest,
+    ] {
+        digest.update(&(value.len() as u64).to_le_bytes());
+        digest.update(value.as_bytes());
+    }
+    digest.update(&reference.conversation_body_v1.size_bytes.to_le_bytes());
+    digest.update(&reference.chars.to_le_bytes());
+    digest.finalize().to_hex().to_string()
+}
+
+impl Runner {
+    fn load_checkpoint(&self) -> Result<Checkpoint> {
+        match std::fs::File::open(&self.checkpoint) {
+            Ok(file) => {
+                let checkpoint: Checkpoint = serde_json::from_reader(file)?;
+                if checkpoint.format_version != 1 || checkpoint.identity != self.identity {
+                    return Err("checkpoint source/target identity mismatch".into());
+                }
+                Ok(checkpoint)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Checkpoint {
+                format_version: 1,
+                identity: self.identity.clone(),
+                ..Default::default()
+            }),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn next_atom(&self, after: &Cursor) -> Result<Option<Cursor>> {
+        let row = sqlx::query(
+            "SELECT tenant_id, content_hash FROM semantic_atoms WHERE (tenant_id, content_hash) > ($1, $2) ORDER BY tenant_id, content_hash LIMIT 1",
+        )
+        .bind(&after.tenant_id)
+        .bind(&after.content_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            Ok(Cursor {
+                tenant_id: row.try_get("tenant_id")?,
+                content_hash: row.try_get("content_hash")?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn source_reference(
+        &self,
+        cursor: &Cursor,
+        copy: bool,
+    ) -> Result<(ConversationBodyReference, String)> {
+        let tenant = Uuid::parse_str(&cursor.tenant_id)?;
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *transaction)
+            .await?;
+        let row = sqlx::query(
+            "SELECT CAST(length(content_json) AS BIGINT) AS chars, CAST(octet_length(content_json) AS BIGINT) AS bytes, md5(content_json) AS digest, left(content_json, 4096) AS prefix FROM semantic_atoms WHERE tenant_id = $1 AND content_hash = $2",
+        )
+        .bind(&cursor.tenant_id).bind(&cursor.content_hash)
+        .fetch_one(&mut *transaction).await?;
+        let chars = u64::try_from(row.try_get::<i64, _>("chars")?)?;
+        let expected_bytes = u64::try_from(row.try_get::<i64, _>("bytes")?)?;
+        let source_md5: String = row.try_get("digest")?;
+        let prefix: String = row.try_get("prefix")?;
+        if expected_bytes <= 4096
+            && let Ok(reference) = serde_json::from_str::<ConversationBodyReference>(&prefix)
+        {
+            transaction.commit().await?;
+            self.target
+                .verify_tenant_content(tenant, &reference.conversation_body_v1)
+                .await?;
+            return Ok((reference, source_md5));
+        }
+        let staging = format!(
+            "migration-staging/conversation-v1/{}/{}",
+            self.identity,
+            Uuid::now_v7()
+        );
+        let mut writer = if copy {
+            Some(self.target.start_writer(&staging).await?)
+        } else {
+            None
+        };
+        let mut digest = blake3::Hasher::new();
+        let mut offset = 0_u64;
+        let mut bytes = 0_u64;
+        while offset < chars {
+            let chunk: String = sqlx::query_scalar(
+                "SELECT substring(content_json FROM $3 FOR 65536) FROM semantic_atoms WHERE tenant_id = $1 AND content_hash = $2",
+            )
+            .bind(&cursor.tenant_id).bind(&cursor.content_hash)
+            .bind(i32::try_from(offset.checked_add(1).ok_or("character offset overflow")?)?)
+            .fetch_one(&mut *transaction).await?;
+            if chunk.is_empty() {
+                return Err("source ended before its declared character count".into());
+            }
+            offset += chunk.chars().count() as u64;
+            bytes += chunk.len() as u64;
+            digest.update(chunk.as_bytes());
+            if let Some(writer) = &mut writer {
+                writer.write(Bytes::from(chunk)).await?;
+            }
+        }
+        transaction.commit().await?;
+        if bytes != expected_bytes || offset != chars {
+            return Err("source byte/character count mismatch".into());
+        }
+        let blake3_digest = digest.finalize().to_hex().to_string();
+        let object = if let Some(writer) = writer {
+            let staged = writer.finish_staged().await?;
+            if staged.blake3_digest != blake3_digest || staged.size_bytes != expected_bytes {
+                return Err("streamed transfer digest mismatch".into());
+            }
+            let object = self
+                .target
+                .promote_staged_text_to_cas(tenant, &staged)
+                .await?;
+            self.target.delete(&staged.object_locator).await?;
+            object
+        } else {
+            memeloop_token_center::archive::CasArchiveObject {
+                object_locator: format!(
+                    "tenants/{tenant}/cas/v1/blake3/{}/{blake3_digest}",
+                    &blake3_digest[..2]
+                ),
+                blake3_digest,
+                size_bytes: expected_bytes,
+            }
+        };
+        Ok((
+            ConversationBodyReference {
+                conversation_body_v1: object,
+                chars,
+            },
+            source_md5,
+        ))
+    }
+
+    async fn transfer(&self, cursor: &Cursor) -> Result<Transfer> {
+        let bytes = self
+            .target
+            .get_bounded(&transfer_key(&self.identity, cursor)?, 16384)
+            .await?;
+        let transfer: Transfer = serde_json::from_slice(&bytes)?;
+        if transfer.format_version != 1
+            || transfer.identity != self.identity
+            || transfer.cursor != *cursor
+        {
+            return Err("transfer receipt identity mismatch".into());
+        }
+        Ok(transfer)
+    }
+
+    async fn copy(&self) -> Result<Checkpoint> {
+        let mut checkpoint = self.load_checkpoint()?;
+        if checkpoint.copied {
+            return Ok(checkpoint);
+        }
+        if checkpoint.copied_rows == 0 {
+            checkpoint.expected_rows = u64::try_from(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM semantic_atoms")
+                    .fetch_one(&self.pool)
+                    .await?,
+            )?;
+            save_checkpoint(&self.checkpoint, &checkpoint)?;
+        }
+        while let Some(cursor) = self.next_atom(&checkpoint.cursor).await? {
+            let (reference, source_md5) = self.source_reference(&cursor, true).await?;
+            let transfer = Transfer {
+                format_version: 1,
+                identity: self.identity.clone(),
+                cursor: cursor.clone(),
+                source_md5,
+                reference,
+            };
+            let key = transfer_key(&self.identity, &cursor)?;
+            self.target
+                .put(&key, Bytes::from(serde_json::to_vec(&transfer)?))
+                .await?;
+            let checked = self.transfer(&cursor).await?;
+            if serde_json::to_vec(&checked)? != serde_json::to_vec(&transfer)? {
+                return Err("transfer receipt readback mismatch".into());
+            }
+            checkpoint.copied_rows += 1;
+            checkpoint.copied_bytes += transfer.reference.conversation_body_v1.size_bytes;
+            checkpoint.ordered_digest =
+                ordered_digest(&checkpoint.ordered_digest, &cursor, &transfer.reference);
+            checkpoint.cursor = cursor;
+            save_checkpoint(&self.checkpoint, &checkpoint)?;
+        }
+        if checkpoint.copied_rows != checkpoint.expected_rows {
+            return Err(
+                "source count changed; quiesce writers before restarting the inventory".into(),
+            );
+        }
+        checkpoint.copied = true;
+        save_checkpoint(&self.checkpoint, &checkpoint)?;
+        Ok(checkpoint)
+    }
+
+    async fn verify(&self) -> Result<Checkpoint> {
+        let mut checkpoint = self.load_checkpoint()?;
+        if !checkpoint.copied || checkpoint.cutover_rows != 0 {
+            return Err("verify requires a completed copy before cutover".into());
+        }
+        let mut cursor = Cursor::default();
+        let mut count = 0_u64;
+        let mut bytes = 0_u64;
+        let mut digest = String::new();
+        while let Some(next) = self.next_atom(&cursor).await? {
+            let transfer = self.transfer(&next).await?;
+            let (source, source_md5) = self.source_reference(&next, false).await?;
+            if source_md5 != transfer.source_md5
+                || serde_json::to_vec(&source)? != serde_json::to_vec(&transfer.reference)?
+            {
+                return Err("source differs from copied transfer".into());
+            }
+            self.target
+                .verify_tenant_content(
+                    Uuid::parse_str(&next.tenant_id)?,
+                    &source.conversation_body_v1,
+                )
+                .await?;
+            digest = ordered_digest(&digest, &next, &source);
+            count += 1;
+            bytes += source.conversation_body_v1.size_bytes;
+            cursor = next;
+        }
+        if count != checkpoint.expected_rows
+            || bytes != checkpoint.copied_bytes
+            || digest != checkpoint.ordered_digest
+        {
+            return Err("full-copy count, byte or ordered hash mismatch".into());
+        }
+        checkpoint.verified_context_nodes = self.verify_context_nodes().await?;
+        checkpoint.verified_rows = count;
+        checkpoint.verified = true;
+        save_checkpoint(&self.checkpoint, &checkpoint)?;
+        Ok(checkpoint)
+    }
+
+    async fn verify_context_nodes(&self) -> Result<u64> {
+        let mut tenant = String::new();
+        let mut node = String::new();
+        let mut count = 0_u64;
+        loop {
+            let row = sqlx::query(
+                "SELECT n.tenant_id, n.node_hash, n.parent_hash, n.atom_hash, n.depth, p.depth AS parent_depth FROM context_nodes n LEFT JOIN context_nodes p ON p.tenant_id = n.tenant_id AND p.node_hash = n.parent_hash WHERE (n.tenant_id, n.node_hash) > ($1, $2) ORDER BY n.tenant_id, n.node_hash LIMIT 1",
+            )
+            .bind(&tenant).bind(&node).fetch_optional(&self.pool).await?;
+            let Some(row) = row else { break };
+            tenant = row.try_get("tenant_id")?;
+            node = row.try_get("node_hash")?;
+            let parent: Option<String> = row.try_get("parent_hash")?;
+            let atom: String = row.try_get("atom_hash")?;
+            let depth: i64 = row.try_get("depth")?;
+            let parent_depth: Option<i64> = row.try_get("parent_depth")?;
+            if depth <= 0
+                || memeloop_token_center::conversation::digest_parts(parent.as_deref(), &atom)
+                    != node
+                || if parent.is_some() {
+                    parent_depth.and_then(|depth| depth.checked_add(1)) != Some(depth)
+                } else {
+                    depth != 1
+                }
+            {
+                return Err("conversation parent/order/hash reconstruction failed".into());
+            }
+            let transfer = self
+                .transfer(&Cursor {
+                    tenant_id: tenant.clone(),
+                    content_hash: atom,
+                })
+                .await?;
+            self.target
+                .verify_tenant_content(
+                    Uuid::parse_str(&tenant)?,
+                    &transfer.reference.conversation_body_v1,
+                )
+                .await?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    async fn cutover_test(&self) -> Result<Checkpoint> {
+        let database: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(&self.pool)
+            .await?;
+        if !database.ends_with("_test") && !database.starts_with("mtc_test_") {
+            return Err(
+                "source mutation is restricted to an explicitly named TEST database".into(),
+            );
+        }
+        let mut checkpoint = self.load_checkpoint()?;
+        if !checkpoint.verified || checkpoint.verified_rows != checkpoint.expected_rows {
+            return Err("cutover requires full count/hash/context verification".into());
+        }
+        while let Some(cursor) = self.next_atom(&checkpoint.cutover_cursor).await? {
+            let transfer = self.transfer(&cursor).await?;
+            self.target
+                .verify_tenant_content(
+                    Uuid::parse_str(&cursor.tenant_id)?,
+                    &transfer.reference.conversation_body_v1,
+                )
+                .await?;
+            let encoded = serde_json::to_string(&transfer.reference)?;
+            let changed = sqlx::query(
+                "UPDATE semantic_atoms SET content_json = $3 WHERE tenant_id = $1 AND content_hash = $2 AND (md5(content_json) = $4 OR content_json = $3)",
+            )
+            .bind(&cursor.tenant_id).bind(&cursor.content_hash).bind(encoded).bind(&transfer.source_md5)
+            .execute(&self.pool).await?;
+            if changed.rows_affected() != 1 {
+                return Err("source changed after verification; source retained".into());
+            }
+            checkpoint.cutover_rows += 1;
+            checkpoint.cutover_cursor = cursor;
+            save_checkpoint(&self.checkpoint, &checkpoint)?;
+        }
+        if checkpoint.cutover_rows != checkpoint.expected_rows {
+            return Err("cutover count mismatch".into());
+        }
+        checkpoint.cutover_complete = true;
+        save_checkpoint(&self.checkpoint, &checkpoint)?;
+        Ok(checkpoint)
+    }
+}
+
+async fn run(args: Args) -> Result<()> {
+    if args.phase != Phase::Inventory && !args.writers_quiesced {
+        return Err("copy/verify/cutover require --writers-quiesced; no concurrent legacy writer is supported".into());
+    }
+    let config = Config::from_env()?;
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&config.database_url)
+        .await?;
+    if args.phase == Phase::Inventory {
+        let row = sqlx::query("SELECT COUNT(*) AS rows, COALESCE(SUM(octet_length(content_json)), 0)::BIGINT AS bytes FROM semantic_atoms")
+            .fetch_one(&pool).await?;
+        println!(
+            "{}",
+            serde_json::json!({"scope":"semantic_atoms", "rows":row.try_get::<i64,_>("rows")?, "body_bytes":row.try_get::<i64,_>("bytes")?})
+        );
+        return Ok(());
+    }
+    let mut source = url::Url::parse(&config.database_url)?;
+    source
+        .set_password(None)
+        .map_err(|_| "invalid database URL")?;
+    source
+        .set_username("")
+        .map_err(|_| "invalid database URL")?;
+    let target_identity = serde_json::to_vec(&(
+        &config.archive_backend,
+        &config.archive_path,
+        &config.s3_endpoint,
+        &config.s3_bucket,
+    ))?;
+    let identity = blake3::hash(&[source.as_str().as_bytes(), &target_identity].concat())
+        .to_hex()
+        .to_string();
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(args.checkpoint.with_extension("lock"))?;
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
+    let mut advisory = pool.acquire().await?;
+    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(70720261029)")
+        .fetch_one(&mut *advisory)
+        .await?;
+    if !acquired {
+        return Err("another conversation migration holds the source lock".into());
+    }
+    let runner = Runner {
+        pool: pool.clone(),
+        target: ArchiveStore::from_config(&config).await?,
+        checkpoint: args.checkpoint,
+        identity,
+    };
+    let result = match args.phase {
+        Phase::Copy => runner.copy().await,
+        Phase::Verify => runner.verify().await,
+        Phase::CutoverTest => runner.cutover_test().await,
+        Phase::Inventory => unreachable!(),
+    };
+    sqlx::query("SELECT pg_advisory_unlock(70720261029)")
+        .execute(&mut *advisory)
+        .await?;
+    println!("{}", serde_json::to_string(&result?)?);
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    match run(Args::parse()).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(_) => {
+            eprintln!(
+                "conversation object migration stopped; source or checkpoint is not verified"
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "conversation_object_migration_tests.rs"]
+mod tests;
