@@ -51,6 +51,20 @@ impl Output {
 }
 
 impl Runner {
+    pub(super) fn require_reconstruction_receipt(&self) -> Result<()> {
+        let receipt: ReconstructionCheckpoint = serde_json::from_reader(std::fs::File::open(
+            self.checkpoint.with_extension("reconstruction.json"),
+        )?)?;
+        if receipt.format_version != 1
+            || receipt.identity != self.identity
+            || !receipt.complete
+            || !receipt.verified
+        {
+            return Err("verified dialogue reconstruction required before TEST cutover".into());
+        }
+        Ok(())
+    }
+
     async fn reconstruct_one(&self, observation: &str, copy: bool) -> Result<Receipt> {
         let row = sqlx::query(
             "SELECT c.tenant_id, o.request_id, o.leaf_node_hash, row_to_json(o)::TEXT AS metadata

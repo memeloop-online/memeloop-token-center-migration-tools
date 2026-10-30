@@ -27,9 +27,11 @@ their JSON or clearing source. The receipt retains field identity and exact
 source digest. This covers original payload bodies as well as branch/tool
 metadata that cannot be discarded on the strength of atom verification alone.
 
-Imported archive records still need separate verified transfer
-receipts before retiring their source tables. Do not use atom counts to claim
-complete dialogue/media migration.
+Locator transfer also inventories import records (including previous locators),
+unlinked requests, quarantine records and immutable quarantine versions. Each
+source class has its own ordered receipt identity; legacy inline originals
+stream from their exact source columns. This does not modify the CPA importer.
+Do not use atom counts to claim complete dialogue/media migration.
 
 `reconstruct` / `verify-reconstruction` walk each retained observation's exact
 prefix ancestry and stream a separate NDJSON object per observation. Event
@@ -64,7 +66,9 @@ byte count, ordered digest and all context-node parent/depth/content identities.
 It does not label absent raw responses or external media as recovered.
 
 Only `--phase cutover-test --writers-quiesced` mutates source rows. It requires
-a completed verification receipt and a database named `*_test` or `mtc_test_*`.
+a completed atom and dialogue-reconstruction verification receipt and a database
+named `*_test` or `mtc_test_*`. Before the first source mutation it reruns atom
+and reconstruction verification; a stale receipt alone is insufficient.
 Each target object is verified again before conditional replacement of the
 old body with its object reference. A changed source stops cutover rather than
 being deleted. Checkpoint resume tolerates a committed row whose checkpoint

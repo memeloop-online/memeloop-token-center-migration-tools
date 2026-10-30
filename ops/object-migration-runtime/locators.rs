@@ -152,6 +152,16 @@ impl Runner {
              SELECT 'request' AS kind, tenant_id AS tenant, id AS identity, request_object AS locator, CAST(NULL AS TEXT) AS expected_digest, CAST(NULL AS BIGINT) AS expected_bytes FROM request_records
              UNION ALL SELECT 'response', tenant_id, id, response_object, NULL, NULL FROM request_records
              UNION ALL SELECT 'media', tenant_id, turn_id || ':' || part_index, object_locator, content_blake3, byte_length FROM conversation_media_parts
+             UNION ALL SELECT 'import_request', tenant_id, json_build_array(source, external_request_id)::TEXT, request_object, NULL, NULL FROM session_archive_import_records
+             UNION ALL SELECT 'import_response', tenant_id, json_build_array(source, external_request_id)::TEXT, response_object, NULL, NULL FROM session_archive_import_records
+             UNION ALL SELECT 'import_previous_request', tenant_id, json_build_array(source, external_request_id)::TEXT, previous_request_object, NULL, NULL FROM session_archive_import_records
+             UNION ALL SELECT 'import_previous_response', tenant_id, json_build_array(source, external_request_id)::TEXT, previous_response_object, NULL, NULL FROM session_archive_import_records
+             UNION ALL SELECT 'unlinked_request', tenant_id, archive_request_id, request_object, NULL, NULL FROM session_archive_unlinked_requests
+             UNION ALL SELECT 'unlinked_response', tenant_id, archive_request_id, response_object, NULL, NULL FROM session_archive_unlinked_requests
+             UNION ALL SELECT 'quarantine_request', tenant_id, id, request_object, NULL, NULL FROM session_archive_quarantine_records
+             UNION ALL SELECT 'quarantine_response', tenant_id, id, response_object, NULL, NULL FROM session_archive_quarantine_records
+             UNION ALL SELECT 'quarantine_version_request', tenant_id, id, request_object, NULL, NULL FROM session_archive_quarantine_record_versions
+             UNION ALL SELECT 'quarantine_version_response', tenant_id, id, response_object, NULL, NULL FROM session_archive_quarantine_record_versions
              ) SELECT kind, tenant, identity, left(locator, 4096) AS locator, expected_digest, expected_bytes FROM sources
              WHERE (kind, tenant, identity) > ($1, $2, $3)
                AND locator IS NOT NULL AND locator <> ''
@@ -218,18 +228,65 @@ impl Runner {
             sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
                 .execute(&mut *transaction)
                 .await?;
-            let statement = match located.cursor.kind.as_str() {
-                "request" => {
-                    "SELECT substring(request_object FROM $3 FOR 65536) FROM request_records WHERE id = $1 AND tenant_id = $2"
+            let (table, id, column) = match located.cursor.kind.as_str() {
+                "request" => ("request_records", "id", "request_object"),
+                "response" => ("request_records", "id", "response_object"),
+                "import_request" => (
+                    "session_archive_import_records",
+                    "json_build_array(source, external_request_id)::TEXT",
+                    "request_object",
+                ),
+                "import_response" => (
+                    "session_archive_import_records",
+                    "json_build_array(source, external_request_id)::TEXT",
+                    "response_object",
+                ),
+                "import_previous_request" => (
+                    "session_archive_import_records",
+                    "json_build_array(source, external_request_id)::TEXT",
+                    "previous_request_object",
+                ),
+                "import_previous_response" => (
+                    "session_archive_import_records",
+                    "json_build_array(source, external_request_id)::TEXT",
+                    "previous_response_object",
+                ),
+                "unlinked_request" => (
+                    "session_archive_unlinked_requests",
+                    "archive_request_id",
+                    "request_object",
+                ),
+                "unlinked_response" => (
+                    "session_archive_unlinked_requests",
+                    "archive_request_id",
+                    "response_object",
+                ),
+                "quarantine_request" => {
+                    ("session_archive_quarantine_records", "id", "request_object")
                 }
-                "response" => {
-                    "SELECT substring(response_object FROM $3 FOR 65536) FROM request_records WHERE id = $1 AND tenant_id = $2"
-                }
+                "quarantine_response" => (
+                    "session_archive_quarantine_records",
+                    "id",
+                    "response_object",
+                ),
+                "quarantine_version_request" => (
+                    "session_archive_quarantine_record_versions",
+                    "id",
+                    "request_object",
+                ),
+                "quarantine_version_response" => (
+                    "session_archive_quarantine_record_versions",
+                    "id",
+                    "response_object",
+                ),
                 _ => return Err("inline media locator is not an archived media object".into()),
             };
+            let statement = format!(
+                "SELECT substring({column} FROM $3 FOR 65536) FROM {table} WHERE {id} = $1 AND tenant_id = $2"
+            );
             let mut position = 13_i32;
             loop {
-                let text: String = sqlx::query_scalar(statement)
+                let text: String = sqlx::query_scalar(sqlx::AssertSqlSafe(statement.as_str()))
                     .bind(&located.cursor.identity)
                     .bind(&located.cursor.tenant)
                     .bind(position)

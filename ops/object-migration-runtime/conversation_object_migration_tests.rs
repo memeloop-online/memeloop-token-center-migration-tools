@@ -18,6 +18,10 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
         "CREATE TABLE semantic_atoms(tenant_id TEXT NOT NULL, content_hash TEXT NOT NULL, content_json TEXT NOT NULL, PRIMARY KEY(tenant_id, content_hash));
          CREATE TABLE context_nodes(tenant_id TEXT NOT NULL, node_hash TEXT NOT NULL, parent_hash TEXT, atom_hash TEXT NOT NULL, depth BIGINT NOT NULL, PRIMARY KEY(tenant_id, node_hash));
          CREATE TABLE request_records(id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, request_object TEXT, response_object TEXT);
+         CREATE TABLE session_archive_import_records(tenant_id TEXT NOT NULL, source TEXT NOT NULL, external_request_id TEXT NOT NULL, request_object TEXT, response_object TEXT, previous_request_object TEXT, previous_response_object TEXT);
+         CREATE TABLE session_archive_unlinked_requests(tenant_id TEXT NOT NULL, archive_request_id TEXT NOT NULL, request_object TEXT, response_object TEXT);
+         CREATE TABLE session_archive_quarantine_records(tenant_id TEXT NOT NULL, id TEXT NOT NULL, request_object TEXT, response_object TEXT);
+         CREATE TABLE session_archive_quarantine_record_versions(LIKE session_archive_quarantine_records INCLUDING ALL);
          CREATE TABLE conversation_media_parts(tenant_id TEXT NOT NULL, turn_id TEXT NOT NULL, part_index BIGINT NOT NULL, object_locator TEXT NOT NULL, content_blake3 TEXT NOT NULL, byte_length BIGINT NOT NULL, media_type TEXT NOT NULL DEFAULT 'application/octet-stream');
          CREATE TABLE conversation_clusters(id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL);
          CREATE TABLE conversation_observations(id TEXT PRIMARY KEY, cluster_id TEXT NOT NULL, request_id TEXT NOT NULL, leaf_node_hash TEXT, agent_id TEXT, parent_agent_id TEXT);
@@ -41,6 +45,15 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
         .unwrap();
     sqlx::query("INSERT INTO context_nodes VALUES ($1, $2, NULL, $3, 1)")
         .bind(tenant.to_string())
+        .bind(&node)
+        .bind(&hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let branch_node = memeloop_token_center::conversation::digest_parts(Some(&node), &hash);
+    sqlx::query("INSERT INTO context_nodes VALUES ($1, $2, $3, $4, 2)")
+        .bind(tenant.to_string())
+        .bind(&branch_node)
         .bind(&node)
         .bind(&hash)
         .execute(&pool)
@@ -86,6 +99,8 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
     .execute(&pool)
     .await
     .unwrap();
+    sqlx::query("INSERT INTO session_archive_quarantine_record_versions VALUES ($1, 'retained-quarantine', $2, NULL)")
+        .bind(tenant.to_string()).bind(format!("inline-json:{document}")).execute(&pool).await.unwrap();
     let locators = runner
         .transfer_locators_from(&source, "fixture", false)
         .await
@@ -96,10 +111,10 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
         .await
         .unwrap();
     assert!(locators.verified);
-    assert_eq!(locators.copied_rows, 3);
+    assert_eq!(locators.copied_rows, 4);
     assert_eq!(
         locators.copied_bytes,
-        document.len() as u64 + response.len() as u64 + 15
+        2 * document.len() as u64 + response.len() as u64 + 15
     );
     source
         .put("fixture/response", Bytes::from_static(b"changed"))
@@ -212,7 +227,7 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
     );
     let verified = runner.verify().await.unwrap();
     assert_eq!(verified.verified_rows, 1);
-    assert_eq!(verified.verified_context_nodes, 1);
+    assert_eq!(verified.verified_context_nodes, 2);
     sqlx::query("INSERT INTO conversation_clusters VALUES ('session', $1)")
         .bind(tenant.to_string())
         .execute(&pool)
@@ -220,6 +235,8 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
         .unwrap();
     sqlx::query("INSERT INTO conversation_observations VALUES ('observation', 'session', $1, $2, 'agent-child', 'agent-parent')")
         .bind(raw_request_id.to_string()).bind(&node).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO conversation_observations VALUES ('branch-observation', 'session', $1, $2, 'agent-child', 'agent-parent')")
+        .bind(raw_request_id.to_string()).bind(&branch_node).execute(&pool).await.unwrap();
     let reconstructed = runner.reconstruct_dialogues(false).await.unwrap();
     assert_eq!(
         (
@@ -227,7 +244,7 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
             reconstructed.events,
             reconstructed.media
         ),
-        (1, 1, 1)
+        (2, 3, 3)
     );
     assert!(runner.reconstruct_dialogues(true).await.unwrap().verified);
     sqlx::query("UPDATE conversation_observations SET parent_agent_id = 'changed-parent'")

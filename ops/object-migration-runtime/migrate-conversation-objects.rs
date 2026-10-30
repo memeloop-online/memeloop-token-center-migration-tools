@@ -446,6 +446,11 @@ impl Runner {
         if !checkpoint.verified || checkpoint.verified_rows != checkpoint.expected_rows {
             return Err("cutover requires full count/hash/context verification".into());
         }
+        self.require_reconstruction_receipt()?;
+        if checkpoint.cutover_rows == 0 {
+            self.verify().await?;
+            self.reconstruct_dialogues(true).await?;
+        }
         while let Some(cursor) = self.next_atom(&checkpoint.cutover_cursor).await? {
             let transfer = self.transfer(&cursor).await?;
             self.target
