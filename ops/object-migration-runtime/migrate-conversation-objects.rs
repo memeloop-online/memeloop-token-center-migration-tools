@@ -17,6 +17,8 @@ type Result<Value> = std::result::Result<Value, Failure>;
 mod locators;
 #[path = "conversation-object-modules/payloads.rs"]
 mod payloads;
+#[path = "conversation-object-modules/reconstruction.rs"]
+mod reconstruction;
 #[path = "conversation-object-modules/spools.rs"]
 mod spools;
 
@@ -32,6 +34,8 @@ enum Phase {
     VerifySpools,
     CopyPayloads,
     VerifyPayloads,
+    Reconstruct,
+    VerifyReconstruction,
 }
 
 #[derive(Parser)]
@@ -525,6 +529,16 @@ async fn run(args: Args) -> Result<()> {
         checkpoint: args.checkpoint,
         identity,
     };
+    if matches!(args.phase, Phase::Reconstruct | Phase::VerifyReconstruction) {
+        let result = runner
+            .reconstruct_dialogues(args.phase == Phase::VerifyReconstruction)
+            .await;
+        sqlx::query("SELECT pg_advisory_unlock(70720261029)")
+            .execute(&mut *advisory)
+            .await?;
+        println!("{}", serde_json::to_string(&result?)?);
+        return Ok(());
+    }
     if matches!(args.phase, Phase::CopyPayloads | Phase::VerifyPayloads) {
         let result = runner
             .transfer_payloads(args.phase == Phase::VerifyPayloads)
@@ -568,7 +582,9 @@ async fn run(args: Args) -> Result<()> {
         | Phase::CopySpools
         | Phase::VerifySpools
         | Phase::CopyPayloads
-        | Phase::VerifyPayloads => {
+        | Phase::VerifyPayloads
+        | Phase::Reconstruct
+        | Phase::VerifyReconstruction => {
             unreachable!()
         }
     };

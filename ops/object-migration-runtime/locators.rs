@@ -25,6 +25,7 @@ struct LocatorReceipt {
 pub(super) struct LocatorCheckpoint {
     format_version: u32,
     identity: String,
+    owner_identity: String,
     cursor: LocatorCursor,
     pub(super) copied_rows: u64,
     pub(super) copied_bytes: u64,
@@ -89,6 +90,44 @@ fn save(path: &std::path::Path, checkpoint: &LocatorCheckpoint) -> Result<()> {
 }
 
 impl Runner {
+    pub(super) async fn verified_locator(
+        &self,
+        kind: &str,
+        tenant: &str,
+        identity: &str,
+    ) -> Result<CasArchiveObject> {
+        let checkpoint: LocatorCheckpoint = serde_json::from_reader(std::fs::File::open(
+            self.checkpoint.with_extension("locators.json"),
+        )?)?;
+        if checkpoint.format_version != 1
+            || checkpoint.owner_identity != self.identity
+            || !checkpoint.complete
+            || !checkpoint.verified
+        {
+            return Err("verified locator inventory required".into());
+        }
+        let cursor = LocatorCursor {
+            kind: kind.into(),
+            tenant: tenant.into(),
+            identity: identity.into(),
+        };
+        let bytes = self
+            .target
+            .get_bounded(&receipt_key(&checkpoint.identity, &cursor)?, 16384)
+            .await?;
+        let receipt: LocatorReceipt = serde_json::from_slice(&bytes)?;
+        if receipt.format_version != 1
+            || receipt.cursor != cursor
+            || receipt.identity != checkpoint.identity
+        {
+            return Err("locator receipt ownership mismatch".into());
+        }
+        self.target
+            .verify_tenant_content(Uuid::parse_str(tenant)?, &receipt.object)
+            .await?;
+        Ok(receipt.object)
+    }
+
     pub(super) async fn transfer_locators(
         &self,
         target_config: &Config,
@@ -270,11 +309,15 @@ impl Runner {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => LocatorCheckpoint {
                 format_version: 1,
                 identity: identity.into(),
+                owner_identity: self.identity.clone(),
                 ..Default::default()
             },
             Err(error) => return Err(error.into()),
         };
-        if checkpoint.format_version != 1 || checkpoint.identity != identity {
+        if checkpoint.format_version != 1
+            || checkpoint.identity != identity
+            || checkpoint.owner_identity != self.identity
+        {
             return Err("locator checkpoint belongs to another source/target".into());
         }
         if verify && !checkpoint.complete {
@@ -291,6 +334,7 @@ impl Runner {
             LocatorCheckpoint {
                 format_version: 1,
                 identity: identity.into(),
+                owner_identity: self.identity.clone(),
                 ..Default::default()
             }
         } else {
@@ -318,6 +362,16 @@ impl Runner {
             self.target
                 .verify_tenant_content(Uuid::parse_str(&located.cursor.tenant)?, &receipt.object)
                 .await?;
+            if verify && matches!(located.cursor.kind.as_str(), "request" | "response") {
+                self.target
+                    .publish_raw_capture(
+                        Uuid::parse_str(&located.cursor.tenant)?,
+                        Uuid::parse_str(&located.cursor.identity)?,
+                        &located.cursor.kind,
+                        &receipt.object,
+                    )
+                    .await?;
+            }
             let mut digest = blake3::Hasher::new();
             digest.update(result.digest.as_bytes());
             digest.update(&encoded);

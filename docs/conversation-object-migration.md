@@ -31,6 +31,21 @@ Imported archive records still need separate verified transfer
 receipts before retiring their source tables. Do not use atom counts to claim
 complete dialogue/media migration.
 
+`reconstruct` / `verify-reconstruction` walk each retained observation's exact
+prefix ancestry and stream a separate NDJSON object per observation. Event
+records carry explicit descending ordinals, parent hashes and verified body
+references; media records carry verified type/part/hash/length references.
+Observation metadata preserves agent/parent relationships without flattening
+branches. Exact original request/response references are mandatory: missing
+raw evidence fails closed. Independent reconstruction must reproduce the same
+object hash, event/media counts and ordered receipt digest. This certifies the
+retained historical projection, not that older normalization captured every
+unknown provider field. Raw JSON/SSE remains the original evidence.
+
+Verified raw-locator transfer publishes the product's immutable raw roots only
+after source/destination byte verification, allowing direct product reads without
+inline-body or old-bucket fallback. It never alters source rows.
+
 The command defaults to read-only `inventory`. Credentials and source database
 URL use existing `MTC_*` environment configuration; the configured archive is
 the destination. No credentials are accepted in command arguments or emitted
