@@ -13,6 +13,8 @@ use uuid::Uuid;
 type Failure = Box<dyn std::error::Error + Send + Sync>;
 type Result<Value> = std::result::Result<Value, Failure>;
 
+#[path = "conversation-object-modules/inventory.rs"]
+mod inventory;
 #[path = "conversation-object-modules/locators.rs"]
 mod locators;
 #[path = "conversation-object-modules/payloads.rs"]
@@ -491,12 +493,7 @@ async fn run(args: Args) -> Result<()> {
         .connect(&config.database_url)
         .await?;
     if args.phase == Phase::Inventory {
-        let row = sqlx::query("SELECT COUNT(*) AS rows, COALESCE(SUM(octet_length(content_json)), 0)::BIGINT AS bytes FROM semantic_atoms")
-            .fetch_one(&pool).await?;
-        println!(
-            "{}",
-            serde_json::json!({"scope":"semantic_atoms", "rows":row.try_get::<i64,_>("rows")?, "body_bytes":row.try_get::<i64,_>("bytes")?})
-        );
+        println!("{}", inventory::inventory(&pool).await?);
         return Ok(());
     }
     let mut source = url::Url::parse(&config.database_url)?;

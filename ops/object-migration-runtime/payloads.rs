@@ -12,7 +12,7 @@ pub(super) enum SourceField {
     Hints,
 }
 
-const FIELDS: [SourceField; 6] = [
+pub(super) const FIELDS: [SourceField; 6] = [
     SourceField::SemanticPayload,
     SourceField::OutboxRequest,
     SourceField::SemanticSnapshot,

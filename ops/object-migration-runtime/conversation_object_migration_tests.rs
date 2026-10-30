@@ -214,6 +214,13 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
     assert_eq!(retained_payload, document);
     assert!(runner.cutover_test().await.is_err());
     let copied = runner.copy().await.unwrap();
+    let inventory = inventory::inventory(&pool).await.unwrap();
+    assert_eq!(
+        inventory["fields"][0]["exact_text_bytes"],
+        document.len() as u64
+    );
+    assert_eq!(inventory["media"]["indexed_bytes"], 15);
+    assert_eq!(inventory["complete_training_fidelity_certified"], false);
     assert_eq!(copied.copied_rows, 1);
     assert_eq!(copied.copied_bytes, document.len() as u64);
     let retained: String = sqlx::query_scalar("SELECT content_json FROM semantic_atoms")
