@@ -15,6 +15,8 @@ type Result<Value> = std::result::Result<Value, Failure>;
 
 #[path = "conversation-object-modules/locators.rs"]
 mod locators;
+#[path = "conversation-object-modules/spools.rs"]
+mod spools;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum Phase {
@@ -24,6 +26,8 @@ enum Phase {
     CutoverTest,
     CopyLocators,
     VerifyLocators,
+    CopySpools,
+    VerifySpools,
 }
 
 #[derive(Parser)]
@@ -96,7 +100,7 @@ fn transfer_key(identity: &str, cursor: &Cursor) -> Result<String> {
     ))
 }
 
-fn save_checkpoint(path: &std::path::Path, checkpoint: &Checkpoint) -> Result<()> {
+fn save_checkpoint<Value: Serialize>(path: &std::path::Path, checkpoint: &Value) -> Result<()> {
     let directory = path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -505,6 +509,19 @@ async fn run(args: Args) -> Result<()> {
         checkpoint: args.checkpoint,
         identity,
     };
+    if matches!(args.phase, Phase::CopySpools | Phase::VerifySpools) {
+        let result = runner
+            .transfer_spools(
+                config.key_pepper.as_bytes(),
+                args.phase == Phase::VerifySpools,
+            )
+            .await;
+        sqlx::query("SELECT pg_advisory_unlock(70720261029)")
+            .execute(&mut *advisory)
+            .await?;
+        println!("{}", serde_json::to_string(&result?)?);
+        return Ok(());
+    }
     if matches!(args.phase, Phase::CopyLocators | Phase::VerifyLocators) {
         let result = runner
             .transfer_locators(&config, args.phase == Phase::VerifyLocators)
@@ -520,7 +537,9 @@ async fn run(args: Args) -> Result<()> {
         Phase::Verify => runner.verify().await,
         Phase::CutoverTest => runner.cutover_test().await,
         Phase::Inventory => unreachable!(),
-        Phase::CopyLocators | Phase::VerifyLocators => unreachable!(),
+        Phase::CopyLocators | Phase::VerifyLocators | Phase::CopySpools | Phase::VerifySpools => {
+            unreachable!()
+        }
     };
     sqlx::query("SELECT pg_advisory_unlock(70720261029)")
         .execute(&mut *advisory)

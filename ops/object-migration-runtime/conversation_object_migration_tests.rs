@@ -18,7 +18,11 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
         "CREATE TABLE semantic_atoms(tenant_id TEXT NOT NULL, content_hash TEXT NOT NULL, content_json TEXT NOT NULL, PRIMARY KEY(tenant_id, content_hash));
          CREATE TABLE context_nodes(tenant_id TEXT NOT NULL, node_hash TEXT NOT NULL, parent_hash TEXT, atom_hash TEXT NOT NULL, depth BIGINT NOT NULL, PRIMARY KEY(tenant_id, node_hash));
          CREATE TABLE request_records(id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, request_object TEXT, response_object TEXT);
-         CREATE TABLE conversation_media_parts(tenant_id TEXT NOT NULL, turn_id TEXT NOT NULL, part_index BIGINT NOT NULL, object_locator TEXT NOT NULL, content_blake3 TEXT NOT NULL, byte_length BIGINT NOT NULL);",
+         CREATE TABLE conversation_media_parts(tenant_id TEXT NOT NULL, turn_id TEXT NOT NULL, part_index BIGINT NOT NULL, object_locator TEXT NOT NULL, content_blake3 TEXT NOT NULL, byte_length BIGINT NOT NULL);
+         CREATE TABLE request_archive_spools(request_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, reservation_id TEXT NOT NULL, state TEXT NOT NULL, chunk_count BIGINT NOT NULL, byte_count BIGINT NOT NULL);
+         CREATE TABLE response_archive_spools(LIKE request_archive_spools INCLUDING ALL);
+         CREATE TABLE request_archive_spool_chunks(request_id TEXT NOT NULL, seq BIGINT NOT NULL, ciphertext TEXT NOT NULL, byte_count BIGINT NOT NULL, PRIMARY KEY(request_id, seq));
+         CREATE TABLE response_archive_spool_chunks(LIKE request_archive_spool_chunks INCLUDING ALL);",
     ).execute(&pool).await.unwrap();
     let tenant = Uuid::now_v7();
     let document = serde_json::json!({"role":"tool", "content":"工具\n".repeat(200000), "tool_call_id":"call-1", "unknown":[1,2,3]}).to_string();
@@ -106,6 +110,49 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
     )
     .unwrap();
     assert!(!checkpoint.verified);
+    let spool_request = Uuid::now_v7();
+    let reservation = Uuid::now_v7();
+    let pepper = b"synthetic-spool-fixture-key";
+    let spool_body = b"data: {\"tool_call_id\":\"call-1\"}\n\n";
+    sqlx::query("INSERT INTO response_archive_spools VALUES ($1, $2, $3, 'pending', 1, $4)")
+        .bind(spool_request.to_string())
+        .bind(tenant.to_string())
+        .bind(reservation.to_string())
+        .bind(spool_body.len() as i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO response_archive_spool_chunks VALUES ($1, 0, $2, $3)")
+        .bind(spool_request.to_string())
+        .bind(spools::fixture_cipher(
+            pepper,
+            tenant,
+            spool_request,
+            reservation,
+            0,
+            spool_body,
+        ))
+        .bind(spool_body.len() as i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let copied_spools = runner.transfer_spools(pepper, false).await.unwrap();
+    assert_eq!(copied_spools.rows, 1);
+    assert_eq!(copied_spools.bytes, spool_body.len() as u64);
+    assert_eq!(copied_spools.chunks, 1);
+    assert!(runner.transfer_spools(pepper, true).await.unwrap().verified);
+    assert!(
+        runner
+            .transfer_spools(b"wrong fixture key", true)
+            .await
+            .is_err()
+    );
+    let source_chunks: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM response_archive_spool_chunks")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(source_chunks, 1);
     assert!(runner.cutover_test().await.is_err());
     let copied = runner.copy().await.unwrap();
     assert_eq!(copied.copied_rows, 1);

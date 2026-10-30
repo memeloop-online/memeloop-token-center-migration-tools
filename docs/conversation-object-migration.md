@@ -13,8 +13,15 @@ credentials use `MTC_SOURCE_S3_*` environment references; destination keeps
 existing `MTC_S3_*` configuration. These phases never replace source locators
 or delete original objects. Media bytes must match the existing index digest.
 
-Encrypted legacy spool chunks, outbox payload snapshots,
-and imported archive records still need separate verified transfer
+`copy-spools` / `verify-spools` decode retained legacy v2/zstd1 chunks with
+authenticated tenant/request/reservation/sequence AAD, stream plaintext into
+CAS, verify chunk sequence/count/bytes and independent readback, and retain the
+entire source. The source encryption key uses the existing key-pepper
+environment reference. Failed authentication stops transfer without clearing
+source rows. Preserving a partial spool does not certify a complete response;
+its original state is retained in the receipt.
+
+Outbox payload snapshots and imported archive records still need separate verified transfer
 receipts before retiring their source tables. Do not use atom counts to claim
 complete dialogue/media migration.
 
