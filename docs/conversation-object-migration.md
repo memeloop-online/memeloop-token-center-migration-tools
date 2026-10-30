@@ -38,7 +38,12 @@ prefix ancestry and stream a separate NDJSON object per observation. Event
 records carry explicit descending ordinals, parent hashes and verified body
 references; media records carry verified type/part/hash/length references.
 Observation metadata preserves agent/parent relationships without flattening
-branches. Exact original request/response references are mandatory: missing
+branches. Version 2 reconstruction also emits every incoming conversation edge
+exactly once, in edge-ID order, preserving the complete relation/evidence record.
+It checks parent tenant ownership and compares the exported edge count with the
+entire source edge table; dangling parents or targets invalidate verification.
+Version 1 reconstruction checkpoints cannot authorize cutover under this contract.
+Exact original request/response references are mandatory: missing
 raw evidence fails closed. Independent reconstruction must reproduce the same
 object hash, event/media counts and ordered receipt digest. This certifies the
 retained historical projection, not that older normalization captured every

@@ -10,6 +10,7 @@ pub(super) struct ReconstructionCheckpoint {
     pub(super) observations: u64,
     pub(super) events: u64,
     pub(super) media: u64,
+    pub(super) edges: u64,
     bytes: u64,
     digest: String,
     complete: bool,
@@ -25,6 +26,7 @@ struct Receipt {
     tenant: Uuid,
     events: u64,
     media: u64,
+    edges: u64,
     object: CasArchiveObject,
 }
 
@@ -55,7 +57,7 @@ impl Runner {
         let receipt: ReconstructionCheckpoint = serde_json::from_reader(std::fs::File::open(
             self.checkpoint.with_extension("reconstruction.json"),
         )?)?;
-        if receipt.format_version != 1
+        if receipt.format_version != 2
             || receipt.identity != self.identity
             || !receipt.complete
             || !receipt.verified
@@ -67,7 +69,7 @@ impl Runner {
 
     async fn reconstruct_one(&self, observation: &str, copy: bool) -> Result<Receipt> {
         let row = sqlx::query(
-            "SELECT c.tenant_id, o.request_id, o.leaf_node_hash, row_to_json(o)::TEXT AS metadata
+            "SELECT c.tenant_id, o.cluster_id, o.request_id, o.leaf_node_hash, row_to_json(o)::TEXT AS metadata
              FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id
              WHERE o.id = $1",
         )
@@ -76,6 +78,7 @@ impl Runner {
         .await?;
         let tenant: String = row.try_get("tenant_id")?;
         let tenant_id = Uuid::parse_str(&tenant)?;
+        let cluster: String = row.try_get("cluster_id")?;
         let request: String = row.try_get("request_id")?;
         let mut head: Option<String> = row.try_get("leaf_node_hash")?;
         let metadata: String = row.try_get("metadata")?;
@@ -96,11 +99,44 @@ impl Runner {
         let request_object = self.verified_locator("request", &tenant, &request).await?;
         let response_object = self.verified_locator("response", &tenant, &request).await?;
         output.line(serde_json::json!({
-            "record":"observation", "format_version":1, "tenant_id":tenant_id,
+            "record":"observation", "format_version":2, "tenant_id":tenant_id,
             "source_metadata":serde_json::from_str::<serde_json::Value>(&metadata)?,
             "raw_request":request_object, "raw_response":response_object,
             "event_order":"descending_ordinal", "fidelity":"historical_projection_with_original_raw"
         })).await?;
+        let mut edges = 0_u64;
+        let mut after_edge = String::new();
+        loop {
+            let edge = sqlx::query(
+                "SELECT e.id, e.cluster_id, e.from_observation_id, source_cluster.tenant_id AS source_tenant,
+                 row_to_json(e)::TEXT AS metadata
+                 FROM conversation_edges e
+                 LEFT JOIN conversation_observations source ON source.id = e.from_observation_id
+                 LEFT JOIN conversation_clusters source_cluster ON source_cluster.id = source.cluster_id
+                 WHERE e.to_observation_id = $1 AND e.id > $2 ORDER BY e.id LIMIT 1",
+            )
+            .bind(observation)
+            .bind(&after_edge)
+            .fetch_optional(&self.pool)
+            .await?;
+            let Some(edge) = edge else { break };
+            let source: Option<String> = edge.try_get("from_observation_id")?;
+            let source_tenant: Option<String> = edge.try_get("source_tenant")?;
+            if edge.try_get::<String, _>("cluster_id")? != cluster
+                || (source.is_some() && source_tenant.as_deref() != Some(tenant.as_str()))
+            {
+                return Err("dialogue edge has missing or cross-tenant parent".into());
+            }
+            let metadata: String = edge.try_get("metadata")?;
+            output
+                .line(serde_json::json!({
+                    "record":"edge",
+                    "source_metadata":serde_json::from_str::<serde_json::Value>(&metadata)?
+                }))
+                .await?;
+            after_edge = edge.try_get("id")?;
+            edges += 1;
+        }
         let mut events = 0_u64;
         let mut media = 0_u64;
         let mut expected_depth = None;
@@ -166,7 +202,9 @@ impl Runner {
             return Err("empty historical dialogue cannot certify reconstruction".into());
         }
         output
-            .line(serde_json::json!({"record":"end", "events":events, "media":media}))
+            .line(
+                serde_json::json!({"record":"end", "events":events, "media":media, "edges":edges}),
+            )
             .await?;
         let digest = output.hash.finalize().to_hex().to_string();
         let object = if let Some(writer) = output.writer {
@@ -194,12 +232,13 @@ impl Runner {
             .verify_tenant_content(tenant_id, &object)
             .await?;
         Ok(Receipt {
-            format_version: 1,
+            format_version: 2,
             identity: self.identity.clone(),
             observation: observation.into(),
             tenant: tenant_id,
             events,
             media,
+            edges,
             object,
         })
     }
@@ -217,14 +256,14 @@ impl Runner {
             Ok(file) => serde_json::from_reader::<_, ReconstructionCheckpoint>(file)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 ReconstructionCheckpoint {
-                    format_version: 1,
+                    format_version: 2,
                     identity: self.identity.clone(),
                     ..Default::default()
                 }
             }
             Err(error) => return Err(error.into()),
         };
-        if checkpoint.format_version != 1 || checkpoint.identity != self.identity {
+        if checkpoint.format_version != 2 || checkpoint.identity != self.identity {
             return Err("reconstruction checkpoint identity mismatch".into());
         }
         if verify && !checkpoint.complete {
@@ -239,7 +278,7 @@ impl Runner {
         }
         let mut result = if verify {
             ReconstructionCheckpoint {
-                format_version: 1,
+                format_version: 2,
                 identity: self.identity.clone(),
                 ..Default::default()
             }
@@ -274,16 +313,24 @@ impl Runner {
             result.observations += 1;
             result.events += receipt.events;
             result.media += receipt.media;
+            result.edges += receipt.edges;
             result.bytes += receipt.object.size_bytes;
             result.after = next;
             if !verify {
                 save_checkpoint(&path, &result)?;
             }
         }
+        let source_edges: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_edges")
+            .fetch_one(&self.pool)
+            .await?;
+        if result.edges != u64::try_from(source_edges)? {
+            return Err("dialogue edge inventory contains missing target or count mismatch".into());
+        }
         if verify {
             if result.observations != checkpoint.observations
                 || result.events != checkpoint.events
                 || result.media != checkpoint.media
+                || result.edges != checkpoint.edges
                 || result.bytes != checkpoint.bytes
                 || result.digest != checkpoint.digest
             {

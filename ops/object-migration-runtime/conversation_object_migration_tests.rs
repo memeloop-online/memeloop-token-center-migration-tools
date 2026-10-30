@@ -25,6 +25,7 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
          CREATE TABLE conversation_media_parts(tenant_id TEXT NOT NULL, turn_id TEXT NOT NULL, part_index BIGINT NOT NULL, object_locator TEXT NOT NULL, content_blake3 TEXT NOT NULL, byte_length BIGINT NOT NULL, media_type TEXT NOT NULL DEFAULT 'application/octet-stream');
          CREATE TABLE conversation_clusters(id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL);
          CREATE TABLE conversation_observations(id TEXT PRIMARY KEY, cluster_id TEXT NOT NULL, request_id TEXT NOT NULL, leaf_node_hash TEXT, agent_id TEXT, parent_agent_id TEXT);
+         CREATE TABLE conversation_edges(id TEXT PRIMARY KEY, cluster_id TEXT NOT NULL, from_observation_id TEXT, to_observation_id TEXT NOT NULL, relation_kind TEXT NOT NULL, confidence_millis BIGINT NOT NULL, evidence_json TEXT NOT NULL);
          CREATE TABLE request_archive_spools(request_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, reservation_id TEXT NOT NULL, state TEXT NOT NULL, chunk_count BIGINT NOT NULL, byte_count BIGINT NOT NULL);
          CREATE TABLE response_archive_spools(LIKE request_archive_spools INCLUDING ALL);
          CREATE TABLE request_archive_spool_chunks(request_id TEXT NOT NULL, seq BIGINT NOT NULL, ciphertext TEXT NOT NULL, byte_count BIGINT NOT NULL, PRIMARY KEY(request_id, seq));
@@ -244,6 +245,8 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
         .bind(raw_request_id.to_string()).bind(&node).execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO conversation_observations VALUES ('branch-observation', 'session', $1, $2, 'agent-child', 'agent-parent')")
         .bind(raw_request_id.to_string()).bind(&branch_node).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO conversation_edges VALUES ('branch-edge', 'session', 'observation', 'branch-observation', 'fork', 1000, '{\"tool_call_id\":\"call-1\"}')")
+        .execute(&pool).await.unwrap();
     let reconstructed = runner.reconstruct_dialogues(false).await.unwrap();
     assert_eq!(
         (
@@ -253,6 +256,24 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
         ),
         (2, 3, 3)
     );
+    assert_eq!(reconstructed.edges, 1);
+    assert!(runner.reconstruct_dialogues(true).await.unwrap().verified);
+    sqlx::query("UPDATE conversation_edges SET from_observation_id = 'missing-parent'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(runner.reconstruct_dialogues(true).await.is_err());
+    sqlx::query("UPDATE conversation_edges SET from_observation_id = 'observation'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO conversation_edges VALUES ('orphan-edge', 'session', 'observation', 'missing-target', 'fork', 1000, '{}')")
+        .execute(&pool).await.unwrap();
+    assert!(runner.reconstruct_dialogues(true).await.is_err());
+    sqlx::query("DELETE FROM conversation_edges WHERE id = 'orphan-edge'")
+        .execute(&pool)
+        .await
+        .unwrap();
     assert!(runner.reconstruct_dialogues(true).await.unwrap().verified);
     sqlx::query("UPDATE conversation_observations SET parent_agent_id = 'changed-parent'")
         .execute(&pool)
