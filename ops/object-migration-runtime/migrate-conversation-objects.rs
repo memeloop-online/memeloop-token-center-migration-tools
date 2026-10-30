@@ -15,6 +15,8 @@ type Result<Value> = std::result::Result<Value, Failure>;
 
 #[path = "conversation-object-modules/locators.rs"]
 mod locators;
+#[path = "conversation-object-modules/payloads.rs"]
+mod payloads;
 #[path = "conversation-object-modules/spools.rs"]
 mod spools;
 
@@ -28,6 +30,8 @@ enum Phase {
     VerifyLocators,
     CopySpools,
     VerifySpools,
+    CopyPayloads,
+    VerifyPayloads,
 }
 
 #[derive(Parser)]
@@ -175,21 +179,33 @@ impl Runner {
         cursor: &Cursor,
         copy: bool,
     ) -> Result<(ConversationBodyReference, String)> {
+        self.source_field_reference(cursor, payloads::SourceField::Atom, copy)
+            .await
+    }
+
+    async fn source_field_reference(
+        &self,
+        cursor: &Cursor,
+        field: payloads::SourceField,
+        copy: bool,
+    ) -> Result<(ConversationBodyReference, String)> {
+        let (table, id, column) = field.columns();
         let tenant = Uuid::parse_str(&cursor.tenant_id)?;
         let mut transaction = self.pool.begin().await?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
             .execute(&mut *transaction)
             .await?;
-        let row = sqlx::query(
-            "SELECT CAST(length(content_json) AS BIGINT) AS chars, CAST(octet_length(content_json) AS BIGINT) AS bytes, md5(content_json) AS digest, left(content_json, 4096) AS prefix FROM semantic_atoms WHERE tenant_id = $1 AND content_hash = $2",
-        )
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT CAST(length({column}) AS BIGINT) AS chars, CAST(octet_length({column}) AS BIGINT) AS bytes, md5({column}) AS digest, left({column}, 4096) AS prefix FROM {table} WHERE tenant_id = $1 AND {id} = $2"
+        )))
         .bind(&cursor.tenant_id).bind(&cursor.content_hash)
         .fetch_one(&mut *transaction).await?;
         let chars = u64::try_from(row.try_get::<i64, _>("chars")?)?;
         let expected_bytes = u64::try_from(row.try_get::<i64, _>("bytes")?)?;
         let source_md5: String = row.try_get("digest")?;
         let prefix: String = row.try_get("prefix")?;
-        if expected_bytes <= 4096
+        if field == payloads::SourceField::Atom
+            && expected_bytes <= 4096
             && let Ok(reference) = serde_json::from_str::<ConversationBodyReference>(&prefix)
         {
             transaction.commit().await?;
@@ -212,9 +228,9 @@ impl Runner {
         let mut offset = 0_u64;
         let mut bytes = 0_u64;
         while offset < chars {
-            let chunk: String = sqlx::query_scalar(
-                "SELECT substring(content_json FROM $3 FOR 65536) FROM semantic_atoms WHERE tenant_id = $1 AND content_hash = $2",
-            )
+            let chunk: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT substring({column} FROM $3 FOR 65536) FROM {table} WHERE tenant_id = $1 AND {id} = $2"
+            )))
             .bind(&cursor.tenant_id).bind(&cursor.content_hash)
             .bind(i32::try_from(offset.checked_add(1).ok_or("character offset overflow")?)?)
             .fetch_one(&mut *transaction).await?;
@@ -509,6 +525,16 @@ async fn run(args: Args) -> Result<()> {
         checkpoint: args.checkpoint,
         identity,
     };
+    if matches!(args.phase, Phase::CopyPayloads | Phase::VerifyPayloads) {
+        let result = runner
+            .transfer_payloads(args.phase == Phase::VerifyPayloads)
+            .await;
+        sqlx::query("SELECT pg_advisory_unlock(70720261029)")
+            .execute(&mut *advisory)
+            .await?;
+        println!("{}", serde_json::to_string(&result?)?);
+        return Ok(());
+    }
     if matches!(args.phase, Phase::CopySpools | Phase::VerifySpools) {
         let result = runner
             .transfer_spools(
@@ -537,7 +563,12 @@ async fn run(args: Args) -> Result<()> {
         Phase::Verify => runner.verify().await,
         Phase::CutoverTest => runner.cutover_test().await,
         Phase::Inventory => unreachable!(),
-        Phase::CopyLocators | Phase::VerifyLocators | Phase::CopySpools | Phase::VerifySpools => {
+        Phase::CopyLocators
+        | Phase::VerifyLocators
+        | Phase::CopySpools
+        | Phase::VerifySpools
+        | Phase::CopyPayloads
+        | Phase::VerifyPayloads => {
             unreachable!()
         }
     };

@@ -22,7 +22,9 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
          CREATE TABLE request_archive_spools(request_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, reservation_id TEXT NOT NULL, state TEXT NOT NULL, chunk_count BIGINT NOT NULL, byte_count BIGINT NOT NULL);
          CREATE TABLE response_archive_spools(LIKE request_archive_spools INCLUDING ALL);
          CREATE TABLE request_archive_spool_chunks(request_id TEXT NOT NULL, seq BIGINT NOT NULL, ciphertext TEXT NOT NULL, byte_count BIGINT NOT NULL, PRIMARY KEY(request_id, seq));
-         CREATE TABLE response_archive_spool_chunks(LIKE request_archive_spool_chunks INCLUDING ALL);",
+         CREATE TABLE response_archive_spool_chunks(LIKE request_archive_spool_chunks INCLUDING ALL);
+         CREATE TABLE conversation_semantic_payloads(request_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, request_json TEXT NOT NULL);
+         CREATE TABLE conversation_projection_outbox(request_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, request_json TEXT NOT NULL, semantic_snapshot_json TEXT, semantic_payload_snapshot_json TEXT, key_snapshot_json TEXT, hints_json TEXT NOT NULL);",
     ).execute(&pool).await.unwrap();
     let tenant = Uuid::now_v7();
     let document = serde_json::json!({"role":"tool", "content":"工具\n".repeat(200000), "tool_call_id":"call-1", "unknown":[1,2,3]}).to_string();
@@ -153,6 +155,33 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
             .await
             .unwrap();
     assert_eq!(source_chunks, 1);
+    let payload_request = Uuid::now_v7().to_string();
+    sqlx::query("INSERT INTO conversation_semantic_payloads VALUES ($1, $2, $3)")
+        .bind(&payload_request)
+        .bind(tenant.to_string())
+        .bind(&document)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO conversation_projection_outbox VALUES ($1, $2, $3, NULL, NULL, NULL, $4)",
+    )
+    .bind(&payload_request)
+    .bind(tenant.to_string())
+    .bind(&document)
+    .bind(r#"{"branch_id":"branch-1","parent_turn_id":"parent-1"}"#)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let payloads = runner.transfer_payloads(false).await.unwrap();
+    assert_eq!(payloads.rows, 3);
+    assert!(runner.transfer_payloads(true).await.unwrap().verified);
+    let retained_payload: String =
+        sqlx::query_scalar("SELECT request_json FROM conversation_semantic_payloads")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(retained_payload, document);
     assert!(runner.cutover_test().await.is_err());
     let copied = runner.copy().await.unwrap();
     assert_eq!(copied.copied_rows, 1);

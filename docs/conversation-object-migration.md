@@ -21,7 +21,13 @@ environment reference. Failed authentication stops transfer without clearing
 source rows. Preserving a partial spool does not certify a complete response;
 its original state is retained in the receipt.
 
-Outbox payload snapshots and imported archive records still need separate verified transfer
+`copy-payloads` / `verify-payloads` stream the original semantic payload and
+outbox request/snapshot/key-snapshot/hints fields into CAS, without normalizing
+their JSON or clearing source. The receipt retains field identity and exact
+source digest. This covers original payload bodies as well as branch/tool
+metadata that cannot be discarded on the strength of atom verification alone.
+
+Imported archive records still need separate verified transfer
 receipts before retiring their source tables. Do not use atom counts to claim
 complete dialogue/media migration.
 
