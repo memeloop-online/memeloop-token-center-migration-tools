@@ -442,7 +442,12 @@ impl Runner {
             "atoms": {"verified": atoms.verified, "rows": atoms.expected_rows,
                 "bytes": atoms.copied_bytes, "digest": atoms.ordered_digest},
         });
-        for extension in ["locators.json", "spools.json", "payloads.json", "reconstruction.json"] {
+        for extension in [
+            "locators.json",
+            "spools.json",
+            "payloads.json",
+            "reconstruction.json",
+        ] {
             let bytes = std::fs::read(self.checkpoint.with_extension(extension))?;
             inputs[extension] = serde_json::json!(blake3::hash(&bytes).to_hex().to_string());
         }
@@ -453,14 +458,22 @@ impl Runner {
         let receipt: serde_json::Value = serde_json::from_reader(std::fs::File::open(
             self.checkpoint.with_extension("all.json"),
         )?)?;
-        if receipt["format_version"] != 1 || receipt["identity"] != self.identity
-            || receipt["verified"] != true || receipt["inputs"] != self.verification_inputs()? {
+        if receipt["format_version"] != 1
+            || receipt["identity"] != self.identity
+            || receipt["verified"] != true
+            || receipt["inputs"] != self.verification_inputs()?
+        {
             return Err("fresh all-source verification receipt required".into());
         }
         Ok(())
     }
 
-    async fn verify_all_from(&self, source: &ArchiveStore, source_identity: &str, pepper: &[u8]) -> Result<serde_json::Value> {
+    async fn verify_all_from(
+        &self,
+        source: &ArchiveStore,
+        source_identity: &str,
+        pepper: &[u8],
+    ) -> Result<serde_json::Value> {
         let path = self.checkpoint.with_extension("all.json");
         let mut receipt = serde_json::json!({
             "format_version":1, "identity":self.identity, "verified":false,
@@ -471,12 +484,17 @@ impl Runner {
         save_checkpoint(&path, &receipt)?;
         let before = inventory::inventory(&self.pool).await?;
         receipt["atoms"] = serde_json::to_value(self.verify().await?)?;
-        receipt["locators"] = serde_json::to_value(self.transfer_locators_from(source, source_identity, true).await?)?;
+        receipt["locators"] = serde_json::to_value(
+            self.transfer_locators_from(source, source_identity, true)
+                .await?,
+        )?;
         receipt["spools"] = serde_json::to_value(self.transfer_spools(pepper, true).await?)?;
         receipt["payloads"] = serde_json::to_value(self.transfer_payloads(true).await?)?;
         receipt["reconstruction"] = serde_json::to_value(self.reconstruct_dialogues(true).await?)?;
         let after = inventory::inventory(&self.pool).await?;
-        if before != after { return Err("source inventory changed during all-source verification".into()); }
+        if before != after {
+            return Err("source inventory changed during all-source verification".into());
+        }
         receipt["source_inventory"] = after;
         receipt["inputs"] = self.verification_inputs()?;
         receipt["verified"] = serde_json::json!(true);
@@ -584,11 +602,19 @@ async fn run(args: Args) -> Result<()> {
     if args.phase == Phase::VerifyAll {
         let source_config = locators::source_config(&config)?;
         let source_identity = blake3::hash(&serde_json::to_vec(&(
-            &runner.identity, &source_config.s3_endpoint, &source_config.s3_bucket,
-        ))?).to_hex().to_string();
+            &runner.identity,
+            &source_config.s3_endpoint,
+            &source_config.s3_bucket,
+        ))?)
+        .to_hex()
+        .to_string();
         let source = ArchiveStore::from_config(&source_config).await?;
-        let result = runner.verify_all_from(&source, &source_identity, config.key_pepper.as_bytes()).await;
-        sqlx::query("SELECT pg_advisory_unlock(70720261029)").execute(&mut *advisory).await?;
+        let result = runner
+            .verify_all_from(&source, &source_identity, config.key_pepper.as_bytes())
+            .await;
+        sqlx::query("SELECT pg_advisory_unlock(70720261029)")
+            .execute(&mut *advisory)
+            .await?;
         println!("{}", serde_json::to_string(&result?)?);
         return Ok(());
     }
