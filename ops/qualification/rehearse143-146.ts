@@ -363,6 +363,9 @@ async function scenario(database: string, spool: boolean) {
   const ledger = await db.rows("SELECT * FROM schema_migrations ORDER BY version");
   const finance = await db.rows("SELECT * FROM credit_accounts ORDER BY id");
   const before = await preflight(db);
+  result.ledger_before = ledger;
+  result.finance_before = finance;
+  result.indexes_before = before;
   try {
     await delay(15000);
     if (spool) {
@@ -424,7 +427,14 @@ async function scenario(database: string, spool: boolean) {
     result.ledger_after = await db.rows("SELECT * FROM schema_migrations ORDER BY version");
     assert.deepEqual(result.ledger_after.filter((r: Row) => r.version<=142), ledger);
     assert.deepEqual(result.ledger_after.filter((r: Row) => r.version>142).map((r: Row) => r.version), [143,144,146]);
-    assert.deepEqual(await db.rows("SELECT * FROM credit_accounts ORDER BY id"), finance);
+    result.finance_after = await db.rows("SELECT * FROM credit_accounts ORDER BY id");
+    assert.deepEqual(result.finance_after, finance);
+    result.constraints_after = await db.rows(`SELECT conrelid::regclass::text AS relation,
+      conname AS name, convalidated AS valid, pg_get_constraintdef(oid) AS definition
+      FROM pg_constraint WHERE conrelid IN ('request_archive_spools'::regclass,
+        'response_archive_spools'::regclass, 'response_archive_spool_budget'::regclass,
+        'archive_budget_reservations'::regclass) ORDER BY conrelid, conname`);
+    assert.ok(result.constraints_after.every((r: Row) => r.valid));
     assert.equal(await db.sql(`SELECT count(*) FROM upstream_accounts WHERE
       (config_json::jsonb->'transport_policy') ? 'failover_deadline_millis'`), "0");
     assert.equal(await db.sql(`SELECT count(*) FROM upstream_accounts WHERE
