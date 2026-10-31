@@ -2,6 +2,7 @@ use std::{fs::OpenOptions, io::Write, path::PathBuf, process::ExitCode};
 
 use bytes::Bytes;
 use clap::{Parser, ValueEnum};
+use futures_util::StreamExt;
 use memeloop_token_center::{
     archive::{ArchiveStore, ConversationBodyReference},
     config::Config,

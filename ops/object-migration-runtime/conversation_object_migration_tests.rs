@@ -612,11 +612,7 @@ async fn preexisting_compressed_atom_cas_is_copied_from_the_real_source_and_veri
         .await
         .unwrap();
     assert!(runner.verify().await.is_err());
-    assert!(
-        !load_checkpoint(&runner.checkpoint, &runner.identity)
-            .unwrap()
-            .verified
-    );
+    assert!(!runner.load_checkpoint().unwrap().verified);
     pool.close().await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE {name}")))
         .execute(&administrative)
