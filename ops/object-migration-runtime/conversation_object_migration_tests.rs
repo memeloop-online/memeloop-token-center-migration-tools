@@ -109,7 +109,13 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
     .execute(&pool)
     .await
     .unwrap();
-    sqlx::query("INSERT INTO session_archive_quarantine_record_versions VALUES ($1, 'retained-quarantine', $2, NULL)")
+    sqlx::query("INSERT INTO session_archive_quarantine_record_versions VALUES ($1, 'retained-quarantine', $2, 'fixture/response')")
+        .bind(tenant.to_string()).bind(format!("inline-json:{document}")).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO session_archive_import_records VALUES ($1, 'fixture-import', 'external-request', $2, 'fixture/response', $2, 'fixture/response')")
+        .bind(tenant.to_string()).bind(format!("inline-json:{document}")).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO session_archive_unlinked_requests VALUES ($1, 'unlinked-request', $2, 'fixture/response')")
+        .bind(tenant.to_string()).bind(format!("inline-json:{document}")).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO session_archive_quarantine_records VALUES ($1, 'quarantine-request', $2, 'fixture/response')")
         .bind(tenant.to_string()).bind(format!("inline-json:{document}")).execute(&pool).await.unwrap();
     let locators = runner
         .transfer_locators_from(&source, "fixture", false)
@@ -121,10 +127,10 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
         .await
         .unwrap();
     assert!(locators.verified);
-    assert_eq!(locators.copied_rows, 4);
+    assert_eq!(locators.copied_rows, 13);
     assert_eq!(
         locators.copied_bytes,
-        2 * document.len() as u64 + response.len() as u64 + 15
+        6 * document.len() as u64 + 6 * response.len() as u64 + 15
     );
     source
         .put("fixture/response", Bytes::from_static(b"changed"))
@@ -223,6 +229,7 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
             .unwrap();
     assert_eq!(retained_payload, document);
     assert!(runner.cutover_test().await.is_err());
+    assert!(runner.cutover_locators_test().await.is_err());
     let copied = runner.copy().await.unwrap();
     let inventory = inventory::inventory(&pool).await.unwrap();
     assert_eq!(
@@ -346,6 +353,143 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
     assert_eq!(restored, document.as_bytes());
     assert_eq!(reference.chars, document.chars().count() as u64);
     assert_eq!(runner.cutover_test().await.unwrap().cutover_rows, 1);
+    // Every retained/imported locator and media index must work against the
+    // target, not merely the live request's independent raw-root override.
+    sqlx::query("UPDATE conversation_media_parts SET content_blake3 = repeat('0', 64)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(runner.cutover_locators_test().await.is_err());
+    let failed: serde_json::Value = serde_json::from_reader(
+        std::fs::File::open(runner.checkpoint.with_extension("locator-cutover.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(failed["complete"], false);
+    sqlx::query("UPDATE conversation_media_parts SET content_blake3 = $1")
+        .bind(blake3::hash(b"synthetic media").to_hex().to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE request_records SET request_object = 'inline-json:changed after verification'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(runner.cutover_locators_test().await.is_err());
+    sqlx::query("UPDATE request_records SET request_object = $1")
+        .bind(format!("inline-json:{document}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let switched = runner.cutover_locators_test().await.unwrap();
+    assert_eq!(switched["complete"], true);
+    assert_eq!(switched["rows"], 13);
+    assert_eq!(switched["source_objects_deleted"], false);
+    assert_eq!(runner.cutover_locators_test().await.unwrap()["rows"], 13);
+    for (table, columns) in [
+        (
+            "request_records",
+            &["request_object", "response_object"][..],
+        ),
+        (
+            "session_archive_import_records",
+            &[
+                "request_object",
+                "response_object",
+                "previous_request_object",
+                "previous_response_object",
+            ][..],
+        ),
+        (
+            "session_archive_unlinked_requests",
+            &["request_object", "response_object"][..],
+        ),
+        (
+            "session_archive_quarantine_records",
+            &["request_object", "response_object"][..],
+        ),
+        (
+            "session_archive_quarantine_record_versions",
+            &["request_object", "response_object"][..],
+        ),
+        ("conversation_media_parts", &["object_locator"][..]),
+    ] {
+        for column in columns {
+            let locator: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT {column} FROM {table} WHERE tenant_id = $1"
+            )))
+            .bind(tenant.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(locator.starts_with(&format!("tenants/{tenant}/cas/v1/blake3/")));
+            let expected = if column.contains("response") {
+                response.as_ref()
+            } else if column == "object_locator" {
+                b"synthetic media"
+            } else {
+                document.as_bytes()
+            };
+            assert_eq!(
+                runner.target.get(&locator).await.unwrap().as_ref(),
+                expected
+            );
+        }
+    }
+    assert_eq!(source.get("fixture/response").await.unwrap(), response);
+    assert_eq!(
+        source.get("fixture/media").await.unwrap().as_ref(),
+        b"synthetic media"
+    );
+    // Restore this fixture's locators to exercise independent source copy
+    // again below; the preceding TEST cutover never deleted those originals.
+    for (table, columns) in [
+        (
+            "request_records",
+            &["request_object", "response_object"][..],
+        ),
+        (
+            "session_archive_import_records",
+            &[
+                "request_object",
+                "response_object",
+                "previous_request_object",
+                "previous_response_object",
+            ][..],
+        ),
+        (
+            "session_archive_unlinked_requests",
+            &["request_object", "response_object"][..],
+        ),
+        (
+            "session_archive_quarantine_records",
+            &["request_object", "response_object"][..],
+        ),
+        (
+            "session_archive_quarantine_record_versions",
+            &["request_object", "response_object"][..],
+        ),
+    ] {
+        for column in columns {
+            let original = if column.contains("response") {
+                "fixture/response".to_owned()
+            } else {
+                format!("inline-json:{document}")
+            };
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE {table} SET {column} = $1"
+            )))
+            .bind(original)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    }
+    sqlx::query("UPDATE conversation_media_parts SET object_locator = 'fixture/media'")
+        .execute(&pool)
+        .await
+        .unwrap();
     // Compressed historical objects must stream beyond the old 64/128 MiB
     // decoder ceilings, including through real RustFS multipart promotion.
     let mut large = source
@@ -401,7 +545,7 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
         .transfer_locators_from(&source, "fixture-gaps", false)
         .await
         .unwrap();
-    assert_eq!(copied.copied_rows, 6);
+    assert_eq!(copied.copied_rows, 15);
     assert_eq!(copied.gap_rows, 3);
     assert!(!copied.verified);
     assert_eq!(
@@ -422,7 +566,7 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
         std::fs::File::open(gap_runner.checkpoint.with_extension("locators.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!((evidence.copied_rows, evidence.gap_rows), (6, 3));
+    assert_eq!((evidence.copied_rows, evidence.gap_rows), (15, 3));
     assert!(!evidence.verified);
     assert!(
         gap_runner

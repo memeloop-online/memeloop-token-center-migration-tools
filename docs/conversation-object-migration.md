@@ -21,6 +21,12 @@ source/target hash, byte, count and ordered-receipt verification. Source
 credentials use `MTC_SOURCE_S3_*` environment references; destination keeps
 existing `MTC_S3_*` configuration. These phases never replace source locators
 or delete original objects. Media bytes must match the existing index digest.
+After `verify-all`, `cutover-locators-test --writers-quiesced` can conditionally
+replace all 13 supported locator kinds with their verified target CAS keys:
+live request/response, indexed media, imports including previous versions,
+unlinked requests, quarantine records and quarantine versions. It uses the
+same TEST database guard as atom cutover. It never deletes source objects,
+spool chunks or historical payloads and does not change runtime configuration.
 Declared `gap://`, metadata-only and unresolved provider references receive
 separate immutable-source-identity gap receipts. Copy continues through later
 readable objects and reports `gap_rows` separately from copied objects/bytes.
@@ -93,7 +99,8 @@ verified before checkpoint advance. Retry reuses immutable tenant CAS objects.
 byte count, ordered digest and all context-node parent/depth/content identities.
 It does not label absent raw responses or external media as recovered.
 
-Only `--phase cutover-test --writers-quiesced` mutates source rows. It requires
+Only `--phase cutover-test --writers-quiesced` and
+`--phase cutover-locators-test --writers-quiesced` mutate source rows. Atom cutover requires
 a completed atom and dialogue-reconstruction verification receipt and a database
 named `*_test` or `mtc_test_*`. Before the first source mutation it reruns atom
 and reconstruction verification; a stale receipt alone is insufficient.
@@ -101,6 +108,20 @@ Each target object is verified again before conditional replacement of the
 old body with its object reference. A changed source stops cutover rather than
 being deleted. Checkpoint resume tolerates a committed row whose checkpoint
 write was interrupted. No production mutation or table-drop command exists.
+
+Locator cutover independently rechecks every target body and request/response
+raw root against the verified receipt. A bounded SQL MD5 of the original full
+locator is used only to fence conditional updates, including arbitrarily long
+inline JSON; the body itself is independently verified with BLAKE3 and length.
+Media hash/length must still match its index at the update. Each row commits
+only when exactly one tenant-scoped identity matches. On resume, already
+switched CAS locators are accepted, but all targets are reverified from the
+first identity and total count/bytes must match the copy. A failed rerun first
+revokes `locator-cutover.json` completion. Receipts made before the conditional
+locator fingerprint was added cannot authorize this phase; use a new checkpoint
+and rerun the full copy/verification sequence. The two TEST cutover phases may
+share that checkpoint; no fresh verification receipt may be fabricated after
+partial source mutation.
 
 Checkpoint files are atomically replaced, fsynced and protected by an exclusive
 file lock plus a database advisory lock. Store them on persistent private

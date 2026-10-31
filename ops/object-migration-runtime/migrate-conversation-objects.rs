@@ -31,6 +31,7 @@ enum Phase {
     Copy,
     Verify,
     CutoverTest,
+    CutoverLocatorsTest,
     CopyLocators,
     VerifyLocators,
     CopySpools,
@@ -649,7 +650,7 @@ impl Runner {
         Ok(receipt)
     }
 
-    async fn cutover_test(&self) -> Result<Checkpoint> {
+    async fn require_test_database(&self) -> Result<()> {
         let database: String = sqlx::query_scalar("SELECT current_database()")
             .fetch_one(&self.pool)
             .await?;
@@ -666,6 +667,11 @@ impl Runner {
                 "source mutation is restricted to an explicitly named TEST database".into(),
             );
         }
+        Ok(())
+    }
+
+    async fn cutover_test(&self) -> Result<Checkpoint> {
+        self.require_test_database().await?;
         let mut checkpoint = self.load_checkpoint()?;
         if !checkpoint.verified || checkpoint.verified_rows != checkpoint.expected_rows {
             return Err("cutover requires full count/hash/context verification".into());
@@ -779,6 +785,14 @@ async fn run(args: Args) -> Result<()> {
         println!("{}", serde_json::to_string(&result?)?);
         return Ok(());
     }
+    if args.phase == Phase::CutoverLocatorsTest {
+        let result = runner.cutover_locators_test().await;
+        sqlx::query("SELECT pg_advisory_unlock(70720261029)")
+            .execute(&mut *advisory)
+            .await?;
+        println!("{}", serde_json::to_string(&result?)?);
+        return Ok(());
+    }
     if matches!(args.phase, Phase::Reconstruct | Phase::VerifyReconstruction) {
         let result = runner
             .reconstruct_dialogues(args.phase == Phase::VerifyReconstruction)
@@ -828,6 +842,7 @@ async fn run(args: Args) -> Result<()> {
         Phase::CutoverTest => runner.cutover_test().await,
         Phase::Inventory => unreachable!(),
         Phase::CopyLocators
+        | Phase::CutoverLocatorsTest
         | Phase::VerifyLocators
         | Phase::CopySpools
         | Phase::VerifySpools

@@ -10,6 +10,67 @@ pub(super) struct LocatorCursor {
     identity: String,
 }
 
+impl LocatorCursor {
+    fn columns(&self) -> Result<(&'static str, &'static str, &'static str)> {
+        Ok(match self.kind.as_str() {
+            "request" => ("request_records", "id", "request_object"),
+            "response" => ("request_records", "id", "response_object"),
+            "import_request" => (
+                "session_archive_import_records",
+                "json_build_array(source, external_request_id)::TEXT",
+                "request_object",
+            ),
+            "import_response" => (
+                "session_archive_import_records",
+                "json_build_array(source, external_request_id)::TEXT",
+                "response_object",
+            ),
+            "import_previous_request" => (
+                "session_archive_import_records",
+                "json_build_array(source, external_request_id)::TEXT",
+                "previous_request_object",
+            ),
+            "import_previous_response" => (
+                "session_archive_import_records",
+                "json_build_array(source, external_request_id)::TEXT",
+                "previous_response_object",
+            ),
+            "unlinked_request" => (
+                "session_archive_unlinked_requests",
+                "archive_request_id",
+                "request_object",
+            ),
+            "unlinked_response" => (
+                "session_archive_unlinked_requests",
+                "archive_request_id",
+                "response_object",
+            ),
+            "quarantine_request" => ("session_archive_quarantine_records", "id", "request_object"),
+            "quarantine_response" => (
+                "session_archive_quarantine_records",
+                "id",
+                "response_object",
+            ),
+            "quarantine_version_request" => (
+                "session_archive_quarantine_record_versions",
+                "id",
+                "request_object",
+            ),
+            "quarantine_version_response" => (
+                "session_archive_quarantine_record_versions",
+                "id",
+                "response_object",
+            ),
+            "media" => (
+                "conversation_media_parts",
+                "turn_id || ':' || part_index",
+                "object_locator",
+            ),
+            _ => return Err("unknown locator source kind".into()),
+        })
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LocatorReceipt {
@@ -17,6 +78,8 @@ struct LocatorReceipt {
     identity: String,
     cursor: LocatorCursor,
     source_locator_blake3: String,
+    #[serde(default)]
+    source_locator_md5: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     object: Option<CasArchiveObject>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -43,6 +106,7 @@ struct LocatedObject {
     cursor: LocatorCursor,
     locator: String,
     source_locator_blake3: String,
+    source_locator_md5: String,
     expected_digest: Option<String>,
     expected_bytes: Option<u64>,
 }
@@ -95,6 +159,135 @@ fn save(path: &std::path::Path, checkpoint: &LocatorCheckpoint) -> Result<()> {
 }
 
 impl Runner {
+    pub(super) async fn cutover_locators_test(&self) -> Result<serde_json::Value> {
+        self.require_test_database().await?;
+        let path = self.checkpoint.with_extension("locator-cutover.json");
+        let mut result = serde_json::json!({
+            "format_version":1, "identity":self.identity,
+            "complete":false, "rows":0, "bytes":0,
+            "source_objects_deleted":false,
+            "complete_training_fidelity_certified":false,
+        });
+        save_checkpoint(&path, &result)?;
+        self.require_reconstruction_receipt()?;
+        self.require_all_verification()?;
+        let checkpoint: LocatorCheckpoint = serde_json::from_reader(std::fs::File::open(
+            self.checkpoint.with_extension("locators.json"),
+        )?)?;
+        if checkpoint.format_version != 1
+            || checkpoint.owner_identity != self.identity
+            || !checkpoint.complete
+            || !checkpoint.verified
+            || checkpoint.gap_rows != 0
+        {
+            return Err("complete verified locator inventory required for TEST cutover".into());
+        }
+        // Start from the first identity on every invocation. A committed CAS
+        // locator is accepted on resume, but every target is reverified and
+        // newly added or changed source rows still revoke completion.
+        let mut cursor = LocatorCursor::default();
+        let mut rows = 0_u64;
+        let mut bytes = 0_u64;
+        while let Some(located) = self.next_locator(&cursor).await? {
+            let encoded = self
+                .target
+                .get_bounded(&receipt_key(&checkpoint.identity, &located.cursor)?, 16384)
+                .await?;
+            let receipt: LocatorReceipt = serde_json::from_slice(&encoded)?;
+            if receipt.format_version != 1
+                || receipt.identity != checkpoint.identity
+                || receipt.cursor != located.cursor
+                || receipt.gap_reason.is_some()
+                || receipt.source_locator_md5.len() != 32
+                || !receipt
+                    .source_locator_md5
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(
+                    "fresh locator receipt with conditional source identity required".into(),
+                );
+            }
+            let object = receipt
+                .object
+                .ok_or("missing source body cannot authorize cutover")?;
+            let tenant = Uuid::parse_str(&located.cursor.tenant)?;
+            self.target.verify_tenant_content(tenant, &object).await?;
+            if (located.source_locator_md5 != receipt.source_locator_md5
+                && located.locator != object.object_locator)
+                || located
+                    .expected_digest
+                    .as_ref()
+                    .is_some_and(|digest| *digest != object.blake3_digest)
+                || located
+                    .expected_bytes
+                    .is_some_and(|size| size != object.size_bytes)
+            {
+                return Err(
+                    "locator or media index changed after verification; source retained".into(),
+                );
+            }
+            if matches!(located.cursor.kind.as_str(), "request" | "response") {
+                let root = self
+                    .target
+                    .raw_capture_reference(
+                        tenant,
+                        Uuid::parse_str(&located.cursor.identity)?,
+                        &located.cursor.kind,
+                    )
+                    .await?
+                    .ok_or("verified raw root required before locator cutover")?;
+                if serde_json::to_value(root)? != serde_json::to_value(&object)? {
+                    return Err("raw root differs from verified locator receipt".into());
+                }
+            }
+            let (table, id, column) = located.cursor.columns()?;
+            let media_guard = if located.cursor.kind == "media" {
+                " AND content_blake3 = $5 AND byte_length = $6"
+            } else {
+                ""
+            };
+            let statement = format!(
+                "UPDATE {table} SET {column} = $1 WHERE {id} = $2 AND tenant_id = $3 AND (md5({column}) = $4 OR {column} = $1){media_guard}"
+            );
+            let mut transaction = self.pool.begin().await?;
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(statement.as_str()))
+                .bind(&object.object_locator)
+                .bind(&located.cursor.identity)
+                .bind(&located.cursor.tenant)
+                .bind(&receipt.source_locator_md5);
+            if located.cursor.kind == "media" {
+                query = query
+                    .bind(&object.blake3_digest)
+                    .bind(i64::try_from(object.size_bytes)?);
+            }
+            if query.execute(&mut *transaction).await?.rows_affected() != 1 {
+                transaction.rollback().await?;
+                return Err(
+                    "locator source identity changed or is ambiguous; source retained".into(),
+                );
+            }
+            transaction.commit().await?;
+            rows = rows
+                .checked_add(1)
+                .ok_or("locator cutover count overflow")?;
+            bytes = bytes
+                .checked_add(object.size_bytes)
+                .ok_or("locator cutover byte overflow")?;
+            cursor = located.cursor;
+            result["rows"] = rows.into();
+            result["bytes"] = bytes.into();
+            result["cursor"] = serde_json::to_value(&cursor)?;
+            save_checkpoint(&path, &result)?;
+        }
+        if rows != checkpoint.copied_rows || bytes != checkpoint.copied_bytes {
+            return Err("locator cutover source/target count or byte mismatch".into());
+        }
+        result["complete"] = true.into();
+        save_checkpoint(&path, &result)?;
+        Ok(result)
+    }
+
     pub(super) async fn verified_locator(
         &self,
         kind: &str,
@@ -173,7 +366,7 @@ impl Runner {
              UNION ALL SELECT 'quarantine_response', tenant_id, id, response_object, NULL, NULL FROM session_archive_quarantine_records
              UNION ALL SELECT 'quarantine_version_request', tenant_id, id, request_object, NULL, NULL FROM session_archive_quarantine_record_versions
              UNION ALL SELECT 'quarantine_version_response', tenant_id, id, response_object, NULL, NULL FROM session_archive_quarantine_record_versions
-             ) SELECT kind, tenant, identity, left(locator, 4096) AS locator, expected_digest, expected_bytes FROM sources
+             ) SELECT kind, tenant, identity, left(locator, 4096) AS locator, md5(locator) AS source_locator_md5, expected_digest, expected_bytes FROM sources
              WHERE (kind, tenant, identity) > ($1, $2, $3)
                AND locator IS NOT NULL AND locator <> ''
              ORDER BY kind, tenant, identity LIMIT 1",
@@ -199,6 +392,7 @@ impl Runner {
             cursor,
             locator,
             source_locator_blake3,
+            source_locator_md5: row.try_get("source_locator_md5")?,
             expected_digest: row.try_get("expected_digest")?,
             expected_bytes: row
                 .try_get::<Option<i64>, _>("expected_bytes")?
@@ -231,59 +425,7 @@ impl Runner {
             sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
                 .execute(&mut *transaction)
                 .await?;
-            let (table, id, column) = match located.cursor.kind.as_str() {
-                "request" => ("request_records", "id", "request_object"),
-                "response" => ("request_records", "id", "response_object"),
-                "import_request" => (
-                    "session_archive_import_records",
-                    "json_build_array(source, external_request_id)::TEXT",
-                    "request_object",
-                ),
-                "import_response" => (
-                    "session_archive_import_records",
-                    "json_build_array(source, external_request_id)::TEXT",
-                    "response_object",
-                ),
-                "import_previous_request" => (
-                    "session_archive_import_records",
-                    "json_build_array(source, external_request_id)::TEXT",
-                    "previous_request_object",
-                ),
-                "import_previous_response" => (
-                    "session_archive_import_records",
-                    "json_build_array(source, external_request_id)::TEXT",
-                    "previous_response_object",
-                ),
-                "unlinked_request" => (
-                    "session_archive_unlinked_requests",
-                    "archive_request_id",
-                    "request_object",
-                ),
-                "unlinked_response" => (
-                    "session_archive_unlinked_requests",
-                    "archive_request_id",
-                    "response_object",
-                ),
-                "quarantine_request" => {
-                    ("session_archive_quarantine_records", "id", "request_object")
-                }
-                "quarantine_response" => (
-                    "session_archive_quarantine_records",
-                    "id",
-                    "response_object",
-                ),
-                "quarantine_version_request" => (
-                    "session_archive_quarantine_record_versions",
-                    "id",
-                    "request_object",
-                ),
-                "quarantine_version_response" => (
-                    "session_archive_quarantine_record_versions",
-                    "id",
-                    "response_object",
-                ),
-                _ => return Err("inline media locator is not an archived media object".into()),
-            };
+            let (table, id, column) = located.cursor.columns()?;
             let statement = format!(
                 "SELECT substring({column} FROM $3 FOR 65536) FROM {table} WHERE {id} = $1 AND tenant_id = $2"
             );
@@ -422,6 +564,7 @@ impl Runner {
                 identity: identity.into(),
                 cursor: located.cursor.clone(),
                 source_locator_blake3: located.source_locator_blake3,
+                source_locator_md5: located.source_locator_md5,
                 object,
                 gap_reason: gap_reason.map(str::to_owned),
             };
