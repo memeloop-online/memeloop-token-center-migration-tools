@@ -94,13 +94,13 @@ jobs:
           MTC_S3_ACCESS_KEY: rustfs-migration-fixture
           MTC_S3_SECRET_KEY: synthetic-test-only-secret-49
         run: |
-          if node ops/object-migration-runtime/prepare-target.mjs; then
+          if node ops/object-migration-runtime/prepare-target.ts; then
             echo "Missing target must not be certified ready" >&2
             exit 1
           fi
-          node ops/object-migration-runtime/prepare-target.mjs --create
-          node ops/object-migration-runtime/prepare-target.mjs
-          node ops/object-migration-runtime/prepare-target.mjs --create
+          node ops/object-migration-runtime/prepare-target.ts --create
+          node ops/object-migration-runtime/prepare-target.ts
+          node ops/object-migration-runtime/prepare-target.ts --create
       - name: Test exact byte transfer, resume, reconstruction and source retention
         working-directory: .object-runtime
         env:

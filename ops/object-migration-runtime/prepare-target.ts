@@ -1,17 +1,23 @@
 // Dependency-free S3 bucket readiness probe/bootstrap. No object overwrite or deletion.
 import { createHash, createHmac } from "node:crypto";
 
-const sha256 = (value) => createHash("sha256").update(value).digest("hex");
-const hmac = (key, value) => createHmac("sha256", key).update(value).digest();
+const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
+const hmac = (key: string | Buffer, value: string) => createHmac("sha256", key).update(value).digest();
+
+function required(name: string): string {
+  const value = process.env[name];
+  if (!value) throw new Error("configuration");
+  return value;
+}
 
 async function main() {
   const args = process.argv.slice(2);
   if (args.some((arg) => arg !== "--create") || args.length > 1) throw new Error("arguments");
-  const endpoint = new URL(process.env.MTC_S3_ENDPOINT);
-  const bucket = process.env.MTC_S3_BUCKET;
+  const endpoint = new URL(required("MTC_S3_ENDPOINT"));
+  const bucket = required("MTC_S3_BUCKET");
   const region = process.env.MTC_S3_REGION || "us-east-1";
-  const access = process.env.MTC_S3_ACCESS_KEY;
-  const secret = process.env.MTC_S3_SECRET_KEY;
+  const access = required("MTC_S3_ACCESS_KEY");
+  const secret = required("MTC_S3_SECRET_KEY");
   if (process.env.MTC_OBJECT_MIGRATION_TEST_NAMESPACE !== "memeloop-token-center-test"
       || !bucket || !/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(bucket)
       || !access || !secret || endpoint.username || endpoint.password
@@ -21,7 +27,7 @@ async function main() {
     throw new Error("configuration");
   }
   const target = new URL(`/${bucket}`, endpoint);
-  async function request(method) {
+  async function request(method: "HEAD" | "PUT"): Promise<number> {
     const date = new Date().toISOString().replace(/[:-]|\.\d{3}/g, "");
     const day = date.slice(0, 8);
     const payload = sha256("");

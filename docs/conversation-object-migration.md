@@ -125,7 +125,7 @@ a missing namespace, and a database identity mismatch are rejected. Existing
 explicitly named test databases remain supported. This guard does not replace
 the quiesced writer requirement or the current `verify-all` receipt.
 
-Before transfer, `node ops/object-migration-runtime/prepare-target.mjs` probes
+Before transfer, `node ops/object-migration-runtime/prepare-target.ts` probes
 the exact configured TEST bucket using signed S3 HEAD. It fails on a missing
 bucket; explicit `--create` may create that empty bucket and verifies it with
 HEAD. It never lists, overwrites or deletes objects. Supply only target
