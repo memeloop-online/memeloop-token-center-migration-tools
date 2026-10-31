@@ -662,7 +662,7 @@ impl Database {
                 sqlx::query("DELETE FROM session_archive_source_sessions WHERE tenant_id=$1 AND source=$2 AND source_session_id=$3")
                 .bind(&tenant_id).bind(input.archive_source).bind(&tombstone.source_session_id).execute(&mut **tx).await?;
                 sqlx::query("INSERT INTO session_archive_applied_tombstones (tenant_id,source,source_session_id,deleted_at_ms,ingest_fence,deleted_records,applied_at) VALUES ($1,$2,$3,$4,$5,$6,$7)")
-                .bind(&tenant_id).bind(input.archive_source).bind(&tombstone.source_session_id).bind(tombstone.deleted_at_ms).bind(input.ingest_fence).bind(i64::try_from(deleted).map_err(|_| AppError::Internal)?).bind(now).execute(&mut **tx).await?;
+                .bind(&tenant_id).bind(input.archive_source).bind(&tombstone.source_session_id).bind(tombstone.deleted_at_ms).bind(input.ingest_fence).bind(i64::try_from(deleted).map_err(|_| AppError::internal("cpa_session_archive_commit_1"))?).bind(now).execute(&mut **tx).await?;
                 result.tombstones_applied += 1;
                 result.deleted_records = result.deleted_records.saturating_add(deleted);
             }
@@ -672,7 +672,7 @@ impl Database {
                 .bind(&tenant_id).bind(input.archive_source).bind(checkpoint.watermark_ms).bind(checkpoint.watermark_request_id).bind(checkpoint.imported_records).bind(now).execute(&mut **tx).await?;
         }
         sqlx::query("INSERT INTO session_archive_snapshot_checkpoints (tenant_id,source,source_fingerprint,sequence,offline_full_snapshot,output_sha256,prior_output_sha256,prior_source_ingest_fence,snapshot_schema_version,ingest_fence,tombstone_safe_after_ingest_fence,session_set_sha256,session_count,request_count,deleted_session_count,applied_tombstones,deleted_records,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) ON CONFLICT(tenant_id,source) DO UPDATE SET source_fingerprint=excluded.source_fingerprint,sequence=excluded.sequence,offline_full_snapshot=excluded.offline_full_snapshot,output_sha256=excluded.output_sha256,prior_output_sha256=excluded.prior_output_sha256,prior_source_ingest_fence=excluded.prior_source_ingest_fence,snapshot_schema_version=excluded.snapshot_schema_version,ingest_fence=excluded.ingest_fence,tombstone_safe_after_ingest_fence=excluded.tombstone_safe_after_ingest_fence,session_set_sha256=excluded.session_set_sha256,session_count=excluded.session_count,request_count=excluded.request_count,deleted_session_count=excluded.deleted_session_count,applied_tombstones=excluded.applied_tombstones,deleted_records=excluded.deleted_records,updated_at=excluded.updated_at")
-            .bind(&tenant_id).bind(input.archive_source).bind(input.source_fingerprint).bind(input.sequence).bind(i64::from(input.offline_full_snapshot)).bind(input.output_sha256).bind(input.prior_output_sha256).bind(input.prior_source_ingest_fence).bind(input.snapshot_schema_version).bind(input.ingest_fence).bind(input.tombstone_safe_after_ingest_fence).bind(input.session_set_sha256).bind(input.session_count).bind(input.request_count).bind(input.deleted_session_count).bind(i64::try_from(result.tombstones_applied).map_err(|_| AppError::Internal)?).bind(i64::try_from(result.deleted_records).map_err(|_| AppError::Internal)?).bind(now).execute(&mut **tx).await?;
+            .bind(&tenant_id).bind(input.archive_source).bind(input.source_fingerprint).bind(input.sequence).bind(i64::from(input.offline_full_snapshot)).bind(input.output_sha256).bind(input.prior_output_sha256).bind(input.prior_source_ingest_fence).bind(input.snapshot_schema_version).bind(input.ingest_fence).bind(input.tombstone_safe_after_ingest_fence).bind(input.session_set_sha256).bind(input.session_count).bind(input.request_count).bind(input.deleted_session_count).bind(i64::try_from(result.tombstones_applied).map_err(|_| AppError::internal("cpa_session_archive_commit_2"))?).bind(i64::try_from(result.deleted_records).map_err(|_| AppError::internal("cpa_session_archive_commit_3"))?).bind(now).execute(&mut **tx).await?;
         if let Some(batch_id) = input.staged_batch_id {
             cleanup_staged_snapshot_in_transaction(tx, batch_id, &tenant_id, input.archive_source)
                 .await?;
@@ -804,7 +804,7 @@ impl Database {
             .bind(input.external_request_id)
             .fetch_optional(&mut **tx)
             .await?
-            .ok_or(AppError::Internal)?;
+            .ok_or(AppError::internal("cpa_session_archive_commit_4"))?;
             let expected_target_request_id = input.target.target_request_id.to_string();
             let compatible = existing.try_get::<String, _>("disposition")? == "exact"
                 && existing.try_get::<String, _>("key_id")? == input.target.key.key_id.to_string()
@@ -1072,7 +1072,7 @@ impl Database {
             .bind(input.external_request_id)
             .fetch_optional(&mut **tx)
             .await?
-            .ok_or(AppError::Internal)?;
+            .ok_or(AppError::internal("cpa_session_archive_commit_5"))?;
             let expected_archive_request_id = input.target.archive_request_id.to_string();
             let compatible = existing.try_get::<String, _>("disposition")? == "unlinked"
                 && existing.try_get::<String, _>("key_id")? == input.target.key.key_id.to_string()
@@ -1206,7 +1206,7 @@ impl Database {
         .execute(&mut **tx)
         .await?;
         if attached.rows_affected() != 1 {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("cpa_session_archive_commit_6"));
         }
         add_archive_record_to_session_projection_in_transaction(
             tx,
@@ -1360,7 +1360,11 @@ mod retirement_tests {
             .await
             .unwrap();
         let (first_request, cluster) = observation(&db, &key, "retiring").await;
-        let task = db.claim_session_title(Uuid::now_v7()).await.unwrap().unwrap();
+        let task = db
+            .claim_session_title(Uuid::now_v7())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(task.session_id, cluster);
         let (last_request, same_cluster) = observation(&db, &key, "retiring").await;
         assert_eq!(same_cluster, cluster);
@@ -1397,7 +1401,11 @@ mod retirement_tests {
         db.request_session_title(key.tenant_id, key.key_id, cluster)
             .await
             .unwrap();
-        let task = db.claim_session_title(Uuid::now_v7()).await.unwrap().unwrap();
+        let task = db
+            .claim_session_title(Uuid::now_v7())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(task.session_id, cluster);
         let mut tx = db.begin_write_transaction().await.unwrap();
         retire_archive_observation_in_transaction(&mut tx, &last_request.to_string())
@@ -1422,7 +1430,11 @@ mod retirement_tests {
         db.request_session_title(key.tenant_id, key.key_id, cluster)
             .await
             .unwrap();
-        let stale_task = db.claim_session_title(Uuid::now_v7()).await.unwrap().unwrap();
+        let stale_task = db
+            .claim_session_title(Uuid::now_v7())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(stale_task.session_id, cluster);
         let mut tx = db.begin_write_transaction().await.unwrap();
         retire_archive_observation_in_transaction(&mut tx, &last_request.to_string())
@@ -1488,7 +1500,15 @@ mod retirement_tests {
         tenant: Uuid,
         key: Uuid,
         session: Uuid,
-    ) -> Vec<(String, String, String, Option<String>, String, i64, Option<String>)> {
+    ) -> Vec<(
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        i64,
+        Option<String>,
+    )> {
         sqlx::query_as("SELECT tenant_id,key_id,session_id,title,state,revision,lease_owner FROM session_generated_titles WHERE NOT (tenant_id=$1 AND key_id=$2 AND session_id=$3) ORDER BY tenant_id,key_id,session_id")
             .bind(tenant.to_string()).bind(key.to_string()).bind(session.to_string())
             .fetch_all(&db.pool).await.unwrap()
@@ -1565,12 +1585,12 @@ async fn finalize_staged_snapshot_in_transaction(
                     .bind(tenant_id).bind(archive_source).bind(&source_session_id).execute(&mut **tx).await?;
                 sqlx::query("INSERT INTO session_archive_source_sessions (tenant_id,source,source_session_id,requests,first_at_ms,last_at_ms,records_sha256,ingest_fence,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(tenant_id,source,source_session_id) DO UPDATE SET requests=excluded.requests,first_at_ms=excluded.first_at_ms,last_at_ms=excluded.last_at_ms,records_sha256=excluded.records_sha256,ingest_fence=excluded.ingest_fence,updated_at=excluded.updated_at")
                     .bind(tenant_id).bind(archive_source).bind(&source_session_id).bind(row.try_get::<i64,_>("requests")?)
-                    .bind(row.try_get::<Option<i64>,_>("first_at_ms")?.ok_or(AppError::Internal)?).bind(row.try_get::<i64,_>("last_at_ms")?)
-                    .bind(row.try_get::<Option<String>,_>("records_sha256")?.ok_or(AppError::Internal)?).bind(input.ingest_fence).bind(now).execute(&mut **tx).await?;
+                    .bind(row.try_get::<Option<i64>,_>("first_at_ms")?.ok_or(AppError::internal("cpa_session_archive_commit_7"))?).bind(row.try_get::<i64,_>("last_at_ms")?)
+                    .bind(row.try_get::<Option<String>,_>("records_sha256")?.ok_or(AppError::internal("cpa_session_archive_commit_8"))?).bind(input.ingest_fence).bind(now).execute(&mut **tx).await?;
             } else {
                 let deleted_at_ms: i64 = row
                     .try_get::<Option<i64>, _>("deleted_at_ms")?
-                    .ok_or(AppError::Internal)?;
+                    .ok_or(AppError::internal("cpa_session_archive_commit_9"))?;
                 let deleted_records: i64 = row.try_get("deleted_records")?;
                 if let Some(existing) = sqlx::query_scalar::<_, i64>("SELECT deleted_at_ms FROM session_archive_applied_tombstones WHERE tenant_id=$1 AND source=$2 AND source_session_id=$3")
                     .bind(tenant_id).bind(archive_source).bind(&source_session_id).fetch_optional(&mut **tx).await? {
@@ -1580,7 +1600,7 @@ async fn finalize_staged_snapshot_in_transaction(
                     sqlx::query("INSERT INTO session_archive_applied_tombstones (tenant_id,source,source_session_id,deleted_at_ms,ingest_fence,deleted_records,applied_at) VALUES ($1,$2,$3,$4,$5,$6,$7)")
                         .bind(tenant_id).bind(archive_source).bind(&source_session_id).bind(deleted_at_ms).bind(input.ingest_fence).bind(deleted_records).bind(now).execute(&mut **tx).await?;
                     result.tombstones_applied += 1;
-                    result.deleted_records = result.deleted_records.saturating_add(u64::try_from(deleted_records).map_err(|_| AppError::Internal)?);
+                    result.deleted_records = result.deleted_records.saturating_add(u64::try_from(deleted_records).map_err(|_| AppError::internal("cpa_session_archive_commit_10"))?);
                 }
                 sqlx::query("DELETE FROM session_archive_source_sessions WHERE tenant_id=$1 AND source=$2 AND source_session_id=$3")
                     .bind(tenant_id).bind(archive_source).bind(&source_session_id).execute(&mut **tx).await?;
@@ -1656,7 +1676,7 @@ pub(super) async fn advance_session_archive_checkpoint(
     .execute(&mut **tx)
     .await?;
     if updated.rows_affected() != 1 {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("cpa_session_archive_commit_11"));
     }
     Ok(())
 }

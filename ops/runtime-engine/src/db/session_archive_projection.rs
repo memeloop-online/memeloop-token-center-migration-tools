@@ -41,7 +41,7 @@ pub(crate) async fn add_archive_record_to_session_projection_in_transaction(
     .execute(&mut **tx)
     .await?;
     if inserted.rows_affected() != 1 {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("cpa_session_archive_projection_1"));
     }
     Ok(())
 }
