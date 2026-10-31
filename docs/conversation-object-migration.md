@@ -116,3 +116,11 @@ A TEST Job uses the published digest, a persistent private checkpoint volume,
 source credential Secret refs and separate RustFS credential refs. The default
 phase remains inventory; copying requires quiesced writers, and source mutation
 remains restricted to explicitly named TEST databases.
+
+The historical TEST database is named `memeloop_token_center`, like production.
+For that database, `cutover-test` additionally requires
+`MTC_OBJECT_MIGRATION_TEST_NAMESPACE` from the Pod namespace downward API and
+an explicit TEST CNPG service hostname in `MTC_DATABASE_URL`. Production hosts,
+a missing namespace, and a database identity mismatch are rejected. Existing
+explicitly named test databases remain supported. This guard does not replace
+the quiesced writer requirement or the current `verify-all` receipt.

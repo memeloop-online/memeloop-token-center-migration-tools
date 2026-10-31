@@ -145,6 +145,68 @@ fn ordered_digest(
     digest.finalize().to_hex().to_string()
 }
 
+// Historical TEST uses the same database name as production. Its namespace
+// comes from the Pod downward API and its endpoint must name the TEST CNPG
+// service explicitly; a namespace assertion alone cannot authorize writes.
+fn test_source_is_explicit(database: &str, source: &str, namespace: Option<&str>) -> bool {
+    let Ok(source) = url::Url::parse(source) else {
+        return false;
+    };
+    if source.path().trim_start_matches('/') != database {
+        return false;
+    }
+    if database.ends_with("_test") || database.starts_with("mtc_test_") {
+        return true;
+    }
+    database == "memeloop_token_center"
+        && namespace == Some("memeloop-token-center-test")
+        && matches!(
+            source.host_str(),
+            Some(
+                "memeloop-token-center-test-pg-rw"
+                    | "memeloop-token-center-test-pg-rw.memeloop-token-center-test"
+                    | "memeloop-token-center-test-pg-rw.memeloop-token-center-test.svc"
+                    | "memeloop-token-center-test-pg-rw.memeloop-token-center-test.svc.cluster.local"
+            )
+        )
+}
+
+#[test]
+fn test_source_guard_rejects_production_with_the_same_database_name() {
+    let test = "postgres://fixture:fixture@memeloop-token-center-test-pg-rw/memeloop_token_center";
+    let prod = "postgres://fixture:fixture@memeloop-token-center-pg-rw/memeloop_token_center";
+    assert!(test_source_is_explicit(
+        "memeloop_token_center",
+        test,
+        Some("memeloop-token-center-test")
+    ));
+    assert!(!test_source_is_explicit(
+        "memeloop_token_center",
+        test,
+        None
+    ));
+    assert!(!test_source_is_explicit(
+        "memeloop_token_center",
+        test,
+        Some("memeloop-token-center")
+    ));
+    assert!(!test_source_is_explicit(
+        "memeloop_token_center",
+        prod,
+        Some("memeloop-token-center-test")
+    ));
+    assert!(!test_source_is_explicit(
+        "wrong_database",
+        test,
+        Some("memeloop-token-center-test")
+    ));
+    assert!(test_source_is_explicit(
+        "fixture_test",
+        "postgres://fixture@localhost/fixture_test",
+        None
+    ));
+}
+
 impl Runner {
     fn load_checkpoint(&self) -> Result<Checkpoint> {
         match std::fs::File::open(&self.checkpoint) {
@@ -506,7 +568,13 @@ impl Runner {
         let database: String = sqlx::query_scalar("SELECT current_database()")
             .fetch_one(&self.pool)
             .await?;
-        if !database.ends_with("_test") && !database.starts_with("mtc_test_") {
+        if !test_source_is_explicit(
+            &database,
+            &std::env::var("MTC_DATABASE_URL")?,
+            std::env::var("MTC_OBJECT_MIGRATION_TEST_NAMESPACE")
+                .ok()
+                .as_deref(),
+        ) {
             return Err(
                 "source mutation is restricted to an explicitly named TEST database".into(),
             );
