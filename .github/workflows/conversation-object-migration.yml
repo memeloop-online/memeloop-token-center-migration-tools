@@ -6,6 +6,11 @@ on:
       - ops/object-migration-runtime/**
       - .github/workflows/conversation-object-migration.yml
   workflow_dispatch:
+    inputs:
+      publish_runtime:
+        description: Publish the verified object migration runtime for a coordinated TEST window
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -14,6 +19,11 @@ jobs:
   test-transfer:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    outputs:
+      runtime_artifact: conversation-object-runtime-${{ github.sha }}
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     services:
       postgres:
         image: postgres:16-alpine
@@ -86,6 +96,26 @@ jobs:
       - name: Build reviewed migration command
         working-directory: .object-runtime
         run: cargo build --locked --bin migrate-conversation-objects
+      - name: Package executable TEST runtime without changing the CPA runtime
+        run: |
+          mkdir -p .object-runtime-package
+          cp .object-runtime/target/debug/migrate-conversation-objects .object-runtime-package/
+          strip .object-runtime-package/migrate-conversation-objects
+          cp ops/object-migration-runtime/Dockerfile .object-runtime-package/
+          docker build --tag mtc-object-migration:verified .object-runtime-package
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --memory 128m --cpus .25 \
+            mtc-object-migration:verified --help
+          docker save mtc-object-migration:verified | gzip -n > .object-runtime-package/runtime.tar.gz
+          (cd .object-runtime-package && sha256sum runtime.tar.gz > SHA256SUMS)
+      - uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        with:
+          name: conversation-object-runtime-${{ github.sha }}
+          path: |
+            .object-runtime-package/runtime.tar.gz
+            .object-runtime-package/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
       - uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
         with:
           name: conversation-object-migration-${{ github.sha }}
@@ -97,3 +127,30 @@ jobs:
           docker inspect rustfs-migration --format 'OOMKilled={{.State.OOMKilled}}'
           docker stats --no-stream rustfs-migration
           docker logs --tail 40 rustfs-migration
+
+  publish-object-runtime:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_runtime
+    needs: test-transfer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+        with:
+          name: ${{ needs.test-transfer.outputs.runtime_artifact }}
+          path: runtime
+      - name: Verify and load the tested runtime
+        run: |
+          (cd runtime && sha256sum -c SHA256SUMS)
+          gzip -dc runtime/runtime.tar.gz | docker load
+      - name: Publish a separate immutable object-migration tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ghcr.io/${{ github.repository }}:conversation-objects-${{ github.sha }}
+        run: |
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker tag mtc-object-migration:verified "$IMAGE"
+          docker push "$IMAGE"
+          docker inspect "$IMAGE" --format '{{index .RepoDigests 0}}' >> "$GITHUB_STEP_SUMMARY"

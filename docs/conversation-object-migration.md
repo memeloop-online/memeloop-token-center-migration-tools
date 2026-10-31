@@ -105,3 +105,14 @@ A failed rerun first revokes the aggregate receipt. TEST atom cutover requires
 this aggregate as well as its existing raw/reconstruction checks; individual
 green phase files cannot authorize cutover. The receipt continues to label
 historical training fidelity as uncertified rather than inventing missing data.
+
+The dedicated workflow also packages the tested command as a non-root OCI
+runtime, runs `--help` with no network and a read-only filesystem, and uploads
+`runtime.tar.gz` with `SHA256SUMS`. A manual workflow dispatch with
+`publish_runtime=true` publishes only the separate
+`conversation-objects-<tools commit>` tag in the canonical tools image. The
+existing CPA importer/runtime pins and running worktrees remain unchanged.
+A TEST Job uses the published digest, a persistent private checkpoint volume,
+source credential Secret refs and separate RustFS credential refs. The default
+phase remains inventory; copying requires quiesced writers, and source mutation
+remains restricted to explicitly named TEST databases.
