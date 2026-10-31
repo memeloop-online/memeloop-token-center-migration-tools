@@ -117,7 +117,7 @@ impl SessionArchiveImportLock {
         if scoped_released && global_released {
             Ok(())
         } else {
-            Err(AppError::Internal)
+            Err(AppError::internal("cpa_session_archive_1"))
         }
     }
 }
@@ -232,7 +232,8 @@ impl Database {
         let target_request_id = parse_uuid(row.try_get("target_request_id")?)?;
         let key_id = parse_uuid(row.try_get("key_id")?)?;
         let policy_json: String = row.try_get("policy_json")?;
-        let policy = serde_json::from_str(&policy_json).map_err(|_| AppError::Internal)?;
+        let policy = serde_json::from_str(&policy_json)
+            .map_err(|_| AppError::internal("cpa_session_archive_2"))?;
 
         let imported = sqlx::query(
             "SELECT target_request_id, record_digest FROM session_archive_import_records WHERE tenant_id = $1 AND source = $2 AND external_request_id = $3",
@@ -474,11 +475,11 @@ impl Database {
             "exact" => {
                 let target_request_id = parse_uuid(
                     row.try_get::<Option<String>, _>("target_request_id")?
-                        .ok_or(AppError::Internal)?,
+                        .ok_or(AppError::internal("cpa_session_archive_3"))?,
                 )?;
                 let external_event_hash = row
                     .try_get::<Option<String>, _>("external_event_hash")?
-                    .ok_or(AppError::Internal)?;
+                    .ok_or(AppError::internal("cpa_session_archive_4"))?;
                 let expected_identity = archive_proof_digest(
                     "memeloop-session-archive-identity-v1",
                     &[
@@ -522,7 +523,7 @@ impl Database {
                         target_request_id,
                         request_created_at: row
                             .try_get::<Option<i64>, _>("target_request_created_at")?
-                            .ok_or(AppError::Internal)?,
+                            .ok_or(AppError::internal("cpa_session_archive_5"))?,
                         key,
                         external_event_hash,
                         source_created_at: row.try_get("source_started_at")?,
@@ -566,7 +567,7 @@ impl Database {
                 );
                 let archive_request_id = parse_uuid(
                     row.try_get::<Option<String>, _>("archive_request_id")?
-                        .ok_or(AppError::Internal)?,
+                        .ok_or(AppError::internal("cpa_session_archive_6"))?,
                 )?;
                 if verified_key.tenant_id != key.tenant_id
                     || verified_key.key_id != key.key_id
@@ -592,7 +593,7 @@ impl Database {
                     },
                 )))
             }
-            _ => Err(AppError::Internal),
+            _ => Err(AppError::internal("cpa_session_archive_7")),
         }
     }
 
@@ -719,7 +720,8 @@ impl Database {
             ));
         }
         expected.push(142);
-        let limit = i64::try_from(expected.len() + 1).map_err(|_| AppError::Internal)?;
+        let limit = i64::try_from(expected.len() + 1)
+            .map_err(|_| AppError::internal("cpa_session_archive_8"))?;
         let applied = sqlx::query_scalar::<_, i64>(
             "SELECT version FROM schema_migrations ORDER BY version LIMIT $1",
         )
@@ -814,7 +816,8 @@ pub(super) fn archive_authenticated_key(row: &AnyRow) -> Result<AuthenticatedKey
         alias: row.try_get("alias")?,
         currency: row.try_get("currency")?,
         credential_generation: row.try_get("credential_generation")?,
-        policy: serde_json::from_str(&policy_json).map_err(|_| AppError::Internal)?,
+        policy: serde_json::from_str(&policy_json)
+            .map_err(|_| AppError::internal("cpa_session_archive_9"))?,
     })
 }
 

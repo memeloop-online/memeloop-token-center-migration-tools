@@ -556,7 +556,10 @@ async fn exact_retirement_fixture(postgres: bool, prior_cluster: bool) {
         .await
         .unwrap_err();
     assert!(
-        matches!(error.downcast_ref::<AppError>(), Some(AppError::Internal)),
+        matches!(
+            error.downcast_ref::<AppError>(),
+            Some(AppError::Internal { .. })
+        ),
         "{error}"
     );
     assert_eq!(

@@ -204,7 +204,7 @@ pub(super) async fn preflight_gap_compatibility(
 pub(super) fn payload_content_location(value: &Value) -> Result<Option<String>, AppError> {
     payload_bytes(value)
         .map(|body| body.map(|body| content_location(&digest(&body))))
-        .map_err(|_| AppError::Internal)
+        .map_err(|_| AppError::internal("cpa_correlation_1"))
 }
 
 pub(super) fn content_location(digest: &str) -> String {
