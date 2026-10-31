@@ -426,7 +426,7 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
             assert!(locator.starts_with(&format!("tenants/{tenant}/cas/v1/blake3/")));
             let expected = if column.contains("response") {
                 response.as_ref()
-            } else if column == "object_locator" {
+            } else if *column == "object_locator" {
                 b"synthetic media"
             } else {
                 document.as_bytes()
