@@ -44,6 +44,29 @@ No cargo, source checkout, package install, network download or product process
 is needed to launch the delivered executable. Verify host dynamic-library
 availability with the isolated `--help` check before supplying real inputs.
 
+### OCI delivery qualification
+
+Release hashes alone do not qualify the container's dynamic loader. An Alpine
+delivery base cannot execute the GNU importer even when every release file
+matches its manifest. The bundle image uses digest-pinned Node24.18.0 on Debian
+Trixie, with the GNU loader, OpenSSL, PostgreSQL and SQLite clients installed by
+CI. The base pin comes from the
+[official Node image metadata](https://github.com/docker-library/repo-info/blob/042a77456cc28ec8543b1cd1770ed4d3f5cef63c/repos/node/remote/24.18.0-trixie-slim.md).
+
+Both PR CI and the official publisher build the same Dockerfile. Its non-root,
+network-disabled build step verifies release checksums and actually launches
+the packaged GNU importer, Node exporter and SQLite backup helper. Missing
+loaders or shared libraries fail publication; no host executable or PATH
+fallback can substitute for the packaged importer. This startup gate is not a
+real database import or reconciliation receipt.
+
+The publisher can deliver an already verified older release without rebuilding
+or relabelling its payload. The tag binds both identities:
+`release-bundle-<payload-revision>-delivery-<delivery-definition-revision>`.
+Record the resulting OCI digest and official workflow run; old payload-only
+tags are not overwritten. Target schema must still match that payload's exact
+compatibility contract, independently of the delivery definition's revision.
+
 Dry-run remains the default. `SESSION_ARCHIVE_APPLY=true` is an explicit write
 decision; the finalizer additionally requires its separately bound approval.
 The engine checks exact target schema133 read-only before import, validates
