@@ -90,6 +90,9 @@ file lock plus a database advisory lock. Store them on persistent private
 storage. Lost checkpoints can restart copy before cutover; never invent a
 verification receipt to continue a partial cutover.
 
-CI exercises an isolated PostgreSQL database and memory-backed ArchiveStore.
+CI exercises an isolated PostgreSQL database and an official, digest-pinned
+RustFS 1.0.4 target. The source object store is isolated in memory. The same
+copy/resume/independent verification, source-retention and TEST atom cutover
+contracts cover a multipart Unicode tool result, raw SSE, media and fork edges.
 RustFS TEST restore, throughput, CPU and memory measurements remain required;
 an in-memory fixture is not evidence for deployment resource sizing.

@@ -34,7 +34,7 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
          CREATE TABLE conversation_projection_outbox(request_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, request_json TEXT NOT NULL, semantic_snapshot_json TEXT, semantic_payload_snapshot_json TEXT, key_snapshot_json TEXT, hints_json TEXT NOT NULL);",
     ).execute(&pool).await.unwrap();
     let tenant = Uuid::now_v7();
-    let document = serde_json::json!({"role":"tool", "content":"工具\n".repeat(200000), "tool_call_id":"call-1", "unknown":[1,2,3]}).to_string();
+    let document = serde_json::json!({"role":"tool", "content":"工具\n".repeat(1200000), "tool_call_id":"call-1", "unknown":[1,2,3]}).to_string();
     let hash = blake3::hash(document.as_bytes()).to_hex().to_string();
     let node = memeloop_token_center::conversation::digest_parts(None, &hash);
     sqlx::query("INSERT INTO semantic_atoms VALUES ($1, $2, $3)")
@@ -61,11 +61,19 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
         .await
         .unwrap();
     let directory = tempfile::tempdir().unwrap();
+    let mut target_config = Config::for_test(url.to_string());
+    if let Ok(endpoint) = std::env::var("MTC_RUSTFS_TEST_ENDPOINT") {
+        target_config.archive_backend = memeloop_token_center::config::ArchiveBackend::S3;
+        target_config.s3_endpoint = Some(endpoint);
+        target_config.s3_bucket = Some(std::env::var("MTC_RUSTFS_TEST_BUCKET").unwrap());
+        target_config.s3_access_key = Some(std::env::var("MTC_RUSTFS_TEST_ACCESS_KEY").unwrap());
+        target_config.s3_secret_key = Some(std::env::var("MTC_RUSTFS_TEST_SECRET_KEY").unwrap());
+        target_config.s3_region = "us-east-1".into();
+        target_config.s3_allow_http = true;
+    }
     let runner = Runner {
         pool: pool.clone(),
-        target: ArchiveStore::from_config(&Config::for_test(url.to_string()))
-            .await
-            .unwrap(),
+        target: ArchiveStore::from_config(&target_config).await.unwrap(),
         checkpoint: directory.path().join("checkpoint.json"),
         identity: "fixture".into(),
     };
