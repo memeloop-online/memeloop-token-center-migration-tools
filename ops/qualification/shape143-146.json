@@ -1,0 +1,19 @@
+{
+  "sampled_at": "2026-10-31T19:18:50Z",
+  "provenance": "Read-only catalog estimates, not live rows. No credentials or account data.",
+  "first_day": "2026-08-24",
+  "daily_rows": [25051,25292,13695,13021,10395,3142,13,40,8,127,14133,2839,960,153,6991,777,20,13698,149,352,3428,31732,21082,30970,22438,29945,19764,1790,1274,1015,2132,2634,1139,3276,3786,7957,6338,11333,4028,10806,8475,6828,7442,16566,15573,19133,23750,19182,18727,21546,20862,17475,24927,19575,21756,27890,22998,26966,23202,18930,25729,28458,26942,28898,36615,34051,37837,45638,26086,0,0,0,0,0,0,0,0],
+  "daily_pages": [3341,3373,1826,1736,1386,418,2,6,1,11,1134,221,82,18,575,60,2,1091,15,30,258,2598,1797,2610,1959,2634,3720,155,114,90,187,230,101,284,336,694,569,986,350,946,1555,587,654,1573,1354,1722,2193,1725,1705,1933,1822,1536,2044,1643,1972,2362,1866,2381,2161,1723,2474,2649,2381,2593,3117,2996,3602,3819,2448,0,0,0,0,0,0,0,0],
+  "default_rows": 260095,
+  "default_pages": 34680,
+  "response_spool_rows": 544084,
+  "response_spool_pages": 24585,
+  "request_spool_rows": 618794,
+  "request_spool_pages": 27925,
+  "assumptions": {
+    "owner_distribution": "Synthetic 90% completed, 5% live unexpired, 5% live expired; not inferred from private rows.",
+    "spool_distribution": "Synthetic 90% bound/cleaned, 5% pending, 5% uploading; zero body bytes and no customer objects.",
+    "accounts": "2000 synthetic config rows, half matching144, not actual account cardinality.",
+    "heap_shape": "Per-leaf inline request_object padding approximates observed pages/row; spool locator padding approximates 370 bytes/row. Actual pages reported, never asserted identical."
+  }
+}
