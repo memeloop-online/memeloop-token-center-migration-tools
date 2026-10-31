@@ -7,6 +7,12 @@ The dedicated object runtime now includes the uncapped streaming compressed
 archive decoder. Real RustFS CI copies and independently verifies a 130 MiB
 compressed historical source while preserving the original source hash/bytes.
 
+Preexisting atom body references also require explicit `MTC_SOURCE_S3_*`
+configuration. Copy reads their source CAS, verifies full byte/hash/UTF-8
+character counts, streams the body to target CAS, and verifies target readback.
+A readable target object alone does not prove a source copy. Wrong or missing
+source credentials/body/count evidence stops verification and preserves source.
+
 Current executable scope: exact `semantic_atoms` body transfer and context-node
 parent/depth/hash reconstruction. This is **not yet a whole-store cutover tool**.
 `copy-locators` / `verify-locators` also stream request/response objects (including

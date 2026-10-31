@@ -90,6 +90,7 @@ struct Checkpoint {
 
 struct Runner {
     pool: PgPool,
+    source: Option<ArchiveStore>,
     target: ArchiveStore,
     checkpoint: PathBuf,
     identity: String,
@@ -252,6 +253,89 @@ impl Runner {
             .await
     }
 
+    async fn transfer_existing_body_reference(
+        &self,
+        tenant: Uuid,
+        reference: &ConversationBodyReference,
+        copy: bool,
+    ) -> Result<ConversationBodyReference> {
+        let source = self
+            .source
+            .as_ref()
+            .ok_or("existing atom CAS requires explicit source object storage configuration")?;
+        let mut stream = source
+            .open_tenant_content(tenant, &reference.conversation_body_v1)
+            .await?
+            .stream;
+        let staging = format!(
+            "migration-staging/conversation-v1/{}/{}",
+            self.identity,
+            Uuid::now_v7()
+        );
+        let mut writer = if copy {
+            Some(self.target.start_writer(&staging).await?)
+        } else {
+            None
+        };
+        let mut digest = blake3::Hasher::new();
+        let mut bytes = 0_u64;
+        let mut chars = 0_u64;
+        let mut pending = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            bytes = bytes
+                .checked_add(chunk.len() as u64)
+                .ok_or("atom body byte count overflow")?;
+            digest.update(&chunk);
+            for part in chunk.chunks(65536) {
+                pending.extend_from_slice(part);
+                let valid = match std::str::from_utf8(&pending) {
+                    Ok(text) => text.len(),
+                    Err(error) if error.error_len().is_none() => error.valid_up_to(),
+                    Err(_) => return Err("source atom body is not UTF-8".into()),
+                };
+                chars = chars
+                    .checked_add(std::str::from_utf8(&pending[..valid])?.chars().count() as u64)
+                    .ok_or("atom character count overflow")?;
+                pending.drain(..valid);
+            }
+            if let Some(writer) = &mut writer {
+                writer.write(chunk).await?;
+            }
+        }
+        let digest = digest.finalize().to_hex().to_string();
+        if !pending.is_empty()
+            || chars != reference.chars
+            || bytes != reference.conversation_body_v1.size_bytes
+            || digest != reference.conversation_body_v1.blake3_digest
+        {
+            return Err("source atom body reference count/hash/characters mismatch".into());
+        }
+        let object = if let Some(writer) = writer {
+            let staged = writer.finish_staged().await?;
+            if staged.size_bytes != bytes || staged.blake3_digest != digest {
+                return Err("atom CAS transfer hash mismatch".into());
+            }
+            let object = self
+                .target
+                .promote_staged_text_to_cas(tenant, &staged)
+                .await?;
+            self.target.delete(&staged.object_locator).await?;
+            object
+        } else {
+            memeloop_token_center::archive::CasArchiveObject {
+                object_locator: format!("tenants/{tenant}/cas/v1/blake3/{}/{digest}", &digest[..2]),
+                blake3_digest: digest,
+                size_bytes: bytes,
+            }
+        };
+        self.target.verify_tenant_content(tenant, &object).await?;
+        Ok(ConversationBodyReference {
+            conversation_body_v1: object,
+            chars,
+        })
+    }
+
     async fn source_field_reference(
         &self,
         cursor: &Cursor,
@@ -278,8 +362,8 @@ impl Runner {
             && let Ok(reference) = serde_json::from_str::<ConversationBodyReference>(&prefix)
         {
             transaction.commit().await?;
-            self.target
-                .verify_tenant_content(tenant, &reference.conversation_body_v1)
+            let reference = self
+                .transfer_existing_body_reference(tenant, &reference, copy)
                 .await?;
             return Ok((reference, source_md5));
         }
@@ -663,8 +747,14 @@ async fn run(args: Args) -> Result<()> {
     if !acquired {
         return Err("another conversation migration holds the source lock".into());
     }
+    let object_source = if std::env::var_os("MTC_SOURCE_S3_ENDPOINT").is_some() {
+        Some(ArchiveStore::from_config(&locators::source_config(&config)?).await?)
+    } else {
+        None
+    };
     let runner = Runner {
         pool: pool.clone(),
+        source: object_source,
         target: ArchiveStore::from_config(&config).await?,
         checkpoint: args.checkpoint,
         identity,

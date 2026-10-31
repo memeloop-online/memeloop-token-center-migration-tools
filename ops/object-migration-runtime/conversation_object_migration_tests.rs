@@ -71,15 +71,16 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
         target_config.s3_region = "us-east-1".into();
         target_config.s3_allow_http = true;
     }
+    let source = ArchiveStore::from_config(&Config::for_test(url.to_string()))
+        .await
+        .unwrap();
     let runner = Runner {
         pool: pool.clone(),
+        source: Some(source.clone()),
         target: ArchiveStore::from_config(&target_config).await.unwrap(),
         checkpoint: directory.path().join("checkpoint.json"),
         identity: "fixture".into(),
     };
-    let source = ArchiveStore::from_config(&Config::for_test(url.to_string()))
-        .await
-        .unwrap();
     let response = Bytes::from_static(
         b"event: message\r\ndata: {\"tool_call_id\":\"call-1\"}\r\n\r\ndata: [DONE]\r\n\r\n",
     );
@@ -391,6 +392,7 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
     }
     let gap_runner = Runner {
         pool: pool.clone(),
+        source: Some(source.clone()),
         target: runner.target.clone(),
         checkpoint: directory.path().join("with-gaps.json"),
         identity: "fixture-gaps".into(),
@@ -432,7 +434,7 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
             .await
             .is_err()
     );
-    let copied_large = CasArchiveObject {
+    let copied_large = memeloop_token_center::archive::CasArchiveObject {
         object_locator: format!(
             "tenants/{tenant}/cas/v1/blake3/{}/{}",
             &large.blake3_digest[..2],
@@ -493,4 +495,131 @@ fn checkpoint_identity_and_atom_key_reject_cross_scope_replay() {
         )
         .is_err()
     );
+}
+
+#[tokio::test]
+async fn preexisting_compressed_atom_cas_is_copied_from_the_real_source_and_verified() {
+    let database_url = std::env::var("MTC_TEST_POSTGRES_URL").unwrap();
+    let administrative = PgPool::connect(&database_url).await.unwrap();
+    let name = format!("mtc_test_{}", Uuid::now_v7().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
+        .execute(&administrative)
+        .await
+        .unwrap();
+    let mut url = url::Url::parse(&database_url).unwrap();
+    url.set_path(&name);
+    let pool = PgPool::connect(url.as_str()).await.unwrap();
+    sqlx::raw_sql("CREATE TABLE semantic_atoms(tenant_id TEXT NOT NULL, content_hash TEXT NOT NULL, content_json TEXT NOT NULL, PRIMARY KEY(tenant_id, content_hash)); CREATE TABLE context_nodes(tenant_id TEXT NOT NULL, node_hash TEXT NOT NULL, parent_hash TEXT, atom_hash TEXT NOT NULL, depth BIGINT NOT NULL, PRIMARY KEY(tenant_id,node_hash));").execute(&pool).await.unwrap();
+    let tenant = Uuid::now_v7();
+    let source = ArchiveStore::from_config(&Config::for_test(url.to_string()))
+        .await
+        .unwrap();
+    let body = serde_json::json!({"role":"user", "content":"工具😀\n".repeat(100000)}).to_string();
+    let hash = blake3::hash(body.as_bytes()).to_hex().to_string();
+    let mut writer = source
+        .start_compressed_writer("fixture/existing-atom")
+        .await
+        .unwrap();
+    for chunk in body.as_bytes().chunks(65536) {
+        writer.write(Bytes::copy_from_slice(chunk)).await.unwrap();
+    }
+    let staged = writer.finish_staged().await.unwrap();
+    let original = source
+        .promote_staged_text_to_cas(tenant, &staged)
+        .await
+        .unwrap();
+    let reference = ConversationBodyReference {
+        conversation_body_v1: original.clone(),
+        chars: body.chars().count() as u64,
+    };
+    sqlx::query("INSERT INTO semantic_atoms VALUES ($1,$2,$3)")
+        .bind(tenant.to_string())
+        .bind(&hash)
+        .bind(serde_json::to_string(&reference).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let node = memeloop_token_center::conversation::digest_parts(None, &hash);
+    sqlx::query("INSERT INTO context_nodes VALUES ($1,$2,NULL,$3,1)")
+        .bind(tenant.to_string())
+        .bind(&node)
+        .bind(&hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut config = Config::for_test(url.to_string());
+    config.archive_backend = memeloop_token_center::config::ArchiveBackend::S3;
+    config.s3_endpoint = Some(std::env::var("MTC_RUSTFS_TEST_ENDPOINT").unwrap());
+    config.s3_bucket = Some(std::env::var("MTC_RUSTFS_TEST_BUCKET").unwrap());
+    config.s3_access_key = Some(std::env::var("MTC_RUSTFS_TEST_ACCESS_KEY").unwrap());
+    config.s3_secret_key = Some(std::env::var("MTC_RUSTFS_TEST_SECRET_KEY").unwrap());
+    config.s3_region = "us-east-1".into();
+    config.s3_allow_http = true;
+    let directory = tempfile::tempdir().unwrap();
+    let runner = Runner {
+        pool: pool.clone(),
+        source: Some(source.clone()),
+        target: ArchiveStore::from_config(&config).await.unwrap(),
+        checkpoint: directory.path().join("cas.json"),
+        identity: "existing-cas-fixture".into(),
+    };
+    assert_eq!(runner.copy().await.unwrap().copied_rows, 1);
+    assert!(runner.verify().await.unwrap().verified);
+    let cursor = Cursor {
+        tenant_id: tenant.to_string(),
+        content_hash: hash.clone(),
+    };
+    let transfer = runner.transfer(&cursor).await.unwrap();
+    assert_eq!(transfer.reference.chars, reference.chars);
+    assert_eq!(
+        transfer.reference.conversation_body_v1.blake3_digest,
+        original.blake3_digest
+    );
+    assert_eq!(
+        runner
+            .target
+            .get_tenant_content(tenant, &transfer.reference.conversation_body_v1, body.len())
+            .await
+            .unwrap()
+            .as_ref(),
+        body.as_bytes()
+    );
+    source
+        .verify_tenant_content(tenant, &original)
+        .await
+        .unwrap();
+    let source_json: String = sqlx::query_scalar("SELECT content_json FROM semantic_atoms")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(source_json, serde_json::to_string(&reference).unwrap());
+    let missing_source = Runner {
+        pool: pool.clone(),
+        source: None,
+        target: runner.target.clone(),
+        checkpoint: directory.path().join("no-source.json"),
+        identity: "missing-source-fixture".into(),
+    };
+    assert!(
+        missing_source.copy().await.is_err(),
+        "a readable target is not proof of a source copy"
+    );
+    let mut tampered = reference;
+    tampered.chars += 1;
+    sqlx::query("UPDATE semantic_atoms SET content_json=$1")
+        .bind(serde_json::to_string(&tampered).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(runner.verify().await.is_err());
+    assert!(
+        !load_checkpoint(&runner.checkpoint, &runner.identity)
+            .unwrap()
+            .verified
+    );
+    pool.close().await;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE {name}")))
+        .execute(&administrative)
+        .await
+        .unwrap();
 }
