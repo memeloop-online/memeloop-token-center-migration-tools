@@ -51,7 +51,7 @@ fn receipt_key(identity: &str, cursor: &LocatorCursor) -> Result<String> {
     ))
 }
 
-fn source_config(target: &Config) -> Result<Config> {
+pub(super) fn source_config(target: &Config) -> Result<Config> {
     let mut source = target.clone();
     source.s3_endpoint = Some(
         std::env::var("MTC_SOURCE_S3_ENDPOINT").map_err(|_| "explicit source endpoint required")?,

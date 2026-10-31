@@ -96,3 +96,12 @@ copy/resume/independent verification, source-retention and TEST atom cutover
 contracts cover a multipart Unicode tool result, raw SSE, media and fork edges.
 RustFS TEST restore, throughput, CPU and memory measurements remain required;
 an in-memory fixture is not evidence for deployment resource sizing.
+
+`--phase verify-all --writers-quiesced` independently reruns atom/context,
+locator/media, authenticated spool, payload and dialogue verification under the
+same source advisory lock. It compares exact inventories before and after,
+records every phase result and binds their checkpoint digests in `*.all.json`.
+A failed rerun first revokes the aggregate receipt. TEST atom cutover requires
+this aggregate as well as its existing raw/reconstruction checks; individual
+green phase files cannot authorize cutover. The receipt continues to label
+historical training fidelity as uncertified rather than inventing missing data.

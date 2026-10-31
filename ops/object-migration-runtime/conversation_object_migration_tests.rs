@@ -298,6 +298,33 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
         .await
         .unwrap();
     assert!(runner.reconstruct_dialogues(true).await.unwrap().verified);
+    assert!(
+        runner.cutover_test().await.is_err(),
+        "individual phase receipts cannot authorize all-source cutover"
+    );
+    let aggregate = runner
+        .verify_all_from(&source, "fixture", pepper)
+        .await
+        .unwrap();
+    assert_eq!(aggregate["verified"], true);
+    assert_eq!(aggregate["complete_training_fidelity_certified"], false);
+    assert!(
+        runner
+            .verify_all_from(&source, "fixture", b"wrong key")
+            .await
+            .is_err()
+    );
+    assert!(
+        runner.cutover_test().await.is_err(),
+        "failed re-verification revokes cutover authority"
+    );
+    assert_eq!(
+        runner
+            .verify_all_from(&source, "fixture", pepper)
+            .await
+            .unwrap()["verified"],
+        true
+    );
     let completed = runner.cutover_test().await.unwrap();
     assert!(completed.cutover_complete);
     let encoded: String = sqlx::query_scalar("SELECT content_json FROM semantic_atoms")
