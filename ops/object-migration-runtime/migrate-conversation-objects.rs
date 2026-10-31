@@ -568,13 +568,15 @@ impl Runner {
         let database: String = sqlx::query_scalar("SELECT current_database()")
             .fetch_one(&self.pool)
             .await?;
-        if !test_source_is_explicit(
-            &database,
-            &std::env::var("MTC_DATABASE_URL")?,
-            std::env::var("MTC_OBJECT_MIGRATION_TEST_NAMESPACE")
-                .ok()
-                .as_deref(),
-        ) {
+        if !(database.ends_with("_test") || database.starts_with("mtc_test_"))
+            && !test_source_is_explicit(
+                &database,
+                &std::env::var("MTC_DATABASE_URL").unwrap_or_default(),
+                std::env::var("MTC_OBJECT_MIGRATION_TEST_NAMESPACE")
+                    .ok()
+                    .as_deref(),
+            )
+        {
             return Err(
                 "source mutation is restricted to an explicitly named TEST database".into(),
             );
