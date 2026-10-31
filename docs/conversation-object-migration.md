@@ -3,6 +3,9 @@
 This command is owned here, not in the product repository. CI assembles it
 against an exact reviewed product revision and its Cargo.lock. It reuses
 `ArchiveStore` and does not modify the existing CPA importer or its runtime pin.
+The dedicated object runtime now includes the uncapped streaming compressed
+archive decoder. Real RustFS CI copies and independently verifies a 130 MiB
+compressed historical source while preserving the original source hash/bytes.
 
 Current executable scope: exact `semantic_atoms` body transfer and context-node
 parent/depth/hash reconstruction. This is **not yet a whole-store cutover tool**.

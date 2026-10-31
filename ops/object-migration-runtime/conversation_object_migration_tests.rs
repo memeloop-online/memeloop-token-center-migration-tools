@@ -345,6 +345,25 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
     assert_eq!(restored, document.as_bytes());
     assert_eq!(reference.chars, document.chars().count() as u64);
     assert_eq!(runner.cutover_test().await.unwrap().cutover_rows, 1);
+    // Compressed historical objects must stream beyond the old 64/128 MiB
+    // decoder ceilings, including through real RustFS multipart promotion.
+    let mut large = source
+        .start_compressed_writer("fixture/large-response")
+        .await
+        .unwrap();
+    let chunk = Bytes::from(vec![b'x'; 64 * 1024]);
+    for _ in 0..2080 {
+        large.write(chunk.clone()).await.unwrap();
+    }
+    let large = large.finish_staged().await.unwrap();
+    let large_id = Uuid::now_v7();
+    sqlx::query("INSERT INTO request_records VALUES ($1, $2, NULL, $3)")
+        .bind(large_id.to_string())
+        .bind(tenant.to_string())
+        .bind(&large.object_locator)
+        .execute(&pool)
+        .await
+        .unwrap();
     // A gap before a readable row must not prevent preservation of the rest
     // of the historical archive. Gap receipts are counted and block a green
     // verification/cutover certificate, including on resume.
@@ -380,7 +399,7 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
         .transfer_locators_from(&source, "fixture-gaps", false)
         .await
         .unwrap();
-    assert_eq!(copied.copied_rows, 5);
+    assert_eq!(copied.copied_rows, 6);
     assert_eq!(copied.gap_rows, 3);
     assert!(!copied.verified);
     assert_eq!(
@@ -401,7 +420,7 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
         std::fs::File::open(gap_runner.checkpoint.with_extension("locators.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!((evidence.copied_rows, evidence.gap_rows), (5, 3));
+    assert_eq!((evidence.copied_rows, evidence.gap_rows), (6, 3));
     assert!(!evidence.verified);
     assert!(
         gap_runner
@@ -412,6 +431,38 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
             )
             .await
             .is_err()
+    );
+    let copied_large = CasArchiveObject {
+        object_locator: format!(
+            "tenants/{tenant}/cas/v1/blake3/{}/{}",
+            &large.blake3_digest[..2],
+            large.blake3_digest
+        ),
+        blake3_digest: large.blake3_digest.clone(),
+        size_bytes: large.size_bytes,
+    };
+    assert!(copied_large.size_bytes > 128 * 1024 * 1024);
+    runner
+        .target
+        .verify_tenant_content(tenant, &copied_large)
+        .await
+        .unwrap();
+    let mut retained = source
+        .open_stream(&large.object_locator, None)
+        .await
+        .unwrap()
+        .stream;
+    let mut retained_digest = blake3::Hasher::new();
+    let mut retained_bytes = 0_u64;
+    while let Some(chunk) = retained.next().await {
+        let chunk = chunk.unwrap();
+        retained_digest.update(&chunk);
+        retained_bytes += chunk.len() as u64;
+    }
+    assert_eq!(retained_bytes, large.size_bytes);
+    assert_eq!(
+        retained_digest.finalize().to_hex().as_str(),
+        large.blake3_digest
     );
     pool.close().await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE {name}")))
