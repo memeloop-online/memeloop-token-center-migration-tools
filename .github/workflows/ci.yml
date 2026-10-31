@@ -81,6 +81,8 @@ jobs:
         run: |
           docker pull ghcr.io/memeloop-online/memeloop-token-center@sha256:145d6f55c3b1cd6574bc2e32cdd6361c0d2218ed92d5daecac321d8572563ae2
       - name: Rehearse sustained writes and original transactions
+        env:
+          QUAL_POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
         run: node ops/qualification/rehearse143-146.ts
       - name: Retain database statement and resource evidence
         if: always()

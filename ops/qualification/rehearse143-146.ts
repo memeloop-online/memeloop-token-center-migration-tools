@@ -131,6 +131,10 @@ async function preflight(db: Session) {
     FROM pg_inherits p JOIN pg_class c ON c.oid=p.inhrelid
     WHERE p.inhparent='request_records'::regclass ORDER BY c.relname`);
   assert.deepEqual(actual.map((r) => r.name), leaves.map((r) => r.name).sort());
+  for (const leaf of leaves) {
+    assert.equal(actual.find((r) => r.name===leaf.name)?.bound, leaf.name.endsWith("default")
+      ? "DEFAULT" : `FOR VALUES FROM ('${leaf.start}') TO ('${leaf.end}')`);
+  }
   const indexes = (await catalog(db)).filter((r) => r.name.startsWith("qual146_"));
   assert.equal(indexes.length, 78);
   for (const [i, leaf] of leaves.entries()) {
@@ -198,7 +202,8 @@ async function seed(db: Session) {
       CASE WHEN g%2=0 THEN '{"transport_policy":{"failover_deadline_millis":1000,"keep":true}}'
       ELSE '{"transport_policy":{"keep":true}}' END, 'disabled',1,1793404800000,1793404800000
     FROM generate_series(1,2000) g`);
-  await db.sql(`INSERT INTO credit_accounts VALUES
+  await db.sql(`INSERT INTO credit_accounts
+    (id,tenant_id,principal_id,currency,available_micros,reserved_micros,created_at,updated_at) VALUES
     ('synthetic-account','synthetic-tenant','synthetic-principal','USD',1000000,0,0,0)`);
   await db.sql("ANALYZE");
   receipt.fixture_relations = await db.rows(`SELECT relname, reltuples::bigint AS estimated_rows,
@@ -375,10 +380,23 @@ async function scenario(database: string, spool: boolean) {
       result.lock_abort.rollback_verified = true;
       load.phase = "after_abort";
       await delay(5000);
+      load.phase = "transaction_abort";
+      result.transaction_abort = await migrate(database, `${database}-transaction-abort`,
+        "-c lock_timeout=500ms -c statement_timeout=2s -c transaction_timeout=100ms");
+      assert.notEqual(result.transaction_abort.code, 0);
+      assert.deepEqual(await db.rows("SELECT * FROM schema_migrations ORDER BY version"), ledger);
+      assert.equal(await db.sql("SELECT to_regclass('request_records_live_owner_expiry_idx') IS NULL"), "t");
+      assert.equal(await db.sql(`SELECT count(*) FROM information_schema.columns
+        WHERE table_name='response_archive_spools' AND column_name='body_blake3'`), "0");
+      await preflight(db);
+      result.transaction_abort.rollback_verified = true;
+      load.phase = "after_abort";
+      await delay(5000);
     }
     load.phase = "official_upgrade";
-    result.migration = await migrate(database, database,
-      "-c lock_timeout=500ms -c statement_timeout=30s -c transaction_timeout=60s");
+    result.migration = await migrate(database, database, spool
+      ? "-c lock_timeout=500ms -c statement_timeout=2s -c transaction_timeout=5s"
+      : "-c lock_timeout=500ms -c statement_timeout=30s -c transaction_timeout=60s");
     load.phase = "after_commit";
     assert.equal(result.migration.code, 0, "official migration must commit");
     await delay(15000);
@@ -404,6 +422,25 @@ async function scenario(database: string, spool: boolean) {
     result.partitions_after = await db.rows(`SELECT c.relname FROM pg_inherits p
       JOIN pg_class c ON c.oid=p.inhrelid WHERE p.inhparent='request_records'::regclass`);
     result.resources_after = await resources(db);
+    if (spool) {
+      load.phase = "future_partition";
+      // Genuinely new partition outside both the observed and runner-maintained set.
+      const start = Math.max(Date.UTC(2026,10,9), Math.floor(Date.now()/86400000)*86400000+10*86400000);
+      const name = `request_records_${new Date(start).toISOString().slice(0,10).replaceAll("-","")}`;
+      const t = performance.now();
+      await db.sql(`CREATE TABLE ${ident(name)} PARTITION OF request_records
+        FOR VALUES FROM (${start}) TO (${start+86400000})`);
+      const inherited = await db.rows(`SELECT ci.relname, i.indisvalid, a.inhparent::regclass::text AS parent
+        FROM pg_index i JOIN pg_class ci ON ci.oid=i.indexrelid
+        JOIN pg_inherits a ON a.inhrelid=i.indexrelid
+        WHERE i.indrelid=${quote(name)}::regclass
+        AND a.inhparent='request_records_live_owner_expiry_idx'::regclass`);
+      assert.equal(inherited.length, 1);
+      assert.equal(inherited[0]!.indisvalid, true);
+      result.future_partition = { name, ms: performance.now()-t, inherited };
+      load.phase = "after_future_partition";
+      await delay(5000);
+    }
   } finally {
     result.writes = await load.finish(database);
     observing.stop = true;
@@ -456,14 +493,20 @@ async function main() {
     await db.close();
     save();
   }
-  const admin = new Session("rehearsal142","qual_clone");
-  // No connection to the template while cloning. Switch this one to a fresh
-  // administrative fixture database, not a production/default database.
-  await admin.sql("CREATE DATABASE rehearsal_admin");
-  await admin.close();
-  const clone = new Session("rehearsal_admin","qual_clone");
-  await clone.sql("CREATE DATABASE rehearsal_leafonly TEMPLATE rehearsal142");
-  await clone.sql("CREATE DATABASE rehearsal_prebuilt TEMPLATE rehearsal142");
+  const container = process.env.QUAL_POSTGRES_CONTAINER!;
+  assert.match(container, /^[a-f0-9]{64}$/u);
+  // Use server-matched pg_dump/restore. Preserve genuine schema and ledger
+  // receipt exactly; no fabricated SQL replay or backwards ledger manipulation.
+  const dump = await command(["docker","exec",container,"pg_dump","-U","token_center",
+    "-d","rehearsal142","-Fc","-f","/tmp/qualification142.dump"]);
+  assert.equal(dump.code, 0, dump.output);
+  const clone = new Session("rehearsal142","qual_clone");
+  for (const database of ["rehearsal_leafonly", "rehearsal_prebuilt"]) {
+    await clone.sql(`CREATE DATABASE ${ident(database)}`);
+    const restored = await command(["docker","exec",container,"pg_restore","-U","token_center",
+      "--exit-on-error","-d",database,"/tmp/qualification142.dump"]);
+    assert.equal(restored.code, 0, restored.output);
+  }
   await clone.close();
   await scenario("rehearsal_leafonly", false);
   await scenario("rehearsal_prebuilt", true);
@@ -471,7 +514,20 @@ async function main() {
   save();
 }
 
-main().catch((error: unknown) => {
+let resourceStop = false;
+async function sampleResources() {
+  while (!resourceStop) {
+    const docker = await command(["docker","stats","--no-stream","--format","{{json .}}"]);
+    appendFileSync(join(root,"resources.jsonl"), JSON.stringify({
+      at: new Date().toISOString(), docker: docker.output,
+      memory: readFileSync("/proc/meminfo","utf8"), disk: readFileSync("/proc/diskstats","utf8"),
+      cpu: readFileSync("/proc/stat","utf8"),
+    })+"\n");
+    await delay(3000);
+  }
+}
+const resourceTask = sampleResources();
+main().then(async () => { resourceStop = true; await resourceTask; }).catch((error: unknown) => {
   receipt.status = "failed";
   receipt.error = String(error);
   save();
