@@ -58,20 +58,20 @@ async fn archive_import_is_fail_closed_gap_only_and_idempotent() {
 }
 
 #[tokio::test]
-async fn sqlite_schema133_precondition_rejects_version_and_relation_drift_without_writes() {
-    schema133_precondition_fixture(false).await;
+async fn sqlite_schema142_precondition_rejects_version_and_relation_drift_without_writes() {
+    schema142_precondition_fixture(false).await;
 }
 
 #[tokio::test]
-async fn postgres_schema133_precondition_rejects_version_and_relation_drift_without_writes() {
+async fn postgres_schema142_precondition_rejects_version_and_relation_drift_without_writes() {
     if std::env::var("MTC_TEST_POSTGRES_URL").is_err() {
         assert!(std::env::var("CI").is_err(), "CI requires PostgreSQL");
         return;
     }
-    schema133_precondition_fixture(true).await;
+    schema142_precondition_fixture(true).await;
 }
 
-async fn schema133_precondition_fixture(postgres: bool) {
+async fn schema142_precondition_fixture(postgres: bool) {
     let directory = tempfile::tempdir().unwrap();
     let database_url = if postgres {
         sqlx::any::install_default_drivers();
@@ -96,6 +96,7 @@ async fn schema133_precondition_fixture(postgres: bool) {
     };
     let db = Database::connect(&database_url).await.unwrap();
     db.migrate().await.unwrap();
+    db.convert_sealed_state(&[7; 32]).await.unwrap();
     db.ensure_session_archive_import_schema().await.unwrap();
     let pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
     sqlx::query("DROP TABLE proxy_operational_terminals")
@@ -108,34 +109,51 @@ async fn schema133_precondition_fixture(postgres: bool) {
         .unwrap();
     assert_schema_rejected_without_writes(&db, &pool).await;
     db.migrate().await.unwrap();
+    db.convert_sealed_state(&[7; 32]).await.unwrap();
     db.ensure_session_archive_import_schema().await.unwrap();
     let versions: Vec<i64> =
         sqlx::query_scalar("SELECT version FROM schema_migrations ORDER BY version")
             .fetch_all(&pool)
             .await
             .unwrap();
-    assert_eq!(versions.len(), 132);
-    assert_eq!(versions.last(), Some(&133));
+    assert_eq!(versions.len(), 141);
+    assert_eq!(versions.last(), Some(&142));
     assert!(!versions.contains(&114));
-    for missing in [127_i64, 131, 132, 133] {
+    for missing in [127_i64, 131, 132, 133, 141, 142] {
         sqlx::query("DELETE FROM schema_migrations WHERE version=$1")
             .bind(missing)
             .execute(&pool)
             .await
             .unwrap();
         assert_schema_rejected_without_writes(&db, &pool).await;
-        sqlx::query("INSERT INTO schema_migrations (version,name,applied_at) VALUES ($1,'fixture',0)")
+        sqlx::query("INSERT INTO schema_migrations (version,name,applied_at) VALUES ($1,$2,0)")
             .bind(missing)
+            .bind(if missing == 142 {
+                "plaintext state instead of sealed envelopes"
+            } else {
+                "fixture"
+            })
             .execute(&pool)
             .await
             .unwrap();
     }
-    for unexpected in [0_i64, 114, 134] {
-        sqlx::query("INSERT INTO schema_migrations (version,name,applied_at) VALUES ($1,'unqualified',0)")
-            .bind(unexpected)
-            .execute(&pool)
-            .await
-            .unwrap();
+    sqlx::query(
+        "UPDATE schema_migrations SET name='archive spool storage accounting' WHERE version=142",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_schema_rejected_without_writes(&db, &pool).await;
+    sqlx::query("UPDATE schema_migrations SET name='plaintext state instead of sealed envelopes' WHERE version=142")
+        .execute(&pool).await.unwrap();
+    for unexpected in [0_i64, 114, 143] {
+        sqlx::query(
+            "INSERT INTO schema_migrations (version,name,applied_at) VALUES ($1,'unqualified',0)",
+        )
+        .bind(unexpected)
+        .execute(&pool)
+        .await
+        .unwrap();
         assert_schema_rejected_without_writes(&db, &pool).await;
         sqlx::query("DELETE FROM schema_migrations WHERE version=$1")
             .bind(unexpected)
@@ -214,7 +232,7 @@ async fn large_archive_import_preserves_objects_replay_tenants_and_financial_sta
 }
 
 #[tokio::test]
-async fn postgres_schema133_large_import_prefix_readback_replay_and_financial_state() {
+async fn postgres_schema142_large_import_prefix_readback_replay_and_financial_state() {
     if std::env::var("MTC_TEST_POSTGRES_URL").is_ok() {
         archive_import_fixture(true, true).await;
     } else {
@@ -271,6 +289,7 @@ async fn exact_retirement_fixture(postgres: bool, prior_cluster: bool) {
         .unwrap()
         .with_terminal_projection_enabled(true);
     db.migrate().await.unwrap();
+    db.convert_sealed_state(&[7; 32]).await.unwrap();
     db.ensure_session_archive_import_schema().await.unwrap();
     let pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
     let config = Config::for_test(database_url.clone());
@@ -485,7 +504,11 @@ async fn exact_retirement_fixture(postgres: bool, prior_cluster: bool) {
         .await
         .unwrap();
     assert_eq!(
-        imported_refs.view.operational_terminal.unwrap().financial_state,
+        imported_refs
+            .view
+            .operational_terminal
+            .unwrap()
+            .financial_state,
         memeloop_token_center::model::RequestFinancialState::Applied
     );
     assert!(!imported_refs.response_object.unwrap().starts_with("gap://"));
@@ -510,7 +533,8 @@ async fn exact_retirement_fixture(postgres: bool, prior_cluster: bool) {
         .bind(key.tenant_id.to_string()).bind(key.key_id.to_string()).bind(&archive_cluster)
         .bind(Uuid::now_v7().to_string()).bind(completed_at + 86_400_000)
         .execute(&pool).await.unwrap();
-    let title_before = retirement_title_state(&pool, key.tenant_id, key.key_id, &archive_cluster).await;
+    let title_before =
+        retirement_title_state(&pool, key.tenant_id, key.key_id, &archive_cluster).await;
     assert_eq!(title_before.as_ref().unwrap().1, "running");
     let delta_path = write_retirement_tombstone(
         directory.path(),
@@ -818,6 +842,7 @@ async fn archive_import_fixture(large: bool, postgres: bool) {
         .await
         .expect("connect isolated target");
     db.migrate().await.expect("migrate target");
+    db.convert_sealed_state(&[7; 32]).await.unwrap();
     db.ensure_session_archive_import_schema()
         .await
         .expect("migrated schema precondition");

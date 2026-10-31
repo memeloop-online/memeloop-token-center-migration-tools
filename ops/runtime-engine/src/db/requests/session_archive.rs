@@ -706,10 +706,19 @@ impl Database {
             DatabaseBackend::PostgreSql => POSTGRES_MIGRATIONS,
             DatabaseBackend::Sqlite => SQLITE_MIGRATIONS,
         };
-        let expected: Vec<i64> = migrations
+        let mut expected: Vec<i64> = migrations
             .iter()
             .map(|migration| migration.version)
             .collect();
+        // The pinned product records its Rust plaintext conversion separately
+        // from the SQL migration list. Require its exact existing receipt;
+        // this importer never runs that conversion or writes schema metadata.
+        if expected.last() != Some(&141) {
+            return Err(AppError::BadRequest(
+                "pinned SQL migration inventory differs".into(),
+            ));
+        }
+        expected.push(142);
         let limit = i64::try_from(expected.len() + 1).map_err(|_| AppError::Internal)?;
         let applied = sqlx::query_scalar::<_, i64>(
             "SELECT version FROM schema_migrations ORDER BY version LIMIT $1",
@@ -722,9 +731,19 @@ impl Database {
                 "target database must be migrated before session archive import".into(),
             )
         })?;
-        if expected.last() != Some(&133) || applied != expected {
+        if applied != expected {
             return Err(AppError::BadRequest(
-                "target database schema differs from the pinned schema133 migration list".into(),
+                "target database schema differs from the pinned schema142 migration list".into(),
+            ));
+        }
+
+        let sweep_name: String =
+            sqlx::query_scalar("SELECT name FROM schema_migrations WHERE version=142")
+                .fetch_one(&self.pool)
+                .await?;
+        if sweep_name != "plaintext state instead of sealed envelopes" {
+            return Err(AppError::BadRequest(
+                "target schema142 has a different conversion identity".into(),
             ));
         }
 
