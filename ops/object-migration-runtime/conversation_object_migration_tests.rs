@@ -345,6 +345,74 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
     assert_eq!(restored, document.as_bytes());
     assert_eq!(reference.chars, document.chars().count() as u64);
     assert_eq!(runner.cutover_test().await.unwrap().cutover_rows, 1);
+    // A gap before a readable row must not prevent preservation of the rest
+    // of the historical archive. Gap receipts are counted and block a green
+    // verification/cutover certificate, including on resume.
+    for (id, locator) in [
+        ("aaa-gap", "gap://fixture/missing-original"),
+        (
+            "aab-metadata",
+            "metadata-only-json:{\"media_archived\":false}",
+        ),
+        (
+            "aac-provider",
+            "provider-reference-json:{\"id\":\"unresolved\"}",
+        ),
+        ("zzz-readable", "fixture/response"),
+    ] {
+        sqlx::query(
+            "INSERT INTO session_archive_quarantine_record_versions VALUES ($1, $2, $3, NULL)",
+        )
+        .bind(tenant.to_string())
+        .bind(id)
+        .bind(locator)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let gap_runner = Runner {
+        pool: pool.clone(),
+        target: runner.target.clone(),
+        checkpoint: directory.path().join("with-gaps.json"),
+        identity: "fixture-gaps".into(),
+    };
+    let copied = gap_runner
+        .transfer_locators_from(&source, "fixture-gaps", false)
+        .await
+        .unwrap();
+    assert_eq!(copied.copied_rows, 5);
+    assert_eq!(copied.gap_rows, 3);
+    assert!(!copied.verified);
+    assert_eq!(
+        gap_runner
+            .transfer_locators_from(&source, "fixture-gaps", false)
+            .await
+            .unwrap()
+            .gap_rows,
+        3
+    );
+    assert!(
+        gap_runner
+            .transfer_locators_from(&source, "fixture-gaps", true)
+            .await
+            .is_err()
+    );
+    let evidence: locators::LocatorCheckpoint = serde_json::from_reader(
+        std::fs::File::open(gap_runner.checkpoint.with_extension("locators.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!((evidence.copied_rows, evidence.gap_rows), (5, 3));
+    assert!(!evidence.verified);
+    assert!(
+        gap_runner
+            .verified_locator(
+                "quarantine_version_request",
+                &tenant.to_string(),
+                "zzz-readable"
+            )
+            .await
+            .is_err()
+    );
     pool.close().await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE {name}")))
         .execute(&administrative)

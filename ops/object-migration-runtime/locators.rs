@@ -17,7 +17,10 @@ struct LocatorReceipt {
     identity: String,
     cursor: LocatorCursor,
     source_locator_blake3: String,
-    object: CasArchiveObject,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    object: Option<CasArchiveObject>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gap_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -29,6 +32,8 @@ pub(super) struct LocatorCheckpoint {
     cursor: LocatorCursor,
     pub(super) copied_rows: u64,
     pub(super) copied_bytes: u64,
+    #[serde(default)]
+    pub(super) gap_rows: u64,
     digest: String,
     complete: bool,
     pub(super) verified: bool,
@@ -122,10 +127,16 @@ impl Runner {
         {
             return Err("locator receipt ownership mismatch".into());
         }
+        let object = receipt
+            .object
+            .ok_or("locator receipt records a source gap")?;
+        if receipt.gap_reason.is_some() {
+            return Err("locator receipt records a source gap".into());
+        }
         self.target
-            .verify_tenant_content(Uuid::parse_str(tenant)?, &receipt.object)
+            .verify_tenant_content(Uuid::parse_str(tenant)?, &object)
             .await?;
-        Ok(receipt.object)
+        Ok(object)
     }
 
     pub(super) async fn transfer_locators(
@@ -176,14 +187,6 @@ impl Runner {
             identity: row.try_get("identity")?,
         };
         let locator: String = row.try_get("locator")?;
-        if locator.starts_with("gap://")
-            || locator.starts_with("metadata-only-json:")
-            || locator.starts_with("provider-reference-json:")
-        {
-            return Err(
-                "unresolved raw source gap; whole-store transfer cannot be certified".into(),
-            );
-        }
         let source_locator_blake3 = if locator.starts_with("inline-json:") {
             String::new()
         } else {
@@ -398,13 +401,29 @@ impl Runner {
             checkpoint.clone()
         };
         while let Some(located) = self.next_locator(&result.cursor).await? {
-            let object = self.copy_locator(source, &located, !verify).await?;
+            // Declared historical gaps are evidence, not an instruction to
+            // stop copying later readable objects. Never fabricate their body.
+            let gap_reason = if located.locator.starts_with("gap://") {
+                Some("source_gap")
+            } else if located.locator.starts_with("metadata-only-json:") {
+                Some("source_metadata_only")
+            } else if located.locator.starts_with("provider-reference-json:") {
+                Some("source_provider_reference_unresolved")
+            } else {
+                None
+            };
+            let object = if gap_reason.is_some() {
+                None
+            } else {
+                Some(self.copy_locator(source, &located, !verify).await?)
+            };
             let receipt = LocatorReceipt {
                 format_version: 1,
                 identity: identity.into(),
                 cursor: located.cursor.clone(),
                 source_locator_blake3: located.source_locator_blake3,
                 object,
+                gap_reason: gap_reason.map(str::to_owned),
             };
             let key = receipt_key(identity, &located.cursor)?;
             let encoded = serde_json::to_vec(&receipt)?;
@@ -416,25 +435,29 @@ impl Runner {
             if serde_json::to_vec(&actual)? != encoded {
                 return Err("locator receipt/source changed".into());
             }
-            self.target
-                .verify_tenant_content(Uuid::parse_str(&located.cursor.tenant)?, &receipt.object)
-                .await?;
-            if verify && matches!(located.cursor.kind.as_str(), "request" | "response") {
+            if let Some(object) = &receipt.object {
                 self.target
-                    .publish_raw_capture(
-                        Uuid::parse_str(&located.cursor.tenant)?,
-                        Uuid::parse_str(&located.cursor.identity)?,
-                        &located.cursor.kind,
-                        &receipt.object,
-                    )
+                    .verify_tenant_content(Uuid::parse_str(&located.cursor.tenant)?, object)
                     .await?;
+                if verify && matches!(located.cursor.kind.as_str(), "request" | "response") {
+                    self.target
+                        .publish_raw_capture(
+                            Uuid::parse_str(&located.cursor.tenant)?,
+                            Uuid::parse_str(&located.cursor.identity)?,
+                            &located.cursor.kind,
+                            object,
+                        )
+                        .await?;
+                }
+                result.copied_rows += 1;
+                result.copied_bytes += object.size_bytes;
+            } else {
+                result.gap_rows += 1;
             }
             let mut digest = blake3::Hasher::new();
             digest.update(result.digest.as_bytes());
             digest.update(&encoded);
             result.digest = digest.finalize().to_hex().to_string();
-            result.copied_rows += 1;
-            result.copied_bytes += receipt.object.size_bytes;
             result.cursor = located.cursor;
             if !verify {
                 save(&checkpoint_path, &result)?;
@@ -444,13 +467,20 @@ impl Runner {
             if result.copied_rows != checkpoint.copied_rows
                 || result.copied_bytes != checkpoint.copied_bytes
                 || result.digest != checkpoint.digest
+                || result.gap_rows != checkpoint.gap_rows
             {
                 return Err("locator count/byte/order digest mismatch".into());
             }
-            result.verified = true;
+            result.verified = result.gap_rows == 0;
         }
         result.complete = true;
         save(&checkpoint_path, &result)?;
+        if verify && result.gap_rows != 0 {
+            return Err(
+                "source gap receipts retained; full locator verification cannot be certified"
+                    .into(),
+            );
+        }
         Ok(result)
     }
 }

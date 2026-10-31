@@ -12,6 +12,14 @@ source/target hash, byte, count and ordered-receipt verification. Source
 credentials use `MTC_SOURCE_S3_*` environment references; destination keeps
 existing `MTC_S3_*` configuration. These phases never replace source locators
 or delete original objects. Media bytes must match the existing index digest.
+Declared `gap://`, metadata-only and unresolved provider references receive
+separate immutable-source-identity gap receipts. Copy continues through later
+readable objects and reports `gap_rows` separately from copied objects/bytes.
+Verification rereads both kinds of receipt, retains all gap evidence, and fails
+with `verified:false` if any gap remains; neither reconstruction nor cutover
+can claim complete originals from that checkpoint. Source read/auth/integrity
+errors still stop without being relabelled as historical gaps. Null/empty
+locator fields remain separately counted by the read-only inventory.
 
 `copy-spools` / `verify-spools` decode retained legacy v2/zstd1 chunks with
 authenticated tenant/request/reservation/sequence AAD, stream plaintext into
