@@ -91,6 +91,9 @@ jobs:
           docker logs "${{ job.services.postgres.id }}" > "$RUNNER_TEMP/migration143-146/postgres.log" 2>&1
           docker inspect "${{ job.services.postgres.id }}" > "$RUNNER_TEMP/migration143-146/postgres-container.json"
           df -h > "$RUNNER_TEMP/migration143-146/disk.txt"
+          if test -f "$RUNNER_TEMP/migration143-146/result.json"; then
+            node ops/qualification/summarize143-146.ts "$RUNNER_TEMP/migration143-146" > "$RUNNER_TEMP/migration143-146/analysis.json"
+          fi
       - uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
         if: always()
         with:

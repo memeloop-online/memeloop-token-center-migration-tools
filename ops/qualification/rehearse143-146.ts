@@ -152,6 +152,7 @@ async function preflight(db: Session) {
 }
 
 async function seed(db: Session) {
+  console.log("Seeding original142 production-shaped synthetic relations");
   const version = await db.sql("SHOW server_version_num");
   assert.equal(version.trim(), "170005");
   receipt.server_version_num = version;
@@ -214,6 +215,7 @@ async function seed(db: Session) {
     request_spools: shape.request_spool_rows, response_spools: shape.response_spool_rows };
   receipt.assumptions = JSON.parse(readFileSync("ops/qualification/shape143-146.json", "utf8")).assumptions;
   save();
+  console.log("Seed complete", receipt.fixture_counts);
 }
 
 type Sample = { phase: string; kind: string; start: number; ms: number; error?: string };
@@ -341,10 +343,17 @@ async function migrate(database: string, name: string, limits: string) {
     "-e","MTC_DATABASE_URL","-e","MTC_KEY_PEPPER","-e","MTC_SERVICE_TOKEN",
     "-e","MTC_DATABASE_MAX_CONNECTIONS",image,"migrate"], env);
   writeFileSync(join(root, `${name}-migrator.log`), result.output);
-  return { code: result.code, wall_ms: result.ms, limits };
+  return { code: result.code, wall_ms: result.ms, requested_url_options: limits,
+    effective_migration_profile: {
+      lock_timeout_ms: 60000, statement_timeout_ms: 900000,
+      transaction_timeout_ms: Number(limits.match(/transaction_timeout=(\d+)ms/u)?.[1] ??
+        Number(limits.match(/transaction_timeout=(\d+)s/u)?.[1]) * 1000),
+      warning: "Exact59b6 after_connect overwrites URL lock/statement limits; transaction_timeout is not overwritten.",
+    } };
 }
 
 async function scenario(database: string, spool: boolean) {
+  console.log("Starting original official upgrade comparison", database);
   const db = new Session(database, "qual_coordinator");
   const load = new Load();
   const observing = { stop: false };
@@ -378,6 +387,7 @@ async function scenario(database: string, spool: boolean) {
         WHERE table_name='response_archive_spools' AND column_name='body_blake3'`), "0");
       await preflight(db);
       result.lock_abort.rollback_verified = true;
+      console.log("Held-writer rollback verified", result.lock_abort);
       load.phase = "after_abort";
       await delay(5000);
       load.phase = "transaction_abort";
@@ -390,6 +400,7 @@ async function scenario(database: string, spool: boolean) {
         WHERE table_name='response_archive_spools' AND column_name='body_blake3'`), "0");
       await preflight(db);
       result.transaction_abort.rollback_verified = true;
+      console.log("Whole-transaction rollback verified", result.transaction_abort);
       load.phase = "after_abort";
       await delay(5000);
     }
@@ -399,6 +410,7 @@ async function scenario(database: string, spool: boolean) {
       : "-c lock_timeout=500ms -c statement_timeout=30s -c transaction_timeout=60s");
     load.phase = "after_commit";
     assert.equal(result.migration.code, 0, "official migration must commit");
+    console.log("Official migration committed", result.migration);
     await delay(15000);
     const after = await catalog(db);
     for (const ix of before) {
@@ -469,6 +481,16 @@ async function main() {
     hashes[`migrations/${file}`] = sha(readFileSync(`.upgrade-source/migrations/${file}`));
   }
   receipt.source_hashes = hashes;
+  const profileSource = readFileSync(".upgrade-source/src/db/mod.rs", "utf8");
+  assert.ok(profileSource.includes('POSTGRES_MIGRATION_STATEMENT_TIMEOUT: &str = "SET statement_timeout = 900000"'));
+  assert.ok(profileSource.includes('POSTGRES_MIGRATION_LOCK_TIMEOUT: &str = "SET lock_timeout = 60000"'));
+  receipt.migration_profile = {
+    source_sha256: sha(profileSource),
+    source: `memeloop-online/memeloop-token-center@${revision}:src/db/mod.rs`,
+    lock_timeout_ms: 60000, statement_timeout_ms: 900000,
+    url_lock_and_statement_options_overwritten: true,
+    transaction_timeout_url_option_preserved: true,
+  };
   const inspect = await command(["docker","image","inspect",image]);
   assert.equal(inspect.code, 0);
   const identity = JSON.parse(inspect.output)[0] as Row;
@@ -483,7 +505,9 @@ async function main() {
   try {
     await delay(15000);
     load.phase = "leaf_cic";
+    console.log("Preparing78 original146-equivalent leaf indexes concurrently");
     receipt.preparation146 = await prepare146(db);
+    console.log("All78 leaf indexes prepared and validated");
     load.phase = "after_cic";
     await delay(15000);
   } finally {
@@ -500,12 +524,15 @@ async function main() {
   const dump = await command(["docker","exec",container,"pg_dump","-U","token_center",
     "-d","rehearsal142","-Fc","-f","/tmp/qualification142.dump"]);
   assert.equal(dump.code, 0, dump.output);
+  console.log("Genuine142 fixture dump complete", dump.ms);
   const clone = new Session("rehearsal142","qual_clone");
   for (const database of ["rehearsal_leafonly", "rehearsal_prebuilt"]) {
+    console.log("Restoring isolated comparison", database);
     await clone.sql(`CREATE DATABASE ${ident(database)}`);
     const restored = await command(["docker","exec",container,"pg_restore","-U","token_center",
       "--exit-on-error","-d",database,"/tmp/qualification142.dump"]);
     assert.equal(restored.code, 0, restored.output);
+    console.log("Restore complete", database, restored.ms);
   }
   await clone.close();
   await scenario("rehearsal_leafonly", false);
