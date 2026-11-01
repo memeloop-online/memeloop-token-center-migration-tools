@@ -42,7 +42,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: memeloop-online/memeloop-token-center
-          ref: b26fc2c7a1a1fad29b8c9b78b257c649ce2ce33d
+          ref: 1215ee6c2a3c51d44e1d72e37ed555fa0a4963bc
           path: .object-runtime
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c

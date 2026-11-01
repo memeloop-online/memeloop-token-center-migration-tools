@@ -530,7 +530,7 @@ mod tests {
             br#"{"choices":[{"message":{"role":"assistant","content":"exact final answer"}}]}"#,
         );
         let hints = memeloop_token_center::conversation::ConversationHints {
-            session_id: Some("unindexed-session".into()),
+            session_id: Some(format!("unindexed-session{}", "x".repeat(1024 * 1024))),
             branch_id: Some("unindexed-branch".into()),
             ..Default::default()
         };
@@ -545,6 +545,10 @@ mod tests {
             )
             .await
             .unwrap();
+        assert!(
+            manifest.size_bytes > 1024 * 1024,
+            "manifest metadata has no aggregate 1 MiB ceiling"
+        );
         source
             .publish_request_conversation(tenant, request, &manifest)
             .await
