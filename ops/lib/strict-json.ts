@@ -6,30 +6,24 @@ export function parseStrictJson(source: string, maxDepth = 128): unknown {
   let cursor = 0;
   const whitespace = (): void => { while ([" ", "\t", "\n", "\r"].includes(source[cursor] ?? "")) cursor += 1; };
   const fail = (): never => { throw new StrictJsonError("invalid JSON"); };
+  const stringBoundary = /["\\\u0000-\u001f]/g;
   const string = (): string => {
+    const start = cursor;
     if (source[cursor++] !== '"') fail();
-    let output = "";
-    while (cursor < source.length) {
-      const character = source[cursor++]!;
-      if (character === '"') return output;
-      if (character === "\\") {
-        const escape = source[cursor++] ?? fail();
-        if (escape === "u") {
-          const hex = source.slice(cursor, cursor + 4);
-          if (!/^[0-9a-fA-F]{4}$/.test(hex)) fail();
-          output += String.fromCharCode(Number.parseInt(hex, 16));
-          cursor += 4;
-        } else {
-          const escapes: Record<string, string> = { '"': '"', "\\": "\\", "/": "/", b: "\b", f: "\f", n: "\n", r: "\r", t: "\t" };
-          if (!(escape in escapes)) fail();
-          output += escapes[escape];
-        }
-      } else {
-        if (character.charCodeAt(0) < 0x20) fail();
-        output += character;
+    let escaped = false;
+    stringBoundary.lastIndex = cursor;
+    for (;;) {
+      const boundary = stringBoundary.exec(source);
+      if (boundary === null) return fail();
+      cursor = stringBoundary.lastIndex;
+      if (boundary[0] === '"') {
+        if (!escaped) return source.slice(start + 1, cursor - 1);
+        try { return JSON.parse(source.slice(start, cursor)) as string; } catch { return fail(); }
       }
+      if (boundary[0] !== "\\") return fail();
+      escaped = true;
+      stringBoundary.lastIndex = cursor + 1;
     }
-    return fail();
   };
   const value = (depth: number): unknown => {
     if (depth > maxDepth) fail();
