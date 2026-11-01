@@ -87,6 +87,7 @@ pub(super) async fn inventory(pool: &PgPool) -> Result<serde_json::Value> {
     Ok(serde_json::json!({
         "format_version":1, "fields":fields, "raw_sources":raw, "spools":spools,
         "media":{"rows":media.try_get::<i64,_>("rows")?, "indexed_bytes":media.try_get::<i64,_>("bytes")?},
+        "durable_object_roots":"not_scanned_by_sql_inventory",
         "object_bytes_verified":false, "complete_training_fidelity_certified":false,
     }))
 }

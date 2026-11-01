@@ -13,8 +13,28 @@ character counts, streams the body to target CAS, and verifies target readback.
 A readable target object alone does not prove a source copy. Wrong or missing
 source credentials/body/count evidence stops verification and preserves source.
 
-Current executable scope: exact `semantic_atoms` body transfer and context-node
-parent/depth/hash reconstruction. This is **not yet a whole-store cutover tool**.
+`copy-durable-roots` / `verify-durable-roots` independently discover source
+`tenants/*/raw/v1` and `tenants/*/conversations/v1` roots, including captures
+that never acquired a SQL index, supplier summaries, outbound failover attempts,
+and explicit failure markers. The conversation walk verifies manifest/prefix
+ancestry, branch/event links, original captures and media references. JSON event
+documents are skipped through a bounded streaming parser while their complete
+CAS bytes are copied and hashed. Compressed locators retain their original
+format and decoded byte/hash identity. Only objects reachable from these roots
+are copied: unreferenced CAS, staging and raw FIFO cache stay outside the set.
+Counts distinguish exact roots, distinct referenced CAS objects, decoded bytes
+and unresolved gap roots. Deduplication uses temporary disk markers rather
+than keeping a body/key inventory in RAM. Every rerun starts enumeration from
+the beginning because backend list order is not a safe resume cursor; immutable
+CAS and exact root creation make this idempotent. A changed source, unknown root
+schema, unreadable object or conflicting target root refuses verification.
+Missing originals remain explicit; an earlier failure marker is only healed by
+a real readable source capture. Run these phases before `verify-all`; previous
+aggregate receipts lacking this independently verified input cannot authorize
+cutover. The default SQL inventory explicitly does not scan object-only roots.
+
+Current executable scope includes durable object roots, exact `semantic_atoms`
+body transfer and context-node parent/depth/hash reconstruction. This is **not yet a whole-store cutover tool**.
 `copy-locators` / `verify-locators` also stream request/response objects (including
 chunked legacy inline JSON) and indexed media into tenant CAS, with independent
 source/target hash, byte, count and ordered-receipt verification. Source
@@ -135,7 +155,7 @@ contracts cover a multipart Unicode tool result, raw SSE, media and fork edges.
 RustFS TEST restore, throughput, CPU and memory measurements remain required;
 an in-memory fixture is not evidence for deployment resource sizing.
 
-`--phase verify-all --writers-quiesced` independently reruns atom/context,
+`--phase verify-all --writers-quiesced` independently reruns durable-root/CAS graphs, atom/context,
 locator/media, authenticated spool, payload and dialogue verification under the
 same source advisory lock. It compares exact inventories before and after,
 records every phase result and binds their checkpoint digests in `*.all.json`.

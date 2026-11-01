@@ -14,6 +14,8 @@ use uuid::Uuid;
 type Failure = Box<dyn std::error::Error + Send + Sync>;
 type Result<Value> = std::result::Result<Value, Failure>;
 
+#[path = "conversation-object-modules/durable_roots.rs"]
+mod durable_roots;
 #[path = "conversation-object-modules/inventory.rs"]
 mod inventory;
 #[path = "conversation-object-modules/locators.rs"]
@@ -32,6 +34,8 @@ enum Phase {
     Verify,
     CutoverTest,
     CutoverLocatorsTest,
+    CopyDurableRoots,
+    VerifyDurableRoots,
     CopyLocators,
     VerifyLocators,
     CopySpools,
@@ -591,6 +595,7 @@ impl Runner {
                 "bytes": atoms.copied_bytes, "digest": atoms.ordered_digest},
         });
         for extension in [
+            "roots.json",
             "locators.json",
             "spools.json",
             "payloads.json",
@@ -631,6 +636,10 @@ impl Runner {
         // leave an older green receipt authorizing source mutation.
         save_checkpoint(&path, &receipt)?;
         let before = inventory::inventory(&self.pool).await?;
+        receipt["durable_roots"] = serde_json::to_value(
+            self.transfer_durable_roots(source, source_identity, true)
+                .await?,
+        )?;
         receipt["atoms"] = serde_json::to_value(self.verify().await?)?;
         receipt["locators"] = serde_json::to_value(
             self.transfer_locators_from(source, source_identity, true)
@@ -785,6 +794,32 @@ async fn run(args: Args) -> Result<()> {
         println!("{}", serde_json::to_string(&result?)?);
         return Ok(());
     }
+    if matches!(
+        args.phase,
+        Phase::CopyDurableRoots | Phase::VerifyDurableRoots
+    ) {
+        let source_config = locators::source_config(&config)?;
+        let source_identity = blake3::hash(&serde_json::to_vec(&(
+            &runner.identity,
+            &source_config.s3_endpoint,
+            &source_config.s3_bucket,
+        ))?)
+        .to_hex()
+        .to_string();
+        let source = ArchiveStore::from_config(&source_config).await?;
+        let result = runner
+            .transfer_durable_roots(
+                &source,
+                &source_identity,
+                args.phase == Phase::VerifyDurableRoots,
+            )
+            .await;
+        sqlx::query("SELECT pg_advisory_unlock(70720261029)")
+            .execute(&mut *advisory)
+            .await?;
+        println!("{}", serde_json::to_string(&result?)?);
+        return Ok(());
+    }
     if args.phase == Phase::CutoverLocatorsTest {
         let result = runner.cutover_locators_test().await;
         sqlx::query("SELECT pg_advisory_unlock(70720261029)")
@@ -841,7 +876,9 @@ async fn run(args: Args) -> Result<()> {
         Phase::Verify => runner.verify().await,
         Phase::CutoverTest => runner.cutover_test().await,
         Phase::Inventory => unreachable!(),
-        Phase::CopyLocators
+        Phase::CopyDurableRoots
+        | Phase::VerifyDurableRoots
+        | Phase::CopyLocators
         | Phase::CutoverLocatorsTest
         | Phase::VerifyLocators
         | Phase::CopySpools

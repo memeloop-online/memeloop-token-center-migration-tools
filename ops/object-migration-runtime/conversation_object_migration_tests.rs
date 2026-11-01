@@ -310,6 +310,10 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
         runner.cutover_test().await.is_err(),
         "individual phase receipts cannot authorize all-source cutover"
     );
+    runner
+        .transfer_durable_roots(&source, "fixture", false)
+        .await
+        .unwrap();
     let aggregate = runner
         .verify_all_from(&source, "fixture", pepper)
         .await
