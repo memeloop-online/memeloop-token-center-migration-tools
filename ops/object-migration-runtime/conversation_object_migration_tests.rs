@@ -232,6 +232,8 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
     assert!(runner.cutover_locators_test().await.is_err());
     let copied = runner.copy().await.unwrap();
     let inventory = inventory::inventory(&pool).await.unwrap();
+    assert_eq!(inventory["inventory_complete"], true);
+    inventory::require_complete(&inventory).unwrap();
     assert_eq!(
         inventory["fields"][0]["exact_text_bytes"],
         document.len() as u64
@@ -640,6 +642,45 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
         retained_digest.finalize().to_hex().as_str(),
         large.blake3_digest
     );
+    // This is only the disposable fixture database. Historical source absence
+    // must preserve all readable counts, expose unknown media and revoke even
+    // a previously green aggregate before attempting any transfer phase.
+    let before_missing_table = inventory::inventory(&pool).await.unwrap();
+    sqlx::query("DROP TABLE conversation_media_parts")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let partial = inventory::inventory(&pool).await.unwrap();
+    assert_eq!(partial["fields"], before_missing_table["fields"]);
+    assert_eq!(partial["raw_sources"], before_missing_table["raw_sources"]);
+    assert_eq!(partial["spools"], before_missing_table["spools"]);
+    assert_eq!(partial["media"]["state"], "source_table_absent");
+    assert!(partial["media"]["rows"].is_null());
+    assert!(partial["media"]["indexed_bytes"].is_null());
+    assert_eq!(partial["inventory_complete"], false);
+    assert_eq!(
+        partial["missing_source_tables"],
+        serde_json::json!(["conversation_media_parts"])
+    );
+    assert!(inventory::require_complete(&partial).is_err());
+    save_checkpoint(
+        &runner.checkpoint.with_extension("all.json"),
+        &serde_json::json!({"verified":true}),
+    )
+    .unwrap();
+    assert!(
+        runner
+            .verify_all_from(&source, "fixture", pepper)
+            .await
+            .is_err()
+    );
+    let failed: serde_json::Value = serde_json::from_reader(
+        std::fs::File::open(runner.checkpoint.with_extension("all.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(failed["verified"], false);
+    assert_eq!(failed["source_inventory"], partial);
+    assert!(runner.require_all_verification().is_err());
     pool.close().await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE {name}")))
         .execute(&administrative)

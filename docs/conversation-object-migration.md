@@ -110,6 +110,15 @@ encrypted chunk bytes and headers with no retained chunks. Indexed media bytes
 are labelled as index claims, not GET/hash verification. It never treats physical
 relation size, missing originals or an empty transfer set as proof of fidelity.
 
+If a historical source lacks `conversation_media_parts`, inventory still prints
+the readable SQL counts, with media counts explicitly `null`, state
+`source_table_absent`, `missing_source_tables` and `inventory_complete:false`.
+It then exits unsuccessfully. This is partial evidence, not a zero-media result
+or schema compatibility for copy/cutover. Other SQL/auth/I/O errors still fail.
+Aggregate verification persists the partial inventory with `verified:false`
+and refuses transfer validation; it cannot reuse an earlier green receipt.
+`inventory_complete:true` describes SQL counting only, not object verification.
+
 Run `copy --writers-quiesced`, then `verify --writers-quiesced`, using the
 `--phase` argument and the same private `--checkpoint` file. Copy streams
 65536-character source fragments through bounded multipart object writes.

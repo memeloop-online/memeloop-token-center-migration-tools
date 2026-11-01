@@ -641,6 +641,9 @@ impl Runner {
         // leave an older green receipt authorizing source mutation.
         save_checkpoint(&path, &receipt)?;
         let before = inventory::inventory(&self.pool).await?;
+        receipt["source_inventory"] = before.clone();
+        save_checkpoint(&path, &receipt)?;
+        inventory::require_complete(&before)?;
         receipt["durable_roots"] = serde_json::to_value(
             self.transfer_durable_roots(source, source_identity, true)
                 .await?,
@@ -654,6 +657,7 @@ impl Runner {
         receipt["payloads"] = serde_json::to_value(self.transfer_payloads(true).await?)?;
         receipt["reconstruction"] = serde_json::to_value(self.reconstruct_dialogues(true).await?)?;
         let after = inventory::inventory(&self.pool).await?;
+        inventory::require_complete(&after)?;
         if before != after {
             return Err("source inventory changed during all-source verification".into());
         }
@@ -736,8 +740,9 @@ async fn run(args: Args) -> Result<()> {
         .connect(&config.database_url)
         .await?;
     if args.phase == Phase::Inventory {
-        println!("{}", inventory::inventory(&pool).await?);
-        return Ok(());
+        let value = inventory::inventory(&pool).await?;
+        println!("{value}");
+        return inventory::require_complete(&value);
     }
     let mut source = url::Url::parse(&config.database_url)?;
     source

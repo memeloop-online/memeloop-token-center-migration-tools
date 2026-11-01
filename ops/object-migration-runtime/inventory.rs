@@ -81,13 +81,35 @@ pub(super) async fn inventory(pool: &PgPool) -> Result<serde_json::Value> {
             "chunks":row.try_get::<i64,_>("chunks")?, "cipher_bytes":row.try_get::<i64,_>("cipher_bytes")?,
         }));
     }
-    let media = sqlx::query("SELECT COUNT(*) AS rows, COALESCE(SUM(byte_length), 0)::BIGINT AS bytes FROM conversation_media_parts")
-        .fetch_one(&mut *transaction).await?;
+    // Probe before querying: a missing relation aborts PostgreSQL's snapshot,
+    // hiding otherwise useful historical counts. Absence is unknown, never 0.
+    let media_present: bool =
+        sqlx::query_scalar("SELECT to_regclass('public.conversation_media_parts') IS NOT NULL")
+            .fetch_one(&mut *transaction)
+            .await?;
+    let media = if media_present {
+        let row = sqlx::query("SELECT COUNT(*) AS rows, COALESCE(SUM(byte_length), 0)::BIGINT AS bytes FROM conversation_media_parts")
+            .fetch_one(&mut *transaction).await?;
+        serde_json::json!({
+            "state":"counted", "rows":row.try_get::<i64,_>("rows")?,
+            "indexed_bytes":row.try_get::<i64,_>("bytes")?,
+        })
+    } else {
+        serde_json::json!({"state":"source_table_absent", "rows":null, "indexed_bytes":null})
+    };
     transaction.commit().await?;
     Ok(serde_json::json!({
         "format_version":1, "fields":fields, "raw_sources":raw, "spools":spools,
-        "media":{"rows":media.try_get::<i64,_>("rows")?, "indexed_bytes":media.try_get::<i64,_>("bytes")?},
+        "media":media, "inventory_complete":media_present,
+        "missing_source_tables":if media_present { Vec::<&str>::new() } else { vec!["conversation_media_parts"] },
         "durable_object_roots":"not_scanned_by_sql_inventory",
         "object_bytes_verified":false, "complete_training_fidelity_certified":false,
     }))
+}
+
+pub(super) fn require_complete(value: &serde_json::Value) -> Result<()> {
+    if value["inventory_complete"] != true {
+        return Err("source SQL inventory incomplete; missing tables remain unknown (see missing_source_tables)".into());
+    }
+    Ok(())
 }
