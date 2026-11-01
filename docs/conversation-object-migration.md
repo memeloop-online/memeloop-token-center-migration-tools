@@ -20,7 +20,9 @@ and explicit failure markers. The conversation walk verifies manifest/prefix
 ancestry, branch/event links, original captures and media references. JSON event
 documents are skipped through a bounded streaming parser while their complete
 CAS bytes are copied and hashed. Compressed locators retain their original
-format and decoded byte/hash identity. Only objects reachable from these roots
+format and decoded byte/hash identity across both the SQL-locator and root
+phases. Existing atom CAS keys retain that same identity. A readable CAS object
+whose actual hash disagrees with its source key stops migration. Only objects reachable from these roots
 are copied: unreferenced CAS, staging and raw FIFO cache stay outside the set.
 Counts distinguish exact roots, distinct referenced CAS objects, decoded bytes
 and unresolved gap roots. Deduplication uses temporary disk markers rather

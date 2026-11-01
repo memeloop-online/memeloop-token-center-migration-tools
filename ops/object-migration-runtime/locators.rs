@@ -413,10 +413,13 @@ impl Runner {
             self.identity,
             Uuid::now_v7()
         );
-        let mut writer = if copy {
-            Some(self.target.start_writer(&key).await?)
-        } else {
+        let compressed = located.locator.ends_with(".mtcz1");
+        let mut writer = if !copy {
             None
+        } else if compressed {
+            Some(self.target.start_compressed_writer(&key).await?)
+        } else {
+            Some(self.target.start_writer(&key).await?)
         };
         let mut digest = blake3::Hasher::new();
         let mut total = 0_u64;
@@ -479,6 +482,21 @@ impl Runner {
         {
             return Err("media hash or length differs from source index".into());
         }
+        if located.locator.starts_with("tenants/") && located.locator.contains("/cas/v1/") {
+            // A source CAS name is an integrity claim, not just a readable
+            // locator. Reject wrong hash/tenant identity instead of silently
+            // turning corrupted source bytes into a different target object.
+            source
+                .verify_tenant_content(
+                    tenant,
+                    &CasArchiveObject {
+                        object_locator: located.locator.clone(),
+                        blake3_digest: digest.clone(),
+                        size_bytes: total,
+                    },
+                )
+                .await?;
+        }
         if let Some(writer) = writer {
             let staged = writer.finish_staged().await?;
             if staged.blake3_digest != digest || staged.size_bytes != total {
@@ -492,7 +510,11 @@ impl Runner {
             Ok(object)
         } else {
             Ok(CasArchiveObject {
-                object_locator: format!("tenants/{tenant}/cas/v1/blake3/{}/{digest}", &digest[..2]),
+                object_locator: format!(
+                    "tenants/{tenant}/cas/v1/blake3/{}/{digest}{}",
+                    &digest[..2],
+                    if compressed { ".mtcz1" } else { "" }
+                ),
                 blake3_digest: digest,
                 size_bytes: total,
             })

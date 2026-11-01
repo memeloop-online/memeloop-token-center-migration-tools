@@ -278,10 +278,16 @@ impl Runner {
             self.identity,
             Uuid::now_v7()
         );
-        let mut writer = if copy {
-            Some(self.target.start_writer(&staging).await?)
-        } else {
+        let mut writer = if !copy {
             None
+        } else if reference
+            .conversation_body_v1
+            .object_locator
+            .ends_with(".mtcz1")
+        {
+            Some(self.target.start_compressed_writer(&staging).await?)
+        } else {
+            Some(self.target.start_writer(&staging).await?)
         };
         let mut digest = blake3::Hasher::new();
         let mut bytes = 0_u64;
@@ -329,12 +335,11 @@ impl Runner {
             self.target.delete(&staged.object_locator).await?;
             object
         } else {
-            memeloop_token_center::archive::CasArchiveObject {
-                object_locator: format!("tenants/{tenant}/cas/v1/blake3/{}/{digest}", &digest[..2]),
-                blake3_digest: digest,
-                size_bytes: bytes,
-            }
+            reference.conversation_body_v1.clone()
         };
+        if object != reference.conversation_body_v1 {
+            return Err("existing atom CAS locator identity changed".into());
+        }
         self.target.verify_tenant_content(tenant, &object).await?;
         Ok(ConversationBodyReference {
             conversation_body_v1: object,

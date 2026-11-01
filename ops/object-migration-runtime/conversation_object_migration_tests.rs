@@ -505,7 +505,15 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
         large.write(chunk.clone()).await.unwrap();
     }
     let large = large.finish_staged().await.unwrap();
+    let large = source
+        .promote_staged_text_to_cas(tenant, &large)
+        .await
+        .unwrap();
     let large_id = Uuid::now_v7();
+    source
+        .publish_raw_capture(tenant, large_id, "response", &large)
+        .await
+        .unwrap();
     sqlx::query("INSERT INTO request_records VALUES ($1, $2, NULL, $3)")
         .bind(large_id.to_string())
         .bind(tenant.to_string())
@@ -582,15 +590,33 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
             .await
             .is_err()
     );
-    let copied_large = memeloop_token_center::archive::CasArchiveObject {
-        object_locator: format!(
-            "tenants/{tenant}/cas/v1/blake3/{}/{}",
-            &large.blake3_digest[..2],
-            large.blake3_digest
-        ),
-        blake3_digest: large.blake3_digest.clone(),
-        size_bytes: large.size_bytes,
-    };
+    let copied_large = large.clone();
+    // SQL locator verification and an independently discovered source root
+    // must agree on the exact compressed CAS key in either execution order.
+    assert_eq!(
+        gap_runner
+            .transfer_durable_roots(&source, "fixture-gaps", false)
+            .await
+            .unwrap()
+            .roots,
+        1
+    );
+    assert!(
+        gap_runner
+            .transfer_durable_roots(&source, "fixture-gaps", true)
+            .await
+            .unwrap()
+            .verified
+    );
+    assert_eq!(
+        runner
+            .target
+            .raw_capture_reference(tenant, large_id, "response")
+            .await
+            .unwrap()
+            .unwrap(),
+        large
+    );
     assert!(copied_large.size_bytes > 128 * 1024 * 1024);
     runner
         .target
@@ -719,6 +745,7 @@ async fn preexisting_compressed_atom_cas_is_copied_from_the_real_source_and_veri
     };
     let transfer = runner.transfer(&cursor).await.unwrap();
     assert_eq!(transfer.reference.chars, reference.chars);
+    assert_eq!(transfer.reference.conversation_body_v1, original);
     assert_eq!(
         transfer.reference.conversation_body_v1.blake3_digest,
         original.blake3_digest
