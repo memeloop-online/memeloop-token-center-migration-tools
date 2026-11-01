@@ -1,5 +1,8 @@
-ARG BASE_IMAGE
-FROM ${BASE_IMAGE}
+FROM node:24.18.0-trixie-slim@sha256:ae91dcc111a68c9d2d81ff2a17bda61be126426176fde6fe7d08ab13b7f50573
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libssl3t64 postgresql-client sqlite3 util-linux \
+    && rm -rf /var/lib/apt/lists/*
 
 ARG RELEASE_REVISION
 LABEL org.opencontainers.image.source="https://github.com/memeloop-online/memeloop-token-center-migration-tools" \
@@ -7,3 +10,24 @@ LABEL org.opencontainers.image.source="https://github.com/memeloop-online/memelo
       org.opencontainers.image.title="MTC migration tools immutable release bundle"
 
 COPY --chown=10001:10001 . /opt/migration-tools-release/
+
+USER 10001:10001
+WORKDIR /opt/migration-tools-release
+
+RUN --network=none set -eu; \
+    test "$(node --version)" = v24.18.0; \
+    sha256sum -c SHA256SUMS; \
+    runtime="$(mktemp -d)"; \
+    tar -xzf "memeloop-token-center-migration-tools-${RELEASE_REVISION}.tar.gz" -C "$runtime"; \
+    node "$runtime/commands/export-cpa-session-archive-delta.mjs" --help >/dev/null; \
+    "$runtime/commands/runtime/import-cpa-session-archive" --help > "$runtime/importer-help.txt"; \
+    grep -- --max-plan-bytes "$runtime/importer-help.txt"; \
+    "$runtime/commands/runtime/cpa-session-archive-backup" --help > "$runtime/backup-help.txt"; \
+    grep -- pages-per-step "$runtime/backup-help.txt"; \
+    sqlite3 --version; \
+    psql --version; \
+    flock --version; \
+    rm -rf "$runtime"
+
+ENTRYPOINT []
+CMD ["node"]

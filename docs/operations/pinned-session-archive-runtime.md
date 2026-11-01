@@ -6,9 +6,9 @@ the pinned current product APIs in CI. This does not authorize cleanup or real i
 ## Immutable source and build
 
 - Product source: `memeloop-online/memeloop-token-center`,
-  revision `a31f28f497036b0374a37077c218505a63aecbc0`, target schema133.
+  revision `61d426a0f0c58319d8e0940b1b3cd4e55fbc7570`, target schema142.
 - Cargo.lock SHA-256:
-  `083e616fe14a58cde159c7ff33607389f91be4df90e5bbb7c4cbe266ddd7705a`.
+  `ce4cb5fa4fe98565236764cda25b5ac847163b933e385ccf2de2f7a107597f67`.
 - Rust `1.95.0`, `cargo --locked`, Ubuntu 24.04, Linux x86_64 GNU.
 - CI executes the importer unit tests and session import/quarantine/unlinked
   integration tests with an isolated PostgreSQL service, then builds only the
@@ -44,9 +44,32 @@ No cargo, source checkout, package install, network download or product process
 is needed to launch the delivered executable. Verify host dynamic-library
 availability with the isolated `--help` check before supplying real inputs.
 
+### OCI delivery qualification
+
+Release hashes alone do not qualify the container's dynamic loader. An Alpine
+delivery base cannot execute the GNU importer even when every release file
+matches its manifest. The bundle image uses digest-pinned Node24.18.0 on Debian
+Trixie, with the GNU loader, OpenSSL, PostgreSQL and SQLite clients installed by
+CI. The base pin comes from the
+[official Node image metadata](https://github.com/docker-library/repo-info/blob/042a77456cc28ec8543b1cd1770ed4d3f5cef63c/repos/node/remote/24.18.0-trixie-slim.md).
+
+Both PR CI and the official publisher build the same Dockerfile. Its non-root,
+network-disabled build step verifies release checksums and actually launches
+the packaged GNU importer, Node exporter and SQLite backup helper. Missing
+loaders or shared libraries fail publication; no host executable or PATH
+fallback can substitute for the packaged importer. This startup gate is not a
+real database import or reconciliation receipt.
+
+The publisher can deliver an already verified older release without rebuilding
+or relabelling its payload. The tag binds both identities:
+`release-bundle-<payload-revision>-delivery-<delivery-definition-revision>`.
+Record the resulting OCI digest and official workflow run; old payload-only
+tags are not overwritten. Target schema must still match that payload's exact
+compatibility contract, independently of the delivery definition's revision.
+
 Dry-run remains the default. `SESSION_ARCHIVE_APPLY=true` is an explicit write
 decision; the finalizer additionally requires its separately bound approval.
-The engine checks exact target schema133 read-only before import, validates
+The engine checks exact target schema142 read-only before import, validates
 identity, and retains the existing gap/quarantine/provenance/replay semantics.
 This release does not implement product schema upgrades and does not relax
 import acceptance for a newer target schema.
@@ -72,5 +95,5 @@ These retired one-shot modules and their regression fixtures now live in
 Current conversation/prefix, archive, model and error implementations remain
 supplied by product; no old observation decoder is restored. The hash-bound
 assembly adds only module exports to three current product files in CI.
-See [the exact source plan, schema impact and CI matrix](schema133-importer-closure.md).
+See [the exact source plan, schema impact and CI matrix](schema142-importer-closure.md).
 Retained source does not authorize production cleanup or import.
