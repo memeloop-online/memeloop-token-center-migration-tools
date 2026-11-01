@@ -1,21 +1,21 @@
 {
   "format_version": 1,
   "extracted_from_revision": "a65097f952e174ac482abe6ff719966fa9d330cb",
-  "product_revision": "61d426a0f0c58319d8e0940b1b3cd4e55fbc7570",
+  "product_revision": "3150445f4841e74faf7a526aa933fe6558c747ed",
   "base_files": {
-    "src/lib.rs": "37bcd752577fa5e54bf0f30493e469070f587b0d4f1e34d672d155e45304e913",
+    "src/lib.rs": "af2ee007a1e1a5325317a10042fb4120689b5946495da26a8f084ecc693e9595",
     "src/db/requests/mod.rs": "de1f4b110bf7f1cb70617befb4f77848b8f581a0df359bdb898e0fd3afcc6e9a",
-    "src/db/mod.rs": "78bcb77bc68ee0b448d1320de8e4200571c14f105a23d90cba5477c23c156fec"
+    "src/db/mod.rs": "d1ca888bd06418ed303e1adf1c87ead4f0dd4835d2c939977fd2d7cf9c7528c6"
   },
   "files": {
     "src/bin/import-cpa-session-archive.rs": "75c69b54e0a6e2eeca00328f0888fd8ae5dfba83bbfbce8db0c7ea139145bce8",
-    "src/db/mod.rs": "6fc80e002497a715455569604ff4a1efb932baab63130ab9dc4f3dac9acce106",
+    "src/db/mod.rs": "0ae739c684e7edc58224cafb327350f794319c18dbe77680239d5100b5b58369",
     "src/db/requests/mod.rs": "d1747c87d22289d80834c069a9931ab21fd7a78153e09c42db8ebdc90f6c471b",
-    "src/db/requests/session_archive.rs": "ae9ab4361b65fa728604a1fca1807ef52af7e00e46868bf1f0c94b019bbbcf8e",
+    "src/db/requests/session_archive.rs": "3a53e2a4973a1cd7dc64a784b6f7d9c7760c19af375ba16edae67d1e94926d2b",
     "src/db/requests/session_archive_commit.rs": "209a0e50be5e865146c948616afb065518377e44bace59bbc9630c0ce8eada0c",
     "src/db/requests/session_archive_quarantine.rs": "2aed98a202f7b03fad62602a3d932958e24873ffde9f8f344a02281d2fa6e918",
     "src/db/session_archive_projection.rs": "65eec279523df56dd07c93ded99a9948fe43e4daec4c76d6ebef43efadd7e1b8",
-    "src/lib.rs": "bce6fee59495f003e2fbbd69ab2076a5f18b69bbb0b2dc7b77961127d786f684",
+    "src/lib.rs": "f7c7c26eb9bf2c3a755f43794f862a22879c06be9b7b60c4668c5ebdcaf86531",
     "src/session_archive_import/apply.rs": "a22c0ae65075c30fccbf0e16463e4e2888fae5742b2369be2f35e0b0a099eaf4",
     "src/session_archive_import/config.rs": "d4d36a85aa3f104f1fe5d672b9909051c04b5748b4e2a9114801458b212f4e11",
     "src/session_archive_import/correlation.rs": "90ef5ffab0d16ebf41fc0459136fe71f2ed9988fe2e1b4ad1cac011b988bda13",
@@ -23,7 +23,7 @@
     "src/session_archive_import/parsing.rs": "60a0a33a7b9c26166e04bd1241fdbad3bbfe35d881c9130c76ba6e80a40ba208",
     "src/session_archive_import/plan.rs": "ec65d4a75beb515df41e123e78684ea6026a0c9cc37aabc5b5270b4f9ba8806c",
     "src/session_archive_import/tests.rs": "721302372df4ede159bb244da9f96493a6f6ad7c912f715663c00235033fdd38",
-    "tests/session_archive_import.rs": "7f025b78ac0cbdad5e28dc82abc371efcd4dc92199e27b7c04bb7e5d4fcf7084",
+    "tests/session_archive_import.rs": "61162f8a22dabe5ece964363bdb84f2dd09f111ad533f35e1b22a990eb8fa636",
     "tests/session_archive_quarantine.rs": "382ded3a6d314f9c2efa03796b9d25189f7da8fe02f699be1f3cdcef1e5c8350",
     "tests/session_archive_unlinked.rs": "25a831974cc6757f8674b8615fe99644190a8c34627347a38aea9b14979a5be9"
   }

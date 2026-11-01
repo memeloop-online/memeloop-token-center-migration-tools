@@ -707,23 +707,24 @@ impl Database {
             DatabaseBackend::PostgreSql => POSTGRES_MIGRATIONS,
             DatabaseBackend::Sqlite => SQLITE_MIGRATIONS,
         };
-        let mut expected: Vec<i64> = migrations
+        let mut expected: Vec<(i64, String)> = migrations
             .iter()
-            .map(|migration| migration.version)
+            .map(|migration| (migration.version, migration.name.to_owned()))
             .collect();
         // The pinned product records its Rust plaintext conversion separately
         // from the SQL migration list. Require its exact existing receipt;
         // this importer never runs that conversion or writes schema metadata.
-        if expected.last() != Some(&141) {
+        if expected.last().map(|migration| migration.0) != Some(146) {
             return Err(AppError::BadRequest(
                 "pinned SQL migration inventory differs".into(),
             ));
         }
-        expected.push(142);
+        expected.push((142, "plaintext state instead of sealed envelopes".into()));
+        expected.sort_by_key(|migration| migration.0);
         let limit = i64::try_from(expected.len() + 1)
             .map_err(|_| AppError::internal("cpa_session_archive_8"))?;
-        let applied = sqlx::query_scalar::<_, i64>(
-            "SELECT version FROM schema_migrations ORDER BY version LIMIT $1",
+        let applied = sqlx::query_as::<_, (i64, String)>(
+            "SELECT version, name FROM schema_migrations ORDER BY version LIMIT $1",
         )
         .bind(limit)
         .fetch_all(&self.pool)
@@ -735,19 +736,21 @@ impl Database {
         })?;
         if applied != expected {
             return Err(AppError::BadRequest(
-                "target database schema differs from the pinned schema142 migration list".into(),
+                "target database schema differs from the pinned schema146 migration identities"
+                    .into(),
             ));
         }
 
-        let sweep_name: String =
-            sqlx::query_scalar("SELECT name FROM schema_migrations WHERE version=142")
-                .fetch_one(&self.pool)
-                .await?;
-        if sweep_name != "plaintext state instead of sealed envelopes" {
-            return Err(AppError::BadRequest(
-                "target schema142 has a different conversion identity".into(),
-            ));
-        }
+        sqlx::query(
+            "SELECT s.body_blake3, s.cipher_bytes, s.chunk_count, s.byte_count, s.attempts, s.last_error_code, r.proxy_owner_expires_at FROM response_archive_spools s CROSS JOIN request_records r WHERE 1 = 0",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| {
+            AppError::BadRequest(
+                "target database schema146 archive storage or request ownership is drifted".into(),
+            )
+        })?;
 
         // Reference every importer-owned relation and the post-v21 locator/source
         // columns. A forged or drifted schema_migrations table therefore remains

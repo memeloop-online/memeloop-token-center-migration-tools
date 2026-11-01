@@ -58,20 +58,20 @@ async fn archive_import_is_fail_closed_gap_only_and_idempotent() {
 }
 
 #[tokio::test]
-async fn sqlite_schema142_precondition_rejects_version_and_relation_drift_without_writes() {
-    schema142_precondition_fixture(false).await;
+async fn sqlite_schema146_precondition_rejects_version_and_relation_drift_without_writes() {
+    schema146_precondition_fixture(false).await;
 }
 
 #[tokio::test]
-async fn postgres_schema142_precondition_rejects_version_and_relation_drift_without_writes() {
+async fn postgres_schema146_precondition_rejects_version_and_relation_drift_without_writes() {
     if std::env::var("MTC_TEST_POSTGRES_URL").is_err() {
         assert!(std::env::var("CI").is_err(), "CI requires PostgreSQL");
         return;
     }
-    schema142_precondition_fixture(true).await;
+    schema146_precondition_fixture(true).await;
 }
 
-async fn schema142_precondition_fixture(postgres: bool) {
+async fn schema146_precondition_fixture(postgres: bool) {
     let directory = tempfile::tempdir().unwrap();
     let database_url = if postgres {
         sqlx::any::install_default_drivers();
@@ -116,23 +116,40 @@ async fn schema142_precondition_fixture(postgres: bool) {
             .fetch_all(&pool)
             .await
             .unwrap();
-    assert_eq!(versions.len(), 141);
-    assert_eq!(versions.last(), Some(&142));
+    assert_eq!(versions.len(), 144);
+    assert_eq!(versions.last(), Some(&146));
     assert!(!versions.contains(&114));
-    for missing in [127_i64, 131, 132, 133, 141, 142] {
+    assert!(!versions.contains(&145));
+    for missing in [127_i64, 131, 132, 133, 141, 142, 143, 144, 146] {
+        let original: (String, i64) =
+            sqlx::query_as("SELECT name, applied_at FROM schema_migrations WHERE version=$1")
+                .bind(missing)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         sqlx::query("DELETE FROM schema_migrations WHERE version=$1")
             .bind(missing)
             .execute(&pool)
             .await
             .unwrap();
         assert_schema_rejected_without_writes(&db, &pool).await;
-        sqlx::query("INSERT INTO schema_migrations (version,name,applied_at) VALUES ($1,$2,0)")
+        sqlx::query("INSERT INTO schema_migrations (version,name,applied_at) VALUES ($1,$2,$3)")
             .bind(missing)
-            .bind(if missing == 142 {
-                "plaintext state instead of sealed envelopes"
-            } else {
-                "fixture"
-            })
+            .bind(&original.0)
+            .bind(original.1)
+            .execute(&pool)
+            .await
+            .unwrap();
+        db.ensure_session_archive_import_schema().await.unwrap();
+        sqlx::query("UPDATE schema_migrations SET name='wrong-qualified-identity' WHERE version=$1")
+            .bind(missing)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_schema_rejected_without_writes(&db, &pool).await;
+        sqlx::query("UPDATE schema_migrations SET name=$2 WHERE version=$1")
+            .bind(missing)
+            .bind(&original.0)
             .execute(&pool)
             .await
             .unwrap();
@@ -146,7 +163,7 @@ async fn schema142_precondition_fixture(postgres: bool) {
     assert_schema_rejected_without_writes(&db, &pool).await;
     sqlx::query("UPDATE schema_migrations SET name='plaintext state instead of sealed envelopes' WHERE version=142")
         .execute(&pool).await.unwrap();
-    for unexpected in [0_i64, 114, 143] {
+    for unexpected in [0_i64, 114, 145, 147] {
         sqlx::query(
             "INSERT INTO schema_migrations (version,name,applied_at) VALUES ($1,'unqualified',0)",
         )
@@ -186,6 +203,8 @@ async fn schema142_precondition_fixture(postgres: bool) {
         ("session_response_summaries", "session_id"),
         ("proxy_operational_terminals", "reservation_id"),
         ("proxy_operational_terminals", "response_object"),
+        ("response_archive_spools", "body_blake3"),
+        ("request_records", "proxy_owner_expires_at"),
     ] {
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "ALTER TABLE {table} RENAME COLUMN {column} TO schema_drift_fixture"
@@ -232,7 +251,7 @@ async fn large_archive_import_preserves_objects_replay_tenants_and_financial_sta
 }
 
 #[tokio::test]
-async fn postgres_schema142_large_import_prefix_readback_replay_and_financial_state() {
+async fn postgres_schema146_large_import_prefix_readback_replay_and_financial_state() {
     if std::env::var("MTC_TEST_POSTGRES_URL").is_ok() {
         archive_import_fixture(true, true).await;
     } else {
@@ -941,8 +960,21 @@ async fn archive_import_fixture(large: bool, postgres: bool) {
         "outcome": "succeeded",
         "status_code": 200,
         "facets": {"turn.id": ["turn-1"], "client": ["Codex"]},
-        "request": {"model":"gpt-fixture","input":[{"role":"user","content":if large { "x".repeat(20_921_650) } else { "fixture prompt".to_owned() }}]},
-        "response": {"id":"response-1","output":[{"role":"assistant","content":"fixture answer"}]}
+        "request": {"model":"gpt-fixture","input":[
+            {"role":"user","content":if large { "x".repeat(20_921_650) } else { "fixture prompt".to_owned() }},
+            {"type":"function_call","call_id":"fixture-call-1","name":"inspect_media","arguments":"{\"path\":\"fixture.png\"}"},
+            {"type":"function_call_output","call_id":"fixture-call-1","output":"complete synthetic tool result"},
+            {"role":"user","content":[
+                {"type":"input_text","text":"retain complete image and audio evidence"},
+                {"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aD1sAAAAASUVORK5CYII="},
+                {"type":"input_audio","input_audio":{"data":"UklGRgQAAABXQVZF","format":"wav"}}
+            ]}
+        ]},
+        "response": {"id":"response-1","output":[
+            {"role":"assistant","content":"fixture answer"},
+            {"type":"function_call","call_id":"fixture-call-2","name":"report","arguments":"{\"complete\":true}"},
+            {"type":"image_generation_call","id":"fixture-image","status":"completed","result":"iVBORw0KGgo="}
+        ]}
     });
     let missing_legacy_hash = json!({
         "schema_version": 1,
@@ -1139,10 +1171,17 @@ async fn archive_import_fixture(large: bool, postgres: bool) {
             .get_bounded(&refs.request_object, options(&input, false).max_line_bytes)
             .await
             .expect("request body"),
-        serde_json::to_vec(
-            &json!({"model":"gpt-fixture","input":[{"role":"user","content":if large { "x".repeat(20_921_650) } else { "fixture prompt".to_owned() }}]})
-        )
-        .unwrap()
+        serde_json::to_vec(&good["request"]).unwrap()
+    );
+    assert_eq!(
+        archive
+            .get_bounded(
+                refs.response_object.as_deref().unwrap(),
+                options(&input, false).max_line_bytes,
+            )
+            .await
+            .expect("complete assistant text, tool call and media response"),
+        serde_json::to_vec(&good["response"]).unwrap()
     );
     let observation_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM conversation_observations WHERE request_id = $1 AND explicit_session_id = 'durable-thread-1'",
@@ -1211,6 +1250,12 @@ async fn archive_import_fixture(large: bool, postgres: bool) {
         .expect("idempotent replay backfills exact correlation");
     assert_eq!(replay.replayed, 1);
     assert_eq!(replay.imported, 0);
+    let replay_refs = db
+        .request_archive_refs_for_tenant("archive-fixture", request_id)
+        .await
+        .expect("unchanged full session object identities after replay");
+    assert_eq!(replay_refs.request_object, refs.request_object);
+    assert_eq!(replay_refs.response_object, refs.response_object);
     let reading_after_replay: (i64, i64) = sqlx::query_as(
         "SELECT (SELECT COUNT(*) FROM session_generated_titles), (SELECT COUNT(*) FROM session_response_summaries)",
     )
