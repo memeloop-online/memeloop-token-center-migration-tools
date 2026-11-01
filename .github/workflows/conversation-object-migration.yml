@@ -1,0 +1,174 @@
+name: Conversation object migration
+
+on:
+  pull_request:
+    paths:
+      - ops/object-migration-runtime/**
+      - .github/workflows/conversation-object-migration.yml
+  workflow_dispatch:
+    inputs:
+      publish_runtime:
+        description: Publish the verified object migration runtime for a coordinated TEST window
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  test-transfer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      runtime_artifact: conversation-object-runtime-${{ github.sha }}
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: conversation_objects_test
+          POSTGRES_USER: fixture
+          POSTGRES_PASSWORD: fixture
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U fixture -d conversation_objects_test"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: memeloop-online/memeloop-token-center
+          ref: 1215ee6c2a3c51d44e1d72e37ed555fa0a4963bc
+          path: .object-runtime
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: .object-runtime
+      - name: Assemble independently owned migration command
+        run: |
+          cp ops/object-migration-runtime/migrate-conversation-objects.rs .object-runtime/src/bin/
+          mkdir -p .object-runtime/src/bin/conversation-object-tests
+          mkdir -p .object-runtime/src/bin/conversation-object-modules
+          cp ops/object-migration-runtime/durable_roots.rs .object-runtime/src/bin/conversation-object-modules/
+          cp ops/object-migration-runtime/locators.rs .object-runtime/src/bin/conversation-object-modules/
+          cp ops/object-migration-runtime/spools.rs .object-runtime/src/bin/conversation-object-modules/
+          cp ops/object-migration-runtime/payloads.rs .object-runtime/src/bin/conversation-object-modules/
+          cp ops/object-migration-runtime/reconstruction.rs .object-runtime/src/bin/conversation-object-modules/
+          cp ops/object-migration-runtime/inventory.rs .object-runtime/src/bin/conversation-object-modules/
+          cp ops/object-migration-runtime/conversation_object_migration_tests.rs .object-runtime/src/bin/conversation-object-tests/
+          sed -i 's|path = "conversation_object_migration_tests.rs"|path = "conversation-object-tests/conversation_object_migration_tests.rs"|' .object-runtime/src/bin/migrate-conversation-objects.rs
+      - name: Start isolated RustFS migration target
+        env:
+          RUSTFS_ACCESS_KEY: rustfs-migration-fixture
+          RUSTFS_SECRET_KEY: synthetic-test-only-secret-49
+        run: |
+          docker run --detach --name rustfs-migration --publish 127.0.0.1:19000:9000 \
+            --memory 1g --cpus 2 \
+            --env RUSTFS_ACCESS_KEY --env RUSTFS_SECRET_KEY \
+            --env RUSTFS_ADDRESS=:9000 --env RUSTFS_CONSOLE_ENABLE=false \
+            --env RUSTFS_OBS_LOG_DIRECTORY= --env RUSTFS_OBS_LOGGER_LEVEL=warn \
+            --entrypoint /usr/bin/rustfs \
+            rustfs/rustfs:1.0.4@sha256:ed9210d6411d77ffceb70d94b964a3cb7d225983368bc25bebe01e995293dcc2 /data
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent --aws-sigv4 'aws:amz:us-east-1:s3' \
+              --user "$RUSTFS_ACCESS_KEY:$RUSTFS_SECRET_KEY" \
+              --request PUT http://127.0.0.1:19000/migration-contract-test; then
+              exit 0
+            fi
+            sleep 2
+          done
+          exit 1
+      - name: Prove TEST target bootstrap and idempotent readiness against real RustFS
+        env:
+          MTC_OBJECT_MIGRATION_TEST_NAMESPACE: memeloop-token-center-test
+          MTC_S3_ENDPOINT: http://127.0.0.1:19000
+          MTC_S3_BUCKET: runtime-bootstrap-test
+          MTC_S3_REGION: us-east-1
+          MTC_S3_ALLOW_HTTP: "true"
+          MTC_S3_ACCESS_KEY: rustfs-migration-fixture
+          MTC_S3_SECRET_KEY: synthetic-test-only-secret-49
+        run: |
+          if node ops/object-migration-runtime/prepare-target.ts; then
+            echo "Missing target must not be certified ready" >&2
+            exit 1
+          fi
+          node ops/object-migration-runtime/prepare-target.ts --create
+          node ops/object-migration-runtime/prepare-target.ts
+          node ops/object-migration-runtime/prepare-target.ts --create
+      - name: Test exact byte transfer, resume, reconstruction and source retention
+        working-directory: .object-runtime
+        env:
+          MTC_TEST_POSTGRES_URL: postgres://fixture:fixture@127.0.0.1:5432/conversation_objects_test
+          MTC_RUSTFS_TEST_ENDPOINT: http://127.0.0.1:19000
+          MTC_RUSTFS_TEST_BUCKET: migration-contract-test
+          MTC_RUSTFS_TEST_ACCESS_KEY: rustfs-migration-fixture
+          MTC_RUSTFS_TEST_SECRET_KEY: synthetic-test-only-secret-49
+        run: cargo test --locked --bin migrate-conversation-objects
+      - name: Build reviewed migration command
+        working-directory: .object-runtime
+        run: cargo build --locked --bin migrate-conversation-objects
+      - name: Package executable TEST runtime without changing the CPA runtime
+        run: |
+          mkdir -p .object-runtime-package
+          cp .object-runtime/target/debug/migrate-conversation-objects .object-runtime-package/
+          strip .object-runtime-package/migrate-conversation-objects
+          cp ops/object-migration-runtime/Dockerfile .object-runtime-package/
+          docker build --tag mtc-object-migration:verified .object-runtime-package
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --memory 128m --cpus .25 \
+            mtc-object-migration:verified --help
+          docker save mtc-object-migration:verified | gzip -n > .object-runtime-package/runtime.tar.gz
+          (cd .object-runtime-package && sha256sum runtime.tar.gz > SHA256SUMS)
+      - uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        with:
+          name: conversation-object-runtime-${{ github.sha }}
+          path: |
+            .object-runtime-package/runtime.tar.gz
+            .object-runtime-package/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        with:
+          name: conversation-object-migration-${{ github.sha }}
+          path: .object-runtime/target/debug/migrate-conversation-objects
+          retention-days: 7
+      - name: RustFS migration diagnostics
+        if: always()
+        run: |
+          docker inspect rustfs-migration --format 'OOMKilled={{.State.OOMKilled}}'
+          docker stats --no-stream rustfs-migration
+          docker logs --tail 40 rustfs-migration
+
+  publish-object-runtime:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_runtime
+    needs: test-transfer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+        with:
+          name: ${{ needs.test-transfer.outputs.runtime_artifact }}
+          path: runtime
+      - name: Verify and load the tested runtime
+        run: |
+          (cd runtime && sha256sum -c SHA256SUMS)
+          gzip -dc runtime/runtime.tar.gz | docker load
+      - name: Publish a separate immutable object-migration tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ghcr.io/${{ github.repository }}:conversation-objects-${{ github.sha }}
+        run: |
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker tag mtc-object-migration:verified "$IMAGE"
+          docker push "$IMAGE"
+          docker inspect "$IMAGE" --format '{{index .RepoDigests 0}}' >> "$GITHUB_STEP_SUMMARY"
