@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   qualify-migration143-146:
-    name: Qualify original142 to exact59b6 on PostgreSQL17.5
+    name: Qualify original142 to pending143 runner fix on PostgreSQL17.5
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     env:
@@ -60,7 +60,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: memeloop-online/memeloop-token-center
-          ref: 59b6a1491c632b1d047d64212378d07af811badb
+          ref: 56658c80ed4b6aada32c531570653dc45aaabb97
           path: .upgrade-source
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
@@ -68,21 +68,26 @@ jobs:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
-          workspaces: ".fixture-source -> target"
+          workspaces: |
+            .fixture-source -> target
+            .upgrade-source -> target
           key: original-schema142-qualification
       - name: Create genuine142 fixture with original runner and conversion
         run: |
           test "$(git -C .fixture-source rev-parse HEAD)" = 61d426a0f0c58319d8e0940b1b3cd4e55fbc7570
-          test "$(git -C .upgrade-source rev-parse HEAD)" = 59b6a1491c632b1d047d64212378d07af811badb
+          test "$(git -C .upgrade-source rev-parse HEAD)" = 56658c80ed4b6aada32c531570653dc45aaabb97
           cp ops/qualification/schema142-fixture.rs .fixture-source/tests/qualification_schema142.rs
           cd .fixture-source
           cargo test --locked --test qualification_schema142 -- --nocapture
-      - name: Pull existing official release by immutable digest
+      - name: Build exact source migrator in CI only (not a release artifact)
         run: |
-          docker pull ghcr.io/memeloop-online/memeloop-token-center@sha256:145d6f55c3b1cd6574bc2e32cdd6361c0d2218ed92d5daecac321d8572563ae2
-      - name: Rehearse sustained writes and original transactions
+          cd .upgrade-source
+          cargo build --locked --bin memeloop-token-center
+          sha256sum target/debug/memeloop-token-center > "$RUNNER_TEMP/migrator-sha256.txt"
+      - name: Rehearse concurrent reads, writes, NOWAIT conflicts and original SQL
         env:
           QUAL_POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+          QUAL_MIGRATOR_BIN: ${{ github.workspace }}/.upgrade-source/target/debug/memeloop-token-center
         run: node ops/qualification/rehearse143-146.ts
       - name: Retain database statement and resource evidence
         if: always()
@@ -90,6 +95,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/migration143-146"
           docker logs "${{ job.services.postgres.id }}" > "$RUNNER_TEMP/migration143-146/postgres.log" 2>&1
           docker inspect "${{ job.services.postgres.id }}" > "$RUNNER_TEMP/migration143-146/postgres-container.json"
+          cp "$RUNNER_TEMP/migrator-sha256.txt" "$RUNNER_TEMP/migration143-146/" 2>/dev/null || true
           df -h > "$RUNNER_TEMP/migration143-146/disk.txt"
           if test -f "$RUNNER_TEMP/migration143-146/result.json"; then
             node ops/qualification/summarize143-146.ts "$RUNNER_TEMP/migration143-146" > "$RUNNER_TEMP/migration143-146/analysis.json"

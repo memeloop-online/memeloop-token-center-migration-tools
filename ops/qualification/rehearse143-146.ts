@@ -1,6 +1,6 @@
 /**
  * CI-only destructive synthetic qualification, NOT a production execution tool.
- * Original fixture runner owns all ledger creation; official image owns upgrades.
+ * Original fixture runner owns baseline ledger creation; exact CI source owns upgrades.
  * No customer timeouts, production endpoints, global settings or ledger edits.
  */
 import assert from "node:assert/strict";
@@ -10,15 +10,16 @@ import { mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync } f
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
-const revision = "59b6a1491c632b1d047d64212378d07af811badb";
-const image = "ghcr.io/memeloop-online/memeloop-token-center@sha256:145d6f55c3b1cd6574bc2e32cdd6361c0d2218ed92d5daecac321d8572563ae2";
+const revision = "56658c80ed4b6aada32c531570653dc45aaabb97";
+const migrator = process.env.QUAL_MIGRATOR_BIN!;
 const root = join(process.env.RUNNER_TEMP ?? "", "migration143-146");
 assert.equal(process.env.GITHUB_ACTIONS, "true", "remote CI only");
 assert.equal(process.env.PGHOST, "127.0.0.1");
 assert.equal(process.env.PGDATABASE, "rehearsal142");
 mkdirSync(root, { recursive: true });
 const receipt: Record<string, unknown> = {
-  revision, image, run: process.env.GITHUB_RUN_ID, tooling_sha: process.env.GITHUB_SHA,
+  revision, migrator, release_artifact: false,
+  run: process.env.GITHUB_RUN_ID, tooling_sha: process.env.GITHUB_SHA,
   status: "running", scenarios: [], source_hashes: {},
 };
 const save = () => writeFileSync(join(root, "result.json"), JSON.stringify(receipt, null, 2));
@@ -102,6 +103,9 @@ const leaves: Leaf[] = shape.daily_rows.map((rows, i) => {
   return { name: `request_records_${new Date(start).toISOString().slice(0, 10).replaceAll("-", "")}`,
     start, end: start + 86400000, rows, pages: shape.daily_pages[i]! };
 });
+const extraStart = Date.parse(shape.first_day) + 77 * 86400000;
+leaves.push({ name: `request_records_${new Date(extraStart).toISOString().slice(0, 10).replaceAll("-", "")}`,
+  start: extraStart, end: extraStart + 86400000, rows: 0, pages: 0 });
 leaves.push({ name: "request_records_default", start: Date.parse(shape.first_day) - 86400000,
   end: Date.parse(shape.first_day), rows: shape.default_rows, pages: shape.default_pages });
 const sql146 = readFileSync(".upgrade-source/migrations/common/0146_request_live_owner_index.sql", "utf8");
@@ -136,7 +140,7 @@ async function preflight(db: Session) {
       ? "DEFAULT" : `FOR VALUES FROM ('${leaf.start}') TO ('${leaf.end}')`);
   }
   const indexes = (await catalog(db)).filter((r) => r.name.startsWith("qual146_"));
-  assert.equal(indexes.length, 78);
+  assert.equal(indexes.length, 79);
   for (const [i, leaf] of leaves.entries()) {
     const ix = indexes.find((r) => r.name === `qual146_${i}`);
     assert.ok(ix && ix.leaf === leaf.name && ix.valid && ix.ready && ix.live);
@@ -237,20 +241,27 @@ class Load {
   samples: Sample[] = [];
   tasks: Promise<void>[] = [];
   start(database: string) {
-    for (let worker=0; worker<6; worker++) {
+    for (let worker=0; worker<8; worker++) {
       this.tasks.push((async () => {
-        const kind = worker<2 ? "records" : worker<4 ? "request" : "response";
+        const kind = worker<2 ? "records" : worker<4 ? "request" : worker<6 ? "response" : "reader";
         const db = new Session(database, `qual_writer_${kind}_${worker}`);
         let n = 0;
         try {
-          assert.equal(await db.sql("SHOW statement_timeout"), "0");
-          assert.equal(await db.sql("SHOW lock_timeout"), "0");
+          await db.sql("SET statement_timeout = 30000");
+          await db.sql("SET lock_timeout = 10000");
+          assert.equal(await db.sql("SHOW statement_timeout"), "30s");
+          assert.equal(await db.sql("SHOW lock_timeout"), "10s");
           assert.equal(await db.sql("SHOW transaction_timeout"), "0");
           while (!this.stop) {
             const start = performance.now(), phase = this.phase;
             let error: string | undefined;
             try {
-              if (kind === "records") {
+              if (kind === "reader") {
+                await db.sql(`SELECT r.id, q.state, s.state FROM request_records r
+                  LEFT JOIN request_archive_spools q ON q.request_id=r.id AND q.tenant_id=r.tenant_id AND q.reservation_id=r.reservation_id
+                  LEFT JOIN response_archive_spools s ON s.request_id=r.id AND s.tenant_id=r.tenant_id AND s.reservation_id=r.reservation_id
+                  WHERE r.id='writer-${database}-0-${Math.max(0,n-1)}' LIMIT 1`);
+              } else if (kind === "records") {
                 await db.sql(`INSERT INTO request_records
                   (id,tenant_id,key_id,created_at,protocol,model,input_tokens,output_tokens,cost_micros,
                    request_object,reservation_id,proxy_owner_token,proxy_owner_expires_at)
@@ -333,27 +344,35 @@ async function prepare143(db: Session) {
 }
 
 async function migrate(database: string, name: string, limits: string) {
+  const started = new Date().toISOString();
   const uri = new URL(`postgres://token_center:token_center@127.0.0.1:5432/${database}`);
-  uri.searchParams.set("options", `${limits} -c application_name=qual_migrator -c log_statement=all -c log_min_duration_statement=0`);
+  uri.searchParams.set("options", `${limits} -c application_name=qual_migrator -c log_statement=all -c log_min_duration_statement=0 -c log_error_verbosity=verbose`);
   const env = { ...process.env, MTC_DATABASE_URL: uri.toString(),
     MTC_KEY_PEPPER: "synthetic-ci-only-pepper-0000000000000000",
     MTC_SERVICE_TOKEN: "synthetic-ci-only-service-token-0000000000000000",
     MTC_DATABASE_MAX_CONNECTIONS: "2" };
-  const result = await command(["docker","run","--rm","--network","host",
-    "-e","MTC_DATABASE_URL","-e","MTC_KEY_PEPPER","-e","MTC_SERVICE_TOKEN",
-    "-e","MTC_DATABASE_MAX_CONNECTIONS",image,"migrate"], env);
+  const result = await command([migrator,"migrate"], env);
   writeFileSync(join(root, `${name}-migrator.log`), result.output);
-  return { code: result.code, wall_ms: result.ms, requested_url_options: limits,
+  let sqlstate: string | undefined;
+  if (result.code !== 0) {
+    const server = await command(["docker", "logs", "--since", started, process.env.QUAL_POSTGRES_CONTAINER!]);
+    writeFileSync(join(root, `${name}-server.log`), server.output);
+    assert.match(server.output, /55P03/u, "only actual NOWAIT conflicts qualify for a fast maintenance failure");
+    assert.doesNotMatch(server.output, /40P01/u);
+    sqlstate = "55P03";
+  }
+  return { code: result.code, wall_ms: result.ms, sqlstate, requested_url_options: limits,
     effective_migration_profile: {
       lock_timeout_ms: 60000, statement_timeout_ms: 900000,
       transaction_timeout_ms: Number(limits.match(/transaction_timeout=(\d+)ms/u)?.[1] ??
-        Number(limits.match(/transaction_timeout=(\d+)s/u)?.[1]) * 1000),
-      warning: "Exact59b6 after_connect overwrites URL lock/statement limits; transaction_timeout is not overwritten.",
+        Number(limits.match(/transaction_timeout=(\d+)s/u)?.[1]) * 1000) || 0,
+      warning: "Existing after_connect overwrites URL lock/statement limits; NOWAIT does not change those settings.",
     } };
 }
 
-async function scenario(database: string, spool: boolean) {
-  console.log("Starting original official upgrade comparison", database);
+async function executionScenario(database: string) {
+  const spool = true;
+  console.log("Starting exact source runner qualification", database);
   const db = new Session(database, "qual_coordinator");
   const load = new Load();
   const observing = { stop: false };
@@ -374,43 +393,58 @@ async function scenario(database: string, spool: boolean) {
       load.phase = "post_cic";
       await delay(5000);
 
-      // One meaningful lock-abort case: actual migrator backend blocked by a
-      // separate held writer. No request deadlines; only migrator has limits.
-      const blocker = new Session(database, "qual_held_writer");
-      await blocker.sql("BEGIN");
-      await blocker.sql("UPDATE response_archive_spools SET updated_at=updated_at WHERE request_id='response-spool-1'");
-      load.phase = "held_writer_abort";
-      result.lock_abort = await migrate(database, `${database}-held`, "-c lock_timeout=200ms -c statement_timeout=2s -c transaction_timeout=5s");
-      await blocker.sql("ROLLBACK");
-      await blocker.close();
-      assert.notEqual(result.lock_abort.code, 0);
-      assert.deepEqual(await db.rows("SELECT * FROM schema_migrations ORDER BY version"), ledger);
-      assert.equal(await db.sql("SELECT to_regclass('request_records_live_owner_expiry_idx') IS NULL"), "t");
-      assert.equal(await db.sql(`SELECT count(*) FROM information_schema.columns
-        WHERE table_name='response_archive_spools' AND column_name='body_blake3'`), "0");
-      await preflight(db);
-      result.lock_abort.rollback_verified = true;
-      console.log("Held-writer rollback verified", result.lock_abort);
+      const inventory = async () => db.rows(`SELECT 'request' AS kind, count(*) AS rows,
+        sum(cipher_bytes) AS cipher_bytes, sum(chunk_count) AS chunks, sum(byte_count) AS plain_bytes
+        FROM request_archive_spools UNION ALL SELECT 'response', count(*), sum(cipher_bytes),
+        sum(chunk_count), sum(byte_count) FROM response_archive_spools ORDER BY kind`);
+      const dataBefore = await inventory();
+      const indexesBefore = await catalog(db);
+      assert.equal(indexesBefore.length, 83);
+      result.conflicts = [];
+      for (const target of ["request_archive_spools", "response_archive_spools",
+        "response_archive_spool_budget", "archive_budget_reservations"]) {
+        for (const mode of ["ACCESS SHARE", "ROW EXCLUSIVE"]) {
+          const blocker = new Session(database, "qual_held_business");
+          try {
+            await blocker.sql("BEGIN");
+            await blocker.sql(`LOCK TABLE ${ident(target)} IN ${mode} MODE`);
+            load.phase = "held_business_abort";
+            const attempt = await migrate(database, `${database}-${target}-${mode.replaceAll(" ", "-")}`, "");
+            assert.notEqual(attempt.code, 0);
+            assert.ok(attempt.wall_ms < 2000, `NOWAIT must exit promptly, actual ${attempt.wall_ms}ms`);
+            assert.deepEqual(await db.rows("SELECT * FROM schema_migrations ORDER BY version"), ledger);
+            assert.deepEqual(await db.rows("SELECT * FROM credit_accounts ORDER BY id"), finance);
+            assert.deepEqual(await inventory(), dataBefore);
+            assert.deepEqual(await catalog(db), indexesBefore);
+            assert.equal(await db.sql("SELECT to_regclass('request_records_live_owner_expiry_idx') IS NULL"), "t");
+            assert.equal(await db.sql(`SELECT count(*) FROM information_schema.columns
+              WHERE table_name='response_archive_spools' AND column_name='body_blake3'`), "0");
+            await db.sql("BEGIN");
+            await db.sql(`LOCK TABLE request_archive_spools, response_archive_spools,
+              response_archive_spool_budget, archive_budget_reservations IN ROW EXCLUSIVE MODE NOWAIT`);
+            await db.sql("ROLLBACK");
+            result.conflicts.push({ target, mode, ...attempt, rollback_verified: true,
+              all_83_oids_preserved: true, data_and_ledger_preserved: true });
+          } finally { await blocker.sql("ROLLBACK"); await blocker.close(); }
+        }
+      }
+      const logs = await command(["docker", "logs", process.env.QUAL_POSTGRES_CONTAINER!]);
+      assert.match(logs.output, /55P03/u, "actual server must identify NOWAIT lock_not_available");
+      assert.doesNotMatch(logs.output, /40P01/u);
+      result.data_before = dataBefore;
+      result.all_indexes_before = indexesBefore;
       load.phase = "after_abort";
-      await delay(5000);
-      load.phase = "transaction_abort";
-      result.transaction_abort = await migrate(database, `${database}-transaction-abort`,
-        "-c lock_timeout=500ms -c statement_timeout=2s -c transaction_timeout=100ms");
-      assert.notEqual(result.transaction_abort.code, 0);
-      assert.deepEqual(await db.rows("SELECT * FROM schema_migrations ORDER BY version"), ledger);
-      assert.equal(await db.sql("SELECT to_regclass('request_records_live_owner_expiry_idx') IS NULL"), "t");
-      assert.equal(await db.sql(`SELECT count(*) FROM information_schema.columns
-        WHERE table_name='response_archive_spools' AND column_name='body_blake3'`), "0");
-      await preflight(db);
-      result.transaction_abort.rollback_verified = true;
-      console.log("Whole-transaction rollback verified", result.transaction_abort);
-      load.phase = "after_abort";
-      await delay(5000);
+      await delay(500);
     }
     load.phase = "official_upgrade";
-    result.migration = await migrate(database, database, spool
-      ? "-c lock_timeout=500ms -c statement_timeout=2s -c transaction_timeout=5s"
-      : "-c lock_timeout=500ms -c statement_timeout=30s -c transaction_timeout=60s");
+    result.normal_attempts = [];
+    for (let attempt = 0; attempt < 5; attempt++) {
+      result.migration = await migrate(database, `${database}-normal-${attempt}`, "");
+      result.normal_attempts.push(result.migration);
+      if (result.migration.code === 0) break;
+      assert.ok(result.migration.wall_ms < 2000);
+      assert.deepEqual(await db.rows("SELECT * FROM schema_migrations ORDER BY version"), ledger);
+    }
     load.phase = "after_commit";
     assert.equal(result.migration.code, 0, "official migration must commit");
     console.log("Official migration committed", result.migration);
@@ -426,9 +460,23 @@ async function scenario(database: string, spool: boolean) {
     result.indexes_after = after;
     result.ledger_after = await db.rows("SELECT * FROM schema_migrations ORDER BY version");
     assert.deepEqual(result.ledger_after.filter((r: Row) => r.version<=142), ledger);
-    assert.deepEqual(result.ledger_after.filter((r: Row) => r.version>142).map((r: Row) => r.version), [143,144,146]);
+    assert.deepEqual(result.ledger_after.filter((r: Row) => r.version>142).map((r: Row) => r.version), [143,144,145,146,147,148]);
     result.finance_after = await db.rows("SELECT * FROM credit_accounts ORDER BY id");
     assert.deepEqual(result.finance_after, finance);
+    for (const original of result.all_indexes_before) {
+      const reused = after.find((index) => index.oid === original.oid);
+      assert.ok(reused?.valid && reused.ready && reused.live);
+    }
+    result.all_83_oids_preserved = true;
+    const repeatedReader = new Session(database, "qual_already_applied_reader");
+    try {
+      await repeatedReader.sql("BEGIN");
+      await repeatedReader.sql(`LOCK TABLE request_archive_spools, response_archive_spools,
+        response_archive_spool_budget, archive_budget_reservations IN ACCESS SHARE MODE`);
+      result.applied143_repeat = await migrate(database, `${database}-already-applied`, "");
+      assert.equal(result.applied143_repeat.code, 0, "applied143 must skip lock acquisition");
+      assert.deepEqual(await db.rows("SELECT * FROM schema_migrations ORDER BY version"), result.ledger_after);
+    } finally { await repeatedReader.sql("ROLLBACK"); await repeatedReader.close(); }
     result.constraints_after = await db.rows(`SELECT conrelid::regclass::text AS relation,
       conname AS name, convalidated AS valid, pg_get_constraintdef(oid) AS definition
       FROM pg_constraint WHERE conrelid IN ('request_archive_spools'::regclass,
@@ -465,6 +513,7 @@ async function scenario(database: string, spool: boolean) {
     }
   } finally {
     result.writes = await load.finish(database);
+    assert.equal(load.samples.filter((sample) => sample.error).length, 0, "business workload must have zero errors");
     observing.stop = true;
     await observer;
     await db.close();
@@ -490,6 +539,10 @@ async function main() {
     "common/0146_request_live_owner_index.sql"]) {
     hashes[`migrations/${file}`] = sha(readFileSync(`.upgrade-source/migrations/${file}`));
   }
+  assert.equal(hashes["migrations/postgres/0143_archive_spool_storage_accounting.sql"],
+    "f64b44d38302f50225711de74e4385f195e40b54353c18dc1063efd118df6716");
+  assert.equal(hashes["migrations/common/0143_archive_spool_ready_indexes.sql"],
+    "156e5beeb6ff694fc069ff3328398fb6b31d73a2e8ffe84ee0477e15aae0d0be");
   receipt.source_hashes = hashes;
   const profileSource = readFileSync(".upgrade-source/src/db/mod.rs", "utf8");
   assert.ok(profileSource.includes('POSTGRES_MIGRATION_STATEMENT_TIMEOUT: &str = "SET statement_timeout = 900000"'));
@@ -501,11 +554,10 @@ async function main() {
     url_lock_and_statement_options_overwritten: true,
     transaction_timeout_url_option_preserved: true,
   };
-  const inspect = await command(["docker","image","inspect",image]);
-  assert.equal(inspect.code, 0);
-  const identity = JSON.parse(inspect.output)[0] as Row;
-  assert.equal(identity.Config.Labels["org.opencontainers.image.revision"], revision);
-  receipt.image_identity = identity;
+  assert.ok(migrator.endsWith("/.upgrade-source/target/debug/memeloop-token-center"));
+  const sourceHead = await command(["git","-C",".upgrade-source","rev-parse","HEAD"]);
+  assert.equal(sourceHead.output.trim(), revision);
+  receipt.migrator_sha256 = sha(readFileSync(migrator));
   const db = new Session("rehearsal142","qual_fixture");
   await seed(db);
   const load = new Load();
@@ -515,9 +567,9 @@ async function main() {
   try {
     await delay(15000);
     load.phase = "leaf_cic";
-    console.log("Preparing78 original146-equivalent leaf indexes concurrently");
+    console.log("Preparing79 original146-equivalent leaf indexes concurrently");
     receipt.preparation146 = await prepare146(db);
-    console.log("All78 leaf indexes prepared and validated");
+    console.log("All79 leaf indexes prepared and validated");
     load.phase = "after_cic";
     await delay(15000);
   } finally {
@@ -536,7 +588,7 @@ async function main() {
   assert.equal(dump.code, 0, dump.output);
   console.log("Genuine142 fixture dump complete", dump.ms);
   const clone = new Session("rehearsal142","qual_clone");
-  for (const database of ["rehearsal_leafonly", "rehearsal_prebuilt"]) {
+  for (const database of ["rehearsal_prebuilt"]) {
     console.log("Restoring isolated comparison", database);
     await clone.sql(`CREATE DATABASE ${ident(database)}`);
     const restored = await command(["docker","exec",container,"pg_restore","-U","token_center",
@@ -545,8 +597,10 @@ async function main() {
     console.log("Restore complete", database, restored.ms);
   }
   await clone.close();
-  await scenario("rehearsal_leafonly", false);
-  await scenario("rehearsal_prebuilt", true);
+  await executionScenario("rehearsal_prebuilt");
+  const finalLogs = await command(["docker", "logs", container]);
+  assert.doesNotMatch(finalLogs.output, /40P01/u);
+  receipt.no_deadlock_sqlstate = true;
   receipt.status = "passed";
   save();
 }

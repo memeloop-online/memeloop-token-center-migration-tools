@@ -35,6 +35,7 @@ for (const record of records) {
 }
 const concise = [...transactions.values()].map((tx) => {
   const sql143 = tx.statements.find((s) => s.sql.startsWith("ALTER TABLE response_archive_spools"));
+  const prelock143 = tx.statements.find((s) => s.sql.startsWith("LOCK TABLE request_archive_spools, response_archive_spools, response_archive_spool_budget, archive_budget_reservations"));
   const sql144 = tx.statements.find((s) => s.sql.startsWith("UPDATE upstream_accounts"));
   const sql146 = tx.statements.find((s) => s.sql.includes("CREATE INDEX request_records_live_owner_expiry_idx"));
   const maintenance = tx.statements.find((s) => s.sql.startsWith("SAVEPOINT memeloop_partition_maintenance"));
@@ -43,6 +44,8 @@ const concise = [...transactions.values()].map((tx) => {
     begin: new Date(tx.begin).toISOString(), end: tx.end ? new Date(tx.end).toISOString() : undefined,
     begin_through_commit_or_abort_ms: tx.end ? tx.end-tx.begin : undefined,
     sql143_ms: sql143?.duration_ms, sql144_ms: sql144?.duration_ms, sql146_ms: sql146?.duration_ms,
+    prelock143_ms: prelock143?.duration_ms,
+    prelock143_through_commit_ms: prelock143 && tx.end ? tx.end-prelock143.start : undefined,
     maintenance_through_commit_ms: maintenance && tx.end ? tx.end-maintenance.start : undefined,
     commit_ms: commit?.duration_ms,
     first143_statement_through_commit_ms: sql143 && tx.end ? tx.end-sql143.start : undefined,
