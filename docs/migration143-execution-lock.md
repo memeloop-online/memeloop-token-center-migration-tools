@@ -3,7 +3,7 @@
 This follows the existing PR51 production-shaped rehearsal. It is CI-only and
 must never be pointed at production. The original PR51 topic is not rewritten.
 
-Product PR733 exact source `56658c80ed4b6aada32c531570653dc45aaabb97` is
+Product PR733 exact source `301f3345352507bad117f1231cee3220fea8f0f7` is
 checked out and built only by Actions. This debug binary is a source-regression
 artifact, not an official deployable release image. Existing official release
 machinery must later produce an exact reviewed master image before TEST/release.
@@ -28,6 +28,12 @@ not infinite lock waits and not changed live business settings. These closed-loo
 SQL clients are not full HTTP request or production-capacity acceptance.
 
 Each of four143 DDL target relations is separately held by a reader and writer.
+The later146 request-record index lock is also held by a writer: the runner
+pre-acquires its recursive SHARE NOWAIT lock before any spool lock when the
+143 upgrade batch includes146. This avoids a second cycle where a business
+transaction holds a request-record write while waiting for a spool table and
+the migration holds spool tables while waiting for the later146 index lock.
+SHARE allows ordinary record reads but pauses record writers until COMMIT.
 The exact source migrator must exit nonzero in under2s with actual server
 SQLSTATE55P03, without40P01;2s is a test assertion, not a new migration timeout.
 All83 index catalogs, spool row/cipher/plain/chunk totals, finance fixture and

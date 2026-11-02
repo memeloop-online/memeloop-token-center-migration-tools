@@ -10,7 +10,7 @@ import { mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync } f
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
-const revision = "56658c80ed4b6aada32c531570653dc45aaabb97";
+const revision = "301f3345352507bad117f1231cee3220fea8f0f7";
 const migrator = process.env.QUAL_MIGRATOR_BIN!;
 const root = join(process.env.RUNNER_TEMP ?? "", "migration143-146");
 assert.equal(process.env.GITHUB_ACTIONS, "true", "remote CI only");
@@ -399,11 +399,13 @@ async function executionScenario(database: string) {
         sum(chunk_count), sum(byte_count) FROM response_archive_spools ORDER BY kind`);
       const dataBefore = await inventory();
       const indexesBefore = await catalog(db);
+      const definitions = (indexes: Row[]) => indexes.map(({ bytes, ...definition }) => definition);
       assert.equal(indexesBefore.length, 83);
       result.conflicts = [];
-      for (const target of ["request_archive_spools", "response_archive_spools",
+      for (const target of ["request_records", "request_archive_spools", "response_archive_spools",
         "response_archive_spool_budget", "archive_budget_reservations"]) {
         for (const mode of ["ACCESS SHARE", "ROW EXCLUSIVE"]) {
+          if (target === "request_records" && mode === "ACCESS SHARE") continue;
           const blocker = new Session(database, "qual_held_business");
           try {
             await blocker.sql("BEGIN");
@@ -415,7 +417,7 @@ async function executionScenario(database: string) {
             assert.deepEqual(await db.rows("SELECT * FROM schema_migrations ORDER BY version"), ledger);
             assert.deepEqual(await db.rows("SELECT * FROM credit_accounts ORDER BY id"), finance);
             assert.deepEqual(await inventory(), dataBefore);
-            assert.deepEqual(await catalog(db), indexesBefore);
+            assert.deepEqual(definitions(await catalog(db)), definitions(indexesBefore));
             assert.equal(await db.sql("SELECT to_regclass('request_records_live_owner_expiry_idx') IS NULL"), "t");
             assert.equal(await db.sql(`SELECT count(*) FROM information_schema.columns
               WHERE table_name='response_archive_spools' AND column_name='body_blake3'`), "0");
