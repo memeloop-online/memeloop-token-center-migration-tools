@@ -3,7 +3,7 @@
 This follows the existing PR51 production-shaped rehearsal. It is CI-only and
 must never be pointed at production. The original PR51 topic is not rewritten.
 
-Product PR733 exact source `4320bf05b25cc346db1e4933c6478b22cd8f89cc` is
+Product PR733 exact source `f828af8fb42deb746323c5ff1a0a9f2cac642924` is
 checked out and built only by Actions. This debug binary is a source-regression
 artifact, not an official deployable release image. Existing official release
 machinery must later produce an exact reviewed master image before TEST/release.

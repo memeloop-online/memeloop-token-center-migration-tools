@@ -10,7 +10,7 @@ import { mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync } f
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
-const revision = "4320bf05b25cc346db1e4933c6478b22cd8f89cc";
+const revision = "f828af8fb42deb746323c5ff1a0a9f2cac642924";
 const migrator = process.env.QUAL_MIGRATOR_BIN!;
 const root = join(process.env.RUNNER_TEMP ?? "", "migration143-146");
 assert.equal(process.env.GITHUB_ACTIONS, "true", "remote CI only");
