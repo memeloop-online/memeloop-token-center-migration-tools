@@ -10,7 +10,7 @@ import { mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync } f
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
-const revision = "f828af8fb42deb746323c5ff1a0a9f2cac642924";
+const revision = "45bef4137bb75b281322384a38461e053fbe0be1";
 const migrator = process.env.QUAL_MIGRATOR_BIN!;
 const root = join(process.env.RUNNER_TEMP ?? "", "migration143-146");
 assert.equal(process.env.GITHUB_ACTIONS, "true", "remote CI only");
@@ -115,6 +115,28 @@ const spoolSql = readFileSync(".upgrade-source/migrations/common/0143_archive_sp
 const spoolStatements = spoolSql.trim().split(";").map((s) => s.trim()).filter(Boolean);
 const spoolNames = spoolStatements.map((s) => s.match(/IF NOT EXISTS (\w+)/u)![1]!);
 
+async function catalog147(db: Session) {
+  return db.rows(`SELECT c.relname AS name, c.oid::bigint AS oid, i.indisvalid AS valid,
+    i.indisready AS ready, i.indislive AS live, pg_get_indexdef(c.oid) AS definition
+    FROM pg_class c JOIN pg_index i ON i.indexrelid=c.oid WHERE c.relname IN
+    ('conversation_observations_explicit_session_idx','request_stats_facts_session_idx') ORDER BY c.relname`);
+}
+
+async function verify151(db: Session, probes: Row[], selections: Row[]) {
+  assert.deepEqual(await db.rows(`SELECT upstream_account_id,status,error_code,latency_ms,checked_at
+    FROM upstream_service_probes ORDER BY upstream_account_id`), probes);
+  assert.equal(await db.sql(`SELECT count(*) FROM upstream_service_probes WHERE result_json IS NOT NULL
+    OR last_attempt_json IS NOT NULL OR actual_model IS NOT NULL`), "0");
+  assert.deepEqual(await db.rows("SELECT * FROM upstream_transport_proxy_selections ORDER BY account_id"), selections);
+  assert.equal(await db.sql("SELECT count(*) FROM upstream_supplier_availability"), "0");
+  await db.sql(`UPDATE upstream_transport_proxy_selections SET base_index=172,selected_index=172
+    WHERE account_id='synthetic-upstream-1'`);
+  await db.sql(`UPDATE upstream_transport_proxy_selections SET base_index=1,selected_index=1
+    WHERE account_id='synthetic-upstream-1'`);
+  return { legacy_probes_preserved: probes.length, no_invented_independent_provenance: true,
+    selections_preserved: selections.length, expanded_member_index_accepted: true };
+}
+
 async function catalog(db: Session) {
   return db.rows(`SELECT c.relname AS leaf, i.indexrelid::int AS oid, ci.relname AS name,
     i.indisvalid AS valid, i.indisready AS ready, i.indislive AS live,
@@ -210,13 +232,30 @@ async function seed(db: Session) {
   await db.sql(`INSERT INTO credit_accounts
     (id,tenant_id,principal_id,currency,available_micros,reserved_micros,created_at,updated_at) VALUES
     ('synthetic-account','synthetic-tenant','synthetic-principal','USD',1000000,0,0,0)`);
+  await db.sql(`INSERT INTO conversation_observations
+    (id,cluster_id,request_id,key_id,atom_hashes_json,explicit_session_id,created_at,inference_version,labels_json)
+    SELECT 'observation-'||g,'synthetic-cluster','observation-request-'||g,'synthetic-key','[]',
+      'synthetic-session-'||(g%10),1793404800000+g,1,'{"padding":"'||repeat(md5(g::text),16)||'"}'
+    FROM generate_series(1,655700) g`);
+  await db.sql(`INSERT INTO request_stats_facts
+    (request_id,tenant_id,key_id,session_id,created_at,model,protocol,status_class,error_code,
+     upstream_account_id,model_route_id,duration_ms,input_tokens,output_tokens,cost_micros)
+    SELECT 'facts-'||g,'synthetic-tenant','synthetic-key','synthetic-session-'||(g%10),1793404800000+g,
+      repeat(md5(g::text),3),'openai','success','','synthetic-upstream-1','synthetic-route',1,7,3,22
+    FROM generate_series(1,1170772) g`);
+  await db.sql(`INSERT INTO upstream_service_probes (upstream_account_id,status,error_code,latency_ms,checked_at)
+    SELECT 'synthetic-upstream-'||g,'success',NULL,100,1793404800000 FROM generate_series(1,20) g`);
+  await db.sql(`INSERT INTO upstream_transport_proxy_selections
+    SELECT 'synthetic-upstream-'||g,1,'original-fingerprint',1,g%4,g%4,1 FROM generate_series(1,20) g`);
   await db.sql("ANALYZE");
   receipt.fixture_relations = await db.rows(`SELECT relname, reltuples::bigint AS estimated_rows,
     relpages, pg_relation_size(oid) AS bytes FROM pg_class
     WHERE relname LIKE 'request_records_%' AND relkind='r'
-    OR relname IN ('request_archive_spools','response_archive_spools') ORDER BY relname`);
+    OR relname IN ('request_archive_spools','response_archive_spools',
+      'conversation_observations','request_stats_facts') ORDER BY relname`);
   receipt.fixture_counts = { request_records: leaves.reduce((n, l) => n + l.rows, 0),
-    request_spools: shape.request_spool_rows, response_spools: shape.response_spool_rows };
+    request_spools: shape.request_spool_rows, response_spools: shape.response_spool_rows,
+    conversation_observations:655700,request_stats_facts:1170772 };
   receipt.assumptions = JSON.parse(readFileSync("ops/qualification/shape143-146.json", "utf8")).assumptions;
   save();
   console.log("Seed complete", receipt.fixture_counts);
@@ -251,7 +290,7 @@ class Load {
     if (!this.paused) return;
     await new Promise<void>((resolve) => {
       this.boundaryWaiters.push(resolve);
-      if (this.boundaryWaiters.length === 8) this.allAtBoundary?.();
+      if (this.boundaryWaiters.length === 12) this.allAtBoundary?.();
     });
   }
   resume() {
@@ -259,9 +298,10 @@ class Load {
     for (const release of this.boundaryWaiters.splice(0)) release();
   }
   start(database: string) {
-    for (let worker=0; worker<8; worker++) {
+    for (let worker=0; worker<12; worker++) {
       this.tasks.push((async () => {
-        const kind = worker<2 ? "records" : worker<4 ? "request" : worker<6 ? "response" : "reader";
+        const kind = worker<2 ? "records" : worker<4 ? "request" : worker<6 ? "response" : worker<8 ? "reader"
+          : worker===8 ? "observation" : worker===9 ? "facts" : worker===10 ? "observation_reader" : "facts_reader";
         const db = new Session(database, `qual_writer_${kind}_${worker}`);
         let n = 0;
         try {
@@ -294,8 +334,17 @@ class Load {
                 await db.sql(`UPDATE response_archive_spools SET updated_at=1793448000000
                   WHERE request_id='response-spool-1' AND state='pending'`);
                 await db.sql("COMMIT");
+              } else if (kind === "observation") {
+                await db.sql(`UPDATE conversation_observations SET explicit_session_id='synthetic-session-${n%10}'
+                  WHERE id='observation-${1+n%1000}'`);
+              } else if (kind === "facts") {
+                await db.sql(`UPDATE request_stats_facts SET session_id='synthetic-session-${n%10}'
+                  WHERE request_id='facts-${1+n%1000}'`);
+              } else if (kind === "observation_reader") {
+                await db.sql("SELECT explicit_session_id FROM conversation_observations WHERE id='observation-1'");
+              } else if (kind === "facts_reader") {
+                await db.sql("SELECT session_id,cost_micros FROM request_stats_facts WHERE request_id='facts-1'");
               } else {
-                // Existing legitimate pending-spool scheduling writes, no invented body/account.
                 const id = 1 + ((n * 2 + worker % 2) % 10000) * 20;
                 await db.sql(`UPDATE ${kind}_archive_spools SET next_attempt_at=1793448000000,
                   updated_at=1793448000000 WHERE request_id='${kind}-spool-${id}' AND state='pending'`);
@@ -333,7 +382,7 @@ async function observe(database: string, control: { stop: boolean }, name: strin
           AND application_name<>'qual_observer' AND state<>'idle') a) AS activity,
         (SELECT json_agg(l) FROM (SELECT pid,relation::regclass::text AS relation,mode,granted
           FROM pg_locks WHERE database=(SELECT oid FROM pg_database WHERE datname=current_database())
-          AND locktype='relation' AND (NOT granted OR mode IN ('AccessExclusiveLock','ShareLock'))) l) AS locks,
+          AND locktype='relation' AND (NOT granted OR mode IN ('AccessExclusiveLock','ShareLock','ShareUpdateExclusiveLock'))) l) AS locks,
         (SELECT json_agg(p) FROM pg_stat_progress_create_index p) AS progress`);
       appendFileSync(file, JSON.stringify(rows[0])+"\n");
       await delay(20);
@@ -373,15 +422,15 @@ async function prepare143(db: Session) {
   return { timings, indexes: ix };
 }
 
-async function migrate(database: string, name: string, limits: string) {
+async function migrate(database: string, name: string, limits: string, binary = migrator) {
   const started = new Date().toISOString();
   const uri = new URL(`postgres://token_center:token_center@127.0.0.1:5432/${database}`);
   uri.searchParams.set("options", `${limits} -c application_name=qual_migrator -c log_statement=all -c log_min_duration_statement=0 -c log_error_verbosity=verbose`);
   const env = { ...process.env, MTC_DATABASE_URL: uri.toString(),
     MTC_KEY_PEPPER: "synthetic-ci-only-pepper-0000000000000000",
     MTC_SERVICE_TOKEN: "synthetic-ci-only-service-token-0000000000000000",
-    MTC_DATABASE_MAX_CONNECTIONS: "2" };
-  const result = await command([migrator,"migrate"], env);
+    MTC_DATABASE_MAX_CONNECTIONS: "1" };
+  const result = await command([binary,"migrate"], env);
   writeFileSync(join(root, `${name}-migrator.log`), result.output);
   let sqlstate: string | undefined;
   let failureRelation: string | undefined;
@@ -413,6 +462,9 @@ async function executionScenario(database: string) {
   const result: Row = { database, resources_before: await resources(db) };
   const ledger = await db.rows("SELECT * FROM schema_migrations ORDER BY version");
   const finance = await db.rows("SELECT * FROM credit_accounts ORDER BY id");
+  const probes = await db.rows(`SELECT upstream_account_id,status,error_code,latency_ms,checked_at
+    FROM upstream_service_probes ORDER BY upstream_account_id`);
+  const selections = await db.rows("SELECT * FROM upstream_transport_proxy_selections ORDER BY account_id");
   const before = await preflight(db);
   result.ledger_before = ledger;
   result.finance_before = finance;
@@ -433,6 +485,20 @@ async function executionScenario(database: string) {
       const indexesBefore = await catalog(db);
       const definitions = (indexes: Row[]) => indexes.map(({ bytes, ...definition }) => definition);
       assert.equal(indexesBefore.length, 83);
+      const prepareBlocker = new Session(database, "qual_cic_boundary_reader");
+      try {
+        await prepareBlocker.sql("BEGIN; LOCK TABLE request_records IN ACCESS SHARE MODE");
+        load.phase = "online147_prepare";
+        result.online147_preparation = await migrate(database, `${database}-online147-prepare`, "");
+        assert.notEqual(result.online147_preparation.code, 0);
+        assert.equal(result.online147_preparation.failure_relation, "request_records");
+        result.online147_indexes = await catalog147(db);
+        assert.equal(result.online147_indexes.length, 2);
+        assert.ok(result.online147_indexes.every((index: Row) => index.valid && index.ready && index.live));
+        assert.deepEqual(await db.rows("SELECT * FROM schema_migrations ORDER BY version"), ledger);
+        assert.deepEqual(await db.rows("SELECT * FROM credit_accounts ORDER BY id"), finance);
+        assert.deepEqual(definitions(await catalog(db)), definitions(indexesBefore));
+      } finally { await prepareBlocker.sql("ROLLBACK"); await prepareBlocker.close(); }
       result.conflicts = [];
       for (const target of ["request_records", "request_events", "request_archive_spools", "response_archive_spools",
         "response_archive_spool_budget", "archive_budget_reservations"]) {
@@ -449,6 +515,7 @@ async function executionScenario(database: string) {
             assert.deepEqual(await db.rows("SELECT * FROM credit_accounts ORDER BY id"), finance);
             assert.deepEqual(await inventory(), dataBefore);
             assert.deepEqual(definitions(await catalog(db)), definitions(indexesBefore));
+            assert.deepEqual(await catalog147(db), result.online147_indexes);
             assert.equal(await db.sql("SELECT to_regclass('request_records_live_owner_expiry_idx') IS NULL"), "t");
             assert.equal(await db.sql(`SELECT count(*) FROM information_schema.columns
               WHERE table_name='response_archive_spools' AND column_name='body_blake3'`), "0");
@@ -483,7 +550,7 @@ async function executionScenario(database: string) {
     if (!result.uncoordinated_commit) {
       load.phase = "synthetic_entry_boundary";
       await load.pauseAtBoundary();
-      result.entry_boundary = "All eight CI generators acknowledge between-transaction boundary; not a production admission policy";
+      result.entry_boundary = "All twelve CI generators acknowledge between-transaction boundary; not a production admission policy";
       let completed = false;
       const migration = migrate(database, `${database}-boundary-entry`, "")
         .finally(() => { completed = true; });
@@ -501,7 +568,7 @@ async function executionScenario(database: string) {
       load.resume();
       result.migration = await migration;
       result.concurrent_generators_resumed_after_granted_locks = acquired;
-      assert.ok(acquired, "eight generators must resume while migration actually holds all four locks");
+      assert.ok(acquired, "twelve generators must resume while migration actually holds all four locks");
     }
     load.phase = "after_commit";
     assert.equal(result.migration.code, 0, "official migration must commit");
@@ -518,7 +585,10 @@ async function executionScenario(database: string) {
     result.indexes_after = after;
     result.ledger_after = await db.rows("SELECT * FROM schema_migrations ORDER BY version");
     assert.deepEqual(result.ledger_after.filter((r: Row) => r.version<=142), ledger);
-    assert.deepEqual(result.ledger_after.filter((r: Row) => r.version>142).map((r: Row) => r.version), [143,144,145,146,147,148]);
+    assert.deepEqual(result.ledger_after.filter((r: Row) => r.version>142).map((r: Row) => r.version), [143,144,145,146,147,148,149,150,151]);
+    assert.deepEqual(await catalog147(db), result.online147_indexes);
+    result.online147_oids_reused = true;
+    result.additional149_151 = await verify151(db, probes, selections);
     result.finance_after = await db.rows("SELECT * FROM credit_accounts ORDER BY id");
     assert.deepEqual(result.finance_after, finance);
     for (const original of result.all_indexes_before) {
@@ -580,6 +650,65 @@ async function executionScenario(database: string) {
   }
 }
 
+async function test146Scenario(database: string) {
+  const db = new Session(database, "qual_test146_coordinator");
+  const result: Row = {database, scenario:"genuine_TEST146_missing145_to151"};
+  const load = new Load();
+  const control = {stop:false};
+  const observer = observe(database,control,database);
+  try {
+    const originalBinary = process.env.QUAL_TEST146_MIGRATOR_BIN!;
+    assert.ok(originalBinary.endsWith("/.test146-source/target/debug/memeloop-token-center"));
+    result.baseline_source = "3150445f4841e74faf7a526aa933fe6558c747ed";
+    result.baseline_upgrade = await migrate(database,`${database}-original146`,"",originalBinary);
+    assert.equal(result.baseline_upgrade.code,0);
+    const ledger = await db.rows("SELECT * FROM schema_migrations ORDER BY version");
+    result.ledger_before = ledger;
+    assert.deepEqual(ledger.filter(entry=>entry.version>=143).map(entry=>entry.version),[143,144,146]);
+    const finance = await db.rows("SELECT * FROM credit_accounts ORDER BY id");
+    const probes = await db.rows(`SELECT upstream_account_id,status,error_code,latency_ms,checked_at
+      FROM upstream_service_probes ORDER BY upstream_account_id`);
+    const selections = await db.rows("SELECT * FROM upstream_transport_proxy_selections ORDER BY account_id");
+    const indexes = await catalog(db);
+    const held = new Session(database,"qual_test146_applied143_reader");
+    try {
+      await held.sql(`BEGIN; LOCK TABLE request_archive_spools,response_archive_spools,
+        response_archive_spool_budget,archive_budget_reservations IN ACCESS SHARE MODE`);
+      load.start(database);
+      load.phase="test146_upgrade_with_applied143_readers";
+      result.migration=await migrate(database,`${database}-to151`,"");
+      assert.equal(result.migration.code,0);
+      result.ledger_after=await db.rows("SELECT * FROM schema_migrations ORDER BY version");
+      for (const entry of ledger) {
+        assert.deepEqual(result.ledger_after.find((row:Row)=>row.version===entry.version),entry);
+      }
+      assert.deepEqual(result.ledger_after.filter((entry:Row)=>!ledger.some(before=>before.version===entry.version))
+        .map((entry:Row)=>entry.version),[145,147,148,149,150,151]);
+      assert.deepEqual(await db.rows("SELECT * FROM credit_accounts ORDER BY id"),finance);
+      result.additional149_151=await verify151(db,probes,selections);
+      const after=await catalog(db);
+      assert.ok(indexes.every(index=>after.some(row=>row.oid===index.oid&&row.valid&&row.ready&&row.live)));
+      result.all_original_index_oids_preserved=true;
+      result.indexes147=await catalog147(db);
+      assert.equal(result.indexes147.length,2);
+      assert.ok(result.indexes147.every((row:Row)=>row.valid&&row.ready&&row.live));
+      result.repeated_migration=await migrate(database,`${database}-repeat151`,"");
+      assert.equal(result.repeated_migration.code,0);
+      assert.deepEqual(await db.rows("SELECT * FROM schema_migrations ORDER BY version"),result.ledger_after);
+      result.applied143_144_146_identity_preserved=true;
+      await delay(1000);
+    } finally { await held.sql("ROLLBACK");await held.close(); }
+  } finally {
+    result.writes=await load.finish(database);
+    control.stop=true;
+    await observer;
+    await db.close();
+    (receipt.scenarios as Row[]).push(result);
+    save();
+    assert.equal(load.samples.filter(sample=>sample.error).length,0);
+  }
+}
+
 async function main() {
   // Every old migration file is byte-identical;142 is the genuine source
   // conversion receipt, not an SQL migration or a synthetic fixture INSERT.
@@ -601,6 +730,8 @@ async function main() {
     "f64b44d38302f50225711de74e4385f195e40b54353c18dc1063efd118df6716");
   assert.equal(hashes["migrations/common/0143_archive_spool_ready_indexes.sql"],
     "156e5beeb6ff694fc069ff3328398fb6b31d73a2e8ffe84ee0477e15aae0d0be");
+  assert.equal(sha(readFileSync(".upgrade-source/migrations/common/0147_session_task_relationships.sql")),
+    "32edfecc096f0fb52e9db6ec75f2c54c819506fc93f0eb0790c73b7f6291256c");
   receipt.source_hashes = hashes;
   const profileSource = readFileSync(".upgrade-source/src/db/mod.rs", "utf8");
   assert.ok(profileSource.includes('POSTGRES_MIGRATION_STATEMENT_TIMEOUT: &str = "SET statement_timeout = 900000"'));
@@ -646,7 +777,7 @@ async function main() {
   assert.equal(dump.code, 0, dump.output);
   console.log("Genuine142 fixture dump complete", dump.ms);
   const clone = new Session("rehearsal142","qual_clone");
-  for (const database of ["rehearsal_prebuilt"]) {
+  for (const database of ["rehearsal_prebuilt","rehearsal_test146"]) {
     console.log("Restoring isolated comparison", database);
     await clone.sql(`CREATE DATABASE ${ident(database)}`);
     const restored = await command(["docker","exec",container,"pg_restore","-U","token_center",
@@ -656,6 +787,7 @@ async function main() {
   }
   await clone.close();
   await executionScenario("rehearsal_prebuilt");
+  await test146Scenario("rehearsal_test146");
   const finalLogs = await command(["docker", "logs", container]);
   assert.doesNotMatch(finalLogs.output, /40P01/u);
   receipt.no_deadlock_sqlstate = true;

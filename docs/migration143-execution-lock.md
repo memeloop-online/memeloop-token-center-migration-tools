@@ -1,5 +1,31 @@
 # PostgreSQL143 runner-order qualification
 
+## Pending147 online follow-up
+
+Product PR735 exact45bef4137bb75b281322384a38461e053fbe0be1 on merged
+master508d0bc4 supersedes the source pin below. The runner builds147's two exact
+indexes CONCURRENTLY in autocommit before its shared transaction and143 locks,
+then omits only validated original statements, preserving published SQL/ledger
+identity. One original pool slot owns the existing maintenance advisory key;
+close-on-drop prevents leaked session ownership on failure/cancellation.
+
+The original142 fixture now populates655700 observations and1170772 stats facts
+alongside1.28M requests/619K/544K spools.12 generators include online147 reads
+and writes. First hold a business request_records reader while the actual runner
+completes both CIC then exits143 NOWAIT; verify unchanged ledger/finance/83
+indexes plus both valid147 OIDs. Further12 aborts retain all85 OIDs, then normal
+142→151 proves unique149–151 additions, original probe provenance remains
+unasserted, selection contents retained and expanded member index accepted.
+
+A separate clone uses exact deployed3150445f original runner to create genuine
+TEST146 ledger143/144/146 (missing145, no manual ledger deletion). New source
+then upgrades145/147–151 under held143 spool readers and live business workload,
+retaining original names/timestamps/OIDs/finance and repeating without changes.
+Both debug binaries are GHA-only, never official deployment artifacts. Timings
+and any failures are actual receipts; no successful result claimed before CI.
+
+The earlier733-only qualification and evidence below remain historical.
+
 This follows the existing PR51 production-shaped rehearsal. It is CI-only and
 must never be pointed at production. The original PR51 topic is not rewritten.
 
