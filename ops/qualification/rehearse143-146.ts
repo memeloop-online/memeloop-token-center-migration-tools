@@ -234,7 +234,7 @@ async function seed(db: Session) {
     ('synthetic-account','synthetic-tenant','synthetic-principal','USD',1000000,0,0,0)`);
   await db.sql(`INSERT INTO conversation_observations
     (id,cluster_id,request_id,key_id,atom_hashes_json,explicit_session_id,created_at,inference_version,labels_json)
-    SELECT 'observation-'||g,'synthetic-cluster','observation-request-'||g,'synthetic-key','[]',
+    SELECT 'observation-'||g,'synthetic-cluster','observation-request-'||g,'synthetic-key','{"context_prefix_v1":null,"atom_count":0}',
       'synthetic-session-'||(g%10),1793404800000+g,1,'{"padding":"'||repeat(md5(g::text),16)||'"}'
     FROM generate_series(1,655700) g`);
   await db.sql(`INSERT INTO request_stats_facts
