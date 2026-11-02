@@ -262,19 +262,28 @@ class Load {
                   LEFT JOIN response_archive_spools s ON s.request_id=r.id AND s.tenant_id=r.tenant_id AND s.reservation_id=r.reservation_id
                   WHERE r.id='writer-${database}-0-${Math.max(0,n-1)}' LIMIT 1`);
               } else if (kind === "records") {
+                await db.sql("BEGIN");
                 await db.sql(`INSERT INTO request_records
                   (id,tenant_id,key_id,created_at,protocol,model,input_tokens,output_tokens,cost_micros,
                    request_object,reservation_id,proxy_owner_token,proxy_owner_expires_at)
                   VALUES ('writer-${database}-${worker}-${n}','synthetic-tenant','synthetic-key',
                   1793448000000,'openai','synthetic-model',0,0,0,'{}','synthetic-reservation',
                   'synthetic-owner',1793491200000)`);
+                await db.sql(`UPDATE request_archive_spools SET updated_at=1793448000000
+                  WHERE request_id='request-spool-1' AND state='pending'`);
+                await db.sql(`UPDATE response_archive_spools SET updated_at=1793448000000
+                  WHERE request_id='response-spool-1' AND state='pending'`);
+                await db.sql("COMMIT");
               } else {
                 // Existing legitimate pending-spool scheduling writes, no invented body/account.
                 const id = 1 + ((n * 2 + worker % 2) % 10000) * 20;
                 await db.sql(`UPDATE ${kind}_archive_spools SET next_attempt_at=1793448000000,
                   updated_at=1793448000000 WHERE request_id='${kind}-spool-${id}' AND state='pending'`);
               }
-            } catch (e) { error = String(e); }
+            } catch (e) {
+              error = String(e);
+              if (kind === "records") await db.sql("ROLLBACK");
+            }
             this.samples.push({ phase, kind, start, ms: performance.now()-start, ...(error ? { error } : {}) });
             n++;
             await delay(10); // pacing synthetic load, never a customer deadline

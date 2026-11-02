@@ -23,6 +23,14 @@ partition maintenance may add later daily leaves; existing OIDs must survive.
 
 Six persistent writers and two readers run concurrently. Readers use the
 business request-record→request-spool→response-spool join shape. CI-only workload
+record writers insert a record and update both spool relations in one real
+transaction, exercising the cross-migration146 dependency rather than only
+unrelated single-table writes. Spool scheduling writers retain their existing
+single-table operations. Catalog identity comparisons exclude physical byte
+growth caused by these concurrent writers, but keep OIDs/definitions/options/
+validity/readiness/live/attachment checks.
+
+Workload
 sessions use the product serve profile's existing30s statement/10s lock limits,
 not infinite lock waits and not changed live business settings. These closed-loop
 SQL clients are not full HTTP request or production-capacity acceptance.
