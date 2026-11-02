@@ -18,6 +18,45 @@ const identity = (value: string, keyId: string) => ({ sourceHash: createHash("sh
 const firstIdentity = identity(first, "10000000-0000-4000-8000-000000000001");
 const secondIdentity = identity(second, "20000000-0000-4000-8000-000000000002");
 
+describe("strict archive JSON string spans", () => {
+  it("preserves decoded strings and rejects malformed escapes and duplicate decoded keys", () => {
+    for (const value of ["", "plain text", "中文😀", "\"\\/\b\f\n\r\t", "\u0000", "\ud800", "\udfff"]) {
+      const encoded = JSON.stringify(value);
+      assert.equal(parseStrictJson(encoded), value);
+    }
+    for (const encoded of ['"\\u0061"', '"\\ud83d\\ude00"', '"escaped\\\\\\"quote"', '"\\/path"']) {
+      assert.equal(parseStrictJson(encoded), JSON.parse(encoded));
+    }
+    for (const encoded of [
+      '"unterminated', '"trailing\\', '"\\x"', '"\\u123"', '"\\uZZZZ"', '"raw\ncontrol"',
+      '{"a":1,"\\u0061":2}', '{"nested":{"key":"first","\\u006bey":"second"}}',
+    ]) assert.throws(() => parseStrictJson(encoded), StrictJsonError);
+    assert.throws(() => parseStrictJson('{"nested":{"value":1}}', 1), StrictJsonError);
+    assert.throws(() => parseStrictJson("9007199254740993"), StrictJsonError);
+  });
+
+  it("parses an observed-size archive string within a bounded heap without per-character ropes", () => {
+    const moduleUrl = new URL("../../ops/lib/strict-json.ts", import.meta.url).href;
+    const script = `
+      import assert from "node:assert/strict";
+      import { parseStrictJson } from ${JSON.stringify(moduleUrl)};
+      const length = 20_921_650;
+      const source = '"' + "x".repeat(length) + '"';
+      const started = performance.now();
+      const value = parseStrictJson(source);
+      assert.equal(value, "x".repeat(length));
+      console.log(JSON.stringify({ length: value.length, elapsed_ms: performance.now() - started, max_rss_kib: process.resourceUsage().maxRSS }));
+    `;
+    const result = spawnSync(process.execPath, ["--max-old-space-size=128", "--input-type=module", "-e", script], {
+      encoding: "utf8", timeout: 20_000, maxBuffer: 4096,
+    });
+    assert.equal(result.status, 0, result.error?.message ?? result.stderr);
+    const receipt = JSON.parse(result.stdout) as { length: number; elapsed_ms: number; max_rss_kib: number };
+    assert.equal(receipt.length, 20_921_650);
+    console.log("strict JSON synthetic large-string receipt", receipt);
+  });
+});
+
 describe("legacy credential attachment planning", () => {
   it("is exact, deterministic, one-to-one, and replay aware", () => {
     const plan = buildPlan([second, first], [firstIdentity, secondIdentity], [firstIdentity]);
