@@ -10,7 +10,7 @@ import { mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync } f
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
-const revision = "301f3345352507bad117f1231cee3220fea8f0f7";
+const revision = "4320bf05b25cc346db1e4933c6478b22cd8f89cc";
 const migrator = process.env.QUAL_MIGRATOR_BIN!;
 const root = join(process.env.RUNNER_TEMP ?? "", "migration143-146");
 assert.equal(process.env.GITHUB_ACTIONS, "true", "remote CI only");
@@ -434,10 +434,9 @@ async function executionScenario(database: string) {
       const definitions = (indexes: Row[]) => indexes.map(({ bytes, ...definition }) => definition);
       assert.equal(indexesBefore.length, 83);
       result.conflicts = [];
-      for (const target of ["request_records", "request_archive_spools", "response_archive_spools",
+      for (const target of ["request_records", "request_events", "request_archive_spools", "response_archive_spools",
         "response_archive_spool_budget", "archive_budget_reservations"]) {
         for (const mode of ["ACCESS SHARE", "ROW EXCLUSIVE"]) {
-          if (target === "request_records" && mode === "ACCESS SHARE") continue;
           const blocker = new Session(database, "qual_held_business");
           try {
             await blocker.sql("BEGIN");
