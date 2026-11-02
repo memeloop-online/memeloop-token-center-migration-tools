@@ -59,6 +59,20 @@ samples, lock samples, server statements and attempts are retained, including
 failures. Re-running after commit while all four tables have held readers must
 skip143 and leave its original ledger/name/timestamp unchanged.
 
+The first retained run41445735610 at tools1cf1d30 failed because all five
+uncoordinated attempts correctly exited55P03 under active workload. It did not
+prove normal commit, and is not relabeled successful or simply rerun. The
+follow-up retains those five attempts unchanged. If none acquires the locks,
+the eight synthetic generators acknowledge a between-transaction barrier;
+the coordinator starts one migration, observes all four actual granted spool
+locks, and immediately resumes all generators while DDL is still active.
+This deterministically measures concurrent business waiting/completion/errors
+and normal migration, without relying on a lucky idle gap or expanding retry
+counts. Both the successful boundary-entry cohort and failed uncoordinated
+cohort remain separate in the receipts. This CI barrier is not a product
+admission feature, production pause policy, or evidence that the migration
+will acquire NOWAIT locks under an arbitrary uninterrupted arrival rate.
+
 The existing final PostgreSQL log analyzer reports prelock-to-COMMIT span in
 addition to DDL/transaction durations. Final logs must contain no40P01. Existing
 83 OIDs, validation bits and old ledger/finance integrity are checked. Source

@@ -240,6 +240,24 @@ class Load {
   stop = false;
   samples: Sample[] = [];
   tasks: Promise<void>[] = [];
+  paused = false;
+  boundaryWaiters: (() => void)[] = [];
+  allAtBoundary?: () => void;
+  async pauseAtBoundary() {
+    this.paused = true;
+    await new Promise<void>((resolve) => { this.allAtBoundary = resolve; });
+  }
+  async boundary() {
+    if (!this.paused) return;
+    await new Promise<void>((resolve) => {
+      this.boundaryWaiters.push(resolve);
+      if (this.boundaryWaiters.length === 8) this.allAtBoundary?.();
+    });
+  }
+  resume() {
+    this.paused = false;
+    for (const release of this.boundaryWaiters.splice(0)) release();
+  }
   start(database: string) {
     for (let worker=0; worker<8; worker++) {
       this.tasks.push((async () => {
@@ -253,6 +271,8 @@ class Load {
           assert.equal(await db.sql("SHOW lock_timeout"), "10s");
           assert.equal(await db.sql("SHOW transaction_timeout"), "0");
           while (!this.stop) {
+            await this.boundary();
+            if (this.stop) break;
             const start = performance.now(), phase = this.phase;
             let error: string | undefined;
             try {
@@ -294,6 +314,7 @@ class Load {
   }
   async finish(name: string) {
     this.stop = true;
+    this.resume();
     await Promise.all(this.tasks);
     writeFileSync(join(root, `${name}-writes.json`), JSON.stringify(this.samples));
     return summary(this.samples);
@@ -456,6 +477,30 @@ async function executionScenario(database: string) {
       assert.ok(result.migration.wall_ms < 2000);
       assert.deepEqual(await db.rows("SELECT * FROM schema_migrations ORDER BY version"), ledger);
     }
+    result.uncoordinated_commit = result.migration.code === 0;
+    if (!result.uncoordinated_commit) {
+      load.phase = "synthetic_entry_boundary";
+      await load.pauseAtBoundary();
+      result.entry_boundary = "All eight CI generators acknowledge between-transaction boundary; not a production admission policy";
+      let completed = false;
+      const migration = migrate(database, `${database}-boundary-entry`, "")
+        .finally(() => { completed = true; });
+      let acquired = false;
+      while (!completed && !acquired) {
+        const held = await db.rows(`SELECT count(*)::int AS count FROM pg_locks l
+          JOIN pg_stat_activity a ON a.pid=l.pid WHERE a.datname=current_database()
+          AND a.application_name='qual_migrator' AND l.granted AND l.mode='AccessExclusiveLock'
+          AND l.relation IN ('request_archive_spools'::regclass,'response_archive_spools'::regclass,
+            'response_archive_spool_budget'::regclass,'archive_budget_reservations'::regclass)`);
+        acquired = held[0]!.count === 4;
+        if (!acquired) await delay(2);
+      }
+      load.phase = "boundary_entry_concurrent_workload";
+      load.resume();
+      result.migration = await migration;
+      result.concurrent_generators_resumed_after_granted_locks = acquired;
+      assert.ok(acquired, "eight generators must resume while migration actually holds all four locks");
+    }
     load.phase = "after_commit";
     assert.equal(result.migration.code, 0, "official migration must commit");
     console.log("Official migration committed", result.migration);
@@ -524,12 +569,12 @@ async function executionScenario(database: string) {
     }
   } finally {
     result.writes = await load.finish(database);
-    assert.equal(load.samples.filter((sample) => sample.error).length, 0, "business workload must have zero errors");
     observing.stop = true;
     await observer;
     await db.close();
     (receipt.scenarios as Row[]).push(result);
     save();
+    assert.equal(load.samples.filter((sample) => sample.error).length, 0, "business workload must have zero errors");
   }
 }
 

@@ -13,7 +13,8 @@ const transactions = new Map<number, Transaction>();
 for (const record of records) {
   const match = record.match(/^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+) UTC \[(\d+)\] (LOG|FATAL|ERROR):\s+([\s\S]*)/u);
   if (!match) continue;
-  const at = Date.parse(`${match[1]!.replace(" ", "T")}Z`), pid = Number(match[2]), message = match[4]!.trim();
+  const at = Date.parse(`${match[1]!.replace(" ", "T")}Z`), pid = Number(match[2]),
+    message = match[4]!.trim().replace(/^[0-9A-Z]{5}: /u, "");
   const statement = message.match(/^(?:statement: |execute [^:]+: )([\s\S]*)/u)?.[1];
   if (statement) {
     const item: Statement = { sql: statement, start: at };
