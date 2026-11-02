@@ -49,6 +49,12 @@ ledger remain identical, and a fresh writer can immediately acquire every
 target after maintenance rollback. The original held business transaction is
 rolled back normally, never terminated by the harness.
 
+Concurrent work may conflict on an earlier relation than the deliberately held
+target. The result records the actual server failure relation and whether that
+held target was the first conflict; it does not pretend all busy scenarios
+prove each specific lock. Product PR733's isolated PostgreSQL unit cases prove
+each exact target with no other workload competing for earlier locks.
+
 The normal upgrade runs with the same workload active. At most five CI-only
 attempts are retained: a failure qualifies only if the actual server log proves
 55P03, the process exits promptly, and its ledger is unchanged. This is not a

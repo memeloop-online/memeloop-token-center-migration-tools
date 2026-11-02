@@ -384,14 +384,16 @@ async function migrate(database: string, name: string, limits: string) {
   const result = await command([migrator,"migrate"], env);
   writeFileSync(join(root, `${name}-migrator.log`), result.output);
   let sqlstate: string | undefined;
+  let failureRelation: string | undefined;
   if (result.code !== 0) {
     const server = await command(["docker", "logs", "--since", started, process.env.QUAL_POSTGRES_CONTAINER!]);
     writeFileSync(join(root, `${name}-server.log`), server.output);
     assert.match(server.output, /55P03/u, "only actual NOWAIT conflicts qualify for a fast maintenance failure");
     assert.doesNotMatch(server.output, /40P01/u);
     sqlstate = "55P03";
+    failureRelation = server.output.match(/ERROR:\s+55P03: could not obtain lock on relation "([^"]+)"/u)?.[1];
   }
-  return { code: result.code, wall_ms: result.ms, sqlstate, requested_url_options: limits,
+  return { code: result.code, wall_ms: result.ms, sqlstate, failure_relation: failureRelation, requested_url_options: limits,
     effective_migration_profile: {
       lock_timeout_ms: 60000, statement_timeout_ms: 900000,
       transaction_timeout_ms: Number(limits.match(/transaction_timeout=(\d+)ms/u)?.[1] ??
@@ -456,6 +458,7 @@ async function executionScenario(database: string) {
               response_archive_spool_budget, archive_budget_reservations IN ROW EXCLUSIVE MODE NOWAIT`);
             await db.sql("ROLLBACK");
             result.conflicts.push({ target, mode, ...attempt, rollback_verified: true,
+              held_target_was_first_conflict: attempt.failure_relation === target,
               all_83_oids_preserved: true, data_and_ledger_preserved: true });
           } finally { await blocker.sql("ROLLBACK"); await blocker.close(); }
         }
