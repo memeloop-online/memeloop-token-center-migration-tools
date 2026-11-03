@@ -5,6 +5,29 @@ pub(super) async fn inventory(pool: &PgPool) -> Result<serde_json::Value> {
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
         .execute(&mut *transaction)
         .await?;
+    let registry_present: bool =
+        sqlx::query_scalar("SELECT to_regclass('public.schema_migrations') IS NOT NULL")
+            .fetch_one(&mut *transaction)
+            .await?;
+    let schema_registry = if registry_present {
+        let rows = sqlx::query("SELECT version, name FROM schema_migrations ORDER BY version")
+            .fetch_all(&mut *transaction)
+            .await?;
+        let mut migrations = Vec::new();
+        for row in rows {
+            migrations.push(serde_json::json!({
+                "version": row.try_get::<i64, _>("version")?,
+                "name": row.try_get::<String, _>("name")?,
+            }));
+        }
+        serde_json::json!({
+            "state":"counted",
+            "blake3":blake3::hash(&serde_json::to_vec(&migrations)?).to_hex().to_string(),
+            "migrations":migrations,
+        })
+    } else {
+        serde_json::json!({"state":"source_table_absent", "blake3":null, "migrations":null})
+    };
     let mut fields = Vec::new();
     for field in std::iter::once(payloads::SourceField::Atom).chain(payloads::FIELDS) {
         let (table, _, column) = field.columns();
@@ -98,10 +121,17 @@ pub(super) async fn inventory(pool: &PgPool) -> Result<serde_json::Value> {
         serde_json::json!({"state":"source_table_absent", "rows":null, "indexed_bytes":null})
     };
     transaction.commit().await?;
+    let mut missing = Vec::new();
+    if !media_present {
+        missing.push("conversation_media_parts");
+    }
+    if !registry_present {
+        missing.push("schema_migrations");
+    }
     Ok(serde_json::json!({
         "format_version":1, "fields":fields, "raw_sources":raw, "spools":spools,
-        "media":media, "inventory_complete":media_present,
-        "missing_source_tables":if media_present { Vec::<&str>::new() } else { vec!["conversation_media_parts"] },
+        "media":media, "schema_registry":schema_registry, "inventory_complete":missing.is_empty(),
+        "missing_source_tables":missing,
         "durable_object_roots":"not_scanned_by_sql_inventory",
         "object_bytes_verified":false, "complete_training_fidelity_certified":false,
     }))

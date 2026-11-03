@@ -85,6 +85,8 @@ jobs:
             sleep 2
           done
           exit 1
+      - name: Verify bounded read-only storage audit
+        run: node --test ops/object-migration-runtime/audit-storage.test.ts
       - name: Prove TEST target bootstrap and idempotent readiness against real RustFS
         env:
           MTC_OBJECT_MIGRATION_TEST_NAMESPACE: memeloop-token-center-test
@@ -100,6 +102,8 @@ jobs:
             exit 1
           fi
           node ops/object-migration-runtime/prepare-target.ts --create
+          node ops/object-migration-runtime/audit-storage.ts --output /tmp/rustfs-storage-audit.json
+          node --input-type=module -e 'import {readFileSync} from "node:fs"; import assert from "node:assert/strict"; const report=JSON.parse(readFileSync("/tmp/rustfs-storage-audit.json","utf8")); assert.equal(report.objects.complete,true); assert.equal(report.multipart.complete,true); assert.equal(report.deletion_authorized,false)'
           node ops/object-migration-runtime/prepare-target.ts
           node ops/object-migration-runtime/prepare-target.ts --create
       - name: Test exact byte transfer, resume, reconstruction and source retention

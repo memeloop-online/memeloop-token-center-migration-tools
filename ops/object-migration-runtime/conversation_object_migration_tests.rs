@@ -15,7 +15,9 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
     url.set_path(&name);
     let pool = PgPool::connect(url.as_str()).await.unwrap();
     sqlx::raw_sql(
-        "CREATE TABLE semantic_atoms(tenant_id TEXT NOT NULL, content_hash TEXT NOT NULL, content_json TEXT NOT NULL, PRIMARY KEY(tenant_id, content_hash));
+        "CREATE TABLE schema_migrations(version BIGINT PRIMARY KEY, name TEXT NOT NULL);
+         INSERT INTO schema_migrations VALUES (152, 'synthetic registry fixture');
+         CREATE TABLE semantic_atoms(tenant_id TEXT NOT NULL, content_hash TEXT NOT NULL, content_json TEXT NOT NULL, PRIMARY KEY(tenant_id, content_hash));
          CREATE TABLE context_nodes(tenant_id TEXT NOT NULL, node_hash TEXT NOT NULL, parent_hash TEXT, atom_hash TEXT NOT NULL, depth BIGINT NOT NULL, PRIMARY KEY(tenant_id, node_hash));
          CREATE TABLE request_records(id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, request_object TEXT, response_object TEXT);
          CREATE TABLE session_archive_import_records(tenant_id TEXT NOT NULL, source TEXT NOT NULL, external_request_id TEXT NOT NULL, request_object TEXT, response_object TEXT, previous_request_object TEXT, previous_response_object TEXT);
@@ -239,6 +241,17 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
         document.len() as u64
     );
     assert_eq!(inventory["media"]["indexed_bytes"], 15);
+    assert_eq!(
+        inventory["schema_registry"]["migrations"][0]["version"],
+        152
+    );
+    assert_eq!(
+        inventory["schema_registry"]["blake3"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
     assert_eq!(inventory["complete_training_fidelity_certified"], false);
     assert_eq!(copied.copied_rows, 1);
     assert_eq!(copied.copied_bytes, document.len() as u64);
