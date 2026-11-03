@@ -137,6 +137,17 @@ reusable, while an older interrupted all-session transaction contains no
 committed partial rows. Random 3612 spools still require the explicit one-time
 read-only conversion above.
 
+Resume still checks SQLite integrity, the source descriptor, every retained
+completed record and each complete session digest before reusing those sessions.
+Completed records are traversed once in bytewise request-id primary-key order,
+updating a separate bounded digest state per completed session. This preserves
+each session's request ordering without secondary-index point lookups into the
+large WITHOUT ROWID payload table. It does not skip verification or rebuild the
+spool. Partial-session source reads still seek strictly after the saved cursor.
+Sanitized integrity start/complete and completed-verification record/byte logs
+distinguish verification work from new export commits; verification progress is
+not an additional durable export checkpoint or an import-completion receipt.
+
 Use this peak-space equation for the filesystem that contains `--output`:
 
 ```text

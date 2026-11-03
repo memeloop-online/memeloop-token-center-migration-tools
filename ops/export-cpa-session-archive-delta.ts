@@ -121,9 +121,11 @@ function openArchiveSpool(path: string, resume: boolean): { database: DatabaseSy
     for (const sidecar of archiveSpoolSidecars(path)) if (existsSync(sidecar)) ensurePrivateSpoolFile(sidecar, "incomplete archive spool sidecar");
     const database = new DatabaseSync(path);
     let integrity: Record<string, unknown> | undefined;
+    process.stderr.write("archive spool phase=integrity_check event=start\n");
     try { integrity = database.prepare("PRAGMA integrity_check").get() as Record<string, unknown> | undefined; }
     catch { database.close(); throw new DeltaError("incomplete archive spool failed its integrity check"); }
     if (integrity === undefined || Object.values(integrity)[0] !== "ok") { database.close(); throw new DeltaError("incomplete archive spool failed its integrity check"); }
+    process.stderr.write("archive spool phase=integrity_check event=complete\n");
     return { database, resumed: true };
   }
   if (archiveSpoolSidecars(path).some(existsSync)) throw new DeltaError("archive spool sidecar exists without its database");
@@ -1012,6 +1014,56 @@ export class SQLiteArchiveSource {
   close(): void { this.database.close(); }
 }
 
+export const COMPLETED_ARCHIVE_SPOOL_SCAN_SQL = "SELECT request_id,session_id,started_at,completed_at,digest,canonical,emit FROM records NOT INDEXED ORDER BY request_id COLLATE BINARY";
+
+export function verifyCompletedArchiveSpool(
+  database: DatabaseSync,
+  sessions: SessionSummary[],
+  enforceDeadline: (stage: string) => void,
+  report: (line: string) => void = (line) => { process.stderr.write(`${line}\n`); },
+): Set<string> {
+  const projection = new Map(sessions.map((session) => [session.session_id, session]));
+  const completed = database.prepare("SELECT session_id,requests,records_sha256 FROM completed_sessions").all() as Array<{ session_id: string; requests: number; records_sha256: string }>;
+  const expected = new Map<string, { requests: number; digest: string; hash: ReturnType<typeof createHash>; count: number }>();
+  for (const prior of completed) {
+    const session = projection.get(prior.session_id);
+    if (session === undefined || session.deleted === true || prior.requests !== session.requests || prior.records_sha256 !== session.records_sha256) {
+      throw new DeltaError("incomplete archive spool session metadata changed");
+    }
+    expected.set(prior.session_id, { requests: prior.requests, digest: prior.records_sha256, hash: createHash("sha256"), count: 0 });
+  }
+  if (expected.size === 0) return new Set();
+  const started = performance.now();
+  let nextReport = started + 20_000, verifiedRecords = 0, verifiedBytes = 0;
+  report(`archive spool phase=completed_session_verification event=start sessions=${expected.size} records=0 bytes=0`);
+  const rows = database.prepare(COMPLETED_ARCHIVE_SPOOL_SCAN_SQL);
+  for (const row of rows.iterate() as Iterable<{ request_id: string; session_id: string; started_at: string; completed_at: string; digest: string; canonical: Uint8Array; emit: number }>) {
+    enforceDeadline("completed session verification");
+    const session = expected.get(row.session_id);
+    if (session === undefined) continue;
+    const canonical = Buffer.from(row.canonical); let record: unknown;
+    try { record = parseStrictJson(canonical.toString("utf8")); } catch { throw new DeltaError("incomplete archive spool session content failed verification"); }
+    if (!isObject(record) || record.request_id !== row.request_id || record.session_id !== row.session_id
+        || record.started_at !== row.started_at || record.completed_at !== row.completed_at || row.digest !== sha256Bytes(canonical) || row.emit !== 1) {
+      throw new DeltaError("incomplete archive spool session content failed verification");
+    }
+    parseCanonicalTime(row.started_at, "incomplete archive spool started_at");
+    parseCanonicalTime(row.completed_at, "incomplete archive spool completed_at");
+    session.hash.update(canonical); session.count += 1;
+    verifiedRecords += 1; verifiedBytes += canonical.length;
+    if (performance.now() >= nextReport) {
+      report(`archive spool phase=completed_session_verification event=progress records=${verifiedRecords} bytes=${verifiedBytes} elapsed_ms=${Math.floor(performance.now() - started)}`);
+      nextReport = performance.now() + 20_000;
+    }
+  }
+  enforceDeadline("completed session verification");
+  for (const session of expected.values()) {
+    if (session.count !== session.requests || session.hash.digest("hex") !== session.digest) throw new DeltaError("incomplete archive spool session content failed verification");
+  }
+  report(`archive spool phase=completed_session_verification event=complete sessions=${expected.size} records=${verifiedRecords} bytes=${verifiedBytes} elapsed_ms=${Math.floor(performance.now() - started)}`);
+  return new Set(expected.keys());
+}
+
 export function sourceFingerprint(client: SourceClient): string {
   const descriptor: JsonObject = {
     origin: client.origin, base: client.base, download_origin: client.downloadOrigin, download_base: client.downloadBase,
@@ -1351,6 +1403,8 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
       const counts = database.prepare("SELECT (SELECT COUNT(*) FROM completed_sessions) AS sessions,(SELECT COUNT(*) FROM session_progress) AS partial_sessions,(SELECT COUNT(*) FROM records) AS records").get() as { sessions: number; partial_sessions: number; records: number };
       process.stderr.write(`archive spool resume completed_sessions=${counts.sessions} records=${counts.records} partial_sessions=${counts.partial_sessions}\n`);
     }
+    const verifiedCompletedSessions = first.protocol === STABLE_CURSOR_PROTOCOL
+      ? verifyCompletedArchiveSpool(database, first.sessions, enforceElapsedDeadline) : new Set<string>();
     let invocationChunks = 0;
     for (const session of [...first.sessions].sort((left, right) => compareUtf8Bytewise(left.session_id, right.session_id))) {
       if (session.deleted === true) {
@@ -1362,22 +1416,7 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
       const priorSession = first.protocol === STABLE_CURSOR_PROTOCOL ? completedSession.get(session.session_id) as { requests: number; records_sha256: string } | undefined : undefined;
       if (priorSession !== undefined) {
         if (priorSession.requests !== session.requests || priorSession.records_sha256 !== session.records_sha256) throw new DeltaError("incomplete archive spool session metadata changed");
-        const resumedDigest = createHash("sha256"); let resumedCount = 0;
-        const rows = database.prepare("SELECT request_id,session_id,started_at,completed_at,digest,canonical,emit FROM records WHERE session_id=? ORDER BY request_id COLLATE BINARY");
-        for (const row of rows.iterate(session.session_id) as Iterable<{ request_id: string; session_id: string; started_at: string; completed_at: string; digest: string; canonical: Uint8Array; emit: number }>) {
-          enforceElapsedDeadline("completed session verification");
-          const canonical = Buffer.from(row.canonical); let record: unknown;
-          try { record = parseStrictJson(canonical.toString("utf8")); } catch { throw new DeltaError("incomplete archive spool session content failed verification"); }
-          if (!isObject(record) || record.request_id !== row.request_id || record.session_id !== row.session_id || row.session_id !== session.session_id
-              || record.started_at !== row.started_at || record.completed_at !== row.completed_at || row.digest !== sha256Bytes(canonical) || row.emit !== 1) {
-            throw new DeltaError("incomplete archive spool session content failed verification");
-          }
-          parseCanonicalTime(row.started_at, "incomplete archive spool started_at");
-          parseCanonicalTime(row.completed_at, "incomplete archive spool completed_at");
-          resumedDigest.update(canonical); resumedCount += 1;
-        }
-        enforceElapsedDeadline("completed session verification");
-        if (resumedCount !== session.requests || resumedDigest.digest("hex") !== session.records_sha256) throw new DeltaError("incomplete archive spool session content failed verification");
+        if (!verifiedCompletedSessions.has(session.session_id)) throw new DeltaError("incomplete archive spool session content failed verification");
         continue;
       }
       enforceElapsedDeadline("session processing");
