@@ -13,6 +13,7 @@ import test, { after, before, beforeEach } from "node:test";
 import { gzipSync } from "node:zlib";
 import {
   ARCHIVE_SPOOL_SCHEMA,
+  COMPLETED_ARCHIVE_SPOOL_SCAN_SQL,
   canonicalBytes,
   type CollectorReadinessDriver,
   collectorTransportDiagnostic,
@@ -25,6 +26,7 @@ import {
   SQLiteArchiveSource,
   STABLE_CURSOR_PROTOCOL,
   unwrapJson,
+  verifyCompletedArchiveSpool,
 } from "../../ops/export-cpa-session-archive-delta.ts";
 
 const ROOT = resolve(import.meta.dirname, "../..");
@@ -439,6 +441,44 @@ test("archive spool stores each canonical payload in one indexed table", () => {
     const indexes = database.prepare("SELECT name FROM sqlite_schema WHERE type='index' AND tbl_name='records' ORDER BY name").all() as Array<{ name: string }>;
     assert.deepEqual(indexes.map((index) => index.name), ["records_by_output", "records_by_session"]);
     assert.doesNotMatch(ARCHIVE_SPOOL_SCHEMA, /seen_records/);
+  } finally { database.close(); }
+});
+
+test("completed spool verification scans overflow payloads once in primary-key order with per-session digests", () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    database.exec(ARCHIVE_SPOOL_SCHEMA);
+    const groups = new Map<string, RecordValue[]>();
+    const add = database.prepare("INSERT INTO records VALUES(?,?,?,?,?,?,?)");
+    for (let index = 95; index >= 0; index -= 1) {
+      const sessionId = index % 2 === 0 ? "private-session-a" : "private-session-b";
+      const item = { ...record(`private-request-${String(index).padStart(4, "0")}`, sessionId, "2025-01-02T01:00:00.000000Z", "2025-01-02T01:00:01.000000Z"), response: { answer: "private-payload-".repeat(2048) } };
+      const bytes = canonicalLine(item);
+      add.run(item.request_id, item.session_id, item.started_at, item.completed_at, createHash("sha256").update(bytes).digest("hex"), bytes, 1);
+      const group = groups.get(sessionId) ?? []; group.push(item); groups.set(sessionId, group);
+    }
+    const projection = [...groups.entries()].map(([sessionId, rows]) => ({ session_id: sessionId, requests: rows.length, last_at: rows[0]!.completed_at, records_sha256: digestRecords(rows) }));
+    for (const session of projection) {
+      database.prepare("INSERT INTO completed_sessions VALUES(?,?,?,?)").run(session.session_id, session.requests, session.records_sha256, 0);
+    }
+    add.run("partial-request", "partial-session", "unused", "unused", "unused", Buffer.from("unverified partial payload"), 1);
+    const plan = database.prepare(`EXPLAIN QUERY PLAN ${COMPLETED_ARCHIVE_SPOOL_SCAN_SQL}`).all() as Array<{ detail: string }>;
+    assert.deepEqual(plan.map((row) => row.detail), ["SCAN records"]);
+    const reports: string[] = []; let deadlines = 0;
+    const verified = verifyCompletedArchiveSpool(database, projection, (stage) => { assert.equal(stage, "completed session verification"); deadlines += 1; }, (line) => { reports.push(line); });
+    assert.deepEqual([...verified].sort(), [...groups.keys()].sort());
+    assert.equal(deadlines, 98);
+    assert.match(reports.at(-1)!, /event=complete sessions=2 records=96 bytes=\d+ elapsed_ms=\d+/);
+    assert.doesNotMatch(reports.join("\n"), /private-|partial-|unverified/);
+    const retained = database.prepare("SELECT COUNT(*) AS records FROM records").get() as { records: number };
+    assert.equal(retained.records, 97);
+    const refusal = new Error("unchanged elapsed deadline");
+    assert.throws(() => verifyCompletedArchiveSpool(database, projection, () => { throw refusal; }, () => {}), (error) => error === refusal);
+    assert.throws(() => verifyCompletedArchiveSpool(database, projection.slice(1), () => {}, () => {}), /session metadata changed/);
+    const original = groups.get("private-session-a")![0]!;
+    const tampered = canonicalLine({ ...original, model: "changed-but-row-hash-consistent" });
+    database.prepare("UPDATE records SET canonical=?,digest=? WHERE request_id=?").run(tampered, createHash("sha256").update(tampered).digest("hex"), original.request_id);
+    assert.throws(() => verifyCompletedArchiveSpool(database, projection, () => {}, () => {}), /session content failed verification/);
   } finally { database.close(); }
 });
 
