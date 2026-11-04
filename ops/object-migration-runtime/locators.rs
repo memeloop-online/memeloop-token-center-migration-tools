@@ -567,7 +567,7 @@ impl Runner {
         while let Some(located) = self.next_locator(&result.cursor).await? {
             // Declared historical gaps are evidence, not an instruction to
             // stop copying later readable objects. Never fabricate their body.
-            let gap_reason = if located.locator.starts_with("gap://") {
+            let mut gap_reason = if located.locator.starts_with("gap://") {
                 Some("source_gap")
             } else if located.locator.starts_with("metadata-only-json:") {
                 Some("source_metadata_only")
@@ -577,7 +577,35 @@ impl Runner {
                 None
             };
             let object = if gap_reason.is_some() {
-                None
+                // SQL can retain an explicit gap after the immutable raw root
+                // was published. Only native request identities have a direct
+                // tenant/request/side binding; imported IDs are not guessed.
+                let root = if matches!(located.cursor.kind.as_str(), "request" | "response") {
+                    source
+                        .raw_capture_reference(
+                            Uuid::parse_str(&located.cursor.tenant)?,
+                            Uuid::parse_str(&located.cursor.identity)?,
+                            &located.cursor.kind,
+                        )
+                        .await?
+                } else {
+                    None
+                };
+                if let Some(root) = root {
+                    let recovered = LocatedObject {
+                        cursor: located.cursor.clone(),
+                        locator: root.object_locator,
+                        source_locator_blake3: located.source_locator_blake3.clone(),
+                        source_locator_md5: located.source_locator_md5.clone(),
+                        expected_digest: Some(root.blake3_digest),
+                        expected_bytes: Some(root.size_bytes),
+                    };
+                    let object = self.copy_locator(source, &recovered, !verify).await?;
+                    gap_reason = None;
+                    Some(object)
+                } else {
+                    None
+                }
             } else {
                 Some(self.copy_locator(source, &located, !verify).await?)
             };

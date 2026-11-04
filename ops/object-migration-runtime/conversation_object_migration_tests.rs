@@ -544,7 +544,9 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
     sqlx::query("INSERT INTO request_records VALUES ($1, $2, NULL, $3)")
         .bind(large_id.to_string())
         .bind(tenant.to_string())
-        .bind(&large.object_locator)
+        // A late SQL gap must not hide the already-published immutable raw
+        // root. Recovery must stream its exact original, including >128MiB.
+        .bind(format!("gap://{large_id}/response/sql-projection-lag"))
         .execute(&pool)
         .await
         .unwrap();
@@ -587,6 +589,16 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
     assert_eq!(copied.copied_rows, 15);
     assert_eq!(copied.gap_rows, 3);
     assert!(!copied.verified);
+    let retained_gap: String =
+        sqlx::query_scalar("SELECT response_object FROM request_records WHERE id = $1")
+            .bind(large_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        retained_gap,
+        format!("gap://{large_id}/response/sql-projection-lag")
+    );
     assert_eq!(
         gap_runner
             .transfer_locators_from(&source, "fixture-gaps", false)
