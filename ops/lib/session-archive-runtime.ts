@@ -4,10 +4,10 @@ import { basename, dirname, isAbsolute, join } from "node:path";
 
 export const archiveRuntimePin = {
   repository: "memeloop-online/memeloop-token-center",
-  revision: "61d426a0f0c58319d8e0940b1b3cd4e55fbc7570",
-  cargo_lock_sha256: "ce4cb5fa4fe98565236764cda25b5ac847163b933e385ccf2de2f7a107597f67",
-  source_closure_sha256: "863324ae6becaec3fc1ca38fbe1d0b59ad87be00ac247d8e9ec302969c6df66b",
-  target_schema_version: 142,
+  revision: "00f4792483db1f00e2208872d51b7d734094f9be",
+  cargo_lock_sha256: "7a4fb6bcc072558a4eb20f86ebd0c79a2593135f02dde6669628aeb73216f3a8",
+  source_closure_sha256: "a6e30d968ec4843787a13a1d4349a707c85e61bad79e1b9efb96cb571abe1fd7",
+  target_schema_version: 152,
   test_fixture_repository: "memeloop-online/memeloop-token-center-example-plugins",
   test_fixture_revision: "21489f4fee6266de99fe7e258349468ce77af8bd",
   rust_version: "1.95.0",

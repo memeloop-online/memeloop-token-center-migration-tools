@@ -707,23 +707,24 @@ impl Database {
             DatabaseBackend::PostgreSql => POSTGRES_MIGRATIONS,
             DatabaseBackend::Sqlite => SQLITE_MIGRATIONS,
         };
-        let mut expected: Vec<i64> = migrations
+        let mut expected: Vec<(i64, String)> = migrations
             .iter()
-            .map(|migration| migration.version)
+            .map(|migration| (migration.version, migration.name.to_owned()))
             .collect();
         // The pinned product records its Rust plaintext conversion separately
         // from the SQL migration list. Require its exact existing receipt;
         // this importer never runs that conversion or writes schema metadata.
-        if expected.last() != Some(&141) {
+        if expected.last().map(|migration| migration.0) != Some(152) {
             return Err(AppError::BadRequest(
                 "pinned SQL migration inventory differs".into(),
             ));
         }
-        expected.push(142);
+        expected.push((142, "plaintext state instead of sealed envelopes".into()));
+        expected.sort_by_key(|migration| migration.0);
         let limit = i64::try_from(expected.len() + 1)
             .map_err(|_| AppError::internal("cpa_session_archive_8"))?;
-        let applied = sqlx::query_scalar::<_, i64>(
-            "SELECT version FROM schema_migrations ORDER BY version LIMIT $1",
+        let applied = sqlx::query_as::<_, (i64, String)>(
+            "SELECT version, name FROM schema_migrations ORDER BY version LIMIT $1",
         )
         .bind(limit)
         .fetch_all(&self.pool)
@@ -735,19 +736,21 @@ impl Database {
         })?;
         if applied != expected {
             return Err(AppError::BadRequest(
-                "target database schema differs from the pinned schema142 migration list".into(),
+                "target database schema differs from the pinned schema152 migration identities"
+                    .into(),
             ));
         }
 
-        let sweep_name: String =
-            sqlx::query_scalar("SELECT name FROM schema_migrations WHERE version=142")
-                .fetch_one(&self.pool)
-                .await?;
-        if sweep_name != "plaintext state instead of sealed envelopes" {
-            return Err(AppError::BadRequest(
-                "target schema142 has a different conversion identity".into(),
-            ));
-        }
+        sqlx::query(
+            "SELECT s.body_blake3, s.cipher_bytes, s.chunk_count, s.byte_count, s.attempts, s.last_error_code, r.proxy_owner_expires_at FROM response_archive_spools s CROSS JOIN request_records r WHERE 1 = 0",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| {
+            AppError::BadRequest(
+                "target database schema152 archive storage or request ownership is drifted".into(),
+            )
+        })?;
 
         // Reference every importer-owned relation and the post-v21 locator/source
         // columns. A forged or drifted schema_migrations table therefore remains
@@ -763,13 +766,23 @@ impl Database {
             )
         })?;
         sqlx::query(
-            "SELECT t.tenant_id, t.key_id, t.session_id, t.title, t.state, t.revision, t.attempts, t.next_attempt_at, t.lease_owner, t.lease_until, t.error_code, t.updated_at, s.tenant_id, s.key_id, s.request_id, s.session_id, s.state, s.atom_hash, s.error_code, s.attempts, s.next_attempt_at, s.lease_owner, s.lease_until, s.created_at, s.updated_at FROM session_generated_titles t CROSS JOIN session_response_summaries s WHERE 1 = 0",
+            "SELECT t.tenant_id, t.key_id, t.session_id, t.title, t.title_source, t.name_sync_id, t.state, t.revision, t.attempts, t.next_attempt_at, t.lease_owner, t.lease_until, t.error_code, t.updated_at, s.tenant_id, s.key_id, s.request_id, s.session_id, s.state, s.atom_hash, s.error_code, s.attempts, s.next_attempt_at, s.lease_owner, s.lease_until, s.created_at, s.updated_at FROM session_generated_titles t CROSS JOIN session_response_summaries s WHERE 1 = 0",
         )
         .fetch_all(&self.pool)
         .await
         .map_err(|_| {
             AppError::BadRequest(
                 "target database session reading schema is incomplete or drifted".into(),
+            )
+        })?;
+        sqlx::query(
+            "SELECT p.tenant_id, p.child_thread_id, p.parent_thread_id, p.evidence, r.tenant_id, r.key_id, r.session_id, r.target_key_id, r.target_session_id, r.kind, r.evidence, r.updated_at, h.mode, h.verified_revision, h.verification_json, b.source, b.after_id, b.done FROM session_thread_parents p CROSS JOIN session_relationships r CROSS JOIN request_history_state h CROSS JOIN request_history_backfill b WHERE 1 = 0",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| {
+            AppError::BadRequest(
+                "target database archive history or session relationship schema is drifted".into(),
             )
         })?;
         sqlx::query(
