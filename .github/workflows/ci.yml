@@ -303,7 +303,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v6.0.0
         with:
           repository: memeloop-online/memeloop-token-center
-          ref: 3150445f4841e74faf7a526aa933fe6558c747ed
+          ref: 00f4792483db1f00e2208872d51b7d734094f9be
           path: .runtime-source
           persist-credentials: false
 
@@ -332,8 +332,8 @@ jobs:
         working-directory: .runtime-source
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "3150445f4841e74faf7a526aa933fe6558c747ed"
-          test "$(sha256sum Cargo.lock | cut -d ' ' -f 1)" = "2caa9ebd39770325fc0743dccc2c221612691dbd9a75a99f24d6baaaea15cc38"
+          test "$(git rev-parse HEAD)" = "00f4792483db1f00e2208872d51b7d734094f9be"
+          test "$(sha256sum Cargo.lock | cut -d ' ' -f 1)" = "7a4fb6bcc072558a4eb20f86ebd0c79a2593135f02dde6669628aeb73216f3a8"
           test -n "$MTC_TEST_POSTGRES_URL"
           cargo test --locked --lib session_archive_import::tests
           cargo test --locked --lib db::requests::conversations::prefix_storage::tests

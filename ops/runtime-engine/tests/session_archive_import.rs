@@ -58,20 +58,20 @@ async fn archive_import_is_fail_closed_gap_only_and_idempotent() {
 }
 
 #[tokio::test]
-async fn sqlite_schema146_precondition_rejects_version_and_relation_drift_without_writes() {
-    schema146_precondition_fixture(false).await;
+async fn sqlite_schema152_precondition_rejects_version_and_relation_drift_without_writes() {
+    schema152_precondition_fixture(false).await;
 }
 
 #[tokio::test]
-async fn postgres_schema146_precondition_rejects_version_and_relation_drift_without_writes() {
+async fn postgres_schema152_precondition_rejects_version_and_relation_drift_without_writes() {
     if std::env::var("MTC_TEST_POSTGRES_URL").is_err() {
         assert!(std::env::var("CI").is_err(), "CI requires PostgreSQL");
         return;
     }
-    schema146_precondition_fixture(true).await;
+    schema152_precondition_fixture(true).await;
 }
 
-async fn schema146_precondition_fixture(postgres: bool) {
+async fn schema152_precondition_fixture(postgres: bool) {
     let directory = tempfile::tempdir().unwrap();
     let database_url = if postgres {
         sqlx::any::install_default_drivers();
@@ -116,11 +116,13 @@ async fn schema146_precondition_fixture(postgres: bool) {
             .fetch_all(&pool)
             .await
             .unwrap();
-    assert_eq!(versions.len(), 144);
-    assert_eq!(versions.last(), Some(&146));
+    assert_eq!(versions.len(), 151);
+    assert_eq!(versions.last(), Some(&152));
     assert!(!versions.contains(&114));
-    assert!(!versions.contains(&145));
-    for missing in [127_i64, 131, 132, 133, 141, 142, 143, 144, 146] {
+    assert!(versions.contains(&145));
+    for missing in [
+        127_i64, 131, 132, 133, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152,
+    ] {
         let original: (String, i64) =
             sqlx::query_as("SELECT name, applied_at FROM schema_migrations WHERE version=$1")
                 .bind(missing)
@@ -141,11 +143,13 @@ async fn schema146_precondition_fixture(postgres: bool) {
             .await
             .unwrap();
         db.ensure_session_archive_import_schema().await.unwrap();
-        sqlx::query("UPDATE schema_migrations SET name='wrong-qualified-identity' WHERE version=$1")
-            .bind(missing)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE schema_migrations SET name='wrong-qualified-identity' WHERE version=$1",
+        )
+        .bind(missing)
+        .execute(&pool)
+        .await
+        .unwrap();
         assert_schema_rejected_without_writes(&db, &pool).await;
         sqlx::query("UPDATE schema_migrations SET name=$2 WHERE version=$1")
             .bind(missing)
@@ -163,7 +167,7 @@ async fn schema146_precondition_fixture(postgres: bool) {
     assert_schema_rejected_without_writes(&db, &pool).await;
     sqlx::query("UPDATE schema_migrations SET name='plaintext state instead of sealed envelopes' WHERE version=142")
         .execute(&pool).await.unwrap();
-    for unexpected in [0_i64, 114, 145, 147] {
+    for unexpected in [0_i64, 114, 153] {
         sqlx::query(
             "INSERT INTO schema_migrations (version,name,applied_at) VALUES ($1,'unqualified',0)",
         )
@@ -182,6 +186,10 @@ async fn schema146_precondition_fixture(postgres: bool) {
         "session_generated_titles",
         "session_response_summaries",
         "proxy_operational_terminals",
+        "session_thread_parents",
+        "session_relationships",
+        "request_history_state",
+        "request_history_backfill",
     ] {
         let drift_table = format!("{table}_schema_drift_fixture");
         sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -200,6 +208,12 @@ async fn schema146_precondition_fixture(postgres: bool) {
     }
     for (table, column) in [
         ("session_generated_titles", "revision"),
+        ("session_generated_titles", "title_source"),
+        ("session_generated_titles", "name_sync_id"),
+        ("session_relationships", "target_session_id"),
+        ("session_thread_parents", "parent_thread_id"),
+        ("request_history_state", "verified_revision"),
+        ("request_history_backfill", "after_id"),
         ("session_response_summaries", "session_id"),
         ("proxy_operational_terminals", "reservation_id"),
         ("proxy_operational_terminals", "response_object"),
@@ -251,7 +265,7 @@ async fn large_archive_import_preserves_objects_replay_tenants_and_financial_sta
 }
 
 #[tokio::test]
-async fn postgres_schema146_large_import_prefix_readback_replay_and_financial_state() {
+async fn postgres_schema152_large_import_prefix_readback_replay_and_financial_state() {
     if std::env::var("MTC_TEST_POSTGRES_URL").is_ok() {
         archive_import_fixture(true, true).await;
     } else {
