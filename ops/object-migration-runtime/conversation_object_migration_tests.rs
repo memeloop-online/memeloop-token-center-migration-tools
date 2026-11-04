@@ -354,6 +354,18 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
     );
     let completed = runner.cutover_test().await.unwrap();
     assert!(completed.cutover_complete);
+    // Simulate the first UPDATE committing while its acknowledgement and the
+    // per-row checkpoint write are lost. The durable start marker survives,
+    // but the disk cursor still precedes the already-converted first row.
+    let mut lost_ack = runner.load_checkpoint().unwrap();
+    assert!(lost_ack.cutover_started);
+    lost_ack.cutover_cursor = Cursor::default();
+    lost_ack.cutover_rows = 0;
+    lost_ack.cutover_complete = false;
+    save_checkpoint(&runner.checkpoint, &lost_ack).unwrap();
+    let resumed = runner.cutover_test().await.unwrap();
+    assert!(resumed.cutover_complete);
+    assert_eq!(resumed.cutover_rows, 1);
     let encoded: String = sqlx::query_scalar("SELECT content_json FROM semantic_atoms")
         .fetch_one(&pool)
         .await

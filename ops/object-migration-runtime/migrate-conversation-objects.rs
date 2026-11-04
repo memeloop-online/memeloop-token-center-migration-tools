@@ -89,6 +89,8 @@ struct Checkpoint {
     verified_rows: u64,
     verified_context_nodes: u64,
     verified: bool,
+    #[serde(default)]
+    cutover_started: bool,
     cutover_cursor: Cursor,
     cutover_rows: u64,
     cutover_complete: bool,
@@ -696,9 +698,16 @@ impl Runner {
         }
         self.require_reconstruction_receipt()?;
         self.require_all_verification()?;
-        if checkpoint.cutover_rows == 0 {
+        if !checkpoint.cutover_started && checkpoint.cutover_rows == 0 {
             self.verify().await?;
             self.reconstruct_dialogues(true).await?;
+        }
+        // Persist the transition before the first SQL commit. A lost commit
+        // acknowledgement must resume the idempotent row updates, not verify
+        // the already-replaced source as if no cutover had begun.
+        if !checkpoint.cutover_started {
+            checkpoint.cutover_started = true;
+            save_checkpoint(&self.checkpoint, &checkpoint)?;
         }
         while let Some(cursor) = self.next_atom(&checkpoint.cutover_cursor).await? {
             let transfer = self.transfer(&cursor).await?;
