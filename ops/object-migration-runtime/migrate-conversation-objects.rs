@@ -14,6 +14,55 @@ use uuid::Uuid;
 type Failure = Box<dyn std::error::Error + Send + Sync>;
 type Result<Value> = std::result::Result<Value, Failure>;
 
+#[derive(Debug)]
+struct MigrationFailure {
+    stage: &'static str,
+    cause: Failure,
+}
+
+impl std::fmt::Display for MigrationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "migration stage {}", self.stage)
+    }
+}
+
+impl std::error::Error for MigrationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.cause.as_ref())
+    }
+}
+
+fn at_stage(stage: &'static str, cause: impl Into<Failure>) -> Failure {
+    Box::new(MigrationFailure {
+        stage,
+        cause: cause.into(),
+    })
+}
+
+fn safe_failure(error: &(dyn std::error::Error + 'static)) -> serde_json::Value {
+    let mut stages = Vec::new();
+    let mut category = "validation";
+    let mut current = Some(error);
+    while let Some(cause) = current {
+        if let Some(context) = cause.downcast_ref::<MigrationFailure>() {
+            stages.push(context.stage);
+        }
+        if cause.is::<sqlx::Error>() {
+            category = "database";
+        } else if cause.is::<std::io::Error>() {
+            category = "filesystem_or_transport";
+        } else if cause.is::<serde_json::Error>() {
+            category = "json_format";
+        } else if cause.is::<memeloop_token_center::error::AppError>() {
+            category = "archive";
+        }
+        current = cause.source();
+    }
+    // Never serialize error Display/Debug: SQL, URLs and object-store errors
+    // can contain credentials or source payload. Stages are static literals.
+    serde_json::json!({"event":"migration_failed","stages":stages,"category":category})
+}
+
 #[path = "conversation-object-modules/durable_roots.rs"]
 mod durable_roots;
 #[path = "conversation-object-modules/inventory.rs"]
@@ -365,7 +414,7 @@ impl Runner {
             "SELECT CAST(length({column}) AS BIGINT) AS chars, CAST(octet_length({column}) AS BIGINT) AS bytes, md5({column}) AS digest, left({column}, 4096) AS prefix FROM {table} WHERE tenant_id = $1 AND {id} = $2"
         )))
         .bind(&cursor.tenant_id).bind(&cursor.content_hash)
-        .fetch_one(&mut *transaction).await?;
+        .fetch_one(&mut *transaction).await.map_err(|e| at_stage("source_field_metadata", e))?;
         let chars = u64::try_from(row.try_get::<i64, _>("chars")?)?;
         let expected_bytes = u64::try_from(row.try_get::<i64, _>("bytes")?)?;
         let source_md5: String = row.try_get("digest")?;
@@ -386,7 +435,12 @@ impl Runner {
             Uuid::now_v7()
         );
         let mut writer = if copy {
-            Some(self.target.start_writer(&staging).await?)
+            Some(
+                self.target
+                    .start_writer(&staging)
+                    .await
+                    .map_err(|e| at_stage("target_writer_start", e))?,
+            )
         } else {
             None
         };
@@ -399,7 +453,7 @@ impl Runner {
             )))
             .bind(&cursor.tenant_id).bind(&cursor.content_hash)
             .bind(i32::try_from(offset.checked_add(1).ok_or("character offset overflow")?)?)
-            .fetch_one(&mut *transaction).await?;
+            .fetch_one(&mut *transaction).await.map_err(|e| at_stage("source_field_chunk", e))?;
             if chunk.is_empty() {
                 return Err("source ended before its declared character count".into());
             }
@@ -407,7 +461,10 @@ impl Runner {
             bytes += chunk.len() as u64;
             digest.update(chunk.as_bytes());
             if let Some(writer) = &mut writer {
-                writer.write(Bytes::from(chunk)).await?;
+                writer
+                    .write(Bytes::from(chunk))
+                    .await
+                    .map_err(|e| at_stage("target_chunk_write", e))?;
             }
         }
         transaction.commit().await?;
@@ -416,15 +473,22 @@ impl Runner {
         }
         let blake3_digest = digest.finalize().to_hex().to_string();
         let object = if let Some(writer) = writer {
-            let staged = writer.finish_staged().await?;
+            let staged = writer
+                .finish_staged()
+                .await
+                .map_err(|e| at_stage("target_upload_finish", e))?;
             if staged.blake3_digest != blake3_digest || staged.size_bytes != expected_bytes {
                 return Err("streamed transfer digest mismatch".into());
             }
             let object = self
                 .target
                 .promote_staged_text_to_cas(tenant, &staged)
-                .await?;
-            self.target.delete(&staged.object_locator).await?;
+                .await
+                .map_err(|e| at_stage("target_cas_promote", e))?;
+            self.target
+                .delete(&staged.object_locator)
+                .await
+                .map_err(|e| at_stage("target_staging_remove", e))?;
             object
         } else {
             memeloop_token_center::archive::CasArchiveObject {
@@ -461,7 +525,9 @@ impl Runner {
     }
 
     async fn copy(&self) -> Result<Checkpoint> {
-        let mut checkpoint = self.load_checkpoint()?;
+        let mut checkpoint = self
+            .load_checkpoint()
+            .map_err(|e| at_stage("checkpoint_load", e))?;
         if checkpoint.copied {
             return Ok(checkpoint);
         }
@@ -473,8 +539,15 @@ impl Runner {
             )?;
             save_checkpoint(&self.checkpoint, &checkpoint)?;
         }
-        while let Some(cursor) = self.next_atom(&checkpoint.cursor).await? {
-            let (reference, source_md5) = self.source_reference(&cursor, true).await?;
+        while let Some(cursor) = self
+            .next_atom(&checkpoint.cursor)
+            .await
+            .map_err(|e| at_stage("atom_cursor", e))?
+        {
+            let (reference, source_md5) = self
+                .source_reference(&cursor, true)
+                .await
+                .map_err(|e| at_stage("atom_source_transfer", e))?;
             let transfer = Transfer {
                 format_version: 1,
                 identity: self.identity.clone(),
@@ -485,8 +558,12 @@ impl Runner {
             let key = transfer_key(&self.identity, &cursor)?;
             self.target
                 .put(&key, Bytes::from(serde_json::to_vec(&transfer)?))
-                .await?;
-            let checked = self.transfer(&cursor).await?;
+                .await
+                .map_err(|e| at_stage("atom_receipt_write", e))?;
+            let checked = self
+                .transfer(&cursor)
+                .await
+                .map_err(|e| at_stage("atom_receipt_read", e))?;
             if serde_json::to_vec(&checked)? != serde_json::to_vec(&transfer)? {
                 return Err("transfer receipt readback mismatch".into());
             }
@@ -921,10 +998,8 @@ async fn run(args: Args) -> Result<()> {
 async fn main() -> ExitCode {
     match run(Args::parse()).await {
         Ok(()) => ExitCode::SUCCESS,
-        Err(_) => {
-            eprintln!(
-                "conversation object migration stopped; source or checkpoint is not verified"
-            );
+        Err(error) => {
+            eprintln!("{}", safe_failure(error.as_ref()));
             ExitCode::FAILURE
         }
     }
@@ -933,3 +1008,27 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 #[path = "conversation_object_migration_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn reports_static_stages_without_error_payload_or_credentials() {
+        let error = at_stage(
+            "atom_source_transfer",
+            at_stage(
+                "source_field_chunk",
+                std::io::Error::other("https://user:password@host/private-source-body"),
+            ),
+        );
+        let report = safe_failure(error.as_ref());
+        assert_eq!(
+            report["stages"],
+            serde_json::json!(["atom_source_transfer", "source_field_chunk"])
+        );
+        assert_eq!(report["category"], "filesystem_or_transport");
+        assert!(!report.to_string().contains("password"));
+        assert!(!report.to_string().contains("private-source-body"));
+    }
+}
