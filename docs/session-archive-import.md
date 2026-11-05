@@ -4,6 +4,15 @@ The importer accepts both normalized archive envelopes emitted by
 `cpa-session-archive`. Legacy releases emit `schema_version: 1`; newer
 identity-aware builds emit `schema_version: 2`.
 These are parsed as their actual versions rather than relabelled during export.
+Exports run until completion by default. `--max-elapsed-seconds 0` explicitly
+selects this behavior; a positive value remains available for an operator-selected
+bounded run, without the former 24-hour ceiling. Existing running processes keep
+their original deadline; changing a Job spec does not update their arguments.
+Resume preserves committed records and source cursors. It repeats SQLite integrity,
+projection and retained-content verification; previous validation is not represented
+by a durable cursor and must not be claimed as reused. Initialization's selected-byte
+total uses a sequential primary-tree scan, avoiding output-index lookups into large
+payload records. Its `selected_bytes` phase logs report validation, not new exports.
 Do not copy an active `archive.sqlite` file without its WAL. Obtain the JSONL
 through an authenticated export ticket, or export from a consistent SQLite
 backup.

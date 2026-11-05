@@ -13,6 +13,7 @@ import test, { after, before, beforeEach } from "node:test";
 import { gzipSync } from "node:zlib";
 import {
   ARCHIVE_SPOOL_SCHEMA,
+  ARCHIVE_SPOOL_SELECTED_BYTES_SQL,
   COMPLETED_ARCHIVE_SPOOL_SCAN_SQL,
   canonicalBytes,
   type CollectorReadinessDriver,
@@ -203,6 +204,27 @@ test("collector 102 progress restarts the bounded archive-download idle timer", 
     assert(diagnostics.some((message) => /^archive download progress status=102 elapsed_seconds=\d+ idle_seconds=\d+ idle_timer_reset=true$/.test(message)));
   } finally {
     await new Promise<void>((resolveClose, rejectClose) => progressServer.close((error) => error === undefined ? resolveClose() : rejectClose(error)));
+  }
+});
+
+test("infinite and long overall deadlines do not overflow the HTTP timer", async () => {
+  const downloadServer = createServer((_request, response) => {
+    setTimeout(() => { response.writeHead(200); response.end('{"schema_version":2}\n'); }, 30);
+  });
+  await new Promise<void>((resolveListen) => downloadServer.listen(0, "127.0.0.1", resolveListen));
+  const address = downloadServer.address();
+  assert(address !== null && typeof address === "object");
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    for (const deadline of [Infinity, performance.now() + 3_000_000_000]) {
+      const client = new SourceClient(base, base, undefined, 1, true, new Set(["127.0.0.1"]), true, 0, 0.5, deadline);
+      (client as unknown as { ticketUrl: () => Promise<URL> }).ticketUrl = async () => new URL(`/archive-api/v1/exports/${"d".repeat(64)}`, base);
+      const lines: string[] = [];
+      for await (const line of client.exportLines("session", 1024, "snapshot", "0".repeat(64))) lines.push(line);
+      assert.deepEqual(lines, ['{"schema_version":2}\n']);
+    }
+  } finally {
+    await new Promise<void>((resolveClose, rejectClose) => downloadServer.close((error) => error === undefined ? resolveClose() : rejectClose(error)));
   }
 });
 
@@ -464,6 +486,14 @@ test("completed spool verification scans overflow payloads once in primary-key o
     add.run("partial-request", "partial-session", "unused", "unused", "unused", Buffer.from("unverified partial payload"), 1);
     const plan = database.prepare(`EXPLAIN QUERY PLAN ${COMPLETED_ARCHIVE_SPOOL_SCAN_SQL}`).all() as Array<{ detail: string }>;
     assert.deepEqual(plan.map((row) => row.detail), ["SCAN records"]);
+    const sizePlan = database.prepare(`EXPLAIN QUERY PLAN ${ARCHIVE_SPOOL_SELECTED_BYTES_SQL}`).all() as Array<{ detail: string }>;
+    assert(sizePlan.some((row) => row.detail === "SCAN records"));
+    assert(sizePlan.every((row) => !/USING INDEX|USING COVERING INDEX|USE TEMP B-TREE/.test(row.detail)), JSON.stringify(sizePlan));
+    const expectedBytes = [...groups.values()].flat().reduce((total, item) => total + canonicalLine(item).length, 0) + Buffer.byteLength("unverified partial payload");
+    assert.equal((database.prepare(ARCHIVE_SPOOL_SELECTED_BYTES_SQL).get() as { bytes: number }).bytes, expectedBytes);
+    add.run("excluded-request", "excluded-session", "unused", "unused", "unused", Buffer.alloc(16384), 0);
+    assert.equal((database.prepare(ARCHIVE_SPOOL_SELECTED_BYTES_SQL).get() as { bytes: number }).bytes, expectedBytes);
+    database.prepare("DELETE FROM records WHERE request_id=?").run("excluded-request");
     const reports: string[] = []; let deadlines = 0;
     const verified = verifyCompletedArchiveSpool(database, projection, (stage) => { assert.equal(stage, "completed session verification"); deadlines += 1; }, (line) => { reports.push(line); });
     assert.deepEqual([...verified].sort(), [...groups.keys()].sort());
@@ -952,6 +982,9 @@ test("completed large-session resume obeys the elapsed deadline and retains only
     assert.equal(existsSync(spool), true, "the verified spool remains resumable after the deadline");
     assert.equal(existsSync(paths.output), false); assert.equal(existsSync(`${paths.output}.pending`), false);
     assert.equal(readdirSync(paths.directory).some((name) => name.startsWith(`.${basename(paths.output)}.`)), false, "temporary JSONL output must be removed");
+    const resumed = await run([...common, "--resume", "--max-elapsed-seconds", "0"]);
+    assert.equal(resumed.code, 0, resumed.stderr);
+    assert.equal(existsSync(paths.output), true, "unlimited resume finishes the retained spool");
   } finally { rmSync(paths.directory, { recursive: true, force: true }); }
 });
 
