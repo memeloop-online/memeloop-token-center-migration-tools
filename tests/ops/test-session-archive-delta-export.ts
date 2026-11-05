@@ -13,6 +13,7 @@ import test, { after, before, beforeEach } from "node:test";
 import { gzipSync } from "node:zlib";
 import {
   ARCHIVE_SPOOL_SCHEMA,
+  DeltaError,
   ARCHIVE_SPOOL_SELECTED_BYTES_SQL,
   COMPLETED_ARCHIVE_SPOOL_SCAN_SQL,
   canonicalBytes,
@@ -271,6 +272,33 @@ test("overall archive-download deadline also covers a final response body", asyn
     await assert.rejects(async () => {
       for await (const _line of client.exportLines("session", 1024, "snapshot", "0".repeat(64))) { /* body continues beyond the deadline */ }
     }, /stage=archive-download,cause=overall_timeout/);
+  } finally {
+    await new Promise<void>((resolveClose, rejectClose) => bodyServer.close((error) => error === undefined ? resolveClose() : rejectClose(error)));
+  }
+});
+
+test("body-side deadline checks retain overall-timeout classification before the timer fires", async () => {
+  const bodyServer = createServer((_request, response) => {
+    response.writeHead(200); response.end('{"schema_version":2}\n');
+  });
+  await new Promise<void>((resolveListen) => bodyServer.listen(0, "127.0.0.1", resolveListen));
+  const address = bodyServer.address();
+  assert(address !== null && typeof address === "object");
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    const client = new SourceClient(base, base, undefined, 1, true, new Set(["127.0.0.1"]), true, 0, 0.5, Infinity);
+    const hooks = client as unknown as { ticketUrl: () => Promise<URL>; timeout: () => number };
+    hooks.ticketUrl = async () => new URL(`/archive-api/v1/exports/${"e".repeat(64)}`, base);
+    let checks = 0;
+    hooks.timeout = () => {
+      checks += 1;
+      if (checks > 1) throw new DeltaError("source export exceeded the configured elapsed-time limit");
+      return 1000;
+    };
+    await assert.rejects(async () => {
+      for await (const _line of client.exportLines("session", 1024, "snapshot", "0".repeat(64))) { /* body check throws */ }
+    }, /stage=archive-download,cause=overall_timeout/);
+    assert.equal(checks, 2);
   } finally {
     await new Promise<void>((resolveClose, rejectClose) => bodyServer.close((error) => error === undefined ? resolveClose() : rejectClose(error)));
   }
