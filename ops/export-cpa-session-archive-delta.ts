@@ -1015,6 +1015,9 @@ export class SQLiteArchiveSource {
 }
 
 export const COMPLETED_ARCHIVE_SPOOL_SCAN_SQL = "SELECT request_id,session_id,started_at,completed_at,digest,canonical,emit FROM records NOT INDEXED ORDER BY request_id COLLATE BINARY";
+// The output index requires primary-key lookups into a payload-bearing
+// WITHOUT ROWID tree. Read the tree sequentially instead.
+export const ARCHIVE_SPOOL_SELECTED_BYTES_SQL = "SELECT COALESCE(SUM(length(canonical)),0) AS bytes FROM records NOT INDEXED WHERE emit=1";
 
 export function verifyCompletedArchiveSpool(
   database: DatabaseSync,
@@ -1387,7 +1390,9 @@ async function exportDelta(args: Arguments, internalResume = false): Promise<Jso
       VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET record_cursor=excluded.record_cursor,staged_records=excluded.staged_records,
       staged_bytes=excluded.staged_bytes,downloaded_bytes=excluded.downloaded_bytes,chunks=excluded.chunks`);
     const clearSessionProgress = database.prepare("DELETE FROM session_progress WHERE session_id=?");
-    let selectedBytes = (database.prepare("SELECT COALESCE(SUM(length(canonical)),0) AS bytes FROM records WHERE emit=1").get() as { bytes: number }).bytes;
+    process.stderr.write("archive spool phase=selected_bytes event=start\n");
+    let selectedBytes = (database.prepare(ARCHIVE_SPOOL_SELECTED_BYTES_SQL).get() as { bytes: number }).bytes;
+    process.stderr.write(`archive spool phase=selected_bytes event=complete bytes=${selectedBytes}\n`);
     if (selectedBytes > args.maxOutputBytes) throw new DeltaError("delta output exceeds the configured size limit");
     client.downloadedBytes = (database.prepare("SELECT COALESCE((SELECT SUM(downloaded_bytes) FROM completed_sessions),0)+COALESCE((SELECT SUM(downloaded_bytes) FROM session_progress),0) AS bytes").get() as { bytes: number }).bytes;
     if (client.downloadedBytes > args.maxDownloadBytes) throw new DeltaError("source archive downloads exceed the configured limit");
@@ -1607,7 +1612,7 @@ function parseCli(argv: string[]): Arguments {
   if (typeof values["base-url"] !== "string" || typeof values.checkpoint !== "string" || typeof values.output !== "string") throw new DeltaError("--base-url, --checkpoint, and --output are required");
   const args: Arguments = { baseUrl: values["base-url"], downloadBaseUrl: values["download-base-url"], tokenFile: values["token-file"], tokenEnv: values["token-env"], checkpoint: values.checkpoint, output: values.output, legacySpool: values["legacy-spool"], sourceSqlite: values["source-sqlite"],
     collectorDirect: values["collector-direct"]!, offlineFull: values["offline-full"]!, privateHttpHosts: values["private-http-host"]!, clientCertFile: values["client-cert-file"], clientKeyFile: values["client-key-file"], since: values.since,
-    overlapSeconds: numberOption(values, "overlap-seconds", 86_400), sessionLimit: numberOption(values, "session-limit", 1000), maxLineBytes: numberOption(values, "max-line-bytes", Math.min(numberOption(values, "max-output-bytes", 64 * 1024 ** 3), numberOption(values, "max-download-bytes", 64 * 1024 ** 3))), maxDownloadBytes: numberOption(values, "max-download-bytes", 64 * 1024 ** 3), maxOutputBytes: numberOption(values, "max-output-bytes", 64 * 1024 ** 3), timeoutSeconds: numberOption(values, "timeout-seconds", 60), maxElapsedSeconds: numberOption(values, "max-elapsed-seconds", 6 * 3600),
+    overlapSeconds: numberOption(values, "overlap-seconds", 86_400), sessionLimit: numberOption(values, "session-limit", 1000), maxLineBytes: numberOption(values, "max-line-bytes", Math.min(numberOption(values, "max-output-bytes", 64 * 1024 ** 3), numberOption(values, "max-download-bytes", 64 * 1024 ** 3))), maxDownloadBytes: numberOption(values, "max-download-bytes", 64 * 1024 ** 3), maxOutputBytes: numberOption(values, "max-output-bytes", 64 * 1024 ** 3), timeoutSeconds: numberOption(values, "timeout-seconds", 60), maxElapsedSeconds: numberOption(values, "max-elapsed-seconds", 0),
     readinessTimeoutSeconds: numberOption(values, "readiness-timeout-seconds", 900), readinessPollMilliseconds: numberOption(values, "readiness-poll-milliseconds", 1000), maxRetries: numberOption(values, "max-retries", 5), retryBaseSeconds: numberOption(values, "retry-base-seconds", 0.5), maxFutureSkewSeconds: numberOption(values, "max-future-skew-seconds", 3600), requireStableSource: values["require-stable-source"]!, allowHttp: values["allow-http"]!, resume: values.resume!,
     chunkRecords: numberOption(values, "chunk-records", 128), chunkBytes: numberOption(values, "chunk-bytes", 16 * 1024 * 1024), chunkSeconds: numberOption(values, "chunk-seconds", 30), maxChunks: numberOption(values, "max-chunks", 0), deadline: 0 };
   if (!Number.isInteger(args.overlapSeconds) || args.overlapSeconds < 1 || args.overlapSeconds > 31 * 86_400) throw new DeltaError("overlap seconds must be between one second and 31 days");
@@ -1616,7 +1621,7 @@ function parseCli(argv: string[]): Arguments {
   if (!Number.isInteger(args.maxDownloadBytes) || args.maxDownloadBytes < args.maxLineBytes || args.maxDownloadBytes > 1024 ** 4) throw new DeltaError("max download bytes must cover one line and be at most 1 TiB");
   if (!Number.isInteger(args.maxOutputBytes) || args.maxOutputBytes < args.maxLineBytes || args.maxOutputBytes > 1024 ** 4) throw new DeltaError("max output bytes must cover one line and be at most 1 TiB");
   if (args.timeoutSeconds <= 0 || args.timeoutSeconds > 3600) throw new DeltaError("timeout seconds must be between 0 and 3600");
-  if (args.maxElapsedSeconds <= 0 || args.maxElapsedSeconds > 86_400) throw new DeltaError("max elapsed seconds must be between 0 and 86400");
+  if (args.maxElapsedSeconds < 0 || args.maxElapsedSeconds > Number.MAX_SAFE_INTEGER / 1000) throw new DeltaError("max elapsed seconds must be non-negative and representable in milliseconds");
   if (args.readinessTimeoutSeconds <= 0 || args.readinessTimeoutSeconds > 86_400) throw new DeltaError("readiness timeout seconds must be between 0 and 86400");
   if (!Number.isInteger(args.readinessPollMilliseconds) || args.readinessPollMilliseconds < 10 || args.readinessPollMilliseconds > 60_000) throw new DeltaError("readiness poll milliseconds must be between 10 and 60000");
   if (!Number.isInteger(args.maxRetries) || args.maxRetries < 0 || args.maxRetries > 20) throw new DeltaError("max retries must be between 0 and 20");
@@ -1639,7 +1644,7 @@ function parseCli(argv: string[]): Arguments {
   if (args.sourceSqlite !== undefined && (!args.collectorDirect || !args.offlineFull)) throw new DeltaError("--source-sqlite requires --collector-direct and --offline-full");
   const normalized = args.privateHttpHosts.map(normalizeHost); if (normalized.some((item, index) => item.length === 0 || item !== args.privateHttpHosts[index])) throw new DeltaError("private HTTP host allowlist contains an invalid host");
   if (new Set(normalized).size !== normalized.length) throw new DeltaError("private HTTP host allowlist contains duplicates");
-  args.deadline = performance.now() + args.maxElapsedSeconds * 1000; return args;
+  args.deadline = args.maxElapsedSeconds === 0 ? Infinity : performance.now() + args.maxElapsedSeconds * 1000; return args;
 }
 
 async function runExport(args: Arguments): Promise<JsonObject> {
@@ -1663,6 +1668,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       "  --token-file FILE              read the legacy CPA token from a protected file\n" +
       "  --token-env NAME               read the legacy CPA token from the named environment variable\n" +
       "  --private-http-host HOST       allow one exact private HTTP collector host\n" +
+      "  --max-elapsed-seconds N       optional overall limit; default 0 runs until completion\n" +
       "  --readiness-timeout-seconds N bound collector readiness within the overall elapsed limit\n" +
       "  --readiness-poll-milliseconds N poll /readyz without starting archive reads early\n" +
       "  --client-cert-file FILE        mTLS client certificate for collector-direct\n" +
