@@ -838,8 +838,10 @@ export class SourceClient {
         if (line.trim()) yield line;
       }
     } catch (error) {
-      const cause = responseDeadlineExceeded() ? "overall_timeout" : error instanceof DeltaError ? "validation" : classifyTransportFailure(error);
+      const overallTimeout = responseDeadlineExceeded() || (error instanceof DeltaError && error.message === "source export exceeded the configured elapsed-time limit");
+      const cause = overallTimeout ? "overall_timeout" : error instanceof DeltaError ? "validation" : classifyTransportFailure(error);
       this.archiveDownloadDiagnostic("failure", downloadStartedAt, lastActivityAt, cause);
+      if (this.collectorDirect && overallTimeout) throw new DeltaError("collector request failed (stage=archive-download,cause=overall_timeout)");
       if (error instanceof DeltaError) throw error;
       if (this.collectorDirect) throw new DeltaError(`collector request failed (stage=archive-download,cause=${cause})`);
       throw new DeltaError("source archive export stream failed");
