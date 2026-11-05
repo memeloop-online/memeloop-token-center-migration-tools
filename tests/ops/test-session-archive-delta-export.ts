@@ -207,6 +207,27 @@ test("collector 102 progress restarts the bounded archive-download idle timer", 
   }
 });
 
+test("infinite and long overall deadlines do not overflow the HTTP timer", async () => {
+  const downloadServer = createServer((_request, response) => {
+    setTimeout(() => { response.writeHead(200); response.end('{"schema_version":2}\n'); }, 30);
+  });
+  await new Promise<void>((resolveListen) => downloadServer.listen(0, "127.0.0.1", resolveListen));
+  const address = downloadServer.address();
+  assert(address !== null && typeof address === "object");
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    for (const deadline of [Infinity, performance.now() + 3_000_000_000]) {
+      const client = new SourceClient(base, base, undefined, 1, true, new Set(["127.0.0.1"]), true, 0, 0.5, deadline);
+      (client as unknown as { ticketUrl: () => Promise<URL> }).ticketUrl = async () => new URL(`/archive-api/v1/exports/${"d".repeat(64)}`, base);
+      const lines: string[] = [];
+      for await (const line of client.exportLines("session", 1024, "snapshot", "0".repeat(64))) lines.push(line);
+      assert.deepEqual(lines, ['{"schema_version":2}\n']);
+    }
+  } finally {
+    await new Promise<void>((resolveClose, rejectClose) => downloadServer.close((error) => error === undefined ? resolveClose() : rejectClose(error)));
+  }
+});
+
 test("collector 102 progress cannot extend the overall archive-download deadline", async () => {
   const progressServer = createServer((_request, response) => {
     response.writeProcessing();

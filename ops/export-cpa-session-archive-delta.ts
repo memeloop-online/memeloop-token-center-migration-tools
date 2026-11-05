@@ -454,10 +454,13 @@ function request(url: URL, headers: Record<string, string>, timeoutMs: number, t
       response.once("error", clearDeadline);
       resolve({ status: response.statusCode ?? 0, headers: response.headers, response, deadlineExceeded: () => deadlineExceeded });
     });
-    if (deadline !== undefined) {
-      const remaining = deadline - performance.now();
-      if (remaining <= 0) queueMicrotask(exceedDeadline);
-      else deadlineTimer = setTimeout(exceedDeadline, remaining);
+    if (deadline !== undefined && Number.isFinite(deadline)) {
+      const scheduleDeadline = () => {
+        const remaining = deadline - performance.now();
+        if (remaining <= 0) queueMicrotask(exceedDeadline);
+        else deadlineTimer = setTimeout(scheduleDeadline, Math.min(remaining, 2_147_483_647));
+      };
+      scheduleDeadline();
     }
     // Node does not treat an HTTP informational response as response-body
     // activity for the request timeout. The collector sends 102 while it
