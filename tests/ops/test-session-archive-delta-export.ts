@@ -487,7 +487,8 @@ test("completed spool verification scans overflow payloads once in primary-key o
     const plan = database.prepare(`EXPLAIN QUERY PLAN ${COMPLETED_ARCHIVE_SPOOL_SCAN_SQL}`).all() as Array<{ detail: string }>;
     assert.deepEqual(plan.map((row) => row.detail), ["SCAN records"]);
     const sizePlan = database.prepare(`EXPLAIN QUERY PLAN ${ARCHIVE_SPOOL_SELECTED_BYTES_SQL}`).all() as Array<{ detail: string }>;
-    assert.deepEqual(sizePlan.map((row) => row.detail), ["SCAN records"]);
+    assert(sizePlan.some((row) => row.detail === "SCAN records"));
+    assert(sizePlan.every((row) => !/USING INDEX|USING COVERING INDEX|USE TEMP B-TREE/.test(row.detail)), JSON.stringify(sizePlan));
     const expectedBytes = [...groups.values()].flat().reduce((total, item) => total + canonicalLine(item).length, 0) + Buffer.byteLength("unverified partial payload");
     assert.equal((database.prepare(ARCHIVE_SPOOL_SELECTED_BYTES_SQL).get() as { bytes: number }).bytes, expectedBytes);
     add.run("excluded-request", "excluded-session", "unused", "unused", "unused", Buffer.alloc(16384), 0);

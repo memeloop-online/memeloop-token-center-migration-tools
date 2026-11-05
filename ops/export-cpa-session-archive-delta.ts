@@ -1020,7 +1020,7 @@ export class SQLiteArchiveSource {
 export const COMPLETED_ARCHIVE_SPOOL_SCAN_SQL = "SELECT request_id,session_id,started_at,completed_at,digest,canonical,emit FROM records NOT INDEXED ORDER BY request_id COLLATE BINARY";
 // The output index requires primary-key lookups into a payload-bearing
 // WITHOUT ROWID tree. Read the tree sequentially instead.
-export const ARCHIVE_SPOOL_SELECTED_BYTES_SQL = "SELECT COALESCE(SUM(length(canonical)),0) AS bytes FROM records NOT INDEXED WHERE emit=1";
+export const ARCHIVE_SPOOL_SELECTED_BYTES_SQL = "SELECT COALESCE(SUM(CASE WHEN emit=1 THEN bytes ELSE 0 END),0) AS bytes FROM (SELECT length(canonical) AS bytes,emit FROM records NOT INDEXED ORDER BY request_id COLLATE BINARY LIMIT -1)";
 
 export function verifyCompletedArchiveSpool(
   database: DatabaseSync,
