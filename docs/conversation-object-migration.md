@@ -43,6 +43,24 @@ source/target hash, byte, count and ordered-receipt verification. Source
 credentials use `MTC_SOURCE_S3_*` environment references; destination keeps
 existing `MTC_S3_*` configuration. These phases never replace source locators
 or delete original objects. Media bytes must match the existing index digest.
+For a source with active writers, use `--phase copy-payloads --online-copy
+--checkpoint /persistent-path/production-online.json`. This copies the original
+semantic payload and outbox text using a repeatable-read transaction per field,
+without changing source rows or source objects. It cannot be combined with
+`--writers-quiesced` or used for verification/cutover. Each invocation scans from
+the beginning so new keys behind a previous cursor and updated rows are revisited.
+Updates behind the current scan require another invocation; this is not a
+globally consistent snapshot or a guarantee to capture every intermediate version.
+
+Keep the adjacent `production-online.online-payload-receipts` directory on
+persistent storage. It retains content-addressed receipts for every checkpointed
+version, including versions no longer in SQL. Restart checks all historical CAS
+objects and committed receipts, recovers pending receipt publications, then
+rescans the source. Historical committed receipts are checked without overwrite.
+A completed scan reports `source_verified: false`; it never marks the quiesced
+checkpoints complete. Final reconciliation, verification and any cutover still
+require quiesced writers and their normal separate checkpoints.
+
 After `verify-all`, `cutover-locators-test --writers-quiesced` can conditionally
 replace all 13 supported locator kinds with their verified target CAS keys:
 live request/response, indexed media, imports including previous versions,

@@ -230,6 +230,44 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
             .await
             .unwrap();
     assert_eq!(retained_payload, document);
+    let online = runner.copy_payloads_online().await.unwrap();
+    assert_eq!(online["rows_observed"], 3);
+    assert_eq!(online["source_verified"], false);
+    // A key before the old cursor and a changed row must both be copied on
+    // restart; historical versions remain checked after their SQL disappears.
+    sqlx::query("INSERT INTO conversation_semantic_payloads VALUES ('!online-before-cursor', $1, 'first version')")
+        .bind(tenant.to_string()).execute(&pool).await.unwrap();
+    let online = runner.copy_payloads_online().await.unwrap();
+    assert_eq!(online["rows_observed"], 4);
+    assert_eq!(online["historical_versions_rechecked"], 3);
+    sqlx::query("UPDATE conversation_semantic_payloads SET request_json = 'second version' WHERE request_id = '!online-before-cursor'")
+        .execute(&pool).await.unwrap();
+    let online = runner.copy_payloads_online().await.unwrap();
+    assert_eq!(online["historical_versions_rechecked"], 4);
+    sqlx::query("DELETE FROM conversation_semantic_payloads WHERE request_id = '!online-before-cursor'")
+        .execute(&pool).await.unwrap();
+    let online = runner.copy_payloads_online().await.unwrap();
+    assert_eq!(online["rows_observed"], 3);
+    assert_eq!(online["historical_versions_rechecked"], 5);
+    let ledger = runner.checkpoint.with_extension("online-payload-receipts");
+    let receipt_path = std::fs::read_dir(&ledger).unwrap().next().unwrap().unwrap().path();
+    let pending_path = receipt_path.with_extension("pending");
+    std::fs::rename(&receipt_path, &pending_path).unwrap();
+    let online = runner.copy_payloads_online().await.unwrap();
+    assert_eq!(online["historical_versions_rechecked"], 5);
+    assert!(receipt_path.exists());
+    assert!(!pending_path.exists());
+    let receipt: serde_json::Value = serde_json::from_reader(std::fs::File::open(&receipt_path).unwrap()).unwrap();
+    let key = format!(
+        "migration-receipts/conversation-v1/{}/online-payloads/{}.json",
+        runner.identity, receipt_path.file_stem().unwrap().to_str().unwrap()
+    );
+    let original_receipt = runner.target.get_bounded(&key, 16384).await.unwrap();
+    assert_eq!(receipt["identity"], runner.identity);
+    runner.target.put(&key, Bytes::from_static(b"corrupt receipt")).await.unwrap();
+    assert!(runner.copy_payloads_online().await.is_err());
+    runner.target.put(&key, original_receipt).await.unwrap();
+    assert!(runner.transfer_payloads(true).await.unwrap().verified);
     assert!(runner.cutover_test().await.is_err());
     assert!(runner.cutover_locators_test().await.is_err());
     let copied = runner.copy().await.unwrap();

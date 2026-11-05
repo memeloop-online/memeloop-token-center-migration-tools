@@ -81,6 +81,119 @@ pub(super) struct PayloadCheckpoint {
 }
 
 impl Runner {
+    // Separate from quiesced checkpoints: every invocation rescans from the
+    // beginning, including keys behind the previous cursor. Receipts describe
+    // observed row versions, never a complete or consistent source snapshot.
+    pub(super) async fn copy_payloads_online(&self) -> Result<serde_json::Value> {
+        let ledger = self.checkpoint.with_extension("online-payload-receipts");
+        std::fs::create_dir_all(&ledger)?;
+        let mut historical_versions = 0_u64;
+        for entry in std::fs::read_dir(&ledger)? {
+            let entry = entry?;
+            // save_checkpoint may leave a temporary file after process death.
+            let path = entry.path();
+            let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+            if extension != "json" && extension != "pending" {
+                continue;
+            }
+            let receipt: PayloadReceipt = serde_json::from_reader(std::fs::File::open(entry.path())?)?;
+            let encoded = serde_json::to_vec(&receipt)?;
+            let digest = blake3::hash(&encoded).to_hex().to_string();
+            if receipt.format_version != 1
+                || receipt.identity != self.identity
+                || receipt.field == SourceField::Atom
+                || entry.file_name().to_str() != Some(format!("{digest}.{extension}").as_str())
+            {
+                return Err("online payload receipt identity mismatch".into());
+            }
+            self.publish_online_payload_receipt(&receipt, &encoded, &digest, extension == "pending").await?;
+            if extension == "pending" {
+                std::fs::rename(&path, ledger.join(format!("{digest}.json")))?;
+                std::fs::File::open(&ledger)?.sync_all()?;
+            }
+            historical_versions += 1;
+        }
+        let mut rows = 0_u64;
+        let mut bytes = 0_u64;
+        for field in FIELDS {
+            let (table, id, column) = field.columns();
+            let mut cursor = Cursor::default();
+            loop {
+                let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "SELECT tenant_id, {id} AS source_id FROM {table} WHERE (tenant_id, {id}) > ($1, $2) AND {column} IS NOT NULL ORDER BY tenant_id, {id} LIMIT 1"
+                )))
+                .bind(&cursor.tenant_id).bind(&cursor.content_hash)
+                .fetch_optional(&self.pool).await?;
+                let Some(row) = row else { break };
+                cursor = Cursor {
+                    tenant_id: row.try_get("tenant_id")?,
+                    content_hash: row.try_get("source_id")?,
+                };
+                let (reference, source_md5) = self.source_field_reference(&cursor, field, true).await?;
+                let receipt = PayloadReceipt {
+                    format_version: 1,
+                    identity: self.identity.clone(),
+                    field,
+                    cursor: cursor.clone(),
+                    source_md5,
+                    reference,
+                };
+                let encoded = serde_json::to_vec(&receipt)?;
+                let digest = blake3::hash(&encoded).to_hex().to_string();
+                // Persist the exact version before publishing its receipt. A
+                // crash is recovered even if the source changes or disappears.
+                let committed = ledger.join(format!("{digest}.json"));
+                if committed.exists() {
+                    self.publish_online_payload_receipt(&receipt, &encoded, &digest, false).await?;
+                } else {
+                    let pending = ledger.join(format!("{digest}.pending"));
+                    save_checkpoint(&pending, &receipt)?;
+                    self.publish_online_payload_receipt(&receipt, &encoded, &digest, true).await?;
+                    std::fs::rename(pending, committed)?;
+                    std::fs::File::open(&ledger)?.sync_all()?;
+                }
+                rows += 1;
+                bytes += receipt.reference.conversation_body_v1.size_bytes;
+            }
+        }
+        Ok(serde_json::json!({
+            "mode": "online_copy",
+            "scan_finished": true,
+            "source_verified": false,
+            "source_writers_quiesced": false,
+            "rows_observed": rows,
+            "bytes_observed": bytes,
+            "historical_versions_rechecked": historical_versions,
+            "requires_quiesced_final_copy_and_verification": true
+        }))
+    }
+
+    async fn publish_online_payload_receipt(
+        &self,
+        receipt: &PayloadReceipt,
+        encoded: &[u8],
+        digest: &str,
+        publish: bool,
+    ) -> Result<()> {
+        self.target.verify_tenant_content(
+            Uuid::parse_str(&receipt.cursor.tenant_id)?,
+            &receipt.reference.conversation_body_v1,
+        ).await?;
+        // Content-addressed receipts preserve earlier versions. Replaying an
+        // interrupted publication writes the identical bytes at the same key.
+        let key = format!(
+            "migration-receipts/conversation-v1/{}/online-payloads/{digest}.json",
+            self.identity
+        );
+        if publish {
+            self.target.put(&key, Bytes::copy_from_slice(encoded)).await?;
+        }
+        if self.target.get_bounded(&key, 16384).await?.as_ref() != encoded {
+            return Err("online payload receipt mismatch".into());
+        }
+        Ok(())
+    }
+
     pub(super) async fn transfer_payloads(&self, verify: bool) -> Result<PayloadCheckpoint> {
         let path = self.checkpoint.with_extension("payloads.json");
         let mut checkpoint = match std::fs::File::open(&path) {

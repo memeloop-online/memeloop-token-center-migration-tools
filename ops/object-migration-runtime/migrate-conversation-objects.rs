@@ -105,6 +105,9 @@ struct Args {
     checkpoint: PathBuf,
     #[arg(long)]
     writers_quiesced: bool,
+    /// Copy payload snapshots with live writers; never verifies or cuts over the source.
+    #[arg(long, conflicts_with = "writers_quiesced")]
+    online_copy: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
@@ -817,7 +820,10 @@ impl Runner {
 }
 
 async fn run(args: Args) -> Result<()> {
-    if args.phase != Phase::Inventory && !args.writers_quiesced {
+    if args.online_copy && args.phase != Phase::CopyPayloads {
+        return Err("--online-copy is only supported for --phase copy-payloads".into());
+    }
+    if args.phase != Phase::Inventory && !args.writers_quiesced && !args.online_copy {
         return Err("copy/verify/cutover require --writers-quiesced; no concurrent legacy writer is supported".into());
     }
     let config = Config::from_env()?;
@@ -935,6 +941,14 @@ async fn run(args: Args) -> Result<()> {
         return Ok(());
     }
     if matches!(args.phase, Phase::CopyPayloads | Phase::VerifyPayloads) {
+        if args.online_copy {
+            let result = runner.copy_payloads_online().await;
+            sqlx::query("SELECT pg_advisory_unlock(70720261029)")
+                .execute(&mut *advisory)
+                .await?;
+            println!("{}", serde_json::to_string(&result?)?);
+            return Ok(());
+        }
         let result = runner
             .transfer_payloads(args.phase == Phase::VerifyPayloads)
             .await;
