@@ -115,6 +115,7 @@ impl Runner {
         }
         let mut rows = 0_u64;
         let mut bytes = 0_u64;
+        let mut disappeared_fields = 0_u64;
         for field in FIELDS {
             let (table, id, column) = field.columns();
             let mut cursor = Cursor::default();
@@ -129,7 +130,12 @@ impl Runner {
                     tenant_id: row.try_get("tenant_id")?,
                     content_hash: row.try_get("source_id")?,
                 };
-                let (reference, source_md5) = self.source_field_reference(&cursor, field, true).await?;
+                let Some((reference, source_md5)) =
+                    self.source_field_reference_if_present(&cursor, field, true).await?
+                else {
+                    disappeared_fields += 1;
+                    continue;
+                };
                 let receipt = PayloadReceipt {
                     format_version: 1,
                     identity: self.identity.clone(),
@@ -163,6 +169,7 @@ impl Runner {
             "source_writers_quiesced": false,
             "rows_observed": rows,
             "bytes_observed": bytes,
+            "fields_disappeared_before_snapshot": disappeared_fields,
             "historical_versions_rechecked": historical_versions,
             "requires_quiesced_final_copy_and_verification": true
         }))

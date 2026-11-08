@@ -230,6 +230,32 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
             .await
             .unwrap();
     assert_eq!(retained_payload, document);
+    // Deterministically interleave the writer after candidate selection but
+    // before the per-field RR snapshot, exactly as the online scan can observe.
+    sqlx::query("UPDATE conversation_projection_outbox SET semantic_snapshot_json = 'race snapshot' WHERE request_id = $1")
+        .bind(&payload_request).execute(&pool).await.unwrap();
+    let candidate: String = sqlx::query_scalar("SELECT request_id FROM conversation_projection_outbox WHERE semantic_snapshot_json IS NOT NULL")
+        .fetch_one(&pool).await.unwrap();
+    sqlx::query("UPDATE conversation_projection_outbox SET semantic_snapshot_json = NULL WHERE request_id = $1")
+        .bind(&candidate).execute(&pool).await.unwrap();
+    let race_cursor = Cursor { tenant_id: tenant.to_string(), content_hash: candidate };
+    assert!(runner.source_field_reference_if_present(&race_cursor, payloads::SourceField::SemanticSnapshot, true).await.unwrap().is_none());
+    // Quiesced copying still rejects disappearance rather than skipping it.
+    assert!(runner.source_field_reference(&race_cursor, payloads::SourceField::SemanticSnapshot, true).await.is_err());
+    sqlx::query("INSERT INTO conversation_semantic_payloads VALUES ('race-delete', $1, 'race payload')")
+        .bind(tenant.to_string()).execute(&pool).await.unwrap();
+    let candidate: String = sqlx::query_scalar("SELECT request_id FROM conversation_semantic_payloads WHERE request_id = 'race-delete' AND request_json IS NOT NULL")
+        .fetch_one(&pool).await.unwrap();
+    sqlx::query("DELETE FROM conversation_semantic_payloads WHERE request_id = $1")
+        .bind(&candidate).execute(&pool).await.unwrap();
+    let race_cursor = Cursor { tenant_id: tenant.to_string(), content_hash: candidate };
+    assert!(runner.source_field_reference_if_present(&race_cursor, payloads::SourceField::SemanticPayload, true).await.unwrap().is_none());
+    // Database errors remain errors, not disappeared-field outcomes.
+    sqlx::query("ALTER TABLE conversation_semantic_payloads RENAME COLUMN request_json TO hidden_request_json")
+        .execute(&pool).await.unwrap();
+    assert!(runner.source_field_reference_if_present(&race_cursor, payloads::SourceField::SemanticPayload, true).await.is_err());
+    sqlx::query("ALTER TABLE conversation_semantic_payloads RENAME COLUMN hidden_request_json TO request_json")
+        .execute(&pool).await.unwrap();
     let online = runner.copy_payloads_online().await.unwrap();
     assert_eq!(online["rows_observed"], 3);
     assert_eq!(online["source_verified"], false);

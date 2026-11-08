@@ -407,6 +407,17 @@ impl Runner {
         field: payloads::SourceField,
         copy: bool,
     ) -> Result<(ConversationBodyReference, String)> {
+        self.source_field_reference_if_present(cursor, field, copy)
+            .await?
+            .ok_or_else(|| "source field missing or null".into())
+    }
+
+    async fn source_field_reference_if_present(
+        &self,
+        cursor: &Cursor,
+        field: payloads::SourceField,
+        copy: bool,
+    ) -> Result<Option<(ConversationBodyReference, String)>> {
         let (table, id, column) = field.columns();
         let tenant = Uuid::parse_str(&cursor.tenant_id)?;
         let mut transaction = self.pool.begin().await?;
@@ -414,10 +425,14 @@ impl Runner {
             .execute(&mut *transaction)
             .await?;
         let row = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT CAST(length({column}) AS BIGINT) AS chars, CAST(octet_length({column}) AS BIGINT) AS bytes, md5({column}) AS digest, left({column}, 4096) AS prefix FROM {table} WHERE tenant_id = $1 AND {id} = $2"
+            "SELECT CAST(length({column}) AS BIGINT) AS chars, CAST(octet_length({column}) AS BIGINT) AS bytes, md5({column}) AS digest, left({column}, 4096) AS prefix FROM {table} WHERE tenant_id = $1 AND {id} = $2 AND {column} IS NOT NULL"
         )))
         .bind(&cursor.tenant_id).bind(&cursor.content_hash)
-        .fetch_one(&mut *transaction).await.map_err(|e| at_stage("source_field_metadata", e))?;
+        .fetch_optional(&mut *transaction).await.map_err(|e| at_stage("source_field_metadata", e))?;
+        let Some(row) = row else {
+            transaction.commit().await?;
+            return Ok(None);
+        };
         let chars = u64::try_from(row.try_get::<i64, _>("chars")?)?;
         let expected_bytes = u64::try_from(row.try_get::<i64, _>("bytes")?)?;
         let source_md5: String = row.try_get("digest")?;
@@ -430,7 +445,7 @@ impl Runner {
             let reference = self
                 .transfer_existing_body_reference(tenant, &reference, copy)
                 .await?;
-            return Ok((reference, source_md5));
+            return Ok(Some((reference, source_md5)));
         }
         let staging = format!(
             "migration-staging/conversation-v1/{}/{}",
@@ -503,13 +518,13 @@ impl Runner {
                 size_bytes: expected_bytes,
             }
         };
-        Ok((
+        Ok(Some((
             ConversationBodyReference {
                 conversation_body_v1: object,
                 chars,
             },
             source_md5,
-        ))
+        )))
     }
 
     async fn transfer(&self, cursor: &Cursor) -> Result<Transfer> {
