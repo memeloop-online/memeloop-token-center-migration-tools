@@ -4,10 +4,12 @@ The `semantic-payload-references` phase consumes committed `.json` receipts from
 
 Deploy compatible product readers and migration 153 to every consumer before applying references. Product PR 846 supports format 1 and qualified format 2 references; PR 841 supplies training routing. Configure the exact training endpoint/bucket/region and credentials on readers. The tool derives the identical immutable training binding from its target S3 configuration. Never repoint that binding to a different store.
 
-Use the same source database and target settings as the copy run, and supply all committed receipt directories:
+All new durable storage and migration checkpoints must reside on haixia. Use the same source database and target settings as the corresponding copy run, and supply its committed receipt directories. A receipt from the former chenhouse target cannot be reused as proof for the new haixia target: keep that receipt and its objects, and perform a separately bound transfer. Do not reinterpret an old locator under a new endpoint.
+
+Example (paths must be on the haixia checkpoint volume):
 
 ```sh
-mtc-object-migration --phase semantic-payload-references \
+migrate-conversation-objects --phase semantic-payload-references \
   --checkpoint /checkpoints/semantic-ref-pass-1.json \
   --receipt-ledger /checkpoints/production-online-shard-0.online-payload-receipts \
   --receipt-ledger /checkpoints/production-online-shard-1.online-payload-receipts \
