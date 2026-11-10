@@ -283,6 +283,179 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
     assert_eq!(online["historical_versions_rechecked"], 5);
     assert!(receipt_path.exists());
     assert!(!pending_path.exists());
+    // Four disjoint workers import every historical version, including the
+    // deleted/changed row. Unchanged current versions are rehashed, not uploaded.
+    let mut partition_runners = Vec::new();
+    for shard in 0..4 {
+        partition_runners.push(Runner {
+            pool: pool.clone(),
+            source: None,
+            target: runner.target.clone(),
+            checkpoint: directory.path().join(format!("online-shard-{shard}.json")),
+            identity: runner.identity.clone(),
+        });
+    }
+    // Import must recover a durably saved, not yet committed publication too,
+    // while leaving the original ledger untouched for rollback/resume.
+    std::fs::rename(&receipt_path, &pending_path).unwrap();
+    let (a, b, c, d) = tokio::join!(
+        partition_runners[0].copy_payloads_online_partition(
+            payloads::OnlinePlan::new(4, 0).unwrap(),
+            Some(&ledger)
+        ),
+        partition_runners[1].copy_payloads_online_partition(
+            payloads::OnlinePlan::new(4, 1).unwrap(),
+            Some(&ledger)
+        ),
+        partition_runners[2].copy_payloads_online_partition(
+            payloads::OnlinePlan::new(4, 2).unwrap(),
+            Some(&ledger)
+        ),
+        partition_runners[3].copy_payloads_online_partition(
+            payloads::OnlinePlan::new(4, 3).unwrap(),
+            Some(&ledger)
+        ),
+    );
+    let results = [a.unwrap(), b.unwrap(), c.unwrap(), d.unwrap()];
+    assert!(pending_path.exists());
+    std::fs::rename(&pending_path, &receipt_path).unwrap();
+    assert_eq!(
+        results
+            .iter()
+            .map(|v| v["rows_observed"].as_u64().unwrap())
+            .sum::<u64>(),
+        3
+    );
+    assert_eq!(
+        results
+            .iter()
+            .map(|v| v["versions_reused_without_upload"].as_u64().unwrap())
+            .sum::<u64>(),
+        3
+    );
+    assert_eq!(
+        results
+            .iter()
+            .map(|v| v["historical_versions_rechecked"].as_u64().unwrap())
+            .sum::<u64>(),
+        5
+    );
+    let original_names: std::collections::HashSet<_> = std::fs::read_dir(&ledger)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    let mut imported_names = std::collections::HashSet::new();
+    for partition in &partition_runners {
+        for entry in std::fs::read_dir(
+            partition
+                .checkpoint
+                .with_extension("online-payload-receipts"),
+        )
+        .unwrap()
+        {
+            assert!(
+                imported_names.insert(entry.unwrap().file_name()),
+                "no receipt may belong to two shards"
+            );
+        }
+    }
+    assert_eq!(
+        original_names, imported_names,
+        "no historical version omitted"
+    );
+    assert!(
+        partition_runners[0]
+            .copy_payloads_online_partition(payloads::OnlinePlan::new(3, 0).unwrap(), None)
+            .await
+            .is_err()
+    );
+    assert!(payloads::OnlinePlan::new(0, 0).is_err());
+    assert!(payloads::OnlinePlan::new(4, 4).is_err());
+
+    // A changed source after import must produce a new receipt, rather than
+    // claiming that an old target digest describes the current source version.
+    sqlx::query("INSERT INTO conversation_semantic_payloads VALUES ('!online-before-cursor', $1, 'third version')")
+        .bind(tenant.to_string()).execute(&pool).await.unwrap();
+    let mut changed_rows = 0;
+    let mut reused_rows = 0;
+    for (shard, partition) in partition_runners.iter().enumerate() {
+        let result = partition
+            .copy_payloads_online_partition(
+                payloads::OnlinePlan::new(4, shard as i32).unwrap(),
+                Some(&ledger),
+            )
+            .await
+            .unwrap();
+        changed_rows += result["rows_observed"].as_u64().unwrap();
+        reused_rows += result["versions_reused_without_upload"].as_u64().unwrap();
+    }
+    assert_eq!(changed_rows, 4);
+    assert_eq!(reused_rows, 3);
+    sqlx::query(
+        "DELETE FROM conversation_semantic_payloads WHERE request_id = '!online-before-cursor'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // The same bigint key fences the released serial tool and all new shards.
+    let mut serial = pool.acquire().await.unwrap();
+    assert!(
+        sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock(70720261029)")
+            .fetch_one(&mut *serial)
+            .await
+            .unwrap()
+    );
+    let mut blocked = pool.acquire().await.unwrap();
+    assert!(
+        payloads::lock_online_shard(&mut blocked, payloads::OnlinePlan::new(4, 0).unwrap(), &runner.identity)
+            .await
+            .is_err()
+    );
+    blocked.close().await.unwrap();
+    serial.close().await.unwrap();
+    let mut first = pool.acquire().await.unwrap();
+    let mut second = pool.acquire().await.unwrap();
+    payloads::lock_online_shard(&mut first, payloads::OnlinePlan::new(4, 0).unwrap(), &runner.identity)
+        .await
+        .unwrap();
+    payloads::lock_online_shard(&mut second, payloads::OnlinePlan::new(4, 1).unwrap(), &runner.identity)
+        .await
+        .unwrap();
+    let mut duplicate = pool.acquire().await.unwrap();
+    assert!(
+        payloads::lock_online_shard(&mut duplicate, payloads::OnlinePlan::new(4, 0).unwrap(), &runner.identity)
+            .await
+            .is_err()
+    );
+    duplicate.close().await.unwrap();
+    let mut incompatible = pool.acquire().await.unwrap();
+    assert!(
+        payloads::lock_online_shard(&mut incompatible, payloads::OnlinePlan::new(3, 2).unwrap(), &runner.identity)
+            .await
+            .is_err()
+    );
+    incompatible.close().await.unwrap();
+    let mut other_target = pool.acquire().await.unwrap();
+    assert!(payloads::lock_online_shard(&mut other_target, payloads::OnlinePlan::new(4, 2).unwrap(), "different-target").await.is_err());
+    other_target.close().await.unwrap();
+    let mut serial = pool.acquire().await.unwrap();
+    assert!(
+        !sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock(70720261029)")
+            .fetch_one(&mut *serial)
+            .await
+            .unwrap()
+    );
+    first.close().await.unwrap();
+    second.close().await.unwrap();
+    assert!(
+        sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock(70720261029)")
+            .fetch_one(&mut *serial)
+            .await
+            .unwrap()
+    );
+    serial.close().await.unwrap();
+
     let receipt: serde_json::Value = serde_json::from_reader(std::fs::File::open(&receipt_path).unwrap()).unwrap();
     let key = format!(
         "migration-receipts/conversation-v1/{}/online-payloads/{}.json",

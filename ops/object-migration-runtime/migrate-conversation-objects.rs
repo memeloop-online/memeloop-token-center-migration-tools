@@ -108,6 +108,14 @@ struct Args {
     /// Copy payload snapshots with live writers; never verifies or cuts over the source.
     #[arg(long, conflicts_with = "writers_quiesced")]
     online_copy: bool,
+    /// Partition every online payload field by the stable tenant/request hash.
+    #[arg(long, default_value_t = 1)]
+    online_shards: i32,
+    #[arg(long, default_value_t = 0)]
+    online_shard: i32,
+    /// Read-only previous online receipt directory; source and target identity must match.
+    #[arg(long)]
+    import_online_ledger: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
@@ -841,6 +849,14 @@ async fn run(args: Args) -> Result<()> {
     if args.phase != Phase::Inventory && !args.writers_quiesced && !args.online_copy {
         return Err("copy/verify/cutover require --writers-quiesced; no concurrent legacy writer is supported".into());
     }
+    let plan = payloads::OnlinePlan::new(args.online_shards, args.online_shard)?;
+    if !args.online_copy
+        && (args.online_shards != 1
+            || args.online_shard != 0
+            || args.import_online_ledger.is_some())
+    {
+        return Err("online partition/import arguments require --online-copy".into());
+    }
     let config = Config::from_env()?;
     let pool = PgPoolOptions::new()
         .max_connections(2)
@@ -874,11 +890,18 @@ async fn run(args: Args) -> Result<()> {
         .open(args.checkpoint.with_extension("lock"))?;
     rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
     let mut advisory = pool.acquire().await?;
-    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(70720261029)")
-        .fetch_one(&mut *advisory)
-        .await?;
-    if !acquired {
-        return Err("another conversation migration holds the source lock".into());
+    if args.online_copy && plan.shards > 1 {
+        if let Err(error) = payloads::lock_online_shard(&mut advisory, plan, &identity).await {
+            advisory.close().await?;
+            return Err(error);
+        }
+    } else {
+        let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(70720261029)")
+            .fetch_one(&mut *advisory)
+            .await?;
+        if !acquired {
+            return Err("another conversation migration holds the source lock".into());
+        }
     }
     let object_source = if std::env::var_os("MTC_SOURCE_S3_ENDPOINT").is_some() {
         Some(ArchiveStore::from_config(&locators::source_config(&config)?).await?)
@@ -957,10 +980,12 @@ async fn run(args: Args) -> Result<()> {
     }
     if matches!(args.phase, Phase::CopyPayloads | Phase::VerifyPayloads) {
         if args.online_copy {
-            let result = runner.copy_payloads_online().await;
-            sqlx::query("SELECT pg_advisory_unlock(70720261029)")
-                .execute(&mut *advisory)
-                .await?;
+            let result = runner
+                .copy_payloads_online_partition(plan, args.import_online_ledger.as_deref())
+                .await;
+            // Close the session, releasing every layout/shard/source lock even
+            // when the copy failed. Never return a session-locked connection to the pool.
+            advisory.close().await?;
             println!("{}", serde_json::to_string(&result?)?);
             return Ok(());
         }
