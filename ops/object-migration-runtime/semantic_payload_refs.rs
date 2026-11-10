@@ -93,7 +93,9 @@ async fn source_version<'e, E: sqlx::Executor<'e, Database = sqlx::Postgres>>(
     let sql = format!(
         "SELECT tenant_id, request_id, key_id, principal_id, format_version, encoded_bytes, digest, md5(request_json) AS stored_md5, octet_length(request_json)::bigint AS stored_bytes, CASE WHEN format_version=2 THEN request_json ELSE NULL END AS reference FROM conversation_semantic_payloads WHERE request_id=$1 AND tenant_id=$2{suffix}"
     );
-    let row = sqlx::query(&sql)
+    // The only SQL fragment is the fixed FOR UPDATE suffix above; all row
+    // identities remain bound values. No input is interpolated into SQL.
+    let row = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(&cursor.content_hash)
         .bind(&cursor.tenant_id)
         .fetch_optional(executor)
