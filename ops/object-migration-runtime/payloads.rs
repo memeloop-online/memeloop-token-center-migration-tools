@@ -199,7 +199,19 @@ impl Runner {
             .await
     }
 
-    pub(super) async fn copy_payloads_online_partition(
+    // Keep the complete transfer state on the heap. In particular, callers
+    // that retain several online-copy calls in one async state must not embed
+    // every source/target streaming future in their own stack frames.
+    pub(super) fn copy_payloads_online_partition<'a>(
+        &'a self,
+        plan: OnlinePlan,
+        import: Option<&'a std::path::Path>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value>> + Send + 'a>>
+    {
+        Box::pin(self.copy_payloads_online_partition_inner(plan, import))
+    }
+
+    async fn copy_payloads_online_partition_inner(
         &self,
         plan: OnlinePlan,
         import: Option<&std::path::Path>,
@@ -567,5 +579,34 @@ impl Runner {
         result.complete = true;
         save_checkpoint(&path, &result)?;
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod future_state_tests {
+    use super::*;
+
+    // Type-only factories are never called: no fake Runner or unsafe reference
+    // is constructed, and measuring state does not connect to PG or an archive.
+    fn future_bytes<F: std::future::Future>(_: impl FnOnce(&'static Runner) -> F) -> usize {
+        std::mem::size_of::<F>()
+    }
+
+    #[test]
+    fn online_transfer_retains_large_state_behind_a_heap_boundary() {
+        let plan = OnlinePlan::new(4, 0).unwrap();
+        let inner = future_bytes(|runner| runner.copy_payloads_online_partition_inner(plan, None));
+        let outer = future_bytes(|runner| runner.copy_payloads_online_partition(plan, None));
+        // Direct stderr remains visible even if a later contract aborts before
+        // libtest can print captured output. These are type sizes, never data.
+        writeln!(
+            std::io::stderr(),
+            "online_copy_future_bytes inner={inner} public={outer}"
+        )
+        .unwrap();
+        assert!(
+            outer < inner,
+            "public callers must not retain the inline transfer state"
+        );
     }
 }
