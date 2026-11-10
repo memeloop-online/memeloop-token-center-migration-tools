@@ -298,23 +298,25 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
     // Import must recover a durably saved, not yet committed publication too,
     // while leaving the original ledger untouched for rollback/resume.
     std::fs::rename(&receipt_path, &pending_path).unwrap();
+    // Keep four large transfer futures out of this already large integration
+    // test's inline async state. Body streaming and production code are unchanged.
     let (a, b, c, d) = tokio::join!(
-        partition_runners[0].copy_payloads_online_partition(
+        Box::pin(partition_runners[0].copy_payloads_online_partition(
             payloads::OnlinePlan::new(4, 0).unwrap(),
             Some(&ledger)
-        ),
-        partition_runners[1].copy_payloads_online_partition(
+        )),
+        Box::pin(partition_runners[1].copy_payloads_online_partition(
             payloads::OnlinePlan::new(4, 1).unwrap(),
             Some(&ledger)
-        ),
-        partition_runners[2].copy_payloads_online_partition(
+        )),
+        Box::pin(partition_runners[2].copy_payloads_online_partition(
             payloads::OnlinePlan::new(4, 2).unwrap(),
             Some(&ledger)
-        ),
-        partition_runners[3].copy_payloads_online_partition(
+        )),
+        Box::pin(partition_runners[3].copy_payloads_online_partition(
             payloads::OnlinePlan::new(4, 3).unwrap(),
             Some(&ledger)
-        ),
+        )),
     );
     let results = [a.unwrap(), b.unwrap(), c.unwrap(), d.unwrap()];
     assert!(pending_path.exists());
