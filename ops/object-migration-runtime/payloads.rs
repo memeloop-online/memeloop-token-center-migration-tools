@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "semantic_payload_refs.rs"]
+mod semantic_payload_refs;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum SourceField {
