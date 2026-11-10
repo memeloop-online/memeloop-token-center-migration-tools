@@ -94,10 +94,13 @@ enum Phase {
     Reconstruct,
     VerifyReconstruction,
     VerifyAll,
+    SemanticPayloadReferences,
 }
 
 #[derive(Parser)]
-#[command(about = "Checkpointed conversation object transfer; source mutation is TEST-only")]
+#[command(
+    about = "Checkpointed conversation object transfer and receipt-backed semantic payload references"
+)]
 struct Args {
     #[arg(long, value_enum, default_value = "inventory")]
     phase: Phase,
@@ -116,6 +119,15 @@ struct Args {
     /// Read-only previous online receipt directory; source and target identity must match.
     #[arg(long)]
     import_online_ledger: Option<PathBuf>,
+    /// Existing committed online-copy receipt directories, read without modifying them.
+    #[arg(long)]
+    receipt_ledger: Vec<PathBuf>,
+    /// Operational scheduling batch, not a request/payload limit.
+    #[arg(long, default_value_t = 32)]
+    reference_batch: usize,
+    /// Apply semantic v2 references only after compatible readers are deployed.
+    #[arg(long)]
+    apply_references: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
@@ -846,7 +858,17 @@ async fn run(args: Args) -> Result<()> {
     if args.online_copy && args.phase != Phase::CopyPayloads {
         return Err("--online-copy is only supported for --phase copy-payloads".into());
     }
-    if args.phase != Phase::Inventory && !args.writers_quiesced && !args.online_copy {
+    let references = args.phase == Phase::SemanticPayloadReferences;
+    if references && (args.receipt_ledger.is_empty() || args.reference_batch == 0) {
+        return Err(
+            "semantic references require receipt ledgers and a nonzero operational batch".into(),
+        );
+    }
+    if !references && (!args.receipt_ledger.is_empty() || args.apply_references) {
+        return Err("receipt/apply arguments require semantic-payload-references".into());
+    }
+    if args.phase != Phase::Inventory && !args.writers_quiesced && !args.online_copy && !references
+    {
         return Err("copy/verify/cutover require --writers-quiesced; no concurrent legacy writer is supported".into());
     }
     let plan = payloads::OnlinePlan::new(args.online_shards, args.online_shard)?;
@@ -890,7 +912,20 @@ async fn run(args: Args) -> Result<()> {
         .open(args.checkpoint.with_extension("lock"))?;
     rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
     let mut advisory = pool.acquire().await?;
-    if args.online_copy && plan.shards > 1 {
+    if references {
+        let source: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock_shared(70720261029)")
+            .fetch_one(&mut *advisory)
+            .await?;
+        let apply: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(70720261031)")
+            .fetch_one(&mut *advisory)
+            .await?;
+        if !source || !apply {
+            advisory.close().await?;
+            return Err(
+                "another incompatible migration or semantic reference worker is active".into(),
+            );
+        }
+    } else if args.online_copy && plan.shards > 1 {
         if let Err(error) = payloads::lock_online_shard(&mut advisory, plan, &identity).await {
             advisory.close().await?;
             return Err(error);
@@ -915,6 +950,19 @@ async fn run(args: Args) -> Result<()> {
         checkpoint: args.checkpoint,
         identity,
     };
+    if references {
+        let result = runner
+            .externalize_semantic_payloads(
+                &config,
+                &args.receipt_ledger,
+                args.reference_batch,
+                args.apply_references,
+            )
+            .await;
+        advisory.close().await?;
+        println!("{}", serde_json::to_string(&result?)?);
+        return Ok(());
+    }
     if args.phase == Phase::VerifyAll {
         let source_config = locators::source_config(&config)?;
         let source_identity = blake3::hash(&serde_json::to_vec(&(
@@ -1037,7 +1085,8 @@ async fn run(args: Args) -> Result<()> {
         | Phase::VerifyPayloads
         | Phase::Reconstruct
         | Phase::VerifyReconstruction
-        | Phase::VerifyAll => {
+        | Phase::VerifyAll
+        | Phase::SemanticPayloadReferences => {
             unreachable!()
         }
     };
