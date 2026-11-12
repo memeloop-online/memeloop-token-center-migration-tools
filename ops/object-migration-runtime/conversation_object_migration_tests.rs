@@ -238,70 +238,22 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
         .fetch_one(&pool).await.unwrap();
     sqlx::query("UPDATE conversation_projection_outbox SET semantic_snapshot_json = NULL WHERE request_id = $1")
         .bind(&candidate).execute(&pool).await.unwrap();
-    let race_cursor = Cursor {
-        tenant_id: tenant.to_string(),
-        content_hash: candidate,
-    };
-    assert!(
-        runner
-            .source_field_reference_if_present(
-                &race_cursor,
-                payloads::SourceField::SemanticSnapshot,
-                true
-            )
-            .await
-            .unwrap()
-            .is_none()
-    );
+    let race_cursor = Cursor { tenant_id: tenant.to_string(), content_hash: candidate };
+    assert!(runner.source_field_reference_if_present(&race_cursor, payloads::SourceField::SemanticSnapshot, true).await.unwrap().is_none());
     // Quiesced copying still rejects disappearance rather than skipping it.
-    assert!(
-        runner
-            .source_field_reference(&race_cursor, payloads::SourceField::SemanticSnapshot, true)
-            .await
-            .is_err()
-    );
-    sqlx::query(
-        "INSERT INTO conversation_semantic_payloads VALUES ('race-delete', $1, 'race payload')",
-    )
-    .bind(tenant.to_string())
-    .execute(&pool)
-    .await
-    .unwrap();
+    assert!(runner.source_field_reference(&race_cursor, payloads::SourceField::SemanticSnapshot, true).await.is_err());
+    sqlx::query("INSERT INTO conversation_semantic_payloads VALUES ('race-delete', $1, 'race payload')")
+        .bind(tenant.to_string()).execute(&pool).await.unwrap();
     let candidate: String = sqlx::query_scalar("SELECT request_id FROM conversation_semantic_payloads WHERE request_id = 'race-delete' AND request_json IS NOT NULL")
         .fetch_one(&pool).await.unwrap();
     sqlx::query("DELETE FROM conversation_semantic_payloads WHERE request_id = $1")
-        .bind(&candidate)
-        .execute(&pool)
-        .await
-        .unwrap();
-    let race_cursor = Cursor {
-        tenant_id: tenant.to_string(),
-        content_hash: candidate,
-    };
-    assert!(
-        runner
-            .source_field_reference_if_present(
-                &race_cursor,
-                payloads::SourceField::SemanticPayload,
-                true
-            )
-            .await
-            .unwrap()
-            .is_none()
-    );
+        .bind(&candidate).execute(&pool).await.unwrap();
+    let race_cursor = Cursor { tenant_id: tenant.to_string(), content_hash: candidate };
+    assert!(runner.source_field_reference_if_present(&race_cursor, payloads::SourceField::SemanticPayload, true).await.unwrap().is_none());
     // Database errors remain errors, not disappeared-field outcomes.
     sqlx::query("ALTER TABLE conversation_semantic_payloads RENAME COLUMN request_json TO hidden_request_json")
         .execute(&pool).await.unwrap();
-    assert!(
-        runner
-            .source_field_reference_if_present(
-                &race_cursor,
-                payloads::SourceField::SemanticPayload,
-                true
-            )
-            .await
-            .is_err()
-    );
+    assert!(runner.source_field_reference_if_present(&race_cursor, payloads::SourceField::SemanticPayload, true).await.is_err());
     sqlx::query("ALTER TABLE conversation_semantic_payloads RENAME COLUMN hidden_request_json TO request_json")
         .execute(&pool).await.unwrap();
     let online = runner.copy_payloads_online().await.unwrap();
@@ -318,22 +270,13 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
         .execute(&pool).await.unwrap();
     let online = runner.copy_payloads_online().await.unwrap();
     assert_eq!(online["historical_versions_rechecked"], 4);
-    sqlx::query(
-        "DELETE FROM conversation_semantic_payloads WHERE request_id = '!online-before-cursor'",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    sqlx::query("DELETE FROM conversation_semantic_payloads WHERE request_id = '!online-before-cursor'")
+        .execute(&pool).await.unwrap();
     let online = runner.copy_payloads_online().await.unwrap();
     assert_eq!(online["rows_observed"], 3);
     assert_eq!(online["historical_versions_rechecked"], 5);
     let ledger = runner.checkpoint.with_extension("online-payload-receipts");
-    let receipt_path = std::fs::read_dir(&ledger)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+    let receipt_path = std::fs::read_dir(&ledger).unwrap().next().unwrap().unwrap().path();
     let pending_path = receipt_path.with_extension("pending");
     std::fs::rename(&receipt_path, &pending_path).unwrap();
     let online = runner.copy_payloads_online().await.unwrap();
@@ -467,64 +410,36 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
     );
     let mut blocked = pool.acquire().await.unwrap();
     assert!(
-        payloads::lock_online_shard(
-            &mut blocked,
-            payloads::OnlinePlan::new(4, 0).unwrap(),
-            &runner.identity
-        )
-        .await
-        .is_err()
+        payloads::lock_online_shard(&mut blocked, payloads::OnlinePlan::new(4, 0).unwrap(), &runner.identity)
+            .await
+            .is_err()
     );
     blocked.close().await.unwrap();
     serial.close().await.unwrap();
     let mut first = pool.acquire().await.unwrap();
     let mut second = pool.acquire().await.unwrap();
-    payloads::lock_online_shard(
-        &mut first,
-        payloads::OnlinePlan::new(4, 0).unwrap(),
-        &runner.identity,
-    )
-    .await
-    .unwrap();
-    payloads::lock_online_shard(
-        &mut second,
-        payloads::OnlinePlan::new(4, 1).unwrap(),
-        &runner.identity,
-    )
-    .await
-    .unwrap();
+    payloads::lock_online_shard(&mut first, payloads::OnlinePlan::new(4, 0).unwrap(), &runner.identity)
+        .await
+        .unwrap();
+    payloads::lock_online_shard(&mut second, payloads::OnlinePlan::new(4, 1).unwrap(), &runner.identity)
+        .await
+        .unwrap();
     let mut duplicate = pool.acquire().await.unwrap();
     assert!(
-        payloads::lock_online_shard(
-            &mut duplicate,
-            payloads::OnlinePlan::new(4, 0).unwrap(),
-            &runner.identity
-        )
-        .await
-        .is_err()
+        payloads::lock_online_shard(&mut duplicate, payloads::OnlinePlan::new(4, 0).unwrap(), &runner.identity)
+            .await
+            .is_err()
     );
     duplicate.close().await.unwrap();
     let mut incompatible = pool.acquire().await.unwrap();
     assert!(
-        payloads::lock_online_shard(
-            &mut incompatible,
-            payloads::OnlinePlan::new(3, 2).unwrap(),
-            &runner.identity
-        )
-        .await
-        .is_err()
+        payloads::lock_online_shard(&mut incompatible, payloads::OnlinePlan::new(3, 2).unwrap(), &runner.identity)
+            .await
+            .is_err()
     );
     incompatible.close().await.unwrap();
     let mut other_target = pool.acquire().await.unwrap();
-    assert!(
-        payloads::lock_online_shard(
-            &mut other_target,
-            payloads::OnlinePlan::new(4, 2).unwrap(),
-            "different-target"
-        )
-        .await
-        .is_err()
-    );
+    assert!(payloads::lock_online_shard(&mut other_target, payloads::OnlinePlan::new(4, 2).unwrap(), "different-target").await.is_err());
     other_target.close().await.unwrap();
     let mut serial = pool.acquire().await.unwrap();
     assert!(
@@ -535,36 +450,21 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
     );
     first.close().await.unwrap();
     second.close().await.unwrap();
-    // Terminate is sent by close, but PostgreSQL may still be processing it.
-    // Wait for server-side session cleanup, bounded by the contract timeout.
-    sqlx::query("SET lock_timeout = '2s'")
-        .execute(&mut *serial)
-        .await
-        .unwrap();
-    sqlx::query("SELECT pg_advisory_lock(70720261029)")
-        .execute(&mut *serial)
-        .await
-        .unwrap();
-    sqlx::query("SET lock_timeout = 0")
-        .execute(&mut *serial)
-        .await
-        .unwrap();
+    // Close sends Terminate; server-side session cleanup may complete later.
+    // Retain the release contract with a bounded wait rather than a race.
+    sqlx::query("SET lock_timeout = '2s'").execute(&mut *serial).await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock(70720261029)").execute(&mut *serial).await.unwrap();
+    sqlx::query("SET lock_timeout = 0").execute(&mut *serial).await.unwrap();
     serial.close().await.unwrap();
 
-    let receipt: serde_json::Value =
-        serde_json::from_reader(std::fs::File::open(&receipt_path).unwrap()).unwrap();
+    let receipt: serde_json::Value = serde_json::from_reader(std::fs::File::open(&receipt_path).unwrap()).unwrap();
     let key = format!(
         "migration-receipts/conversation-v1/{}/online-payloads/{}.json",
-        runner.identity,
-        receipt_path.file_stem().unwrap().to_str().unwrap()
+        runner.identity, receipt_path.file_stem().unwrap().to_str().unwrap()
     );
     let original_receipt = runner.target.get_bounded(&key, 16384).await.unwrap();
     assert_eq!(receipt["identity"], runner.identity);
-    runner
-        .target
-        .put(&key, Bytes::from_static(b"corrupt receipt"))
-        .await
-        .unwrap();
+    runner.target.put(&key, Bytes::from_static(b"corrupt receipt")).await.unwrap();
     assert!(runner.copy_payloads_online().await.is_err());
     runner.target.put(&key, original_receipt).await.unwrap();
     assert!(runner.transfer_payloads(true).await.unwrap().verified);
