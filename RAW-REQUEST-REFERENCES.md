@@ -65,7 +65,7 @@ exclusive ownership, globally verified source, retention release or GC consent.
 
 Once actual all-reader compatibility includes the raw publisher/binder replay
 fix, the separate `raw-request-reference --apply-references` can use this same
-checkpoint and revalidate the target/root/source before conditional root and SQL
+checkpoint and revalidate target, root and source before conditional root and SQL
 updates. Copy does not itself authorize that step. The legacy small root is
 still authoritative during this intermediate phase; its final backend-aware
 lookup migration and native publication/release fence remain separate work.
