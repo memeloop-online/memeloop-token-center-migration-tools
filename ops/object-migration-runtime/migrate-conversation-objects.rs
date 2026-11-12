@@ -86,6 +86,8 @@ mod inventory;
 mod locators;
 #[path = "conversation-object-modules/payloads.rs"]
 mod payloads;
+#[path = "conversation-object-modules/raw_request_refs.rs"]
+mod raw_request_refs;
 #[path = "conversation-object-modules/reconstruction.rs"]
 mod reconstruction;
 #[path = "conversation-object-modules/spools.rs"]
@@ -111,6 +113,7 @@ enum Phase {
     VerifyAll,
     SemanticPayloadReferences,
     SemanticReferenceReadback,
+    RawRequestReference,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -152,6 +155,9 @@ struct Args {
     /// Apply semantic v2 references only after compatible readers are deployed.
     #[arg(long)]
     apply_references: bool,
+    /// One completed request/root and its already-present qualified raw target.
+    #[arg(long)]
+    raw_reference_plan: Option<PathBuf>,
     /// Committed semantic-reference audit directories; read only.
     #[arg(long)]
     reference_audit_dir: Vec<PathBuf>,
@@ -954,6 +960,16 @@ async fn run(args: Args) -> Result<()> {
     if args.online_field.is_some() && !args.online_copy {
         return Err("--online-field requires --online-copy".into());
     }
+    let raw_reference = args.phase == Phase::RawRequestReference;
+    if raw_reference != args.raw_reference_plan.is_some() {
+        return Err("raw-request-reference requires its dedicated raw-reference-plan".into());
+    }
+    if raw_reference && !args.receipt_ledger.is_empty() {
+        return Err(
+            "raw references create their own verified immutable proof, not semantic receipts"
+                .into(),
+        );
+    }
     let references = args.phase == Phase::SemanticPayloadReferences;
     let readback = args.phase == Phase::SemanticReferenceReadback;
     if readback
@@ -975,7 +991,11 @@ async fn run(args: Args) -> Result<()> {
             "semantic references require receipt ledgers and a nonzero operational batch".into(),
         );
     }
-    if !references && !readback && (!args.receipt_ledger.is_empty() || args.apply_references) {
+    if !references
+        && !readback
+        && !raw_reference
+        && (!args.receipt_ledger.is_empty() || args.apply_references)
+    {
         return Err("receipt/apply arguments require semantic-payload-references".into());
     }
     if args.phase != Phase::Inventory
@@ -983,6 +1003,7 @@ async fn run(args: Args) -> Result<()> {
         && !args.online_copy
         && !references
         && !readback
+        && !raw_reference
     {
         return Err("copy/verify/cutover require --writers-quiesced; no concurrent legacy writer is supported".into());
     }
@@ -1027,11 +1048,11 @@ async fn run(args: Args) -> Result<()> {
         .open(args.checkpoint.with_extension("lock"))?;
     rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
     let mut advisory = pool.acquire().await?;
-    if references || readback {
+    if references || readback || raw_reference {
         let source: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock_shared(70720261029)")
             .fetch_one(&mut *advisory)
             .await?;
-        let apply: bool = if references {
+        let apply: bool = if references || raw_reference {
             sqlx::query_scalar("SELECT pg_try_advisory_lock(70720261031)")
                 .fetch_one(&mut *advisory)
                 .await?
@@ -1069,6 +1090,19 @@ async fn run(args: Args) -> Result<()> {
         checkpoint: args.checkpoint,
         identity,
     };
+    if raw_reference {
+        let plan = serde_json::from_reader(std::fs::File::open(
+            args.raw_reference_plan
+                .as_ref()
+                .ok_or("raw reference plan missing")?,
+        )?)?;
+        let result = runner
+            .relocate_raw_request(&config, plan, args.apply_references)
+            .await;
+        advisory.close().await?;
+        println!("{}", serde_json::to_string(&result?)?);
+        return Ok(());
+    }
     if readback {
         let result = runner
             .readback_semantic_references(
@@ -1223,7 +1257,8 @@ async fn run(args: Args) -> Result<()> {
         | Phase::VerifyReconstruction
         | Phase::VerifyAll
         | Phase::SemanticPayloadReferences
-        | Phase::SemanticReferenceReadback => {
+        | Phase::SemanticReferenceReadback
+        | Phase::RawRequestReference => {
             unreachable!()
         }
     };
