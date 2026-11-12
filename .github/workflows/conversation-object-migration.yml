@@ -115,7 +115,9 @@ jobs:
           MTC_RUSTFS_TEST_BUCKET: migration-contract-test
           MTC_RUSTFS_TEST_ACCESS_KEY: rustfs-migration-fixture
           MTC_RUSTFS_TEST_SECRET_KEY: synthetic-test-only-secret-49
-        run: cargo test --locked --bin migrate-conversation-objects
+        # These contracts intentionally exercise cluster-wide advisory keys.
+        # Separate test databases do not isolate PostgreSQL advisory locks.
+        run: cargo test --locked --bin migrate-conversation-objects -- --test-threads=1
       - name: Build reviewed migration command
         working-directory: .object-runtime
         run: cargo build --locked --bin migrate-conversation-objects
