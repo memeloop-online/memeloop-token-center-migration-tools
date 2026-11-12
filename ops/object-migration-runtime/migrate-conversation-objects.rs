@@ -110,6 +110,7 @@ enum Phase {
     VerifyReconstruction,
     VerifyAll,
     SemanticPayloadReferences,
+    SemanticReferenceReadback,
 }
 
 #[derive(Parser)]
@@ -143,6 +144,9 @@ struct Args {
     /// Apply semantic v2 references only after compatible readers are deployed.
     #[arg(long)]
     apply_references: bool,
+    /// Committed semantic-reference audit directories; read only.
+    #[arg(long)]
+    reference_audit_dir: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
@@ -940,15 +944,34 @@ async fn run(args: Args) -> Result<()> {
         return Err("--online-copy is only supported for --phase copy-payloads".into());
     }
     let references = args.phase == Phase::SemanticPayloadReferences;
+    let readback = args.phase == Phase::SemanticReferenceReadback;
+    if readback
+        && (args.receipt_ledger.is_empty()
+            || args.reference_audit_dir.is_empty()
+            || args.reference_batch == 0
+            || args.apply_references)
+    {
+        return Err(
+            "semantic readback requires receipt/audit directories, a nonzero batch and no apply"
+                .into(),
+        );
+    }
+    if !readback && !args.reference_audit_dir.is_empty() {
+        return Err("reference-audit-dir requires semantic-reference-readback".into());
+    }
     if references && (args.receipt_ledger.is_empty() || args.reference_batch == 0) {
         return Err(
             "semantic references require receipt ledgers and a nonzero operational batch".into(),
         );
     }
-    if !references && (!args.receipt_ledger.is_empty() || args.apply_references) {
+    if !references && !readback && (!args.receipt_ledger.is_empty() || args.apply_references) {
         return Err("receipt/apply arguments require semantic-payload-references".into());
     }
-    if args.phase != Phase::Inventory && !args.writers_quiesced && !args.online_copy && !references
+    if args.phase != Phase::Inventory
+        && !args.writers_quiesced
+        && !args.online_copy
+        && !references
+        && !readback
     {
         return Err("copy/verify/cutover require --writers-quiesced; no concurrent legacy writer is supported".into());
     }
@@ -993,13 +1016,17 @@ async fn run(args: Args) -> Result<()> {
         .open(args.checkpoint.with_extension("lock"))?;
     rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
     let mut advisory = pool.acquire().await?;
-    if references {
+    if references || readback {
         let source: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock_shared(70720261029)")
             .fetch_one(&mut *advisory)
             .await?;
-        let apply: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(70720261031)")
-            .fetch_one(&mut *advisory)
-            .await?;
+        let apply: bool = if references {
+            sqlx::query_scalar("SELECT pg_try_advisory_lock(70720261031)")
+                .fetch_one(&mut *advisory)
+                .await?
+        } else {
+            true
+        };
         if !source || !apply {
             advisory.close().await?;
             return Err(
@@ -1031,6 +1058,19 @@ async fn run(args: Args) -> Result<()> {
         checkpoint: args.checkpoint,
         identity,
     };
+    if readback {
+        let result = runner
+            .readback_semantic_references(
+                &config,
+                &args.receipt_ledger,
+                &args.reference_audit_dir,
+                args.reference_batch,
+            )
+            .await;
+        advisory.close().await?;
+        println!("{}", serde_json::to_string(&result?)?);
+        return Ok(());
+    }
     if references {
         let result = runner
             .externalize_semantic_payloads(
@@ -1167,7 +1207,8 @@ async fn run(args: Args) -> Result<()> {
         | Phase::Reconstruct
         | Phase::VerifyReconstruction
         | Phase::VerifyAll
-        | Phase::SemanticPayloadReferences => {
+        | Phase::SemanticPayloadReferences
+        | Phase::SemanticReferenceReadback => {
             unreachable!()
         }
     };

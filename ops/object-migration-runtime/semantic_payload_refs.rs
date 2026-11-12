@@ -2,6 +2,9 @@
 //! Object verification happens outside the short source-row transaction.
 use super::*;
 
+#[path = "semantic_reference_readback.rs"]
+mod readback;
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct SourceVersion {
@@ -483,11 +486,11 @@ mod tests {
         };
         let tenant = Uuid::now_v7();
         let mut versions = Vec::new();
-        for changed in [false, true] {
+        for changed in [false, true, false] {
             let request = Uuid::now_v7();
             let key = Uuid::now_v7();
             let principal = Uuid::now_v7();
-            let body = serde_json::json!({"messages":[{"role":"user","content":"工具原文🙂"}],"changed":changed}).to_string();
+            let body = serde_json::json!({"messages":[{"role":"user","content":"工具原文🙂".repeat(20000)}],"changed":changed}).to_string();
             let mut digest = blake3::Hasher::new_derive_key("MTC conversation semantic payload v1");
             for part in [
                 request.to_string(),
@@ -559,7 +562,7 @@ mod tests {
             .externalize_semantic_payloads(&config, &ledgers, 32, false)
             .await
             .unwrap();
-        assert_eq!(dry["eligible"], 1);
+        assert_eq!(dry["eligible"], 2);
         assert_eq!(dry["skipped"], 1);
         let v1: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM conversation_semantic_payloads WHERE format_version=1",
@@ -567,13 +570,13 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(v1, 2);
+        assert_eq!(v1, 3);
         runner.checkpoint = directory.path().join("apply.json");
         let applied = runner
             .externalize_semantic_payloads(&config, &ledgers, 32, true)
             .await
             .unwrap();
-        assert_eq!(applied["applied"], 1);
+        assert_eq!(applied["applied"], 2);
         assert_eq!(applied["skipped"], 1);
         let (receipt, id, original, body) = &versions[0];
         let current = source_version(&pool, &receipt.cursor, false)
@@ -604,14 +607,127 @@ mod tests {
             .externalize_semantic_payloads(&config, &ledgers, 32, true)
             .await
             .unwrap();
-        assert_eq!(replay["already_referenced"], 1);
+        assert_eq!(replay["already_referenced"], 2);
         assert_eq!(replay["applied"], 0);
         let audit: ReferenceAudit = serde_json::from_reader(
             std::fs::File::open(audit_dir.join(format!("{id}.json"))).unwrap(),
         )
         .unwrap();
         assert_eq!(audit.status, "committed_confirmed_by_reread");
-        assert_eq!(std::fs::read_dir(&ledger).unwrap().count(), 2);
+        assert_eq!(std::fs::read_dir(&ledger).unwrap().count(), 3);
+        // Two different request identities share one object. One object stream
+        // must satisfy both independently framed semantic digests.
+        runner.checkpoint = directory.path().join("readback.json");
+        let audit_dirs = vec![audit_dir.clone()];
+        let readback = runner
+            .readback_semantic_references(&config, &ledgers, &audit_dirs, 32)
+            .await
+            .unwrap();
+        assert_eq!(readback["objects_read"], 1);
+        assert_eq!(readback["rows_proven"], 2);
+        assert_eq!(readback["bytes_read"], body.len() as u64);
+        assert_eq!(readback["gc_authorized"], false);
+        assert_eq!(readback["source_writers_quiesced"], false);
+        let proof_dir = runner.checkpoint.with_extension("semantic-readback-proofs");
+        let proof_path = std::fs::read_dir(&proof_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let previous = std::fs::read(&proof_path).unwrap();
+        let replay = runner
+            .readback_semantic_references(&config, &ledgers, &audit_dirs, 32)
+            .await
+            .unwrap();
+        assert_eq!(replay["objects_read"], 1);
+        assert_eq!(
+            std::fs::read(&proof_path).unwrap(),
+            previous,
+            "no cached-proof timestamp refresh"
+        );
+        let mut wrong = config.clone();
+        wrong.s3_region = "different-region".into();
+        assert!(
+            runner
+                .readback_semantic_references(&wrong, &ledgers, &audit_dirs, 32)
+                .await
+                .is_err()
+        );
+
+        // An actual bad object invalidates the whole group and publishes no proof.
+        let object = &receipt.reference.conversation_body_v1;
+        runner
+            .target
+            .put(&object.object_locator, Bytes::from_static(b"corrupt"))
+            .await
+            .unwrap();
+        runner.checkpoint = directory.path().join("corrupt-readback.json");
+        assert!(
+            runner
+                .readback_semantic_references(&config, &ledgers, &audit_dirs, 32)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_dir(runner.checkpoint.with_extension("semantic-readback-proofs"))
+                .unwrap()
+                .count(),
+            0
+        );
+        runner
+            .target
+            .put(
+                &object.object_locator,
+                Bytes::copy_from_slice(body.as_bytes()),
+            )
+            .await
+            .unwrap();
+
+        // Hold one real source row until readback reaches FOR SHARE, then change
+        // its identity. The final locked read must defer this row, not attest it.
+        let mut held = pool.begin().await.unwrap();
+        sqlx::query(
+            "SELECT request_id FROM conversation_semantic_payloads WHERE request_id=$1 FOR UPDATE",
+        )
+        .bind(&receipt.cursor.content_hash)
+        .fetch_one(&mut *held)
+        .await
+        .unwrap();
+        runner.checkpoint = directory.path().join("race-readback.json");
+        let verify =
+            Box::pin(runner.readback_semantic_references(&config, &ledgers, &audit_dirs, 32));
+        let change = Box::pin(async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let blocked: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND wait_event_type='Lock' AND query LIKE '%FOR SHARE%')")
+                        .bind(&name).fetch_one(&pool).await.unwrap();
+                    if blocked { break; }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }).await.unwrap();
+            sqlx::query("UPDATE conversation_semantic_payloads SET key_id=$1 WHERE request_id=$2")
+                .bind(Uuid::now_v7().to_string())
+                .bind(&receipt.cursor.content_hash)
+                .execute(&mut *held)
+                .await
+                .unwrap();
+            held.commit().await.unwrap();
+        });
+        let (result, ()) = tokio::join!(verify, change);
+        let result = result.unwrap();
+        assert_eq!(result["objects_read"], 1);
+        assert_eq!(result["rows_proven"], 1);
+        assert_eq!(result["rows_deferred"], 1);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM conversation_semantic_payloads WHERE format_version=2"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            2
+        );
         // A source changed between readback and row locking is never replaced.
         let audits = directory.path().join("race-audits");
         std::fs::create_dir(&audits).unwrap();
