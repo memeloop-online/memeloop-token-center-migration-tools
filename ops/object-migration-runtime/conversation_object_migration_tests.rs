@@ -366,10 +366,14 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
         "no historical version omitted"
     );
     // A forged placement remains invalid even when remote checks are deferred.
-    let misplaced = std::fs::read_dir(partition_runners[0].checkpoint.with_extension("online-payload-receipts")).unwrap().next().unwrap().unwrap().path();
-    let wrong_path = partition_runners[1].checkpoint.with_extension("online-payload-receipts").join(misplaced.file_name().unwrap());
+    let (owner, misplaced) = partition_runners.iter().enumerate().find_map(|(index, runner)| {
+        std::fs::read_dir(runner.checkpoint.with_extension("online-payload-receipts")).unwrap()
+            .find_map(|entry| { let path = entry.unwrap().path(); (path.extension().is_some_and(|e| e == "json")).then_some((index, path)) })
+    }).expect("at least one imported committed receipt");
+    let wrong = (owner + 1) % partition_runners.len();
+    let wrong_path = partition_runners[wrong].checkpoint.with_extension("online-payload-receipts").join(misplaced.file_name().unwrap());
     std::fs::copy(&misplaced, &wrong_path).unwrap();
-    assert!(partition_runners[1].copy_payloads_online_partition(payloads::OnlinePlan::new(4, 1).unwrap(), None).await.is_err());
+    assert!(partition_runners[wrong].copy_payloads_online_partition(payloads::OnlinePlan::new(4, wrong as i32).unwrap(), None).await.is_err());
     std::fs::remove_file(wrong_path).unwrap();
 
     assert!(
