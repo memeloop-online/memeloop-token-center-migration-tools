@@ -101,7 +101,10 @@ async fn root(
     path: &Path,
 ) -> Result<(Bytes, Option<String>, Option<String>)> {
     // Get body and conditional version from the same response, never HEAD+GET.
-    let result = store.get(path).await?;
+    let result = store
+        .get(path)
+        .await
+        .map_err(|e| at_stage("raw_root_read", e))?;
     if result.meta.size > 4096 {
         return Err("raw root exceeds its metadata format".into());
     }
@@ -265,7 +268,8 @@ impl Runner {
         bare.object_locator = target_key.to_owned();
         self.target
             .verify_tenant_content(plan.tenant_id, &bare)
-            .await?;
+            .await
+            .map_err(|e| at_stage("raw_target_readback", e))?;
         if !apply {
             let (observed, etag, version) = root(source_client.as_ref(), &root_path).await?;
             let new_root = serde_json::to_vec(&audit.proof.target)?;
@@ -335,7 +339,7 @@ impl Runner {
                 audit.status = "root_update_unconfirmed".into();
                 save_checkpoint(&audit_path, &audit)?;
                 return match update {
-                    Err(e) => Err(e.into()),
+                    Err(e) => Err(at_stage("raw_root_conditional_put", e)),
                     Ok(_) => Err("raw root readback conflict".into()),
                 };
             }
