@@ -969,8 +969,20 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
     assert!(runner.source_field_reference_if_present(&external_cursor, payloads::SourceField::SemanticPayload, true).await.unwrap().is_none());
     let stored: String = sqlx::query_scalar("SELECT request_json FROM conversation_semantic_payloads WHERE request_id=$1").bind(&external_cursor.content_hash).fetch_one(&pool).await.unwrap();
     assert_eq!(stored, external);
+    let final_copy = Runner { pool: pool.clone(), source: runner.source.clone(), target: runner.target.clone(), checkpoint: directory.path().join("external-final.json"), identity: runner.identity.clone() };
+    let failure = final_copy.transfer_payloads(false).await.err().expect("legacy final verifier must not accept external metadata as plaintext");
+    assert!(failure.to_string().contains("external semantic reference"));
+    if let Ok(file) = std::fs::File::open(final_copy.checkpoint.with_extension("payloads.json")) {
+        let final_state: serde_json::Value = serde_json::from_reader(file).unwrap();
+        assert_ne!(final_state["verified"], serde_json::json!(true));
+        assert_ne!(final_state["complete"], serde_json::json!(true));
+    }
     sqlx::query("UPDATE conversation_semantic_payloads SET format_version=3 WHERE request_id=$1").bind(&external_cursor.content_hash).execute(&pool).await.unwrap();
     assert!(runner.source_field_reference_if_present(&external_cursor, payloads::SourceField::SemanticPayload, true).await.is_err());
+    sqlx::query("DELETE FROM conversation_semantic_payloads WHERE request_id=$1").bind(&external_cursor.content_hash).execute(&pool).await.unwrap();
+    let (value, external_retained) = runner.observe_source_field(&external_cursor, payloads::SourceField::SemanticPayload, true).await.unwrap().into_parts();
+    assert!(value.is_none());
+    assert!(!external_retained, "a deleted row is not an external reference retained by the RR snapshot");
     pool.close().await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE {name}")))
         .execute(&administrative)

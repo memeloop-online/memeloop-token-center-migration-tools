@@ -14,6 +14,21 @@ use uuid::Uuid;
 type Failure = Box<dyn std::error::Error + Send + Sync>;
 type Result<Value> = std::result::Result<Value, Failure>;
 
+enum SourceObservation {
+    Present(ConversationBodyReference, String),
+    Missing,
+    ExternalReference,
+}
+impl SourceObservation {
+    fn into_parts(self) -> (Option<(ConversationBodyReference, String)>, bool) {
+        match self {
+            Self::Present(reference, md5) => (Some((reference, md5)), false),
+            Self::Missing => (None, false),
+            Self::ExternalReference => (None, true),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct MigrationFailure {
     stage: &'static str,
@@ -427,9 +442,11 @@ impl Runner {
         field: payloads::SourceField,
         copy: bool,
     ) -> Result<(ConversationBodyReference, String)> {
-        self.source_field_reference_if_present(cursor, field, copy)
-            .await?
-            .ok_or_else(|| "source field missing or null".into())
+        match self.observe_source_field(cursor, field, copy).await? {
+            SourceObservation::Present(reference, md5) => Ok((reference, md5)),
+            SourceObservation::Missing => Err("source field missing or null".into()),
+            SourceObservation::ExternalReference => Err("external semantic reference requires reference-aware final verification; source remains unverified".into()),
+        }
     }
 
     async fn source_field_reference_if_present(
@@ -438,6 +455,19 @@ impl Runner {
         field: payloads::SourceField,
         copy: bool,
     ) -> Result<Option<(ConversationBodyReference, String)>> {
+        Ok(self
+            .observe_source_field(cursor, field, copy)
+            .await?
+            .into_parts()
+            .0)
+    }
+
+    async fn observe_source_field(
+        &self,
+        cursor: &Cursor,
+        field: payloads::SourceField,
+        copy: bool,
+    ) -> Result<SourceObservation> {
         let (table, id, column) = field.columns();
         let tenant = Uuid::parse_str(&cursor.tenant_id)?;
         let mut transaction = self.pool.begin().await?;
@@ -489,7 +519,7 @@ impl Runner {
                         // Already external: retain it as a reference, never copy its JSON
                         // as a new body or count this as verified target content.
                         transaction.commit().await?;
-                        return Ok(None);
+                        return Ok(SourceObservation::ExternalReference);
                     }
                     _ => return Err("semantic payload format unsupported".into()),
                 }
@@ -502,7 +532,7 @@ impl Runner {
         .fetch_optional(&mut *transaction).await.map_err(|e| at_stage("source_field_metadata", e))?;
         let Some(row) = row else {
             transaction.commit().await?;
-            return Ok(None);
+            return Ok(SourceObservation::Missing);
         };
         let chars = u64::try_from(row.try_get::<i64, _>("chars")?)?;
         let expected_bytes = u64::try_from(row.try_get::<i64, _>("bytes")?)?;
@@ -516,7 +546,7 @@ impl Runner {
             let reference = self
                 .transfer_existing_body_reference(tenant, &reference, copy)
                 .await?;
-            return Ok(Some((reference, source_md5)));
+            return Ok(SourceObservation::Present(reference, source_md5));
         }
         let staging = format!(
             "migration-staging/conversation-v1/{}/{}",
@@ -589,13 +619,13 @@ impl Runner {
                 size_bytes: expected_bytes,
             }
         };
-        Ok(Some((
+        Ok(SourceObservation::Present(
             ConversationBodyReference {
                 conversation_body_v1: object,
                 chars,
             },
             source_md5,
-        )))
+        ))
     }
 
     async fn transfer(&self, cursor: &Cursor) -> Result<Transfer> {

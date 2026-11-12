@@ -334,15 +334,10 @@ impl Runner {
         let mut external_semantic_references = 0_u64;
         for field in FIELDS {
             let (table, id, column) = field.columns();
-            let source_format = if field == SourceField::SemanticPayload {
-                "format_version::bigint"
-            } else {
-                "1::bigint"
-            };
             let mut cursor = Cursor::default();
             loop {
                 let row = sqlx::query(sqlx::AssertSqlSafe(format!(
-                    "SELECT tenant_id, {id} AS source_id, {source_format} AS source_format FROM {table} WHERE (tenant_id, {id}) > ($1, $2) AND {column} IS NOT NULL AND (('x' || substr(md5(tenant_id || ':' || {id}), 1, 8))::bit(32)::bigint % $3) = $4 ORDER BY tenant_id, {id} LIMIT 1"
+                    "SELECT tenant_id, {id} AS source_id FROM {table} WHERE (tenant_id, {id}) > ($1, $2) AND {column} IS NOT NULL AND (('x' || substr(md5(tenant_id || ':' || {id}), 1, 8))::bit(32)::bigint % $3) = $4 ORDER BY tenant_id, {id} LIMIT 1"
                 )))
                 .bind(&cursor.tenant_id).bind(&cursor.content_hash)
                 .bind(i64::from(plan.shards)).bind(i64::from(plan.shard))
@@ -354,14 +349,16 @@ impl Runner {
                 };
                 let versions =
                     known.get(&(cursor.tenant_id.clone(), cursor.content_hash.clone(), field));
-                let mut observed = if versions.is_some() {
+                let (mut observed, mut external_reference) = if versions.is_some() {
                     // Rehash the current source in a fresh repeatable-read
                     // snapshot. MD5 alone never authorizes reuse of a version.
-                    self.source_field_reference_if_present(&cursor, field, false)
+                    self.observe_source_field(&cursor, field, false)
                         .await?
+                        .into_parts()
                 } else {
-                    self.source_field_reference_if_present(&cursor, field, true)
+                    self.observe_source_field(&cursor, field, true)
                         .await?
+                        .into_parts()
                 };
                 if let Some((reference, md5)) = observed.as_ref() {
                     if let Some(versions) = versions {
@@ -379,16 +376,15 @@ impl Runner {
                         } else {
                             // A changed row is copied under another complete
                             // snapshot; disappearance still retains every old receipt.
-                            observed = self
-                                .source_field_reference_if_present(&cursor, field, true)
-                                .await?;
+                            (observed, external_reference) = self
+                                .observe_source_field(&cursor, field, true)
+                                .await?
+                                .into_parts();
                         }
                     }
                 }
                 let Some((reference, source_md5)) = observed else {
-                    if field == SourceField::SemanticPayload
-                        && row.try_get::<i64, _>("source_format")? == 2
-                    {
+                    if external_reference {
                         external_semantic_references += 1;
                     } else {
                         disappeared_fields += 1;
