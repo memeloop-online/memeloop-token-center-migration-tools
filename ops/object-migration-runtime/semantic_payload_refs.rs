@@ -451,6 +451,7 @@ impl Runner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object_store::{ObjectStoreExt, PutPayload};
 
     #[tokio::test]
     async fn semantic_reference_apply_preserves_identity_and_skips_changed_sources() {
@@ -657,9 +658,23 @@ mod tests {
 
         // An actual bad object invalidates the whole group and publishes no proof.
         let object = &receipt.reference.conversation_body_v1;
-        runner
-            .target
-            .put(&object.object_locator, Bytes::from_static(b"corrupt"))
+        // Fault injection uses the isolated TEST object store directly. The
+        // production ArchiveStore correctly forbids overwriting immutable CAS.
+        let fixture_store = object_store::aws::AmazonS3Builder::new()
+            .with_endpoint(config.s3_endpoint.as_ref().unwrap())
+            .with_bucket_name(config.s3_bucket.as_ref().unwrap())
+            .with_region(&config.s3_region)
+            .with_access_key_id(config.s3_access_key.as_ref().unwrap())
+            .with_secret_access_key(config.s3_secret_key.as_ref().unwrap())
+            .with_allow_http(true)
+            .build()
+            .unwrap();
+        let fixture_path = object_store::path::Path::from(object.object_locator.as_str());
+        fixture_store
+            .put(
+                &fixture_path,
+                PutPayload::from_bytes(Bytes::from_static(b"corrupt")),
+            )
             .await
             .unwrap();
         runner.checkpoint = directory.path().join("corrupt-readback.json");
@@ -675,11 +690,10 @@ mod tests {
                 .count(),
             0
         );
-        runner
-            .target
+        fixture_store
             .put(
-                &object.object_locator,
-                Bytes::copy_from_slice(body.as_bytes()),
+                &fixture_path,
+                PutPayload::from_bytes(Bytes::copy_from_slice(body.as_bytes())),
             )
             .await
             .unwrap();
