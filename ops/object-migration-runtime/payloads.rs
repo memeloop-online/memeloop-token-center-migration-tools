@@ -331,6 +331,7 @@ impl Runner {
         let mut rows = 0_u64;
         let mut bytes = 0_u64;
         let mut disappeared_fields = 0_u64;
+        let mut external_semantic_references = 0_u64;
         for field in FIELDS {
             let (table, id, column) = field.columns();
             let mut cursor = Cursor::default();
@@ -348,14 +349,16 @@ impl Runner {
                 };
                 let versions =
                     known.get(&(cursor.tenant_id.clone(), cursor.content_hash.clone(), field));
-                let mut observed = if versions.is_some() {
+                let (mut observed, mut external_reference) = if versions.is_some() {
                     // Rehash the current source in a fresh repeatable-read
                     // snapshot. MD5 alone never authorizes reuse of a version.
-                    self.source_field_reference_if_present(&cursor, field, false)
+                    self.observe_source_field(&cursor, field, false)
                         .await?
+                        .into_parts()
                 } else {
-                    self.source_field_reference_if_present(&cursor, field, true)
+                    self.observe_source_field(&cursor, field, true)
                         .await?
+                        .into_parts()
                 };
                 if let Some((reference, md5)) = observed.as_ref() {
                     if let Some(versions) = versions {
@@ -373,14 +376,19 @@ impl Runner {
                         } else {
                             // A changed row is copied under another complete
                             // snapshot; disappearance still retains every old receipt.
-                            observed = self
-                                .source_field_reference_if_present(&cursor, field, true)
-                                .await?;
+                            (observed, external_reference) = self
+                                .observe_source_field(&cursor, field, true)
+                                .await?
+                                .into_parts();
                         }
                     }
                 }
                 let Some((reference, source_md5)) = observed else {
-                    disappeared_fields += 1;
+                    if external_reference {
+                        external_semantic_references += 1;
+                    } else {
+                        disappeared_fields += 1;
+                    }
                     continue;
                 };
                 let receipt = PayloadReceipt {
@@ -422,6 +430,7 @@ impl Runner {
             "online_shard": plan.shard,
             "bytes_observed": bytes,
             "fields_disappeared_before_snapshot": disappeared_fields,
+            "external_semantic_references_retained": external_semantic_references,
             "historical_versions_rechecked": historical_versions,
             "requires_quiesced_final_copy_and_verification": true
         }))
