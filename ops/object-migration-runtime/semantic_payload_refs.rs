@@ -760,6 +760,60 @@ mod tests {
                 .unwrap(),
             "skipped"
         );
+        // Priority copying must not read the outbox at all (this fixture's
+        // outbox intentionally lacks the other all-fields source columns).
+        let (valid_receipt, _, valid_source, valid_body) = &versions[1];
+        sqlx::query("UPDATE conversation_semantic_payloads SET request_json=$1, encoded_bytes=$2, digest=$3 WHERE request_id=$4")
+            .bind(valid_body).bind(valid_source.encoded_bytes).bind(&valid_source.semantic_digest)
+            .bind(&valid_receipt.cursor.content_hash).execute(&pool).await.unwrap();
+        let mut ignored = versions[0].0.clone();
+        ignored.field = SourceField::OutboxRequest;
+        let ignored_bytes = serde_json::to_vec(&ignored).unwrap();
+        let ignored_digest = blake3::hash(&ignored_bytes).to_hex().to_string();
+        // No remote receipt is published: this out-of-scope record must never
+        // be imported, verified remotely or counted as migrated.
+        save_checkpoint(&ledger.join(format!("{ignored_digest}.json")), &ignored).unwrap();
+        runner.checkpoint = directory.path().join("priority-semantic.json");
+        let plan = OnlinePlan::new(1, 0).unwrap();
+        let priority = runner
+            .copy_payloads_online_partition_filtered(plan, Some(&ledger), true)
+            .await
+            .unwrap();
+        assert_eq!(priority["rows_observed"], 1);
+        assert_eq!(priority["versions_reused_without_upload"], 1);
+        assert_eq!(priority["external_semantic_references_retained"], 2);
+        assert_eq!(priority["fields"], serde_json::json!(["semantic_payload"]));
+        assert_eq!(priority["source_verified"], false);
+        assert_eq!(priority["source_writers_quiesced"], false);
+        let layout: serde_json::Value = serde_json::from_reader(
+            std::fs::File::open(runner.checkpoint.with_extension("online-layout.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(layout["fields"], serde_json::json!(["semantic_payload"]));
+        let scoped = runner.checkpoint.with_extension("online-payload-receipts");
+        assert_eq!(std::fs::read_dir(&scoped).unwrap().count(), 3);
+        // Same source/target and partition do not permit reinterpreting the
+        // priority checkpoint as all-fields, or mixing a foreign field in it.
+        let mismatch = runner
+            .copy_payloads_online_partition(plan, None)
+            .await
+            .unwrap_err();
+        assert!(mismatch.to_string().contains("layout mismatch"));
+        save_checkpoint(&scoped.join(format!("{ignored_digest}.json")), &ignored).unwrap();
+        let mismatch = runner
+            .copy_payloads_online_partition_filtered(plan, None, true)
+            .await
+            .unwrap_err();
+        assert!(mismatch.to_string().contains("bound online scope"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM conversation_semantic_payloads WHERE format_version=2"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            2
+        );
         pool.close().await;
         sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE {name}")))
             .execute(&admin)

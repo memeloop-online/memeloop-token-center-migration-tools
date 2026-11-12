@@ -113,6 +113,11 @@ enum Phase {
     SemanticReferenceReadback,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum OnlineField {
+    SemanticPayload,
+}
+
 #[derive(Parser)]
 #[command(
     about = "Checkpointed conversation object transfer and receipt-backed semantic payload references"
@@ -127,6 +132,9 @@ struct Args {
     /// Copy payload snapshots with live writers; never verifies or cuts over the source.
     #[arg(long, conflicts_with = "writers_quiesced")]
     online_copy: bool,
+    /// Restrict migration scheduling to semantic payloads in a distinct checkpoint.
+    #[arg(long, value_enum)]
+    online_field: Option<OnlineField>,
     /// Partition every online payload field by the stable tenant/request hash.
     #[arg(long, default_value_t = 1)]
     online_shards: i32,
@@ -943,6 +951,9 @@ async fn run(args: Args) -> Result<()> {
     if args.online_copy && args.phase != Phase::CopyPayloads {
         return Err("--online-copy is only supported for --phase copy-payloads".into());
     }
+    if args.online_field.is_some() && !args.online_copy {
+        return Err("--online-field requires --online-copy".into());
+    }
     let references = args.phase == Phase::SemanticPayloadReferences;
     let readback = args.phase == Phase::SemanticReferenceReadback;
     if readback
@@ -1150,7 +1161,11 @@ async fn run(args: Args) -> Result<()> {
     if matches!(args.phase, Phase::CopyPayloads | Phase::VerifyPayloads) {
         if args.online_copy {
             let result = runner
-                .copy_payloads_online_partition(plan, args.import_online_ledger.as_deref())
+                .copy_payloads_online_partition_filtered(
+                    plan,
+                    args.import_online_ledger.as_deref(),
+                    matches!(args.online_field, Some(OnlineField::SemanticPayload)),
+                )
                 .await;
             // Close the session, releasing every layout/shard/source lock even
             // when the copy failed. Never return a session-locked connection to the pool.
