@@ -47,6 +47,13 @@ struct RawAudit {
     status: String,
 }
 
+#[derive(Clone, Copy)]
+enum RawAction {
+    Verify,
+    Apply,
+    CopyTarget,
+}
+
 async fn row<'e, E: sqlx::Executor<'e, Database = sqlx::Postgres>>(
     executor: E,
     plan: &RawRequestPlan,
@@ -122,11 +129,90 @@ fn report(audit: &RawAudit) -> serde_json::Value {
 }
 
 impl Runner {
+    async fn copy_one_raw_target(
+        &self,
+        tenant: Uuid,
+        original: &CasArchiveObject,
+        expected: &CasArchiveObject,
+    ) -> Result<()> {
+        let source = self
+            .source
+            .as_ref()
+            .ok_or("raw copy requires explicit source archive")?;
+        let mut stream = source
+            .open_tenant_content(tenant, original)
+            .await
+            .map_err(|e| at_stage("raw_source_stream", e))?
+            .stream;
+        let staging = format!(
+            "migration-staging/raw-request-v1/{}/{}",
+            self.identity,
+            Uuid::now_v7()
+        );
+        let mut writer = if expected.object_locator.ends_with(".mtcz1") {
+            self.target.start_compressed_writer(&staging).await?
+        } else {
+            self.target.start_writer(&staging).await?
+        };
+        while let Some(chunk) = stream.next().await {
+            writer
+                .write(chunk.map_err(|e| at_stage("raw_source_stream", e))?)
+                .await
+                .map_err(|e| at_stage("raw_target_write", e))?;
+        }
+        let staged = writer
+            .finish_staged()
+            .await
+            .map_err(|e| at_stage("raw_target_finish", e))?;
+        if staged.blake3_digest != expected.blake3_digest
+            || staged.size_bytes != expected.size_bytes
+        {
+            return Err("raw source stream digest/length mismatch".into());
+        }
+        let actual = self
+            .target
+            .promote_staged_text_to_cas(tenant, &staged)
+            .await
+            .map_err(|e| at_stage("raw_target_promote", e))?;
+        if actual != *expected {
+            return Err("raw target CAS identity mismatch".into());
+        }
+        self.target.delete(&staged.object_locator).await?;
+        Ok(())
+    }
+
     pub(super) fn relocate_raw_request<'a>(
         &'a self,
         config: &'a Config,
         plan: RawRequestPlan,
         apply: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value>> + Send + 'a>>
+    {
+        self.raw_request_action(
+            config,
+            plan,
+            if apply {
+                RawAction::Apply
+            } else {
+                RawAction::Verify
+            },
+        )
+    }
+
+    pub(super) fn copy_raw_request_target<'a>(
+        &'a self,
+        config: &'a Config,
+        plan: RawRequestPlan,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value>> + Send + 'a>>
+    {
+        self.raw_request_action(config, plan, RawAction::CopyTarget)
+    }
+
+    fn raw_request_action<'a>(
+        &'a self,
+        config: &'a Config,
+        plan: RawRequestPlan,
+        action: RawAction,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value>> + Send + 'a>>
     {
         Box::pin(async move {
@@ -137,7 +223,7 @@ impl Runner {
                 config,
                 &source_config,
                 plan,
-                apply,
+                action,
                 source_client,
                 target_client,
             )
@@ -149,7 +235,7 @@ impl Runner {
         config: &Config,
         source_config: &Config,
         plan: RawRequestPlan,
-        apply: bool,
+        action: RawAction,
         source_client: Arc<dyn ObjectStore>,
         target_client: Arc<dyn ObjectStore>,
     ) -> Result<serde_json::Value> {
@@ -263,14 +349,35 @@ impl Runner {
         {
             return Err("raw proof does not preserve the original logical body".into());
         }
-        // Resume re-proves this exact raw target, never all historical bodies.
+        // Resolve the same raw identity; semantic payload references are never
+        // evidence for the original request byte stream.
         let mut bare = audit.proof.target.clone();
         bare.object_locator = target_key.to_owned();
-        self.target
-            .verify_tenant_content(plan.tenant_id, &bare)
-            .await
-            .map_err(|e| at_stage("raw_target_readback", e))?;
-        if !apply {
+        if bare.object_locator != canonical && bare.object_locator != format!("{canonical}.mtcz1") {
+            return Err("raw target must preserve the canonical tenant/digest key".into());
+        }
+        let copy_target = matches!(action, RawAction::CopyTarget);
+        let mut uploaded = false;
+        if copy_target {
+            match target_client.head(&Path::from(target_key)).await {
+                Ok(_) => {}
+                Err(object_store::Error::NotFound { .. }) => {
+                    self.copy_one_raw_target(plan.tenant_id, &original, &bare)
+                        .await?;
+                    uploaded = true;
+                }
+                Err(error) => return Err(at_stage("raw_target_head", error)),
+            }
+        }
+        // New CAS promotion already performs complete target readback. An
+        // existing target is streamed and verified, never trusted from HEAD.
+        if !uploaded {
+            self.target
+                .verify_tenant_content(plan.tenant_id, &bare)
+                .await
+                .map_err(|e| at_stage("raw_target_readback", e))?;
+        }
+        if !matches!(action, RawAction::Apply) {
             let (observed, etag, version) = root(source_client.as_ref(), &root_path).await?;
             let new_root = serde_json::to_vec(&audit.proof.target)?;
             let root_matches = observed.as_ref() == new_root
@@ -280,9 +387,14 @@ impl Runner {
             let source_matches = row(&self.pool, &plan, false)
                 .await?
                 .is_some_and(|r| r == audit.proof.source || matches_committed(&r, &audit.proof));
-            return Ok(
-                serde_json::json!({"mode":"raw_request_reference_dry_run","request_id":plan.request_id,"eligible":root_matches && source_matches,"source_deleted":false,"gc_authorized":false}),
-            );
+            if !copy_target {
+                return Ok(
+                    serde_json::json!({"mode":"raw_request_reference_dry_run","request_id":plan.request_id,"eligible":root_matches && source_matches,"source_deleted":false,"gc_authorized":false}),
+                );
+            }
+            if !root_matches || !source_matches {
+                return Err("raw source changed during target copy; source retained".into());
+            }
         }
         let proof_bytes = serde_json::to_vec(&audit.proof)?;
         let proof_digest = blake3::hash(&proof_bytes).to_hex().to_string();
@@ -310,6 +422,26 @@ impl Runner {
             || receipt.bytes().await?.as_ref() != proof_bytes
         {
             return Err("immutable raw proof receipt mismatch".into());
+        }
+        if copy_target {
+            // This proves only this immutable raw body. It is not a root/SQL
+            // cutover, a source-release proof, or a globally verified snapshot.
+            if !matches!(
+                audit.status.as_str(),
+                "committed" | "committed_confirmed_by_reread"
+            ) {
+                audit.status = "target_verified".into();
+            }
+            save_checkpoint(&audit_path, &audit)?;
+            return Ok(serde_json::json!({
+                "mode":"copy_raw_request_target","request_id":plan.request_id,
+                "status":audit.status,"body_bytes":bare.size_bytes,
+                "source_streamed":uploaded,"target_reused":!uploaded,
+                "target_cas_creation_measured":false,"raw_body_verified":true,
+                "source_writers_quiesced":false,
+                "root_changed":false,"sql_changed":false,
+                "source_deleted":false,"gc_authorized":false,"global_verified":false
+            }));
         }
         save_checkpoint(&audit_path, &audit)?;
         let new_root = serde_json::to_vec(&audit.proof.target)?;
@@ -482,11 +614,162 @@ mod tests {
             request_id: request,
             target_locator: format!("stores/training/{training}/{}", original.object_locator),
         };
+        // Copy and pointer mutation are separate operations. This fixture uses
+        // an independent memory body source and real RustFS roots/target, while
+        // production builds both source clients from one explicit S3 config.
+        let body_source = ArchiveStore::from_config(&Config::for_test(url.to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            body_source
+                .put_tenant_content(tenant, body.clone())
+                .await
+                .unwrap(),
+            original
+        );
+        let copy_runner = Runner {
+            pool: pool.clone(),
+            source: Some(body_source),
+            target: runner.target.clone(),
+            checkpoint: directory.path().join("raw-copy.json"),
+            identity: runner.identity.clone(),
+        };
+        // Gaps cannot be filled from a semantically similar document.
+        sqlx::query("UPDATE request_records SET request_object=$1 WHERE id=$2")
+            .bind(format!("gap://{request}/request"))
+            .bind(request.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            Box::pin(copy_runner.relocate_raw_request_with_clients(
+                &config,
+                &source_config,
+                plan.clone(),
+                RawAction::CopyTarget,
+                source_client.clone(),
+                target_client.clone(),
+            ))
+            .await
+            .is_err()
+        );
+        sqlx::query("UPDATE request_records SET request_object=$1 WHERE id=$2")
+            .bind(&original.object_locator)
+            .bind(request.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Only isolated fixture injection removes the target to test a miss.
+        target_client
+            .delete(&Path::from(original.object_locator.as_str()))
+            .await
+            .unwrap();
+        let copied = Box::pin(copy_runner.relocate_raw_request_with_clients(
+            &config,
+            &source_config,
+            plan.clone(),
+            RawAction::CopyTarget,
+            source_client.clone(),
+            target_client.clone(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(copied["source_streamed"], true);
+        assert_eq!(copied["sql_changed"], false);
+        assert_eq!(copied["root_changed"], false);
+        assert_eq!(copied["gc_authorized"], false);
+        assert_eq!(
+            row(&pool, &plan, false)
+                .await
+                .unwrap()
+                .unwrap()
+                .request_object,
+            original.object_locator
+        );
+        assert_eq!(
+            root(source_client.as_ref(), &root_path)
+                .await
+                .unwrap()
+                .0
+                .as_ref(),
+            original_encoded
+        );
+        assert_eq!(
+            runner
+                .target
+                .get_tenant_content(tenant, &original, body.len())
+                .await
+                .unwrap(),
+            body
+        );
+        let metadata_before = target_client
+            .head(&Path::from(original.object_locator.as_str()))
+            .await
+            .unwrap();
+        let reused = Box::pin(copy_runner.relocate_raw_request_with_clients(
+            &config,
+            &source_config,
+            plan.clone(),
+            RawAction::CopyTarget,
+            source_client.clone(),
+            target_client.clone(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(reused["target_reused"], true);
+        assert_eq!(reused["source_streamed"], false);
+        let metadata_after = target_client
+            .head(&Path::from(original.object_locator.as_str()))
+            .await
+            .unwrap();
+        assert_eq!(metadata_after.last_modified, metadata_before.last_modified);
+        assert_eq!(metadata_after.e_tag, metadata_before.e_tag);
+        // Compression changes the physical representation, never the raw bytes
+        // or request/root identity. No semantic-normalized body is substituted.
+        let compressed_plan = RawRequestPlan {
+            target_locator: format!("{}.mtcz1", plan.target_locator),
+            ..plan.clone()
+        };
+        let compressed_runner = Runner {
+            checkpoint: directory.path().join("raw-copy-compressed.json"),
+            ..copy_runner
+        };
+        let compressed = Box::pin(compressed_runner.relocate_raw_request_with_clients(
+            &config,
+            &source_config,
+            compressed_plan.clone(),
+            RawAction::CopyTarget,
+            source_client.clone(),
+            target_client.clone(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(compressed["source_streamed"], true);
+        let compressed_object = CasArchiveObject {
+            object_locator: format!("{}.mtcz1", original.object_locator),
+            ..original.clone()
+        };
+        assert_eq!(
+            runner
+                .target
+                .get_tenant_content(tenant, &compressed_object, body.len())
+                .await
+                .unwrap(),
+            body
+        );
+        assert_eq!(
+            root(source_client.as_ref(), &root_path)
+                .await
+                .unwrap()
+                .0
+                .as_ref(),
+            original_encoded
+        );
         let dry = Box::pin(runner.relocate_raw_request_with_clients(
             &config,
             &source_config,
             plan.clone(),
-            false,
+            RawAction::Verify,
             source_client.clone(),
             target_client.clone(),
         ))
@@ -511,13 +794,29 @@ mod tests {
             &config,
             &source_config,
             plan.clone(),
-            true,
+            RawAction::Apply,
             source_client.clone(),
             target_client.clone(),
         ))
         .await
         .unwrap();
         assert_eq!(applied["status"], "committed");
+        let rechecked = Box::pin(runner.relocate_raw_request_with_clients(
+            &config,
+            &source_config,
+            plan.clone(),
+            RawAction::CopyTarget,
+            source_client.clone(),
+            target_client.clone(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            rechecked["status"], "committed",
+            "copy readback must not downgrade a committed audit"
+        );
+        assert_eq!(rechecked["target_reused"], true);
+
         assert_eq!(applied["source_deleted"], false);
         assert_eq!(applied["gc_authorized"], false);
         let published: CasArchiveObject =
@@ -557,7 +856,7 @@ mod tests {
             &config,
             &source_config,
             plan.clone(),
-            true,
+            RawAction::Apply,
             source_client.clone(),
             target_client.clone(),
         ))
@@ -568,7 +867,7 @@ mod tests {
             &config,
             &source_config,
             plan.clone(),
-            true,
+            RawAction::Apply,
             source_client.clone(),
             target_client.clone(),
         ))
@@ -582,7 +881,7 @@ mod tests {
                 &config,
                 &source_config,
                 wrong_plan,
-                true,
+                RawAction::Apply,
                 source_client.clone(),
                 target_client.clone()
             ))
@@ -603,7 +902,7 @@ mod tests {
             &config,
             &source_config,
             plan.clone(),
-            true,
+            RawAction::Apply,
             source_client.clone(),
             target_client.clone(),
         ))
@@ -632,7 +931,31 @@ mod tests {
                 &config,
                 &source_config,
                 plan.clone(),
-                true,
+                RawAction::CopyTarget,
+                source_client.clone(),
+                target_client.clone(),
+            ))
+            .await
+            .is_err(),
+            "copy mode must not overwrite an existing corrupt CAS"
+        );
+        assert_eq!(
+            target_client
+                .get(&Path::from(original.object_locator.as_str()))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+            Bytes::from_static(b"bad target")
+        );
+
+        assert!(
+            Box::pin(runner.relocate_raw_request_with_clients(
+                &config,
+                &source_config,
+                plan.clone(),
+                RawAction::Apply,
                 source_client.clone(),
                 target_client.clone()
             ))
@@ -673,7 +996,7 @@ mod tests {
                 &config,
                 &source_config,
                 plan,
-                true,
+                RawAction::Apply,
                 source_client.clone(),
                 target_client
             ))

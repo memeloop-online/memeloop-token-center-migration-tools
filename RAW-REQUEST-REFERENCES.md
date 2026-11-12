@@ -42,3 +42,41 @@ persistent root/staging backend identity across every reader and publisher,
 actual publication/release fences, closed reference sets, final root lookup
 cutover, and reference-aware GC. Neither terminal status nor projected_at alone
 is a release proof. Do not erase legacy roots or blobs after this command.
+
+
+## Online raw target preparation
+
+`--phase copy-raw-request-target --raw-reference-plan <plan.json> --checkpoint
+<request-checkpoint.json>` prepares only one completed request's exact raw body.
+It requires explicit source S3 configuration and the same canonical target plan
+as `raw-request-reference`. It rejects `--apply-references`; no source root or
+SQL pointer changes occur. Raw gap locators are not synthesized from semantic
+payloads.
+
+The target is inspected only at the exact canonical tenant/digest key. If it
+exists, the entire target is verified and reused without PUT. A missing target
+is streamed from the original immutable CAS (including its decoded length and
+BLAKE3 verification), through the existing multipart writer and immutable
+same-backend promotion. The target receives its normal complete readback before
+an immutable receipt and durable audit are written. A present corrupt object
+fails closed rather than being overwritten. Source row/root identity is checked
+again; changes keep the source and fail this operation. This does not claim
+exclusive ownership, globally verified source, retention release or GC consent.
+
+Once actual all-reader compatibility includes the raw publisher/binder replay
+fix, the separate `raw-request-reference --apply-references` can use this same
+checkpoint and revalidate the target/root/source before conditional root and SQL
+updates. Copy does not itself authorize that step. The legacy small root is
+still authoritative during this intermediate phase; its final backend-aware
+lookup migration and native publication/release fence remain separate work.
+
+The phase retains the existing shared migration lock and exclusive reference
+operation lock. Operate it at the single-writer scheduler's safe boundary;
+do not start it alongside the automatic semantic CAS controller or another raw
+operation. Existing semantic priority jobs and their checkpoints remain unchanged.
+
+The report distinguishes `source_streamed` from `target_reused` (the exact key
+was already present before copy). It does not infer a unique new CAS object
+from staging upload: a concurrent conditional promotion may reuse a CAS object,
+so `target_cas_creation_measured=false`. Body bytes are decoded bytes, not wire
+or physical storage growth.
