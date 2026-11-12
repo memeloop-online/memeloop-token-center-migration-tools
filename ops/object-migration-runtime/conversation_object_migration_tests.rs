@@ -32,7 +32,7 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
          CREATE TABLE response_archive_spools(LIKE request_archive_spools INCLUDING ALL);
          CREATE TABLE request_archive_spool_chunks(request_id TEXT NOT NULL, seq BIGINT NOT NULL, ciphertext TEXT NOT NULL, byte_count BIGINT NOT NULL, PRIMARY KEY(request_id, seq));
          CREATE TABLE response_archive_spool_chunks(LIKE request_archive_spool_chunks INCLUDING ALL);
-         CREATE TABLE conversation_semantic_payloads(request_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, request_json TEXT NOT NULL);
+         CREATE TABLE conversation_semantic_payloads(request_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, request_json TEXT NOT NULL, format_version BIGINT NOT NULL DEFAULT 1, encoded_bytes BIGINT NOT NULL DEFAULT 0);
          CREATE TABLE conversation_projection_outbox(request_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, request_json TEXT NOT NULL, semantic_snapshot_json TEXT, semantic_payload_snapshot_json TEXT, key_snapshot_json TEXT, hints_json TEXT NOT NULL);",
     ).execute(&pool).await.unwrap();
     let tenant = Uuid::now_v7();
@@ -204,7 +204,7 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
             .unwrap();
     assert_eq!(source_chunks, 1);
     let payload_request = Uuid::now_v7().to_string();
-    sqlx::query("INSERT INTO conversation_semantic_payloads VALUES ($1, $2, $3)")
+    sqlx::query("INSERT INTO conversation_semantic_payloads(request_id,tenant_id,request_json) VALUES ($1, $2, $3)")
         .bind(&payload_request)
         .bind(tenant.to_string())
         .bind(&document)
@@ -242,7 +242,7 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
     assert!(runner.source_field_reference_if_present(&race_cursor, payloads::SourceField::SemanticSnapshot, true).await.unwrap().is_none());
     // Quiesced copying still rejects disappearance rather than skipping it.
     assert!(runner.source_field_reference(&race_cursor, payloads::SourceField::SemanticSnapshot, true).await.is_err());
-    sqlx::query("INSERT INTO conversation_semantic_payloads VALUES ('race-delete', $1, 'race payload')")
+    sqlx::query("INSERT INTO conversation_semantic_payloads(request_id,tenant_id,request_json) VALUES ('race-delete', $1, 'race payload')")
         .bind(tenant.to_string()).execute(&pool).await.unwrap();
     let candidate: String = sqlx::query_scalar("SELECT request_id FROM conversation_semantic_payloads WHERE request_id = 'race-delete' AND request_json IS NOT NULL")
         .fetch_one(&pool).await.unwrap();
@@ -261,7 +261,7 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
     assert_eq!(online["source_verified"], false);
     // A key before the old cursor and a changed row must both be copied on
     // restart; historical versions remain checked after their SQL disappears.
-    sqlx::query("INSERT INTO conversation_semantic_payloads VALUES ('!online-before-cursor', $1, 'first version')")
+    sqlx::query("INSERT INTO conversation_semantic_payloads(request_id,tenant_id,request_json) VALUES ('!online-before-cursor', $1, 'first version')")
         .bind(tenant.to_string()).execute(&pool).await.unwrap();
     let online = runner.copy_payloads_online().await.unwrap();
     assert_eq!(online["rows_observed"], 4);
@@ -376,7 +376,7 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
 
     // A changed source after import must produce a new receipt, rather than
     // claiming that an old target digest describes the current source version.
-    sqlx::query("INSERT INTO conversation_semantic_payloads VALUES ('!online-before-cursor', $1, 'third version')")
+    sqlx::query("INSERT INTO conversation_semantic_payloads(request_id,tenant_id,request_json) VALUES ('!online-before-cursor', $1, 'third version')")
         .bind(tenant.to_string()).execute(&pool).await.unwrap();
     let mut changed_rows = 0;
     let mut reused_rows = 0;
@@ -956,6 +956,21 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
     assert_eq!(failed["verified"], false);
     assert_eq!(failed["source_inventory"], partial);
     assert!(runner.require_all_verification().is_err());
+    // A stored v2 reference is metadata, not another plaintext source body.
+    let external = serde_json::json!({
+        "conversation_body_v1": {
+            "object_locator": format!("stores/training/{}/tenants/{tenant}/cas/v1/blake3/aa/{}", "b".repeat(64), "a".repeat(64)),
+            "blake3_digest": "a".repeat(64), "size_bytes": 123
+        }, "chars": 100
+    }).to_string();
+    let external_cursor = Cursor { tenant_id: tenant.to_string(), content_hash: Uuid::now_v7().to_string() };
+    sqlx::query("INSERT INTO conversation_semantic_payloads(request_id,tenant_id,request_json,format_version,encoded_bytes) VALUES($1,$2,$3,2,123)")
+        .bind(&external_cursor.content_hash).bind(&external_cursor.tenant_id).bind(&external).execute(&pool).await.unwrap();
+    assert!(runner.source_field_reference_if_present(&external_cursor, payloads::SourceField::SemanticPayload, true).await.unwrap().is_none());
+    let stored: String = sqlx::query_scalar("SELECT request_json FROM conversation_semantic_payloads WHERE request_id=$1").bind(&external_cursor.content_hash).fetch_one(&pool).await.unwrap();
+    assert_eq!(stored, external);
+    sqlx::query("UPDATE conversation_semantic_payloads SET format_version=3 WHERE request_id=$1").bind(&external_cursor.content_hash).execute(&pool).await.unwrap();
+    assert!(runner.source_field_reference_if_present(&external_cursor, payloads::SourceField::SemanticPayload, true).await.is_err());
     pool.close().await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE {name}")))
         .execute(&administrative)

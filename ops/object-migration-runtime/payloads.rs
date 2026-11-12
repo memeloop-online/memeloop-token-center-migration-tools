@@ -331,12 +331,18 @@ impl Runner {
         let mut rows = 0_u64;
         let mut bytes = 0_u64;
         let mut disappeared_fields = 0_u64;
+        let mut external_semantic_references = 0_u64;
         for field in FIELDS {
             let (table, id, column) = field.columns();
+            let source_format = if field == SourceField::SemanticPayload {
+                "format_version::bigint"
+            } else {
+                "1::bigint"
+            };
             let mut cursor = Cursor::default();
             loop {
                 let row = sqlx::query(sqlx::AssertSqlSafe(format!(
-                    "SELECT tenant_id, {id} AS source_id FROM {table} WHERE (tenant_id, {id}) > ($1, $2) AND {column} IS NOT NULL AND (('x' || substr(md5(tenant_id || ':' || {id}), 1, 8))::bit(32)::bigint % $3) = $4 ORDER BY tenant_id, {id} LIMIT 1"
+                    "SELECT tenant_id, {id} AS source_id, {source_format} AS source_format FROM {table} WHERE (tenant_id, {id}) > ($1, $2) AND {column} IS NOT NULL AND (('x' || substr(md5(tenant_id || ':' || {id}), 1, 8))::bit(32)::bigint % $3) = $4 ORDER BY tenant_id, {id} LIMIT 1"
                 )))
                 .bind(&cursor.tenant_id).bind(&cursor.content_hash)
                 .bind(i64::from(plan.shards)).bind(i64::from(plan.shard))
@@ -380,7 +386,13 @@ impl Runner {
                     }
                 }
                 let Some((reference, source_md5)) = observed else {
-                    disappeared_fields += 1;
+                    if field == SourceField::SemanticPayload
+                        && row.try_get::<i64, _>("source_format")? == 2
+                    {
+                        external_semantic_references += 1;
+                    } else {
+                        disappeared_fields += 1;
+                    }
                     continue;
                 };
                 let receipt = PayloadReceipt {
@@ -422,6 +434,7 @@ impl Runner {
             "online_shard": plan.shard,
             "bytes_observed": bytes,
             "fields_disappeared_before_snapshot": disappeared_fields,
+            "external_semantic_references_retained": external_semantic_references,
             "historical_versions_rechecked": historical_versions,
             "requires_quiesced_final_copy_and_verification": true
         }))

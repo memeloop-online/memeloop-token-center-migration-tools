@@ -444,6 +444,57 @@ impl Runner {
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
             .execute(&mut *transaction)
             .await?;
+        if field == payloads::SourceField::SemanticPayload {
+            let version = sqlx::query("SELECT format_version::bigint AS format_version, encoded_bytes, CASE WHEN format_version = 2 THEN left(request_json, 16385) END AS reference FROM conversation_semantic_payloads WHERE tenant_id=$1 AND request_id=$2")
+                .bind(&cursor.tenant_id).bind(&cursor.content_hash)
+                .fetch_optional(&mut *transaction).await?;
+            if let Some(version) = version {
+                match version.try_get::<i64, _>("format_version")? {
+                    1 => {}
+                    2 => {
+                        let encoded: String = version.try_get("reference")?;
+                        if encoded.len() > 16384 {
+                            return Err("semantic external reference is too large".into());
+                        }
+                        let reference: ConversationBodyReference = serde_json::from_str(&encoded)?;
+                        let object = &reference.conversation_body_v1;
+                        let digest = &object.blake3_digest;
+                        let locator = object
+                            .object_locator
+                            .strip_prefix("stores/training/")
+                            .ok_or("semantic external reference backend unsupported")?;
+                        let (identity, key) = locator
+                            .split_once('/')
+                            .ok_or("semantic external reference identity missing")?;
+                        let hex = |value: &str| {
+                            value.len() == 64
+                                && value
+                                    .bytes()
+                                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                        };
+                        if !hex(identity)
+                            || !hex(digest)
+                            || key
+                                != format!(
+                                    "tenants/{tenant}/cas/v1/blake3/{}/{}",
+                                    &digest[..2],
+                                    digest
+                                )
+                            || u64::try_from(version.try_get::<i64, _>("encoded_bytes")?).ok()
+                                != Some(object.size_bytes)
+                            || reference.chars > object.size_bytes
+                        {
+                            return Err("semantic external reference metadata mismatch".into());
+                        }
+                        // Already external: retain it as a reference, never copy its JSON
+                        // as a new body or count this as verified target content.
+                        transaction.commit().await?;
+                        return Ok(None);
+                    }
+                    _ => return Err("semantic payload format unsupported".into()),
+                }
+            }
+        }
         let row = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT CAST(length({column}) AS BIGINT) AS chars, CAST(octet_length({column}) AS BIGINT) AS bytes, md5({column}) AS digest, left({column}, 4096) AS prefix FROM {table} WHERE tenant_id = $1 AND {id} = $2 AND {column} IS NOT NULL"
         )))
