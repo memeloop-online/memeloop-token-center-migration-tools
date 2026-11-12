@@ -83,7 +83,8 @@ pub(super) struct PayloadCheckpoint {
     pub(super) verified: bool,
 }
 
-// The layout always includes all six fields. Only the primary-key hash is
+// The default layout includes all six fields; semantic priority binds an
+// explicit one-field layout in a distinct checkpoint. The primary-key hash is
 // partitioned; a row's fields stay on the same worker and retain their original
 // per-field repeatable-read snapshots and 64 Ki-character streaming chunks.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -218,25 +219,41 @@ impl Runner {
     // Keep the complete transfer state on the heap. In particular, callers
     // that retain several online-copy calls in one async state must not embed
     // every source/target streaming future in their own stack frames.
+    #[cfg(test)]
     pub(super) fn copy_payloads_online_partition<'a>(
         &'a self,
         plan: OnlinePlan,
         import: Option<&'a std::path::Path>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value>> + Send + 'a>>
     {
-        Box::pin(self.copy_payloads_online_partition_inner(plan, import))
+        self.copy_payloads_online_partition_filtered(plan, import, false)
+    }
+
+    pub(super) fn copy_payloads_online_partition_filtered<'a>(
+        &'a self,
+        plan: OnlinePlan,
+        import: Option<&'a std::path::Path>,
+        semantic_only: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value>> + Send + 'a>>
+    {
+        Box::pin(self.copy_payloads_online_partition_inner(plan, import, semantic_only))
     }
 
     async fn copy_payloads_online_partition_inner(
         &self,
         plan: OnlinePlan,
         import: Option<&std::path::Path>,
+        semantic_only: bool,
     ) -> Result<serde_json::Value> {
         let binding = OnlineBinding {
             format_version: 1,
             identity: self.identity.clone(),
             plan,
-            fields: FIELDS.to_vec(),
+            fields: if semantic_only {
+                vec![SourceField::SemanticPayload]
+            } else {
+                FIELDS.to_vec()
+            },
         };
         let binding_path = self.checkpoint.with_extension("online-layout.json");
         match std::fs::File::open(&binding_path) {
@@ -250,7 +267,7 @@ impl Runner {
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 // Legacy ledgers have no layout and belong to the serial plan.
-                if plan.shards != 1
+                if (plan.shards != 1 || semantic_only)
                     && self
                         .checkpoint
                         .with_extension("online-payload-receipts")
@@ -283,6 +300,9 @@ impl Runner {
                     continue;
                 }
                 let (receipt, encoded, digest) = self.read_online_receipt(&path)?;
+                if !binding.fields.contains(&receipt.field) {
+                    continue;
+                }
                 if !plan.owns(&self.pool, &receipt.cursor).await? {
                     continue;
                 }
@@ -317,6 +337,9 @@ impl Runner {
                 continue;
             }
             let (receipt, encoded, digest) = self.read_online_receipt(&path)?;
+            if !binding.fields.contains(&receipt.field) {
+                return Err("receipt field is outside the bound online scope".into());
+            }
             if extension == "pending" {
                 if !plan.owns(&self.pool, &receipt.cursor).await? {
                     return Err("receipt belongs to a different online shard".into());
@@ -363,7 +386,7 @@ impl Runner {
         let mut bytes = 0_u64;
         let mut disappeared_fields = 0_u64;
         let mut external_semantic_references = 0_u64;
-        for field in FIELDS {
+        for field in binding.fields.iter().copied() {
             let (table, id, column) = field.columns();
             let mut cursor = Cursor::default();
             loop {
@@ -461,6 +484,8 @@ impl Runner {
             "scan_finished": true,
             "source_verified": false,
             "source_writers_quiesced": false,
+            "fields": binding.fields,
+            "plan_identity": blake3::hash(&serde_json::to_vec(&binding)?).to_hex().to_string(),
             "rows_observed": rows,
             "versions_reused_without_upload": reused,
             "online_shards": plan.shards,
@@ -661,7 +686,8 @@ mod future_state_tests {
     #[test]
     fn online_transfer_retains_large_state_behind_a_heap_boundary() {
         let plan = OnlinePlan::new(4, 0).unwrap();
-        let inner = future_bytes(|runner| runner.copy_payloads_online_partition_inner(plan, None));
+        let inner =
+            future_bytes(|runner| runner.copy_payloads_online_partition_inner(plan, None, false));
         let outer = future_bytes(|runner| runner.copy_payloads_online_partition(plan, None));
         // Direct stderr remains visible even if a later contract aborts before
         // libtest can print captured output. These are type sizes, never data.

@@ -81,3 +81,11 @@ coverage. Deleted/changed historical versions remain part of the ledger.
 keeps `source_verified=false`, `source_writers_quiesced=false`, and
 `requires_quiesced_final_copy_and_verification=true`. Copy completion does not
 perform reference switching, delete PostgreSQL rows, or reclaim PG storage.
+
+## Prioritize live semantic payload bodies
+
+`--phase copy-payloads --online-copy --online-field semantic-payload --online-shards 4 --online-shard 1 --checkpoint /checkpoints/haixia-priority-semantic-shard-1.json` copies only `conversation_semantic_payloads.request_json`. Run shards 1, 2 and 3 sequentially with distinct checkpoint filenames/ledgers, followed by receipt-backed semantic reference application. This is migration scheduling, not a model-request limit. Existing format2 references remain protected and are never copied as body JSON; v1 uses the unchanged streaming repeatable-read proof.
+
+Use a new checkpoint: the existing layout already binds its exact fields vector. A semantic-only checkpoint cannot be reopened as the default six-field plan or vice versa. `plan_identity` fingerprints the whole bound layout; source/target receipt identity stays unchanged so correctly verified same-target receipts remain usable. Optional imports filter to the selected field before object I/O and still verify every imported object/immutable receipt plus current source version before reuse. Foreign-field records in the destination ledger are rejected.
+
+Default invocations retain all six fields and resume their existing checkpoints unchanged. Suspending an old all-fields Job preserves that work and is not success or full coverage; restore it separately after priority PG bodies are moved. A semantic-only successful scan also remains `source_verified=false`, not a global snapshot, final cutover or permission to delete old source/financial evidence.
