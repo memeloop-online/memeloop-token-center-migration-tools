@@ -101,6 +101,19 @@ impl OnlinePlan {
         Ok(Self { shards, shard })
     }
 
+    async fn verify_ownership_batches(self, pool: &PgPool, cursors: &[String]) -> Result<()> {
+        for chunk in cursors.chunks(1024) {
+            let all_owned: bool = sqlx::query_scalar(
+                "SELECT COALESCE(bool_and((('x' || substr(md5(value), 1, 8))::bit(32)::bigint % $2) = $3), true) FROM unnest($1::text[]) AS c(value)"
+            ).bind(chunk).bind(i64::from(self.shards)).bind(i64::from(self.shard))
+                .fetch_one(pool).await?;
+            if !all_owned {
+                return Err("receipt belongs to a different online shard".into());
+            }
+        }
+        Ok(())
+    }
+
     async fn owns(self, pool: &PgPool, cursor: &Cursor) -> Result<bool> {
         Ok(sqlx::query_scalar::<_, i64>(
             "SELECT (('x' || substr(md5($1 || ':' || $2), 1, 8))::bit(32)::bigint % $3)",
@@ -292,6 +305,7 @@ impl Runner {
             None
         };
         let mut historical_versions = 0_u64;
+        let mut committed_cursors = Vec::new();
         let mut known =
             std::collections::HashMap::<(String, String, SourceField), Vec<PayloadReceipt>>::new();
         for entry in std::fs::read_dir(&ledger)? {
@@ -303,15 +317,20 @@ impl Runner {
                 continue;
             }
             let (receipt, encoded, digest) = self.read_online_receipt(&path)?;
-            if !plan.owns(&self.pool, &receipt.cursor).await? {
-                return Err("receipt belongs to a different online shard".into());
-            }
             if extension == "pending" {
+                if !plan.owns(&self.pool, &receipt.cursor).await? {
+                    return Err("receipt belongs to a different online shard".into());
+                }
                 self.publish_online_payload_receipt(&receipt, &encoded, &digest, true)
                     .await?;
             } else {
-                self.verify_committed_payload_receipt(&encoded, &digest)
-                    .await?;
+                // Local canonical digest and identity were checked above. Do not
+                // remotely recheck stale historical versions. Reuse still requires
+                // a fresh source proof and exact immutable receipt readback below.
+                committed_cursors.push(format!(
+                    "{}:{}",
+                    receipt.cursor.tenant_id, receipt.cursor.content_hash
+                ));
             }
             if extension == "pending" {
                 std::fs::rename(&path, ledger.join(format!("{digest}.json")))?;
@@ -326,7 +345,19 @@ impl Runner {
                 .or_default()
                 .push(receipt);
             historical_versions += 1;
+            if historical_versions % 4096 == 0 {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"event":"online_resume_metadata_loaded", "receipt_records":historical_versions})
+                );
+            }
         }
+        plan.verify_ownership_batches(&self.pool, &committed_cursors)
+            .await?;
+        eprintln!(
+            "{}",
+            serde_json::json!({"event":"online_resume_metadata_ready", "receipt_records":historical_versions, "pending_requires_full_verification":true})
+        );
         let mut reused = 0_u64;
         let mut rows = 0_u64;
         let mut bytes = 0_u64;
@@ -417,6 +448,12 @@ impl Runner {
                 }
                 rows += 1;
                 bytes += receipt.reference.conversation_body_v1.size_bytes;
+                if rows == 1 || rows % 128 == 0 {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"event":"online_source_progress", "rows_observed":rows, "versions_reused_without_upload":reused, "bytes_observed":bytes, "external_semantic_references_retained":external_semantic_references})
+                    );
+                }
             }
         }
         Ok(serde_json::json!({
@@ -432,6 +469,8 @@ impl Runner {
             "fields_disappeared_before_snapshot": disappeared_fields,
             "external_semantic_references_retained": external_semantic_references,
             "historical_versions_rechecked": historical_versions,
+            "committed_remote_checks_deferred_to_source_match": true,
+            "historical_receipt_metadata_loaded": historical_versions,
             "requires_quiesced_final_copy_and_verification": true
         }))
     }

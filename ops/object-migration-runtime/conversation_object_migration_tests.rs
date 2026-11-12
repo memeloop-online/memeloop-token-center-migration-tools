@@ -365,6 +365,17 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
         original_names, imported_names,
         "no historical version omitted"
     );
+    // A forged placement remains invalid even when remote checks are deferred.
+    let (owner, misplaced) = partition_runners.iter().enumerate().find_map(|(index, runner)| {
+        std::fs::read_dir(runner.checkpoint.with_extension("online-payload-receipts")).unwrap()
+            .find_map(|entry| { let path = entry.unwrap().path(); (path.extension().is_some_and(|e| e == "json")).then_some((index, path)) })
+    }).expect("at least one imported committed receipt");
+    let wrong = (owner + 1) % partition_runners.len();
+    let wrong_path = partition_runners[wrong].checkpoint.with_extension("online-payload-receipts").join(misplaced.file_name().unwrap());
+    std::fs::copy(&misplaced, &wrong_path).unwrap();
+    assert!(partition_runners[wrong].copy_payloads_online_partition(payloads::OnlinePlan::new(4, wrong as i32).unwrap(), None).await.is_err());
+    std::fs::remove_file(wrong_path).unwrap();
+
     assert!(
         partition_runners[0]
             .copy_payloads_online_partition(payloads::OnlinePlan::new(3, 0).unwrap(), None)
@@ -399,6 +410,23 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
     .execute(&pool)
     .await
     .unwrap();
+
+    // An obsolete version need not be fetched remotely on every startup, but
+    // a version matching the current source may never bypass its remote proof.
+    let receipt_files: Vec<_> = std::fs::read_dir(&ledger).unwrap().map(|entry| entry.unwrap().path()).filter(|p| p.extension().is_some_and(|e| e == "json")).collect();
+    for (request, should_succeed) in [("!online-before-cursor", true), (payload_request.as_str(), false)] {
+        let path = receipt_files.iter().find(|path| {
+            let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            value["field"] == "semantic_payload" && value["cursor"]["content_hash"] == request
+        }).unwrap();
+        let encoded = std::fs::read(path).unwrap();
+        let digest = path.file_stem().unwrap().to_str().unwrap();
+        let remote = format!("migration-receipts/conversation-v1/{}/online-payloads/{digest}.json", runner.identity);
+        runner.target.delete(&remote).await.unwrap();
+        let outcome = runner.copy_payloads_online().await;
+        assert_eq!(outcome.is_ok(), should_succeed);
+        runner.target.put(&remote, Bytes::from(encoded)).await.unwrap();
+    }
 
     // The same bigint key fences the released serial tool and all new shards.
     let mut serial = pool.acquire().await.unwrap();
