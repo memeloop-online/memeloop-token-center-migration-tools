@@ -306,13 +306,13 @@ impl Runner {
             if !plan.owns(&self.pool, &receipt.cursor).await? {
                 return Err("receipt belongs to a different online shard".into());
             }
-            self.publish_online_payload_receipt(
-                &receipt,
-                &encoded,
-                &digest,
-                extension == "pending",
-            )
-            .await?;
+            if extension == "pending" {
+                self.publish_online_payload_receipt(&receipt, &encoded, &digest, true)
+                    .await?;
+            } else {
+                self.verify_committed_payload_receipt(&encoded, &digest)
+                    .await?;
+            }
             if extension == "pending" {
                 std::fs::rename(&path, ledger.join(format!("{digest}.json")))?;
                 std::fs::File::open(&ledger)?.sync_all()?;
@@ -397,7 +397,7 @@ impl Runner {
                 // crash is recovered even if the source changes or disappears.
                 let committed = ledger.join(format!("{digest}.json"));
                 if committed.exists() {
-                    self.publish_online_payload_receipt(&receipt, &encoded, &digest, false)
+                    self.verify_committed_payload_receipt(&encoded, &digest)
                         .await?;
                 } else {
                     let pending = ledger.join(format!("{digest}.pending"));
@@ -442,6 +442,21 @@ impl Runner {
             return Err("online payload receipt identity mismatch".into());
         }
         Ok((receipt, encoded, digest))
+    }
+
+    // A committed local record is accepted only against its immutable remote
+    // receipt. Its filename digest and target/source identity were checked by
+    // read_online_receipt; current source reuse still requires the fresh source
+    // snapshot comparison below. Do not download historical bodies on resume.
+    async fn verify_committed_payload_receipt(&self, encoded: &[u8], digest: &str) -> Result<()> {
+        let key = format!(
+            "migration-receipts/conversation-v1/{}/online-payloads/{digest}.json",
+            self.identity
+        );
+        if self.target.get_bounded(&key, 16384).await?.as_ref() != encoded {
+            return Err("committed online payload receipt mismatch".into());
+        }
+        Ok(())
     }
 
     async fn publish_online_payload_receipt(

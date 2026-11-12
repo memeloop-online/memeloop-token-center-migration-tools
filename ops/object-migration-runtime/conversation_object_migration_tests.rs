@@ -450,12 +450,11 @@ async fn copy_resume_verify_and_test_cutover_preserve_exact_large_unicode_body()
     );
     first.close().await.unwrap();
     second.close().await.unwrap();
-    assert!(
-        sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock(70720261029)")
-            .fetch_one(&mut *serial)
-            .await
-            .unwrap()
-    );
+    // Close sends Terminate; server-side session cleanup may complete later.
+    // Retain the release contract with a bounded wait rather than a race.
+    sqlx::query("SET lock_timeout = '2s'").execute(&mut *serial).await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock(70720261029)").execute(&mut *serial).await.unwrap();
+    sqlx::query("SET lock_timeout = 0").execute(&mut *serial).await.unwrap();
     serial.close().await.unwrap();
 
     let receipt: serde_json::Value = serde_json::from_reader(std::fs::File::open(&receipt_path).unwrap()).unwrap();
