@@ -12,7 +12,6 @@ struct ObjectIdentity {
     algorithm: String,
     digest: String,
     bytes: u64,
-    chars: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -121,7 +120,7 @@ impl Runner {
             .checkpoint
             .with_extension("semantic-readback-progress.json");
         let mut progress = match std::fs::File::open(&progress_path) {
-            Ok(file) => serde_json::from_reader::<ReadbackProgress>(file)?,
+            Ok(file) => serde_json::from_reader::<_, ReadbackProgress>(file)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => ReadbackProgress {
                 format_version: 1,
                 identity: self.identity.clone(),
@@ -226,7 +225,6 @@ impl Runner {
                     algorithm: "blake3".into(),
                     digest: object.blake3_digest.clone(),
                     bytes: object.size_bytes,
-                    chars: receipt.reference.chars,
                 };
                 if progress.after.as_ref().is_none_or(|after| &key > after) {
                     groups.entry(key).or_default().push(Candidate {
@@ -340,11 +338,16 @@ impl Runner {
             }
         }
         if bytes != object.bytes
-            || chars != object.chars
             || !tail.is_empty()
             || body_digest.finalize().to_hex().as_str() != object.digest
         {
             return Err("readback object digest/bytes/characters mismatch".into());
+        }
+        if members
+            .iter()
+            .any(|member| member.candidate.receipt.reference.chars != chars)
+        {
+            return Err("readback object character count mismatch".into());
         }
         // Any member's digest failure invalidates the complete object group.
         if members.iter().any(|member| {
