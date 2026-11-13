@@ -1270,7 +1270,8 @@ async fn run(args: Args) -> Result<()> {
         | Phase::VerifyAll
         | Phase::SemanticPayloadReferences
         | Phase::SemanticReferenceReadback
-        | Phase::RawRequestReference => {
+        | Phase::RawRequestReference
+        | Phase::CopyRawRequestTarget => {
             unreachable!()
         }
     };
