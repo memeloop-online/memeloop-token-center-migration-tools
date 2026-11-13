@@ -15,6 +15,8 @@ pub(super) struct RawRequestPlan {
     target_locator: String,
     #[serde(default, skip_serializing_if = "is_false")]
     allow_pending: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    allow_bound_source: bool,
 }
 fn is_false(value: &bool) -> bool {
     !value
@@ -67,6 +69,81 @@ struct RequestVersion {
     request_object: String,
 }
 
+// The operational source owner is separate from the immutable financial receipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoundSourceVersion {
+    request_id: String,
+    tenant_id: String,
+    reservation_id: String,
+    state: String,
+    bound_locator: String,
+    body_byte_count: i64,
+    body_blake3: String,
+    chunk_count: i64,
+    cipher_bytes: i64,
+    updated_at: i64,
+}
+async fn bound_source<'e, E: sqlx::Executor<'e, Database = sqlx::Postgres>>(
+    executor: E,
+    plan: &RawRequestPlan,
+    lock: bool,
+) -> Result<Option<BoundSourceVersion>> {
+    let suffix = if lock { " FOR UPDATE" } else { "" };
+    let sql = format!(
+        "SELECT request_id,tenant_id,reservation_id,state,bound_locator,body_byte_count,body_blake3,chunk_count,cipher_bytes,updated_at FROM request_archive_spools WHERE request_id=$1 AND tenant_id=$2{suffix}"
+    );
+    let record = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(plan.request_id.to_string())
+        .bind(plan.tenant_id.to_string())
+        .fetch_optional(executor)
+        .await?;
+    record
+        .map(|r| {
+            Ok(BoundSourceVersion {
+                request_id: r.try_get("request_id")?,
+                tenant_id: r.try_get("tenant_id")?,
+                reservation_id: r.try_get("reservation_id")?,
+                state: r.try_get("state")?,
+                bound_locator: r.try_get("bound_locator")?,
+                body_byte_count: r.try_get("body_byte_count")?,
+                body_blake3: r.try_get("body_blake3")?,
+                chunk_count: r.try_get("chunk_count")?,
+                cipher_bytes: r.try_get("cipher_bytes")?,
+                updated_at: r.try_get("updated_at")?,
+            })
+        })
+        .transpose()
+}
+fn bound_matches_committed(current: &BoundSourceVersion, proof: &RawProof) -> bool {
+    proof.bound_source.as_ref().is_some_and(|original| {
+        let mut expected = original.clone();
+        expected.bound_locator = proof.target.object_locator.clone();
+        *current == expected
+    })
+}
+fn valid_bound_source(
+    source: &RequestVersion,
+    spool: &BoundSourceVersion,
+    original: &CasArchiveObject,
+) -> bool {
+    spool.request_id == source.request_id
+        && spool.tenant_id == source.tenant_id
+        && spool.reservation_id == source.reservation_id
+        && spool.state == "bound"
+        && spool.bound_locator == source.request_object
+        && spool.chunk_count == 0
+        && spool.cipher_bytes == 0
+        && spool.body_byte_count >= 0
+        && spool.body_byte_count as u64 == original.size_bytes
+        && spool.body_blake3 == original.blake3_digest
+        && source.request_object
+            == format!(
+                "staging/proxy/{}/request/{}/body.json",
+                source.request_id, source.request_id
+            )
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawProof {
@@ -79,6 +156,8 @@ struct RawProof {
     root_etag: Option<String>,
     root_version: Option<String>,
     target: CasArchiveObject,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bound_source: Option<BoundSourceVersion>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -468,8 +547,11 @@ impl Runner {
             Err(e) => return Err(e.into()),
         };
         let mut audit = if let Some(audit) = stored {
-            if !matches!(audit.proof.format_version, 1 | 2)
-                || (audit.proof.format_version == 2) != audit.proof.source.completed_at.is_none()
+            if !matches!(audit.proof.format_version, 1 | 2 | 3 | 4)
+                || (matches!(audit.proof.format_version, 2 | 4))
+                    != audit.proof.source.completed_at.is_none()
+                || (audit.proof.format_version >= 3) != audit.proof.bound_source.is_some()
+                || (audit.proof.bound_source.is_some() && !plan.allow_bound_source)
                 || (audit.proof.source.completed_at.is_none() && !plan.allow_pending)
                 || audit.proof.identity != self.identity
                 || audit.proof.training_identity != training
@@ -490,7 +572,19 @@ impl Runner {
                 return Err("conditional raw root version required".into());
             }
             let original: CasArchiveObject = serde_json::from_slice(&encoded)?;
-            if original.object_locator != source.request_object
+            let bound =
+                if original.object_locator != source.request_object && plan.allow_bound_source {
+                    let spool = bound_source(&self.pool, &plan, false)
+                        .await?
+                        .ok_or("bound source owner missing")?;
+                    if !valid_bound_source(&source, &spool, &original) {
+                        return Err("bound source identity/digest/length mismatch".into());
+                    }
+                    Some(spool)
+                } else {
+                    None
+                };
+            if (original.object_locator != source.request_object && bound.is_none())
                 || !original
                     .object_locator
                     .starts_with(&format!("tenants/{}/cas/v1/blake3/", plan.tenant_id))
@@ -501,7 +595,12 @@ impl Runner {
             target.object_locator = plan.target_locator.clone();
             RawAudit {
                 proof: RawProof {
-                    format_version: if source.completed_at.is_none() { 2 } else { 1 },
+                    format_version: match (bound.is_some(), source.completed_at.is_none()) {
+                        (false, false) => 1,
+                        (false, true) => 2,
+                        (true, false) => 3,
+                        (true, true) => 4,
+                    },
                     identity: self.identity.clone(),
                     training_identity: training,
                     source_store_identity: source_identity,
@@ -510,6 +609,7 @@ impl Runner {
                     root_etag: etag,
                     root_version: version,
                     target,
+                    bound_source: bound,
                 },
                 status: "prepared".into(),
             }
@@ -531,7 +631,12 @@ impl Runner {
         );
         if (original.object_locator != canonical
             && original.object_locator != format!("{canonical}.mtcz1"))
-            || original.object_locator != audit.proof.source.request_object
+            || (original.object_locator != audit.proof.source.request_object
+                && !audit
+                    .proof
+                    .bound_source
+                    .as_ref()
+                    .is_some_and(|spool| valid_bound_source(&audit.proof.source, spool, &original)))
             || original.blake3_digest != audit.proof.target.blake3_digest
             || original.size_bytes != audit.proof.target.size_bytes
         {
@@ -543,6 +648,16 @@ impl Runner {
         bare.object_locator = target_key.to_owned();
         if bare.object_locator != canonical && bare.object_locator != format!("{canonical}.mtcz1") {
             return Err("raw target must preserve the canonical tenant/digest key".into());
+        }
+        if audit.proof.bound_source.is_some() {
+            // The bridge is justified by the original raw CAS stream, not a
+            // staging locator or metadata assertion. It never changes money/ACK.
+            self.source
+                .as_ref()
+                .ok_or("raw source store required")?
+                .verify_tenant_content(plan.tenant_id, &original)
+                .await
+                .map_err(|e| at_stage("raw_bound_source_stream", e))?;
         }
         let copy_target = matches!(action, RawAction::CopyTarget);
         let mut uploaded = false;
@@ -575,12 +690,21 @@ impl Runner {
             let source_matches = row(&self.pool, &plan, false)
                 .await?
                 .is_some_and(|r| r == audit.proof.source || matches_committed(&r, &audit.proof));
+            let bound_matches = if let Some(expected) = &audit.proof.bound_source {
+                bound_source(&self.pool, &plan, false)
+                    .await?
+                    .is_some_and(|spool| {
+                        spool == *expected || bound_matches_committed(&spool, &audit.proof)
+                    })
+            } else {
+                true
+            };
             if !copy_target {
                 return Ok(
-                    serde_json::json!({"mode":"raw_request_reference_dry_run","request_id":plan.request_id,"eligible":root_matches && source_matches,"source_deleted":false,"gc_authorized":false}),
+                    serde_json::json!({"mode":"raw_request_reference_dry_run","request_id":plan.request_id,"eligible":root_matches && source_matches && bound_matches,"source_deleted":false,"gc_authorized":false}),
                 );
             }
-            if !root_matches || !source_matches {
+            if !root_matches || !source_matches || !bound_matches {
                 return Err("raw source changed during target copy; source retained".into());
             }
         }
@@ -674,13 +798,22 @@ impl Runner {
             save_checkpoint(&audit_path, &audit)?;
             return Ok(report(&audit));
         };
-        if matches_committed(&current, &audit.proof) {
+        let spool = if audit.proof.bound_source.is_some() {
+            bound_source(&mut *tx, &plan, true).await?
+        } else {
+            None
+        };
+        let spool_committed = audit.proof.bound_source.is_none()
+            || spool
+                .as_ref()
+                .is_some_and(|r| bound_matches_committed(r, &audit.proof));
+        if matches_committed(&current, &audit.proof) && spool_committed {
             tx.rollback().await?;
             audit.status = "committed_confirmed_by_reread".into();
             save_checkpoint(&audit_path, &audit)?;
             return Ok(report(&audit));
         }
-        if current != audit.proof.source {
+        if current != audit.proof.source || spool.as_ref() != audit.proof.bound_source.as_ref() {
             tx.rollback().await?;
             audit.status = "row_changed_after_root".into();
             save_checkpoint(&audit_path, &audit)?;
@@ -691,13 +824,34 @@ impl Runner {
         if changed.rows_affected() != 1 {
             return Err("locked raw source row changed".into());
         }
+        if audit.proof.bound_source.is_some() {
+            let changed = sqlx::query("UPDATE request_archive_spools SET bound_locator=$1 WHERE request_id=$2 AND tenant_id=$3 AND reservation_id=$4 AND bound_locator=$5")
+                .bind(&audit.proof.target.object_locator).bind(&current.request_id)
+                .bind(&current.tenant_id).bind(&current.reservation_id).bind(&current.request_object)
+                .execute(&mut *tx).await?;
+            if changed.rows_affected() != 1 {
+                return Err("locked bound source changed".into());
+            }
+        }
         match tx.commit().await {
             Ok(()) => audit.status = "committed".into(),
             Err(error) => {
-                if row(&self.pool, &plan, false)
-                    .await?
-                    .is_some_and(|r| matches_committed(&r, &audit.proof))
-                {
+                // New transaction on the pool: lock both operational owners
+                // before accepting commit-unknown. A half-match is not success.
+                let mut check = self.pool.begin().await?;
+                let request = row(&mut *check, &plan, true).await?;
+                let spool = if audit.proof.bound_source.is_some() {
+                    bound_source(&mut *check, &plan, true).await?
+                } else {
+                    None
+                };
+                let committed = request.is_some_and(|r| matches_committed(&r, &audit.proof))
+                    && (audit.proof.bound_source.is_none()
+                        || spool
+                            .as_ref()
+                            .is_some_and(|r| bound_matches_committed(r, &audit.proof)));
+                check.rollback().await?;
+                if committed {
                     audit.status = "committed_confirmed_by_reread".into();
                 } else {
                     return Err(error.into());
@@ -815,6 +969,7 @@ mod tests {
             request_id: request,
             target_locator: format!("stores/training/{training}/{}", original.object_locator),
             allow_pending: false,
+            allow_bound_source: false,
         };
         // Copy and pointer mutation are separate operations. This fixture uses
         // an independent memory body source and real RustFS roots/target, while
@@ -1107,6 +1262,194 @@ mod tests {
             );
             assert_eq!(
                 pending_runner
+                    .source
+                    .as_ref()
+                    .unwrap()
+                    .get_tenant_content(tenant, &original, body.len())
+                    .await
+                    .unwrap(),
+                body
+            );
+        }
+        // A legacy bound spool is an operational owner, not a financial ACK.
+        // The root CAS stream must bridge its digest/length before both pointers
+        // may move. A changed spool version rolls back the request update too.
+        sqlx::raw_sql("CREATE TABLE request_archive_spools(request_id TEXT PRIMARY KEY,tenant_id TEXT NOT NULL,reservation_id TEXT NOT NULL,state TEXT NOT NULL,bound_locator TEXT NOT NULL,body_byte_count BIGINT NOT NULL,body_blake3 TEXT NOT NULL,chunk_count BIGINT NOT NULL,cipher_bytes BIGINT NOT NULL,updated_at BIGINT NOT NULL)").execute(&pool).await.unwrap();
+        for mutation in 0..4 {
+            let id = Uuid::now_v7();
+            let stage = format!("staging/proxy/{id}/request/{id}/body.json");
+            let completed = if mutation == 3 { Some(2_i64) } else { None };
+            sqlx::query("INSERT INTO request_records VALUES($1,$2,'key','reservation',1,$3,$4)")
+                .bind(id.to_string())
+                .bind(tenant.to_string())
+                .bind(completed)
+                .bind(&stage)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO request_archive_spools VALUES($1,$2,'reservation','bound',$3,$4,$5,0,0,7)")
+                .bind(id.to_string()).bind(tenant.to_string()).bind(&stage)
+                .bind(body.len() as i64).bind(&original.blake3_digest).execute(&pool).await.unwrap();
+            let path = Path::from(format!("tenants/{tenant}/raw/v1/{id}/request.json"));
+            source_client
+                .put(
+                    &path,
+                    PutPayload::from_bytes(Bytes::from(original_encoded.clone())),
+                )
+                .await
+                .unwrap();
+            let bound_runner = Runner {
+                pool: pool.clone(),
+                source: compressed_runner.source.clone(),
+                target: runner.target.clone(),
+                checkpoint: directory.path().join(format!("bound-{id}.json")),
+                identity: runner.identity.clone(),
+            };
+            let mut bound_plan = RawRequestPlan {
+                request_id: id,
+                allow_pending: false,
+                allow_bound_source: false,
+                ..plan.clone()
+            };
+            assert!(
+                Box::pin(bound_runner.relocate_raw_request_with_clients(
+                    &config,
+                    &source_config,
+                    bound_plan.clone(),
+                    RawAction::CopyTarget,
+                    source_client.clone(),
+                    target_client.clone()
+                ))
+                .await
+                .is_err()
+            );
+            bound_plan.allow_bound_source = true;
+            if completed.is_none() {
+                assert!(
+                    Box::pin(bound_runner.relocate_raw_request_with_clients(
+                        &config,
+                        &source_config,
+                        bound_plan.clone(),
+                        RawAction::CopyTarget,
+                        source_client.clone(),
+                        target_client.clone()
+                    ))
+                    .await
+                    .is_err(),
+                    "bound scope never implicitly enables pending"
+                );
+                bound_plan.allow_pending = true;
+            }
+            Box::pin(bound_runner.relocate_raw_request_with_clients(
+                &config,
+                &source_config,
+                bound_plan.clone(),
+                RawAction::CopyTarget,
+                source_client.clone(),
+                target_client.clone(),
+            ))
+            .await
+            .unwrap();
+            let audit: RawAudit = serde_json::from_reader(
+                std::fs::File::open(
+                    bound_runner
+                        .checkpoint
+                        .with_extension("raw-request-audit.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                audit.proof.format_version,
+                if completed.is_none() { 4 } else { 3 }
+            );
+            let old_spool = bound_source(&pool, &bound_plan, false)
+                .await
+                .unwrap()
+                .unwrap();
+            if mutation == 1 {
+                sqlx::query("UPDATE request_archive_spools SET updated_at=8 WHERE request_id=$1")
+                    .bind(id.to_string())
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            if mutation == 2 {
+                sqlx::query("UPDATE request_archive_spools SET body_blake3=$1 WHERE request_id=$2")
+                    .bind("0".repeat(64))
+                    .bind(id.to_string())
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            let result = Box::pin(bound_runner.relocate_raw_request_with_clients(
+                &config,
+                &source_config,
+                bound_plan.clone(),
+                RawAction::Apply,
+                source_client.clone(),
+                target_client.clone(),
+            ))
+            .await
+            .unwrap();
+            let record = row(&pool, &bound_plan, false).await.unwrap().unwrap();
+            let spool = bound_source(&pool, &bound_plan, false)
+                .await
+                .unwrap()
+                .unwrap();
+            if mutation == 1 || mutation == 2 {
+                assert_eq!(result["status"], "row_changed_after_root");
+                assert_eq!(record.request_object, stage);
+                assert_eq!(spool.bound_locator, stage);
+                let resumed = Box::pin(bound_runner.relocate_raw_request_with_clients(
+                    &config,
+                    &source_config,
+                    bound_plan.clone(),
+                    RawAction::Apply,
+                    source_client.clone(),
+                    target_client.clone(),
+                ))
+                .await
+                .unwrap();
+                assert_eq!(resumed["status"], "row_changed_after_root");
+            } else {
+                assert_eq!(result["status"], "committed");
+                assert_eq!(record.request_object, bound_plan.target_locator);
+                let mut expected = old_spool;
+                expected.bound_locator = bound_plan.target_locator.clone();
+                assert_eq!(
+                    spool, expected,
+                    "no owner/state/financial completion changes"
+                );
+                assert_eq!(record.completed_at, completed);
+                // The original handoff's request ownership fence runs before
+                // staging/spool mutation. Its old-locator callback is a no-op,
+                // not an ACK, after the atomic operational pointer conversion.
+                let callback=sqlx::query("UPDATE request_records SET request_object=request_object WHERE id=$1 AND tenant_id=$2 AND reservation_id='reservation' AND request_object=$3 RETURNING key_id")
+                    .bind(id.to_string()).bind(tenant.to_string()).bind(&stage).fetch_optional(&pool).await.unwrap();
+                assert!(callback.is_none());
+                let resumed = Box::pin(bound_runner.relocate_raw_request_with_clients(
+                    &config,
+                    &source_config,
+                    bound_plan.clone(),
+                    RawAction::Apply,
+                    source_client.clone(),
+                    target_client.clone(),
+                ))
+                .await
+                .unwrap();
+                assert_eq!(resumed["status"], "committed_confirmed_by_reread");
+            }
+            assert_eq!(
+                serde_json::from_slice::<CasArchiveObject>(
+                    &root(source_client.as_ref(), &path).await.unwrap().0
+                )
+                .unwrap()
+                .object_locator,
+                bound_plan.target_locator
+            );
+            assert_eq!(
+                bound_runner
                     .source
                     .as_ref()
                     .unwrap()

@@ -125,3 +125,29 @@ this phase. The existing deployed 885 contract independently covers a pending
 row binding/replaying the effective published training locator after its legacy
 body is unavailable; the new tool contract covers pending relocation and
 concurrent completion/owner changes. Neither grants GC authorization.
+
+### Legacy bound request-source owner
+
+`allow_bound_source: true` opts one request into the legacy bound-source bridge;
+it does not enable `allow_pending`. A pending request needs both flags explicitly.
+The supported source is exactly `staging/proxy/<request>/request/<request>/body.json`
+with a matching bound spool owner, zero chunks/cipher bytes and complete raw-body
+BLAKE3/length. The original raw root must identify a canonical legacy CAS object.
+That object's decoded stream is fully verified; staging metadata alone is not body
+proof. Target Create/reuse retains the existing complete digest/readback contract.
+
+Proof versions 3 (completed) and 4 (pending) carry the exact bound spool snapshot.
+Old versions 1/2 and default plans retain their encoding. After conditional root
+update, one short transaction locks request then spool and compares both versions;
+only their operational locators move together. Financial receipts, settlement,
+claim state and staging leases are untouched. A late source callback with the old
+locator fails its original request ownership predicate; it is not acknowledged.
+An unknown commit is accepted only after both owners are re-read under locks in a
+new transaction and match the expected target plus original owner/hash/version.
+Conflicts retain the relocated root and original SQL/source for reconciliation.
+
+An unprojected request remains protected by the product's existing staging reaper
+contract at that observation time. This is not a future lease or a deletion
+permit: natural projection and reaper release continue under the existing product
+contract. Neither this bridge nor its proof authorizes migration GC or financial
+ACK. The old raw CAS body and immutable original receipts remain retained.
