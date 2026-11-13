@@ -104,3 +104,24 @@ Source-streamed does not measure newly created physical CAS objects: immutable
 promotion may reuse a concurrently created object. Completed batch cursors are
 execution receipts, not fresh readability, source-release or GC authorization.
 No batch operation deletes source bodies or migrates the legacy root namespace.
+
+## Pending request references
+
+A plan may explicitly set `allow_pending: true` for a fully captured raw request
+whose existing canonical CAS root matches the current SQL locator. The default
+still selects completed requests. Omitted/false serializes exactly as the old
+plan, preserving existing batch identities. This option changes migration
+scope only; it never changes financial pending state, owners, claims or ACKs.
+
+Pending proof receipts use format 2 with `completed_at: null`; completed format 1
+receipts retain their original numeric encoding and remain readable. Old receipt
+objects are never rewritten. The final locked full-row comparison is NULL-safe:
+completion or owner changes after the proof reject SQL relocation. If the root
+has already moved, the audit records `row_changed_after_root`; resume retains the
+new root and both bodies rather than rolling it back over a publisher. Such an
+execution result is not a committed SQL relocation or source-release proof.
+Legacy staging locators and roots that do not match the SQL CAS remain outside
+this phase. The existing deployed 885 contract independently covers a pending
+row binding/replaying the effective published training locator after its legacy
+body is unavailable; the new tool contract covers pending relocation and
+concurrent completion/owner changes. Neither grants GC authorization.
