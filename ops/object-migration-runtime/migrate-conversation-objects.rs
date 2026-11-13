@@ -114,6 +114,7 @@ enum Phase {
     SemanticPayloadReferences,
     SemanticReferenceReadback,
     RawRequestReference,
+    CopyRawRequestTarget,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -960,7 +961,14 @@ async fn run(args: Args) -> Result<()> {
     if args.online_field.is_some() && !args.online_copy {
         return Err("--online-field requires --online-copy".into());
     }
-    let raw_reference = args.phase == Phase::RawRequestReference;
+    let raw_copy = args.phase == Phase::CopyRawRequestTarget;
+    let raw_reference = matches!(
+        args.phase,
+        Phase::RawRequestReference | Phase::CopyRawRequestTarget
+    );
+    if raw_copy && args.apply_references {
+        return Err("copy-raw-request-target cannot apply references".into());
+    }
     if raw_reference != args.raw_reference_plan.is_some() {
         return Err("raw-request-reference requires its dedicated raw-reference-plan".into());
     }
@@ -1096,9 +1104,13 @@ async fn run(args: Args) -> Result<()> {
                 .as_ref()
                 .ok_or("raw reference plan missing")?,
         )?)?;
-        let result = runner
-            .relocate_raw_request(&config, plan, args.apply_references)
-            .await;
+        let result = if raw_copy {
+            runner.copy_raw_request_target(&config, plan).await
+        } else {
+            runner
+                .relocate_raw_request(&config, plan, args.apply_references)
+                .await
+        };
         advisory.close().await?;
         println!("{}", serde_json::to_string(&result?)?);
         return Ok(());
@@ -1258,7 +1270,8 @@ async fn run(args: Args) -> Result<()> {
         | Phase::VerifyAll
         | Phase::SemanticPayloadReferences
         | Phase::SemanticReferenceReadback
-        | Phase::RawRequestReference => {
+        | Phase::RawRequestReference
+        | Phase::CopyRawRequestTarget => {
             unreachable!()
         }
     };
