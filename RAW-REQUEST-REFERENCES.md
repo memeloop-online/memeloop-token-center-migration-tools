@@ -151,3 +151,30 @@ contract at that observation time. This is not a future lease or a deletion
 permit: natural projection and reaper release continue under the existing product
 contract. Neither this bridge nor its proof authorizes migration GC or financial
 ACK. The old raw CAS body and immutable original receipts remain retained.
+
+### Completed response roots
+
+A plan with `"side":"response"` uses the same copy-target and conditional-apply
+phases for `response.json` and `request_records.response_object`. The side is a
+closed enum selecting fixed SQL identifiers. Omitted side retains request behavior
+and the exact old plan/proof encoding. Response proof version 5 requires completed
+state and no bound-source bridge; `allow_pending` and `allow_bound_source` are
+rejected for this scope. Pending financial responses require the separate verified
+operational resolution mapping, without altering their original receipts/digests.
+
+Both sides may appear in one ordered batch, with separate per-side audit paths;
+request audit filenames stay unchanged. Source reload, locked version comparison,
+conditional update and commit-unknown re-read all use the selected side. Root
+IfMatch, complete raw-body hash/length readback and immutable target Create/reuse
+remain mandatory. Response migration does not change the request body reference.
+The deployed late finish only updates incomplete records; response bind/spool
+handoffs are restricted to gap/null/empty or the exact effective reference. A
+concurrent different response is preserved as a conflict, including after the
+root has moved; it is never overwritten on retry.
+
+Existing response spool/financial receipt references are not rewritten by this
+phase. Old roots and bodies remain until their separate ownership/reference
+closure; neither a completed response migration nor a row proof permits GC.
+Bound-source copy reports count its required original-source readback as a source
+stream even when the immutable target is reused. A target miss uses the copy
+engine's already verified source stream, avoiding a second identical source GET.

@@ -7,6 +7,31 @@ use object_store::{
 };
 use std::sync::Arc;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RawSide {
+    #[default]
+    Request,
+    Response,
+}
+impl RawSide {
+    fn is_request(&self) -> bool {
+        *self == Self::Request
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Response => "response",
+        }
+    }
+    fn column(self) -> &'static str {
+        match self {
+            Self::Request => "request_object",
+            Self::Response => "response_object",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RawRequestPlan {
@@ -17,6 +42,8 @@ pub(super) struct RawRequestPlan {
     allow_pending: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     allow_bound_source: bool,
+    #[serde(default, skip_serializing_if = "RawSide::is_request")]
+    side: RawSide,
 }
 fn is_false(value: &bool) -> bool {
     !value
@@ -50,7 +77,7 @@ fn validate_batch(plan: &RawBatchPlan) -> Result<()> {
     }
     let mut seen = std::collections::HashSet::new();
     for request in &plan.requests {
-        if !seen.insert((request.tenant_id, request.request_id)) {
+        if !seen.insert((request.tenant_id, request.request_id, request.side)) {
             return Err("duplicate raw batch request identity".into());
         }
     }
@@ -158,6 +185,8 @@ struct RawProof {
     target: CasArchiveObject,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     bound_source: Option<BoundSourceVersion>,
+    #[serde(default, skip_serializing_if = "RawSide::is_request")]
+    side: RawSide,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -179,8 +208,11 @@ async fn row<'e, E: sqlx::Executor<'e, Database = sqlx::Postgres>>(
     lock: bool,
 ) -> Result<Option<RequestVersion>> {
     let suffix = if lock { " FOR UPDATE" } else { "" };
+    let column = plan.side.column();
+    // Only a closed enum selects a SQL identifier. The serialized source field
+    // name stays request_object for byte-compatible versions 1--4.
     let sql = format!(
-        "SELECT tenant_id,id,key_id,reservation_id,created_at,completed_at,request_object FROM request_records WHERE tenant_id=$1 AND id=$2 AND (completed_at IS NOT NULL OR $3){suffix}"
+        "SELECT tenant_id,id,key_id,reservation_id,created_at,completed_at,{column} AS request_object FROM request_records WHERE tenant_id=$1 AND id=$2 AND (completed_at IS NOT NULL OR $3){suffix}"
     );
     let r = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(plan.tenant_id.to_string())
@@ -245,7 +277,7 @@ fn matches_committed(current: &RequestVersion, proof: &RawProof) -> bool {
     *current == committed
 }
 fn report(audit: &RawAudit) -> serde_json::Value {
-    serde_json::json!({"mode":"raw_request_reference","request_id":audit.proof.source.request_id,"status":audit.status,"body_bytes":audit.proof.target.size_bytes,"source_deleted":false,"gc_authorized":false,"global_verified":false})
+    serde_json::json!({"mode":"raw_request_reference","request_id":audit.proof.source.request_id,"side":audit.proof.side.name(),"status":audit.status,"body_bytes":audit.proof.target.size_bytes,"source_deleted":false,"gc_authorized":false,"global_verified":false})
 }
 
 impl Runner {
@@ -340,8 +372,11 @@ impl Runner {
                 pool: self.pool.clone(),
                 source: self.source.clone(),
                 target: self.target.clone(),
-                checkpoint: directory
-                    .join(format!("{}-{}.json", request.tenant_id, request.request_id)),
+                checkpoint: directory.join(if request.side.is_request() {
+                    format!("{}-{}.json", request.tenant_id, request.request_id)
+                } else {
+                    format!("{}-{}-response.json", request.tenant_id, request.request_id)
+                }),
                 identity: self.identity.clone(),
             };
             let result = Box::pin(child.relocate_raw_request_with_clients(
@@ -504,6 +539,11 @@ impl Runner {
         source_client: Arc<dyn ObjectStore>,
         target_client: Arc<dyn ObjectStore>,
     ) -> Result<serde_json::Value> {
+        if plan.side == RawSide::Response && (plan.allow_pending || plan.allow_bound_source) {
+            return Err(
+                "response migration requires completed scope without a bound-source bridge".into(),
+            );
+        }
         if config.archive_backend != memeloop_token_center::config::ArchiveBackend::S3 {
             return Err("raw references require the configured S3 target".into());
         }
@@ -537,8 +577,10 @@ impl Runner {
         .to_hex()
         .to_string();
         let root_path = Path::from(format!(
-            "tenants/{}/raw/v1/{}/request.json",
-            plan.tenant_id, plan.request_id
+            "tenants/{}/raw/v1/{}/{}.json",
+            plan.tenant_id,
+            plan.request_id,
+            plan.side.name()
         ));
         let audit_path = self.checkpoint.with_extension("raw-request-audit.json");
         let stored = match std::fs::File::open(&audit_path) {
@@ -547,10 +589,19 @@ impl Runner {
             Err(e) => return Err(e.into()),
         };
         let mut audit = if let Some(audit) = stored {
-            if !matches!(audit.proof.format_version, 1 | 2 | 3 | 4)
-                || (matches!(audit.proof.format_version, 2 | 4))
-                    != audit.proof.source.completed_at.is_none()
-                || (audit.proof.format_version >= 3) != audit.proof.bound_source.is_some()
+            if !matches!(
+                (
+                    audit.proof.format_version,
+                    audit.proof.side,
+                    audit.proof.source.completed_at.is_none(),
+                    audit.proof.bound_source.is_some()
+                ),
+                (1, RawSide::Request, false, false)
+                    | (2, RawSide::Request, true, false)
+                    | (3, RawSide::Request, false, true)
+                    | (4, RawSide::Request, true, true)
+                    | (5, RawSide::Response, false, false)
+            ) || audit.proof.side != plan.side
                 || (audit.proof.bound_source.is_some() && !plan.allow_bound_source)
                 || (audit.proof.source.completed_at.is_none() && !plan.allow_pending)
                 || audit.proof.identity != self.identity
@@ -595,11 +646,15 @@ impl Runner {
             target.object_locator = plan.target_locator.clone();
             RawAudit {
                 proof: RawProof {
-                    format_version: match (bound.is_some(), source.completed_at.is_none()) {
-                        (false, false) => 1,
-                        (false, true) => 2,
-                        (true, false) => 3,
-                        (true, true) => 4,
+                    format_version: if plan.side == RawSide::Response {
+                        5
+                    } else {
+                        match (bound.is_some(), source.completed_at.is_none()) {
+                            (false, false) => 1,
+                            (false, true) => 2,
+                            (true, false) => 3,
+                            (true, true) => 4,
+                        }
                     },
                     identity: self.identity.clone(),
                     training_identity: training,
@@ -610,6 +665,7 @@ impl Runner {
                     root_version: version,
                     target,
                     bound_source: bound,
+                    side: plan.side,
                 },
                 status: "prepared".into(),
             }
@@ -649,16 +705,6 @@ impl Runner {
         if bare.object_locator != canonical && bare.object_locator != format!("{canonical}.mtcz1") {
             return Err("raw target must preserve the canonical tenant/digest key".into());
         }
-        if audit.proof.bound_source.is_some() {
-            // The bridge is justified by the original raw CAS stream, not a
-            // staging locator or metadata assertion. It never changes money/ACK.
-            self.source
-                .as_ref()
-                .ok_or("raw source store required")?
-                .verify_tenant_content(plan.tenant_id, &original)
-                .await
-                .map_err(|e| at_stage("raw_bound_source_stream", e))?;
-        }
         let copy_target = matches!(action, RawAction::CopyTarget);
         let mut uploaded = false;
         if copy_target {
@@ -671,6 +717,16 @@ impl Runner {
                 }
                 Err(error) => return Err(at_stage("raw_target_head", error)),
             }
+        }
+        if audit.proof.bound_source.is_some() && !uploaded {
+            // The bridge is justified by the original raw CAS stream, not a
+            // staging locator or metadata assertion. It never changes money/ACK.
+            self.source
+                .as_ref()
+                .ok_or("raw source store required")?
+                .verify_tenant_content(plan.tenant_id, &original)
+                .await
+                .map_err(|e| at_stage("raw_bound_source_stream", e))?;
         }
         // New CAS promotion already performs complete target readback. An
         // existing target is streamed and verified, never trusted from HEAD.
@@ -748,7 +804,7 @@ impl Runner {
             return Ok(serde_json::json!({
                 "mode":"copy_raw_request_target","request_id":plan.request_id,
                 "status":audit.status,"body_bytes":bare.size_bytes,
-                "source_streamed":uploaded,"target_reused":!uploaded,
+                "source_streamed":uploaded || audit.proof.bound_source.is_some(),"target_reused":!uploaded,
                 "target_cas_creation_measured":false,"raw_body_verified":true,
                 "source_writers_quiesced":false,
                 "root_changed":false,"sql_changed":false,
@@ -819,8 +875,17 @@ impl Runner {
             save_checkpoint(&audit_path, &audit)?;
             return Ok(report(&audit));
         }
-        let changed=sqlx::query("UPDATE request_records SET request_object=$1 WHERE tenant_id=$2 AND id=$3 AND request_object=$4")
-            .bind(&audit.proof.target.object_locator).bind(&current.tenant_id).bind(&current.request_id).bind(&current.request_object).execute(&mut *tx).await?;
+        let column = plan.side.column();
+        let sql = format!(
+            "UPDATE request_records SET {column}=$1 WHERE tenant_id=$2 AND id=$3 AND {column}=$4"
+        );
+        let changed = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(&audit.proof.target.object_locator)
+            .bind(&current.tenant_id)
+            .bind(&current.request_id)
+            .bind(&current.request_object)
+            .execute(&mut *tx)
+            .await?;
         if changed.rows_affected() != 1 {
             return Err("locked raw source row changed".into());
         }
@@ -970,6 +1035,7 @@ mod tests {
             target_locator: format!("stores/training/{training}/{}", original.object_locator),
             allow_pending: false,
             allow_bound_source: false,
+            side: RawSide::Request,
         };
         // Copy and pointer mutation are separate operations. This fixture uses
         // an independent memory body source and real RustFS roots/target, while
@@ -1681,6 +1747,202 @@ mod tests {
                 .unwrap(),
             body
         );
+        // Response roots use the identical immutable raw-body engine, with an
+        // explicit side in both plan and proof. Pending financial response
+        // migration is deliberately outside this completed-only operation.
+        sqlx::raw_sql("ALTER TABLE request_records ADD COLUMN response_object TEXT")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for mutation in 0..3 {
+            let id = Uuid::now_v7();
+            let completed = if mutation == 2 { None } else { Some(2_i64) };
+            sqlx::query("INSERT INTO request_records(id,tenant_id,key_id,reservation_id,created_at,completed_at,request_object,response_object) VALUES($1,$2,'key','reservation',1,$3,'request-retained',$4)")
+                .bind(id.to_string()).bind(tenant.to_string()).bind(completed).bind(&original.object_locator).execute(&pool).await.unwrap();
+            let response_root = Path::from(format!("tenants/{tenant}/raw/v1/{id}/response.json"));
+            let request_root = Path::from(format!("tenants/{tenant}/raw/v1/{id}/request.json"));
+            for path in [&response_root, &request_root] {
+                source_client
+                    .put(
+                        path,
+                        PutPayload::from_bytes(Bytes::from(original_encoded.clone())),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let response_runner = Runner {
+                pool: pool.clone(),
+                source: compressed_runner.source.clone(),
+                target: runner.target.clone(),
+                checkpoint: directory.path().join(format!("response-{id}.json")),
+                identity: runner.identity.clone(),
+            };
+            let mut response_plan = RawRequestPlan {
+                request_id: id,
+                side: RawSide::Response,
+                ..plan.clone()
+            };
+            if mutation == 2 {
+                assert!(
+                    Box::pin(response_runner.relocate_raw_request_with_clients(
+                        &config,
+                        &source_config,
+                        response_plan.clone(),
+                        RawAction::CopyTarget,
+                        source_client.clone(),
+                        target_client.clone()
+                    ))
+                    .await
+                    .is_err()
+                );
+                response_plan.allow_pending = true;
+                assert!(
+                    Box::pin(response_runner.relocate_raw_request_with_clients(
+                        &config,
+                        &source_config,
+                        response_plan.clone(),
+                        RawAction::CopyTarget,
+                        source_client.clone(),
+                        target_client.clone()
+                    ))
+                    .await
+                    .is_err(),
+                    "pending response needs a separate canonical financial owner mapping"
+                );
+                continue;
+            }
+            Box::pin(response_runner.relocate_raw_request_with_clients(
+                &config,
+                &source_config,
+                response_plan.clone(),
+                RawAction::CopyTarget,
+                source_client.clone(),
+                target_client.clone(),
+            ))
+            .await
+            .unwrap();
+            let proof: RawAudit = serde_json::from_reader(
+                std::fs::File::open(
+                    response_runner
+                        .checkpoint
+                        .with_extension("raw-request-audit.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(proof.proof.format_version, 5);
+            assert_eq!(proof.proof.side, RawSide::Response);
+            let mut wrong_side = response_plan.clone();
+            wrong_side.side = RawSide::Request;
+            assert!(
+                Box::pin(response_runner.relocate_raw_request_with_clients(
+                    &config,
+                    &source_config,
+                    wrong_side,
+                    RawAction::Apply,
+                    source_client.clone(),
+                    target_client.clone()
+                ))
+                .await
+                .is_err(),
+                "same request checkpoint cannot be reinterpreted as another side"
+            );
+            if mutation == 1 {
+                sqlx::query(
+                    "UPDATE request_records SET response_object='third-party-response' WHERE id=$1",
+                )
+                .bind(id.to_string())
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            let result = Box::pin(response_runner.relocate_raw_request_with_clients(
+                &config,
+                &source_config,
+                response_plan.clone(),
+                RawAction::Apply,
+                source_client.clone(),
+                target_client.clone(),
+            ))
+            .await
+            .unwrap();
+            let current = row(&pool, &response_plan, false).await.unwrap().unwrap();
+            if mutation == 0 {
+                assert_eq!(result["status"], "committed");
+                assert_eq!(current.request_object, response_plan.target_locator);
+                // Product late bind/spool handoffs only replace gap/null/empty
+                // or the exact published reference; an old body cannot revert
+                // the canonical response after migration.
+                let late_bind=sqlx::query("UPDATE request_records SET response_object=$1 WHERE id=$2 AND tenant_id=$3 AND (response_object IS NULL OR response_object='' OR response_object=$1 OR response_object='gap://' || id || '/response')")
+                    .bind(&original.object_locator).bind(id.to_string()).bind(tenant.to_string()).execute(&pool).await.unwrap();
+                assert_eq!(late_bind.rows_affected(), 0);
+                let late_finish=sqlx::query("UPDATE request_records SET response_object=$1 WHERE id=$2 AND completed_at IS NULL")
+                    .bind(&original.object_locator).bind(id.to_string()).execute(&pool).await.unwrap();
+                assert_eq!(late_finish.rows_affected(), 0);
+                let resumed = Box::pin(response_runner.relocate_raw_request_with_clients(
+                    &config,
+                    &source_config,
+                    response_plan.clone(),
+                    RawAction::Apply,
+                    source_client.clone(),
+                    target_client.clone(),
+                ))
+                .await
+                .unwrap();
+                assert_eq!(resumed["status"], "committed_confirmed_by_reread");
+            } else {
+                assert_eq!(result["status"], "row_changed_after_root");
+                assert_eq!(current.request_object, "third-party-response");
+                let resumed = Box::pin(response_runner.relocate_raw_request_with_clients(
+                    &config,
+                    &source_config,
+                    response_plan.clone(),
+                    RawAction::Apply,
+                    source_client.clone(),
+                    target_client.clone(),
+                ))
+                .await
+                .unwrap();
+                assert_eq!(resumed["status"], "row_changed_after_root");
+            }
+            let request_locator: String =
+                sqlx::query_scalar("SELECT request_object FROM request_records WHERE id=$1")
+                    .bind(id.to_string())
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(request_locator, "request-retained");
+            assert_eq!(current.completed_at, completed);
+            assert_eq!(
+                root(source_client.as_ref(), &request_root)
+                    .await
+                    .unwrap()
+                    .0
+                    .as_ref(),
+                original_encoded
+            );
+            assert_eq!(
+                serde_json::from_slice::<CasArchiveObject>(
+                    &root(source_client.as_ref(), &response_root)
+                        .await
+                        .unwrap()
+                        .0
+                )
+                .unwrap()
+                .object_locator,
+                response_plan.target_locator
+            );
+            assert_eq!(
+                response_runner
+                    .source
+                    .as_ref()
+                    .unwrap()
+                    .get_tenant_content(tenant, &original, body.len())
+                    .await
+                    .unwrap(),
+                body
+            );
+        }
         let audit_path = runner.checkpoint.with_extension("raw-request-audit.json");
         let mut audit: RawAudit =
             serde_json::from_reader(std::fs::File::open(&audit_path).unwrap()).unwrap();
