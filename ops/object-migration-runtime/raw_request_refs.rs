@@ -15,6 +15,41 @@ pub(super) struct RawRequestPlan {
     target_locator: String,
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub(super) enum RawPlanInput {
+    Single(RawRequestPlan),
+    Batch(RawBatchPlan),
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RawBatchPlan {
+    requests: Vec<RawRequestPlan>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawBatchProgress {
+    identity: String,
+    next: usize,
+    reference_bytes: u64,
+    source_streamed: u64,
+    target_reused: u64,
+    targets: std::collections::BTreeMap<String, u64>,
+}
+
+fn validate_batch(plan: &RawBatchPlan) -> Result<()> {
+    if plan.requests.is_empty() {
+        return Err("raw batch must contain requests".into());
+    }
+    let mut seen = std::collections::HashSet::new();
+    for request in &plan.requests {
+        if !seen.insert((request.tenant_id, request.request_id)) {
+            return Err("duplicate raw batch request identity".into());
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RequestVersion {
@@ -129,6 +164,145 @@ fn report(audit: &RawAudit) -> serde_json::Value {
 }
 
 impl Runner {
+    pub(super) async fn raw_plan_input(
+        &self,
+        config: &Config,
+        input: RawPlanInput,
+        copy: bool,
+        apply: bool,
+    ) -> Result<serde_json::Value> {
+        let RawPlanInput::Batch(plan) = input else {
+            let RawPlanInput::Single(plan) = input else {
+                unreachable!()
+            };
+            return if copy {
+                self.copy_raw_request_target(config, plan).await
+            } else {
+                self.relocate_raw_request(config, plan, apply).await
+            };
+        };
+        let source_config = locators::source_config(config)?;
+        self.raw_batch_with_clients(
+            config,
+            &source_config,
+            plan,
+            copy,
+            apply,
+            client(&source_config)?,
+            client(config)?,
+        )
+        .await
+    }
+
+    async fn raw_batch_with_clients(
+        &self,
+        config: &Config,
+        source_config: &Config,
+        plan: RawBatchPlan,
+        copy: bool,
+        apply: bool,
+        source_client: Arc<dyn ObjectStore>,
+        target_client: Arc<dyn ObjectStore>,
+    ) -> Result<serde_json::Value> {
+        validate_batch(&plan)?;
+        if !copy && !apply {
+            return Err(
+                "raw batch requires copy-target or explicit apply; dry-run remains single-plan"
+                    .into(),
+            );
+        }
+        let mode = if copy { "copy" } else { "apply" };
+        let identity = blake3::hash(&serde_json::to_vec(&(
+            "raw-request-batch-v1",
+            &self.identity,
+            mode,
+            &plan,
+        ))?)
+        .to_hex()
+        .to_string();
+        let progress_path = self
+            .checkpoint
+            .with_extension(format!("raw-batch-{mode}.json"));
+        let mut progress = if progress_path.exists() {
+            let value: RawBatchProgress =
+                serde_json::from_reader(std::fs::File::open(&progress_path)?)?;
+            if value.identity != identity || value.next > plan.requests.len() {
+                return Err("raw batch checkpoint plan/identity mismatch".into());
+            }
+            value
+        } else {
+            RawBatchProgress {
+                identity,
+                next: 0,
+                reference_bytes: 0,
+                source_streamed: 0,
+                target_reused: 0,
+                targets: std::collections::BTreeMap::new(),
+            }
+        };
+        // Copy/apply share the per-request durable audit. Their aggregate cursors are separate.
+        // Pool and archive clients are cloned handles, never additional pools or writers.
+        let directory = self.checkpoint.with_extension("raw-batch-requests");
+        std::fs::create_dir_all(&directory)?;
+        for request in plan.requests.iter().skip(progress.next) {
+            let child = Runner {
+                pool: self.pool.clone(),
+                source: self.source.clone(),
+                target: self.target.clone(),
+                checkpoint: directory
+                    .join(format!("{}-{}.json", request.tenant_id, request.request_id)),
+                identity: self.identity.clone(),
+            };
+            let result = Box::pin(child.relocate_raw_request_with_clients(
+                config,
+                source_config,
+                request.clone(),
+                if copy {
+                    RawAction::CopyTarget
+                } else {
+                    RawAction::Apply
+                },
+                source_client.clone(),
+                target_client.clone(),
+            ))
+            .await?;
+            let bytes = result["body_bytes"]
+                .as_u64()
+                .ok_or("raw result missing byte count")?;
+            if let Some(previous) = progress
+                .targets
+                .insert(request.target_locator.clone(), bytes)
+            {
+                if previous != bytes {
+                    return Err("same raw target has conflicting lengths".into());
+                }
+            }
+            progress.reference_bytes = progress
+                .reference_bytes
+                .checked_add(
+                    result["body_bytes"]
+                        .as_u64()
+                        .ok_or("raw result missing byte count")?,
+                )
+                .ok_or("raw batch byte counter overflow")?;
+            progress.source_streamed +=
+                u64::from(result["source_streamed"].as_bool() == Some(true));
+            progress.target_reused += u64::from(result["target_reused"].as_bool() == Some(true));
+            progress.next += 1;
+            save_checkpoint(&progress_path, &progress)?;
+        }
+        Ok(
+            serde_json::json!({"mode":format!("raw_batch_{mode}"), "requests":plan.requests.len(),
+            "completed":progress.next,"reference_bytes":progress.reference_bytes,
+            "unique_target_objects":progress.targets.len(),
+            "unique_target_bytes":progress.targets.values().sum::<u64>(),
+            "reused_target_references":progress.next-progress.targets.len(),
+            "source_streamed_requests":progress.source_streamed,"target_reused_requests":progress.target_reused,
+            "target_cas_creation_measured":false,"source_deleted":false,"gc_authorized":false,
+            "global_verified":false}),
+        )
+    }
+
     async fn copy_one_raw_target(
         &self,
         tenant: Uuid,
@@ -789,6 +963,112 @@ mod tests {
                 .checkpoint
                 .with_extension("raw-request-audit.json")
                 .exists()
+        );
+        // Two distinct requests share one immutable target. Batch cursors must not
+        // repeat completed work, and changing the plan must fail closed.
+        let mut batch_requests = Vec::new();
+        for _ in 0..2 {
+            let id = Uuid::now_v7();
+            sqlx::query("INSERT INTO request_records SELECT $1,tenant_id,key_id,reservation_id,created_at,completed_at,request_object FROM request_records WHERE id=$2")
+                .bind(id.to_string()).bind(request.to_string()).execute(&pool).await.unwrap();
+            source_client
+                .put(
+                    &Path::from(format!("tenants/{tenant}/raw/v1/{id}/request.json")),
+                    PutPayload::from_bytes(Bytes::from(original_encoded.clone())),
+                )
+                .await
+                .unwrap();
+            batch_requests.push(RawRequestPlan {
+                request_id: id,
+                ..plan.clone()
+            });
+        }
+        let batch_runner = Runner {
+            pool: pool.clone(),
+            source: copy_runner.source.clone(),
+            target: runner.target.clone(),
+            checkpoint: directory.path().join("batch.json"),
+            identity: runner.identity.clone(),
+        };
+        let copied_batch = Box::pin(batch_runner.raw_batch_with_clients(
+            &config,
+            &source_config,
+            RawBatchPlan {
+                requests: batch_requests.clone(),
+            },
+            true,
+            false,
+            source_client.clone(),
+            target_client.clone(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(copied_batch["completed"], 2);
+        assert_eq!(copied_batch["target_reused_requests"], 2);
+        assert_eq!(copied_batch["unique_target_objects"], 1);
+        assert_eq!(copied_batch["unique_target_bytes"], body.len() as u64);
+        assert_eq!(copied_batch["source_streamed_requests"], 0);
+        let applied_batch = Box::pin(batch_runner.raw_batch_with_clients(
+            &config,
+            &source_config,
+            RawBatchPlan {
+                requests: batch_requests.clone(),
+            },
+            false,
+            true,
+            source_client.clone(),
+            target_client.clone(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(applied_batch["completed"], 2);
+        assert_eq!(applied_batch["reference_bytes"], (body.len() * 2) as u64);
+        for member in &batch_requests {
+            assert_eq!(
+                row(&pool, member, false)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .request_object,
+                plan.target_locator
+            );
+        }
+        let resumed = Box::pin(batch_runner.raw_batch_with_clients(
+            &config,
+            &source_config,
+            RawBatchPlan {
+                requests: batch_requests.clone(),
+            },
+            false,
+            true,
+            source_client.clone(),
+            target_client.clone(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(resumed, applied_batch);
+        batch_requests.reverse();
+        assert!(
+            Box::pin(batch_runner.raw_batch_with_clients(
+                &config,
+                &source_config,
+                RawBatchPlan {
+                    requests: batch_requests.clone()
+                },
+                false,
+                true,
+                source_client.clone(),
+                target_client.clone()
+            ))
+            .await
+            .is_err()
+        );
+        batch_requests.push(batch_requests[0].clone());
+        assert!(
+            validate_batch(&RawBatchPlan {
+                requests: batch_requests
+            })
+            .is_err()
         );
         let applied = Box::pin(runner.relocate_raw_request_with_clients(
             &config,

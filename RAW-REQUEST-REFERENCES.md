@@ -80,3 +80,27 @@ was already present before copy). It does not infer a unique new CAS object
 from staging upload: a concurrent conditional promotion may reuse a CAS object,
 so `target_cas_creation_measured=false`. Body bytes are decoded bytes, not wire
 or physical storage growth.
+
+## Bounded raw batches
+
+Both raw phases also accept `{"requests":[<the existing single-request plan>, ...]}`.
+Use a metadata-only eligibility pass to select completed requests with an observed
+legacy root and exact current SQL locator; in-flight requests and source gaps are
+not filled or acknowledged. Financial/pending state is preserved.
+
+Run copy-target, then explicit apply against the same checkpoint and exact plan.
+Copy and apply have separate durable cursors bound to the full ordered plan,
+source/target identity and action. Per-request audit files are shared between
+those phases. A failed item stops the batch; restart resumes that item's existing
+recovery protocol. Duplicate request identities are rejected before object IO.
+Use distinct checkpoints for distinct batches, retain all audits, and never edit
+checkpoint identities. The existing global migration locks and pool of two are
+unchanged; members execute serially. Single-plan dry-run remains available;
+batch dry-run is explicitly rejected.
+
+Reports distinguish reference bytes, unique target locators/bytes, repeated
+references to those targets, source-streamed requests and existing-target reuse.
+Source-streamed does not measure newly created physical CAS objects: immutable
+promotion may reuse a concurrently created object. Completed batch cursors are
+execution receipts, not fresh readability, source-release or GC authorization.
+No batch operation deletes source bodies or migrates the legacy root namespace.
