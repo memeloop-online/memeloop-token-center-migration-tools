@@ -1104,13 +1104,9 @@ async fn run(args: Args) -> Result<()> {
                 .as_ref()
                 .ok_or("raw reference plan missing")?,
         )?)?;
-        let result = if raw_copy {
-            runner.copy_raw_request_target(&config, plan).await
-        } else {
-            runner
-                .relocate_raw_request(&config, plan, args.apply_references)
-                .await
-        };
+        let result = runner
+            .raw_plan_input(&config, plan, raw_copy, args.apply_references)
+            .await;
         advisory.close().await?;
         println!("{}", serde_json::to_string(&result?)?);
         return Ok(());
