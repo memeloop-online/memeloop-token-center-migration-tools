@@ -215,6 +215,12 @@ impl Runner {
         let identity = blake3::hash(&serde_json::to_vec(&(
             "raw-request-batch-v1",
             &self.identity,
+            (
+                &source_config.s3_endpoint,
+                &source_config.s3_bucket,
+                &source_config.s3_region,
+            ),
+            (&config.s3_endpoint, &config.s3_bucket, &config.s3_region),
             mode,
             &plan,
         ))?)
@@ -985,7 +991,7 @@ mod tests {
         }
         let batch_runner = Runner {
             pool: pool.clone(),
-            source: copy_runner.source.clone(),
+            source: compressed_runner.source.clone(),
             target: runner.target.clone(),
             checkpoint: directory.path().join("batch.json"),
             identity: runner.identity.clone(),
@@ -1047,6 +1053,73 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resumed, applied_batch);
+        // A completed cursor must reject store drift before skipping children.
+        for target_drift in [false, true] {
+            let mut changed_source = source_config.clone();
+            let mut changed_target = config.clone();
+            if target_drift {
+                changed_target.s3_region = "changed-region".into();
+            } else {
+                changed_source.s3_endpoint = Some("http://changed-source.invalid".into());
+            }
+            assert!(
+                Box::pin(batch_runner.raw_batch_with_clients(
+                    &changed_target,
+                    &changed_source,
+                    RawBatchPlan {
+                        requests: batch_requests.clone()
+                    },
+                    false,
+                    true,
+                    source_client.clone(),
+                    target_client.clone()
+                ))
+                .await
+                .is_err()
+            );
+        }
+        // An interrupted cursor is subject to the same full-store binding.
+        let cursor_path = batch_runner
+            .checkpoint
+            .with_extension("raw-batch-apply.json");
+        let mut partial: RawBatchProgress =
+            serde_json::from_reader(std::fs::File::open(&cursor_path).unwrap()).unwrap();
+        partial.next = 1;
+        save_checkpoint(&cursor_path, &partial).unwrap();
+        let mut changed_source = source_config.clone();
+        changed_source.s3_region = "changed-source-region".into();
+        assert!(
+            Box::pin(batch_runner.raw_batch_with_clients(
+                &config,
+                &changed_source,
+                RawBatchPlan {
+                    requests: batch_requests.clone()
+                },
+                false,
+                true,
+                source_client.clone(),
+                target_client.clone()
+            ))
+            .await
+            .is_err()
+        );
+        let mut changed_target = config.clone();
+        changed_target.s3_endpoint = Some("http://changed-target.invalid".into());
+        assert!(
+            Box::pin(batch_runner.raw_batch_with_clients(
+                &changed_target,
+                &source_config,
+                RawBatchPlan {
+                    requests: batch_requests.clone()
+                },
+                false,
+                true,
+                source_client.clone(),
+                target_client.clone()
+            ))
+            .await
+            .is_err()
+        );
         batch_requests.reverse();
         assert!(
             Box::pin(batch_runner.raw_batch_with_clients(
