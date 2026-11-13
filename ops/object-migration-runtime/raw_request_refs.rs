@@ -13,6 +13,11 @@ pub(super) struct RawRequestPlan {
     tenant_id: Uuid,
     request_id: Uuid,
     target_locator: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    allow_pending: bool,
+}
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 #[derive(Deserialize)]
@@ -58,7 +63,7 @@ struct RequestVersion {
     key_id: String,
     reservation_id: String,
     created_at: i64,
-    completed_at: i64,
+    completed_at: Option<i64>,
     request_object: String,
 }
 
@@ -96,11 +101,12 @@ async fn row<'e, E: sqlx::Executor<'e, Database = sqlx::Postgres>>(
 ) -> Result<Option<RequestVersion>> {
     let suffix = if lock { " FOR UPDATE" } else { "" };
     let sql = format!(
-        "SELECT tenant_id,id,key_id,reservation_id,created_at,completed_at,request_object FROM request_records WHERE tenant_id=$1 AND id=$2 AND completed_at IS NOT NULL{suffix}"
+        "SELECT tenant_id,id,key_id,reservation_id,created_at,completed_at,request_object FROM request_records WHERE tenant_id=$1 AND id=$2 AND (completed_at IS NOT NULL OR $3){suffix}"
     );
     let r = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(plan.tenant_id.to_string())
         .bind(plan.request_id.to_string())
+        .bind(plan.allow_pending)
         .fetch_optional(executor)
         .await?;
     r.map(|r| {
@@ -462,7 +468,9 @@ impl Runner {
             Err(e) => return Err(e.into()),
         };
         let mut audit = if let Some(audit) = stored {
-            if audit.proof.format_version != 1
+            if !matches!(audit.proof.format_version, 1 | 2)
+                || (audit.proof.format_version == 2) != audit.proof.source.completed_at.is_none()
+                || (audit.proof.source.completed_at.is_none() && !plan.allow_pending)
                 || audit.proof.identity != self.identity
                 || audit.proof.training_identity != training
                 || audit.proof.source_store_identity != source_identity
@@ -476,7 +484,7 @@ impl Runner {
         } else {
             let source = row(&self.pool, &plan, false)
                 .await?
-                .ok_or("completed source request required")?;
+                .ok_or("source request outside explicit completion scope")?;
             let (encoded, etag, version) = root(source_client.as_ref(), &root_path).await?;
             if etag.is_none() && version.is_none() {
                 return Err("conditional raw root version required".into());
@@ -493,7 +501,7 @@ impl Runner {
             target.object_locator = plan.target_locator.clone();
             RawAudit {
                 proof: RawProof {
-                    format_version: 1,
+                    format_version: if source.completed_at.is_none() { 2 } else { 1 },
                     identity: self.identity.clone(),
                     training_identity: training,
                     source_store_identity: source_identity,
@@ -705,6 +713,19 @@ impl Runner {
 mod tests {
     use super::*;
 
+    #[test]
+    fn old_completed_plan_and_audit_encoding_remain_compatible() {
+        let id = Uuid::now_v7();
+        let value = serde_json::json!({"tenant_id":id,"request_id":id,"target_locator":"target"});
+        let plan: RawRequestPlan = serde_json::from_value(value.clone()).unwrap();
+        assert!(!plan.allow_pending);
+        assert_eq!(serde_json::to_value(plan).unwrap(), value);
+        let value = serde_json::json!({"tenant_id":"t","request_id":"r","key_id":"k","reservation_id":"o","created_at":1,"completed_at":2,"request_object":"l"});
+        let version: RequestVersion = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(version.completed_at, Some(2));
+        assert_eq!(serde_json::to_value(version).unwrap(), value);
+    }
+
     #[tokio::test]
     async fn raw_root_conditional_relocation_retains_source_and_recovers_without_overwriting_changes()
      {
@@ -793,6 +814,7 @@ mod tests {
             tenant_id: tenant,
             request_id: request,
             target_locator: format!("stores/training/{training}/{}", original.object_locator),
+            allow_pending: false,
         };
         // Copy and pointer mutation are separate operations. This fixture uses
         // an independent memory body source and real RustFS roots/target, while
@@ -970,6 +992,130 @@ mod tests {
                 .with_extension("raw-request-audit.json")
                 .exists()
         );
+        // Pending financial state is preserved. A concurrent completion/owner
+        // change fences SQL while retaining the already relocated root and source.
+        for mutation in 0..3 {
+            let id = Uuid::now_v7();
+            sqlx::query("INSERT INTO request_records SELECT $1,tenant_id,key_id,reservation_id,created_at,NULL,request_object FROM request_records WHERE id=$2")
+                .bind(id.to_string()).bind(request.to_string()).execute(&pool).await.unwrap();
+            let pending_root = Path::from(format!("tenants/{tenant}/raw/v1/{id}/request.json"));
+            source_client
+                .put(
+                    &pending_root,
+                    PutPayload::from_bytes(Bytes::from(original_encoded.clone())),
+                )
+                .await
+                .unwrap();
+            let pending_runner = Runner {
+                pool: pool.clone(),
+                source: compressed_runner.source.clone(),
+                target: runner.target.clone(),
+                checkpoint: directory.path().join(format!("pending-{id}.json")),
+                identity: runner.identity.clone(),
+            };
+            let mut pending_plan = RawRequestPlan {
+                request_id: id,
+                ..plan.clone()
+            };
+            assert!(
+                Box::pin(pending_runner.relocate_raw_request_with_clients(
+                    &config,
+                    &source_config,
+                    pending_plan.clone(),
+                    RawAction::CopyTarget,
+                    source_client.clone(),
+                    target_client.clone()
+                ))
+                .await
+                .is_err()
+            );
+            pending_plan.allow_pending = true;
+            let original_pending = row(&pool, &pending_plan, false).await.unwrap().unwrap();
+            assert_eq!(original_pending.completed_at, None);
+            Box::pin(pending_runner.relocate_raw_request_with_clients(
+                &config,
+                &source_config,
+                pending_plan.clone(),
+                RawAction::CopyTarget,
+                source_client.clone(),
+                target_client.clone(),
+            ))
+            .await
+            .unwrap();
+            let audit_path = pending_runner
+                .checkpoint
+                .with_extension("raw-request-audit.json");
+            let proof: RawAudit =
+                serde_json::from_reader(std::fs::File::open(&audit_path).unwrap()).unwrap();
+            assert_eq!(proof.proof.format_version, 2);
+            if mutation == 1 {
+                sqlx::query("UPDATE request_records SET completed_at=99 WHERE id=$1")
+                    .bind(id.to_string())
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            if mutation == 2 {
+                sqlx::query("UPDATE request_records SET reservation_id=$1 WHERE id=$2")
+                    .bind(Uuid::now_v7().to_string())
+                    .bind(id.to_string())
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            let result = Box::pin(pending_runner.relocate_raw_request_with_clients(
+                &config,
+                &source_config,
+                pending_plan.clone(),
+                RawAction::Apply,
+                source_client.clone(),
+                target_client.clone(),
+            ))
+            .await
+            .unwrap();
+            let after = row(&pool, &pending_plan, false).await.unwrap().unwrap();
+            if mutation == 0 {
+                assert_eq!(result["status"], "committed");
+                let mut expected = original_pending;
+                expected.request_object = pending_plan.target_locator.clone();
+                assert_eq!(
+                    after, expected,
+                    "only the locator may change; pending/owner remain exact"
+                );
+            } else {
+                assert_eq!(result["status"], "row_changed_after_root");
+                assert_eq!(after.request_object, original.object_locator);
+                let resumed = Box::pin(pending_runner.relocate_raw_request_with_clients(
+                    &config,
+                    &source_config,
+                    pending_plan.clone(),
+                    RawAction::Apply,
+                    source_client.clone(),
+                    target_client.clone(),
+                ))
+                .await
+                .unwrap();
+                assert_eq!(resumed["status"], "row_changed_after_root");
+            }
+            assert_eq!(
+                serde_json::from_slice::<CasArchiveObject>(
+                    &root(source_client.as_ref(), &pending_root).await.unwrap().0
+                )
+                .unwrap()
+                .object_locator,
+                pending_plan.target_locator
+            );
+            assert_eq!(
+                pending_runner
+                    .source
+                    .as_ref()
+                    .unwrap()
+                    .get_tenant_content(tenant, &original, body.len())
+                    .await
+                    .unwrap(),
+                body
+            );
+        }
         // Two distinct requests share one immutable target. Batch cursors must not
         // repeat completed work, and changing the plan must fail closed.
         let mut batch_requests = Vec::new();
