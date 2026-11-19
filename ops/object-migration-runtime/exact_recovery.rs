@@ -135,6 +135,11 @@ pub(super) async fn run(plan_path: &std::path::Path, receipt_path: &std::path::P
                 &plan.request.locator,
                 &plan.response.locator,
                 owner,
+                current_snapshot.as_deref(),
+                receipt["lease_owner"]
+                    .as_str()
+                    .map(Uuid::parse_str)
+                    .transpose()?,
             )
             .await?;
         if !claimed {
@@ -149,7 +154,7 @@ pub(super) async fn run(plan_path: &std::path::Path, receipt_path: &std::path::P
     verify_source(&state.archive, &plan.request).await?;
     verify_source(&state.archive, &plan.response).await?;
     let row = sqlx::query(
-        "SELECT semantic_snapshot_json, (SELECT leaf_node_hash FROM conversation_observations WHERE request_id = $1 LIMIT 1) AS leaf_node_hash FROM conversation_projection_outbox
+        "SELECT semantic_snapshot_json, (SELECT o.leaf_node_hash FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE o.request_id = $1 AND c.tenant_id = $2 LIMIT 1) AS leaf_node_hash FROM conversation_projection_outbox
          WHERE request_id = $1 AND tenant_id = $2",
     )
     .bind(plan.request_id.to_string())
