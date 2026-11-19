@@ -154,11 +154,12 @@ pub(super) async fn run(plan_path: &std::path::Path, receipt_path: &std::path::P
     verify_source(&state.archive, &plan.request).await?;
     verify_source(&state.archive, &plan.response).await?;
     let row = sqlx::query(
-        "SELECT semantic_snapshot_json, (SELECT o.leaf_node_hash FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE o.request_id = $1 AND c.tenant_id = $2 LIMIT 1) AS leaf_node_hash FROM conversation_projection_outbox
-         WHERE request_id = $1 AND tenant_id = $2",
+        "SELECT semantic_snapshot_json, (SELECT o.leaf_node_hash FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE o.request_id = $1 AND c.tenant_id = $2 AND o.key_id = $3 LIMIT 1) AS leaf_node_hash FROM conversation_projection_outbox
+         WHERE request_id = $1 AND tenant_id = $2 AND key_id = $3",
     )
     .bind(plan.request_id.to_string())
     .bind(plan.tenant_id.to_string())
+    .bind(plan.key_id.to_string())
     .fetch_optional(&pool)
     .await?;
     let observation_leaf: Option<String> = row
