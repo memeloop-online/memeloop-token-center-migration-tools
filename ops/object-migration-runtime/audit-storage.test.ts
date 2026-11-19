@@ -86,3 +86,16 @@ test("receipt page budget stays partial and source denial remains unknown", asyn
   assert.equal(report.coverage_state,"partial");
   assert.equal(report.gaps[0]?.source_candidate,"raw_root_access_unknown");
 });
+
+test("a legitimate retired raw root stays distinct from malformed or verified bytes", async () => {
+  const { auditLocatorGaps } = await import("./audit-storage.ts");
+  const prefix = "migration-receipts/conversation-v1/fixture/locators/";
+  const report = await auditLocatorGaps(async (_query,key) => !key
+    ? {status:200,xml:`<ListBucketResult><Contents><Key>${prefix}a.json</Key></Contents><IsTruncated>false</IsTruncated></ListBucketResult>`}
+    : {status:200,xml:JSON.stringify({format_version:1,identity:"fixture",cursor:{kind:"response",tenant:"00000000-0000-0000-0000-000000000001",identity:"00000000-0000-0000-0000-000000000002"},gap_reason:"source_gap"})},
+  async()=>({status:200,xml:JSON.stringify({format_version:1,retired:true,release_generation:"fixture"})}),
+  {format_version:1,identity:"fixture",copied_rows:0,gap_rows:1,complete:true,digest:"original"},1);
+  assert.equal(report.gaps[0]?.source_candidate,"raw_root_retired_provenance_unverified");
+  assert.equal(report.body_bytes_verified,false);
+  await assert.rejects(auditLocatorGaps(async()=>{throw new Error("must not access storage");},async()=>{throw new Error("must not access source");},{format_version:1,identity:"fixture",copied_rows:-1,gap_rows:1,complete:true,digest:"original"},1));
+});

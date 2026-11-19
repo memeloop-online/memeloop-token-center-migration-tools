@@ -171,7 +171,7 @@ type LocatorCheckpoint = { format_version: number; identity: string; copied_rows
 
 // Read existing migration receipts; never mutate their checkpoint or certify bodies.
 export async function auditLocatorGaps(target: Get, source: Get, checkpoint: LocatorCheckpoint, maximumPages: number) {
-  if (checkpoint.format_version !== 1 || !checkpoint.complete || !/^[a-zA-Z0-9_-]+$/u.test(checkpoint.identity) ||
+  if (checkpoint.format_version !== 1 || !checkpoint.complete || !Number.isSafeInteger(checkpoint.copied_rows) || checkpoint.copied_rows < 0 || !Number.isSafeInteger(checkpoint.gap_rows) || checkpoint.gap_rows < 0 || !/^[a-zA-Z0-9_-]+$/u.test(checkpoint.identity) ||
       !Number.isSafeInteger(maximumPages) || maximumPages < 1 || maximumPages > 100) throw new Error("invalid_locator_checkpoint");
   const prefix = `migration-receipts/conversation-v1/${checkpoint.identity}/locators/`;
   const report = { format_version: 1, read_only: true, checkpoint_identity: checkpoint.identity,
@@ -209,7 +209,9 @@ export async function auditLocatorGaps(target: Get, source: Get, checkpoint: Loc
         if (root.status === 200) {
           try {
             const object = JSON.parse(root.xml);
-            candidate = typeof object.object_locator === "string" && object.object_locator.startsWith(`tenants/${tenant}/cas/`) && /^[0-9a-f]{64}$/u.test(object.blake3_digest) &&
+            candidate = object.format_version === 1 && object.retired === true
+              ? "raw_root_retired_provenance_unverified"
+              : typeof object.object_locator === "string" && object.object_locator.startsWith(`tenants/${tenant}/cas/`) && /^[0-9a-f]{64}$/u.test(object.blake3_digest) &&
               Number.isSafeInteger(object.size_bytes) && object.size_bytes >= 0 ? "raw_root_candidate_unverified" : "raw_root_malformed";
           } catch { candidate = "raw_root_malformed"; }
         }
@@ -307,7 +309,10 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   main().catch((error: unknown) => {
     const allowed = new Set(["invalid_locator_checkpoint", "receipt_listing_unavailable", "invalid_receipt_listing", "receipt_unavailable", "receipt_identity_mismatch", "duplicate_receipt_identity", "conflicting_gap_receipt", "invalid_receipt_cursor", "configuration"]);
     const reason = error instanceof Error && allowed.has(error.message) ? error.message : "storage_audit_failed";
-    console.error(JSON.stringify({ report_written: false, reason }));
+    const code = typeof (error as {code?:unknown})?.code === "string" ? (error as {code:string}).code : "";
+    const safeCode = ["ENOENT", "EACCES", "EROFS", "ENOSPC", "ENOTDIR"].includes(code) ? code : undefined;
+    const errorType = error instanceof SyntaxError ? "json_format" : error instanceof TypeError ? "transport_or_type" : error instanceof Error ? error.name === "TimeoutError" ? "transport_timeout" : "validation" : "unknown";
+    console.error(JSON.stringify({ report_written: false, reason, error_type: errorType, filesystem_code: safeCode }));
     process.exitCode = 1;
   });
 }
