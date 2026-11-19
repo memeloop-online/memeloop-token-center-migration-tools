@@ -304,8 +304,10 @@ async function main() {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  main().catch(() => {
-    console.error(JSON.stringify({ report_written: false, reason: "storage_audit_failed" }));
+  main().catch((error: unknown) => {
+    const allowed = new Set(["invalid_locator_checkpoint", "receipt_listing_unavailable", "invalid_receipt_listing", "receipt_unavailable", "receipt_identity_mismatch", "duplicate_receipt_identity", "conflicting_gap_receipt", "invalid_receipt_cursor", "configuration"]);
+    const reason = error instanceof Error && allowed.has(error.message) ? error.message : "storage_audit_failed";
+    console.error(JSON.stringify({ report_written: false, reason }));
     process.exitCode = 1;
   });
 }
