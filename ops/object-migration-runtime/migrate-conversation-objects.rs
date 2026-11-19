@@ -93,6 +93,9 @@ mod reconstruction;
 #[path = "conversation-object-modules/spools.rs"]
 mod spools;
 
+#[path = "conversation-object-modules/exact_recovery.rs"]
+mod exact_recovery;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum Phase {
     Inventory,
@@ -115,6 +118,7 @@ enum Phase {
     SemanticReferenceReadback,
     RawRequestReference,
     CopyRawRequestTarget,
+    RecoverExactConversation,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -159,6 +163,9 @@ struct Args {
     /// One completed request/root and its already-present qualified raw target.
     #[arg(long)]
     raw_reference_plan: Option<PathBuf>,
+    /// Exact, independently verified source identities; only this request is rebuilt.
+    #[arg(long)]
+    exact_recovery_plan: Option<PathBuf>,
     /// Committed semantic-reference audit directories; read only.
     #[arg(long)]
     reference_audit_dir: Vec<PathBuf>,
@@ -955,6 +962,16 @@ impl Runner {
 }
 
 async fn run(args: Args) -> Result<()> {
+    if args.phase == Phase::RecoverExactConversation {
+        let plan = args
+            .exact_recovery_plan
+            .as_deref()
+            .ok_or("exact recovery plan required")?;
+        return exact_recovery::run(plan, &args.checkpoint).await;
+    }
+    if args.exact_recovery_plan.is_some() {
+        return Err("exact-recovery-plan requires recover-exact-conversation".into());
+    }
     if args.online_copy && args.phase != Phase::CopyPayloads {
         return Err("--online-copy is only supported for --phase copy-payloads".into());
     }
@@ -1267,7 +1284,8 @@ async fn run(args: Args) -> Result<()> {
         | Phase::SemanticPayloadReferences
         | Phase::SemanticReferenceReadback
         | Phase::RawRequestReference
-        | Phase::CopyRawRequestTarget => {
+        | Phase::CopyRawRequestTarget
+        | Phase::RecoverExactConversation => {
             unreachable!()
         }
     };
