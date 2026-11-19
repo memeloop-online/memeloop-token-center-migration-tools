@@ -1,5 +1,5 @@
 import { createHash, createHmac, randomUUID } from "node:crypto";
-import { open, rename, rm } from "node:fs/promises";
+import { open, readFile, rename, rm } from "node:fs/promises";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -167,16 +167,80 @@ export async function audit(get: Get, maximumPages: number, prefix = "") {
   return report;
 }
 
-function signedGet(): Get {
-  const endpoint = new URL(process.env.MTC_S3_ENDPOINT || "");
-  const bucket = process.env.MTC_S3_BUCKET || "";
-  const access = process.env.MTC_S3_ACCESS_KEY || "";
-  const secret = process.env.MTC_S3_SECRET_KEY || "";
-  const region = process.env.MTC_S3_REGION || "us-east-1";
+type LocatorCheckpoint = { format_version: number; identity: string; copied_rows: number; gap_rows: number; complete: boolean; digest: string };
+
+// Read existing migration receipts; never mutate their checkpoint or certify bodies.
+export async function auditLocatorGaps(target: Get, source: Get, checkpoint: LocatorCheckpoint, maximumPages: number) {
+  if (checkpoint.format_version !== 1 || !checkpoint.complete || !Number.isSafeInteger(checkpoint.copied_rows) || checkpoint.copied_rows < 0 || !Number.isSafeInteger(checkpoint.gap_rows) || checkpoint.gap_rows < 0 || !/^[a-zA-Z0-9_-]+$/u.test(checkpoint.identity) ||
+      !Number.isSafeInteger(maximumPages) || maximumPages < 1 || maximumPages > 100) throw new Error("invalid_locator_checkpoint");
+  const prefix = `migration-receipts/conversation-v1/${checkpoint.identity}/locators/`;
+  const report = { format_version: 1, read_only: true, checkpoint_identity: checkpoint.identity,
+    expected_receipts: checkpoint.copied_rows + checkpoint.gap_rows, expected_gaps: checkpoint.gap_rows,
+    receipts: 0, gap_count: 0, pagination_exhausted: false, counts_match: false,
+    ordered_digest_verified: false, coverage_state: "partial", body_bytes_verified: false,
+    reconstruction_verified: false, deletion_authorized: false,
+    gaps: [] as { receipt_key: string; kind: string; tenant: string; identity: string; gap_reason: string; source_candidate: string }[] };
+  const seen = new Set<string>(); const cursors = new Set<string>(); const tokens = new Set<string>(); let token = "";
+  for (let page = 0; page < maximumPages; page++) {
+    const listing = await target({ "list-type": "2", prefix, "max-keys": "1000", ...(token ? { "continuation-token": token } : {}) });
+    if (listing.status !== 200) throw new Error("receipt_listing_unavailable");
+    for (const block of blocks(listing.xml, "Contents")) {
+      const key = text(block, "Key");
+      if (!key || !key.startsWith(prefix) || !key.endsWith(".json") || seen.has(key)) throw new Error("invalid_receipt_listing");
+      seen.add(key);
+      const response = await target({}, key);
+      if (response.status !== 200) throw new Error("receipt_unavailable");
+      const receipt = JSON.parse(response.xml);
+      if (receipt.format_version !== 1 || receipt.identity !== checkpoint.identity ||
+          typeof receipt.cursor?.kind !== "string" || typeof receipt.cursor?.tenant !== "string" || typeof receipt.cursor?.identity !== "string") throw new Error("receipt_identity_mismatch");
+      const cursorKey = JSON.stringify([receipt.cursor.kind, receipt.cursor.tenant, receipt.cursor.identity]);
+      if (cursors.has(cursorKey)) throw new Error("duplicate_receipt_identity");
+      cursors.add(cursorKey);
+      report.receipts++;
+      if (!receipt.gap_reason) continue;
+      if (receipt.object != null) throw new Error("conflicting_gap_receipt");
+      report.gap_count++;
+      let candidate = "external_identity_requires_source_resolution";
+      const { kind, tenant, identity } = receipt.cursor;
+      const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+      if ((kind === "request" || kind === "response") && uuid.test(tenant) && uuid.test(identity)) {
+        const root = await source({}, `tenants/${tenant}/raw/v1/${identity}/${kind}.json`);
+        candidate = root.status === 404 ? "raw_root_missing" : root.status === 403 ? "raw_root_access_unknown" : "raw_root_unavailable";
+        if (root.status === 200) {
+          try {
+            const object = JSON.parse(root.xml);
+            candidate = object.format_version === 1 && object.retired === true
+              ? "raw_root_retired_provenance_unverified"
+              : typeof object.object_locator === "string" && object.object_locator.startsWith(`tenants/${tenant}/cas/`) && /^[0-9a-f]{64}$/u.test(object.blake3_digest) &&
+              Number.isSafeInteger(object.size_bytes) && object.size_bytes >= 0 ? "raw_root_candidate_unverified" : "raw_root_malformed";
+          } catch { candidate = "raw_root_malformed"; }
+        }
+      }
+      report.gaps.push({ receipt_key: key, kind, tenant, identity, gap_reason: String(receipt.gap_reason), source_candidate: candidate });
+    }
+    const truncated = text(listing.xml, "IsTruncated");
+    if (truncated === "false") { report.pagination_exhausted = true; break; }
+    const next = text(listing.xml, "NextContinuationToken");
+    if (truncated !== "true" || !next || tokens.has(next)) throw new Error("invalid_receipt_cursor");
+    tokens.add(next); token = next;
+  }
+  report.counts_match = report.pagination_exhausted && report.receipts === report.expected_receipts && report.gap_count === report.expected_gaps;
+  // The existing ordered BLAKE3 digest must be checked by the Rust verifier.
+  // A complete listing/count is not an independent body or aggregate proof.
+  report.coverage_state = report.counts_match ? "enumerated_digest_unverified" : "partial";
+  return report;
+}
+
+function signedGet(environment = process.env): Get {
+  const endpoint = new URL(environment.MTC_S3_ENDPOINT || "");
+  const bucket = environment.MTC_S3_BUCKET || "";
+  const access = environment.MTC_S3_ACCESS_KEY || "";
+  const secret = environment.MTC_S3_SECRET_KEY || "";
+  const region = environment.MTC_S3_REGION || "us-east-1";
   if (!/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/u.test(bucket) || !access || !secret ||
       endpoint.username || endpoint.password || endpoint.search || endpoint.hash || endpoint.pathname !== "/" ||
       !["http:", "https:"].includes(endpoint.protocol) ||
-      (endpoint.protocol === "http:" && process.env.MTC_S3_ALLOW_HTTP !== "true")) throw new Error("configuration");
+      (endpoint.protocol === "http:" && environment.MTC_S3_ALLOW_HTTP !== "true")) throw new Error("configuration");
   return async (params, key) => {
     const path = `/${bucket}${key === undefined ? "" : `/${key.split("/").map(encode).join("/")}`}`;
     const query = Object.entries(params).map(([name, value]) => [encode(name), encode(value)] as const)
@@ -214,12 +278,16 @@ async function main() {
   for (let index = 0; index < args.length; index += 2) {
     const flag = args[index]!;
     const value = args[index + 1];
-    if (!["--output", "--max-pages", "--prefix"].includes(flag) || value === undefined || options.has(flag)) throw new Error("arguments");
+    if (!["--output", "--max-pages", "--prefix", "--locator-checkpoint"].includes(flag) || value === undefined || options.has(flag)) throw new Error("arguments");
     options.set(flag, value);
   }
   const output = options.get("--output");
   if (!output) throw new Error("output_required");
-  const report = await audit(signedGet(), Number(options.get("--max-pages") ?? "1"), options.get("--prefix") ?? "");
+  const locatorCheckpoint = options.get("--locator-checkpoint");
+  const sourceEnvironment = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith("MTC_SOURCE_S3_")).map(([key,value]) => [key.replace("MTC_SOURCE_S3_", "MTC_S3_"),value]));
+  const report = locatorCheckpoint
+    ? await auditLocatorGaps(signedGet(), signedGet(sourceEnvironment), JSON.parse(await readFile(locatorCheckpoint, "utf8")), Number(options.get("--max-pages") ?? "1"))
+    : await audit(signedGet(), Number(options.get("--max-pages") ?? "1"), options.get("--prefix") ?? "");
   const temporary = `${resolve(output)}.${randomUUID()}.tmp`;
   try {
     const file = await open(temporary, "wx", 0o600);
@@ -233,13 +301,18 @@ async function main() {
   } finally {
     await rm(temporary, { force: true });
   }
-  console.log(JSON.stringify({ report_written: true, object_inventory_complete: report.objects.complete,
-    multipart_list_complete: report.multipart.complete, deletion_authorized: false }));
+  console.log(JSON.stringify({ report_written: true, object_inventory_complete: "objects" in report ? report.objects.complete : false,
+    multipart_list_complete: "multipart" in report ? report.multipart.complete : false, deletion_authorized: false }));
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  main().catch(() => {
-    console.error(JSON.stringify({ report_written: false, reason: "storage_audit_failed" }));
+  main().catch((error: unknown) => {
+    const allowed = new Set(["invalid_locator_checkpoint", "receipt_listing_unavailable", "invalid_receipt_listing", "receipt_unavailable", "receipt_identity_mismatch", "duplicate_receipt_identity", "conflicting_gap_receipt", "invalid_receipt_cursor", "configuration"]);
+    const reason = error instanceof Error && allowed.has(error.message) ? error.message : "storage_audit_failed";
+    const code = typeof (error as {code?:unknown})?.code === "string" ? (error as {code:string}).code : "";
+    const safeCode = ["ENOENT", "EACCES", "EROFS", "ENOSPC", "ENOTDIR"].includes(code) ? code : undefined;
+    const errorType = error instanceof SyntaxError ? "json_format" : error instanceof TypeError ? "transport_or_type" : error instanceof Error ? error.name === "TimeoutError" ? "transport_timeout" : "validation" : "unknown";
+    console.error(JSON.stringify({ report_written: false, reason, error_type: errorType, filesystem_code: safeCode }));
     process.exitCode = 1;
   });
 }
