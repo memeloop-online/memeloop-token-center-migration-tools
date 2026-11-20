@@ -42,7 +42,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: memeloop-online/memeloop-token-center
-          ref: cc0ae27f4c5c80858c4cf95c7e22907997532762
+          ref: 2ef447df5ca018ba40e98cbbfb4ee5b0bca130b8
           path: .object-runtime
           persist-credentials: false
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
