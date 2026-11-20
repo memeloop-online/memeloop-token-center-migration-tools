@@ -57,10 +57,49 @@ fn at_stage(stage: &'static str, cause: impl Into<Failure>) -> Failure {
 fn safe_failure(error: &(dyn std::error::Error + 'static)) -> serde_json::Value {
     let mut stages = Vec::new();
     let mut category = "validation";
+    let mut diagnostic = None;
     let mut current = Some(error);
     while let Some(cause) = current {
         if let Some(context) = cause.downcast_ref::<MigrationFailure>() {
             stages.push(context.stage);
+        }
+        if let Some(error) = cause.downcast_ref::<memeloop_token_center::config::ConfigError>() {
+            use memeloop_token_center::config::ConfigError as E;
+            diagnostic = Some(match error {
+                E::InvalidProxyMemoryBudget => "invalid_proxy_memory_budget",
+                E::InvalidResponsesRequestSpool => "invalid_request_spool_path",
+                E::InvalidS3Timeouts => "invalid_s3_timeouts",
+                E::Missing(name) => name,
+                E::WeakKeyPepper => "weak_key_pepper",
+                E::ServiceTokenTooShort => "service_token_too_short",
+                E::InvalidServiceTokenCharacters => "invalid_service_token_characters",
+                E::SecretTooShort(name, _) | E::InvalidSecretCharacters(name) => name,
+                E::InvalidArchiveBackend(_) => "invalid_archive_backend",
+                E::InvalidInteger(name, _) => name,
+                E::InvalidUpstreamHealthConfig(_) => "invalid_upstream_health_config",
+                E::InvalidPricingSourceUrl(name) => name,
+            });
+        }
+        if let Some(error) = cause.downcast_ref::<memeloop_token_center::InitializationError>() {
+            diagnostic = Some(match error {
+                memeloop_token_center::InitializationError::Database(
+                    memeloop_token_center::error::AppError::Storage { code, .. },
+                ) => code,
+                memeloop_token_center::InitializationError::Database(_) => {
+                    "database_initialization"
+                }
+                memeloop_token_center::InitializationError::Archive => "archive_initialization",
+                memeloop_token_center::InitializationError::Plugin => "plugin_initialization",
+                memeloop_token_center::InitializationError::HttpClient => {
+                    "http_client_initialization"
+                }
+                memeloop_token_center::InitializationError::ProxyMemoryBudget => {
+                    "proxy_memory_budget"
+                }
+                memeloop_token_center::InitializationError::TransportProxyGroups => {
+                    "transport_proxy_groups"
+                }
+            });
         }
         if cause.is::<sqlx::Error>() {
             category = "database";
@@ -75,7 +114,7 @@ fn safe_failure(error: &(dyn std::error::Error + 'static)) -> serde_json::Value 
     }
     // Never serialize error Display/Debug: SQL, URLs and object-store errors
     // can contain credentials or source payload. Stages are static literals.
-    serde_json::json!({"event":"migration_failed","stages":stages,"category":category})
+    serde_json::json!({"event":"migration_failed","stages":stages,"category":category,"diagnostic":diagnostic})
 }
 
 #[path = "conversation-object-modules/durable_roots.rs"]

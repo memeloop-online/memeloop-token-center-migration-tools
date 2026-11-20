@@ -54,16 +54,22 @@ pub(super) async fn run(plan_path: &std::path::Path, receipt_path: &std::path::P
     if plan.format_version != 1 || plan.request.locator == plan.response.locator {
         return Err("invalid exact recovery plan".into());
     }
-    let mut config = Config::from_env()?;
+    let mut config = Config::from_env().map_err(|e| at_stage("exact_configuration", e))?;
     // An exact content repair must not perform startup schema migrations.
     config.run_migrations_on_start = false;
     let pool = PgPoolOptions::new()
         .max_connections(2)
         .connect(&config.database_url)
         .await?;
-    let state = memeloop_token_center::AppState::initialize(config).await?;
-    verify_source(&state.archive, &plan.request).await?;
-    verify_source(&state.archive, &plan.response).await?;
+    let state = memeloop_token_center::AppState::initialize(config)
+        .await
+        .map_err(|e| at_stage("exact_initialize", e))?;
+    verify_source(&state.archive, &plan.request)
+        .await
+        .map_err(|e| at_stage("exact_request_source", e))?;
+    verify_source(&state.archive, &plan.response)
+        .await
+        .map_err(|e| at_stage("exact_response_source", e))?;
     let identity = blake3::hash(&bytes).to_hex().to_string();
     let mut receipt: serde_json::Value = if receipt_path.exists() {
         let previous: serde_json::Value =
@@ -148,11 +154,17 @@ pub(super) async fn run(plan_path: &std::path::Path, receipt_path: &std::path::P
         receipt["claimed"] = true.into();
         receipt["lease_owner"] = owner.to_string().into();
         save_checkpoint(receipt_path, &receipt)?;
-        memeloop_token_center::worker::archive_session_body(&state, owner, plan.request_id).await?
+        memeloop_token_center::worker::archive_session_body(&state, owner, plan.request_id)
+            .await
+            .map_err(|e| at_stage("exact_canonical_writer", e))?
     };
     // Re-read all original bytes after publication; no source is deleted here.
-    verify_source(&state.archive, &plan.request).await?;
-    verify_source(&state.archive, &plan.response).await?;
+    verify_source(&state.archive, &plan.request)
+        .await
+        .map_err(|e| at_stage("exact_request_source", e))?;
+    verify_source(&state.archive, &plan.response)
+        .await
+        .map_err(|e| at_stage("exact_response_source", e))?;
     let row = sqlx::query(
         "SELECT semantic_snapshot_json, (SELECT o.leaf_node_hash FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE o.request_id = $1 AND c.tenant_id = $2 AND o.key_id = $3 LIMIT 1) AS leaf_node_hash FROM conversation_projection_outbox
          WHERE request_id = $1 AND tenant_id = $2 AND key_id = $3",
