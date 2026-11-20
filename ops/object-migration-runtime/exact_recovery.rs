@@ -177,7 +177,7 @@ pub(super) async fn run(plan_path: &std::path::Path, receipt_path: &std::path::P
         receipt["claimed"] = true.into();
         receipt["lease_owner"] = owner.to_string().into();
         save_checkpoint(receipt_path, &receipt)?;
-        memeloop_token_center::worker::archive_session_body(&state, owner, plan.request_id)
+        memeloop_token_center::worker::recover_claimed_session_body(&state, owner, plan.request_id)
             .await
             .map_err(|e| at_stage("exact_canonical_writer", e))?
     };

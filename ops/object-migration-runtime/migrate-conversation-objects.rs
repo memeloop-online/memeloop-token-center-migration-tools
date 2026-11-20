@@ -63,6 +63,20 @@ fn safe_failure(error: &(dyn std::error::Error + 'static)) -> serde_json::Value 
         if let Some(context) = cause.downcast_ref::<MigrationFailure>() {
             stages.push(context.stage);
         }
+        if let Some(memeloop_token_center::error::AppError::Storage { code, facts }) =
+            cause.downcast_ref::<memeloop_token_center::error::AppError>()
+        {
+            diagnostic = Some(*code);
+            if let Some(stage) = facts.stage {
+                stages.push(stage);
+            }
+            if let Some(kind) = facts.kind {
+                stages.push(kind);
+            }
+            if let Some(phase) = facts.phase {
+                stages.push(phase);
+            }
+        }
         if let Some(error) = cause.downcast_ref::<memeloop_token_center::config::ConfigError>() {
             use memeloop_token_center::config::ConfigError as E;
             diagnostic = Some(match error {
