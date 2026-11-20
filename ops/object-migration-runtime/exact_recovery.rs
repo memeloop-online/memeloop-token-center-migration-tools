@@ -105,9 +105,32 @@ pub(super) async fn run(plan_path: &std::path::Path, receipt_path: &std::path::P
             .await?;
         }
     }
-    let row = sqlx::query("SELECT projected_at, semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1 AND tenant_id = $2 AND key_id = $3")
+    let row = sqlx::query("SELECT o.projected_at, o.semantic_snapshot_json, r.request_object, r.response_object FROM conversation_projection_outbox o JOIN request_records r ON r.id = o.request_id AND r.tenant_id = o.tenant_id AND r.key_id = o.key_id WHERE o.request_id = $1 AND o.tenant_id = $2 AND o.key_id = $3")
         .bind(plan.request_id.to_string()).bind(plan.tenant_id.to_string()).bind(plan.key_id.to_string())
         .fetch_one(&pool).await?;
+    let current_request: String = row.try_get("request_object")?;
+    let current_response: Option<String> = row.try_get("response_object")?;
+    let current_response = current_response.ok_or("exact response source disappeared")?;
+    // The normal writer may durably bind an equivalent raw-root CAS locator
+    // before preparation. Resume only after independently hashing that current
+    // selected content against the original immutable plan.
+    for (locator, expected) in [
+        (&current_request, &plan.request),
+        (&current_response, &plan.response),
+    ] {
+        verify_source(
+            &state.archive,
+            &Source {
+                locator: locator.clone(),
+                decoded_bytes: expected.decoded_bytes,
+                decoded_sha256: expected.decoded_sha256.clone(),
+            },
+        )
+        .await
+        .map_err(|e| at_stage("exact_current_source", e))?;
+    }
+    receipt["current_source_locators"] =
+        serde_json::json!({"request":current_request,"response":current_response});
     let current_ack: Option<i64> = row.try_get("projected_at")?;
     let current_snapshot: Option<String> = row.try_get("semantic_snapshot_json")?;
     let already_written = current_ack.is_some() && current_snapshot.is_some();
@@ -138,8 +161,8 @@ pub(super) async fn run(plan_path: &std::path::Path, receipt_path: &std::path::P
                 plan.key_id,
                 plan.request_id,
                 expected_ack,
-                &plan.request.locator,
-                &plan.response.locator,
+                &current_request,
+                &current_response,
                 owner,
                 current_snapshot.as_deref(),
                 receipt["lease_owner"]
