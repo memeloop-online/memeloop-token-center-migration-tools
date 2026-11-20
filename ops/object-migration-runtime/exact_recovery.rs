@@ -266,3 +266,62 @@ pub(super) async fn run(plan_path: &std::path::Path, receipt_path: &std::path::P
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn equivalent_rebound_locator_must_match_original_decoded_bytes() {
+        let archive = ArchiveStore::from_config(&Config::for_test("sqlite::memory:".into()))
+            .await
+            .unwrap();
+        let tenant = Uuid::now_v7();
+        let bytes = Bytes::from_static(br#"{"input":"original request"}"#);
+        archive
+            .put("legacy/request.json", bytes.clone())
+            .await
+            .unwrap();
+        let original = Source {
+            locator: "legacy/request.json".into(),
+            decoded_bytes: bytes.len() as u64,
+            decoded_sha256: format!("{:x}", Sha256::digest(&bytes)),
+        };
+        verify_source(&archive, &original).await.unwrap();
+        let rebound = archive
+            .put_tenant_content(tenant, bytes.clone())
+            .await
+            .unwrap();
+        assert_ne!(rebound.object_locator, original.locator);
+        verify_source(
+            &archive,
+            &Source {
+                locator: rebound.object_locator.clone(),
+                decoded_bytes: original.decoded_bytes,
+                decoded_sha256: original.decoded_sha256.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        archive
+            .put(
+                "legacy/changed.json",
+                Bytes::from_static(br#"{"input":"different source"}"#),
+            )
+            .await
+            .unwrap();
+        assert!(
+            verify_source(
+                &archive,
+                &Source {
+                    locator: "legacy/changed.json".into(),
+                    decoded_bytes: original.decoded_bytes,
+                    decoded_sha256: original.decoded_sha256
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(archive.get(&original.locator).await.unwrap(), bytes);
+    }
+}
