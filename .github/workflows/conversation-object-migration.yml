@@ -42,7 +42,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: memeloop-online/memeloop-token-center
-          ref: 3c1d41c27256e125a8e5ec8ae5c69e81312b5cf0
+          ref: 94afcb0229c55d4fee3cb35ff3f61c2a3a6be01e
           path: .object-runtime
           persist-credentials: false
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -127,6 +127,7 @@ jobs:
         run: |
           cargo test --locked --bin migrate-conversation-objects
           cargo test --locked --lib db::requests::conversations::archive_readiness_tests::postgres_exact_legacy_body_rebuild_preserves_incomplete_and_financial_receipt -- --exact
+          cargo test --locked --lib archive::routing_tests::streamed_legacy_body_uses_current_metadata_backend_and_survives_switchback -- --exact
       - name: Build reviewed migration command
         working-directory: .object-runtime
         run: cargo build --locked --bin migrate-conversation-objects
