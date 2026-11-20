@@ -63,18 +63,27 @@ fn safe_failure(error: &(dyn std::error::Error + 'static)) -> serde_json::Value 
         if let Some(context) = cause.downcast_ref::<MigrationFailure>() {
             stages.push(context.stage);
         }
-        if let Some(memeloop_token_center::error::AppError::Storage { code, facts }) =
-            cause.downcast_ref::<memeloop_token_center::error::AppError>()
-        {
-            diagnostic = Some(*code);
-            if let Some(stage) = facts.stage {
-                stages.push(stage);
-            }
-            if let Some(kind) = facts.kind {
-                stages.push(kind);
-            }
-            if let Some(phase) = facts.phase {
-                stages.push(phase);
+        if let Some(error) = cause.downcast_ref::<memeloop_token_center::error::AppError>() {
+            use memeloop_token_center::error::AppError as E;
+            let facts = match error {
+                E::Storage { code, facts } | E::Internal { code, facts }
+                | E::Capacity { code, facts } | E::Upstream { code, facts } => {
+                    diagnostic = Some(*code);
+                    Some(facts)
+                }
+                E::DatabaseUnavailable(failure) => {
+                    diagnostic = Some(failure.code());
+                    None
+                }
+                E::NotFound => { diagnostic = Some("not_found"); None }
+                E::Conflict(_) => { diagnostic = Some("conflict"); None }
+                E::BadRequest(_) => { diagnostic = Some("invalid_request"); None }
+                _ => { diagnostic = Some("unclassified_application_error"); None }
+            };
+            if let Some(facts) = facts {
+                if let Some(stage) = facts.stage { stages.push(stage); }
+                if let Some(kind) = facts.kind { stages.push(kind); }
+                if let Some(phase) = facts.phase { stages.push(phase); }
             }
         }
         if let Some(error) = cause.downcast_ref::<memeloop_token_center::config::ConfigError>() {
@@ -1367,6 +1376,16 @@ mod tests;
 #[cfg(test)]
 mod diagnostic_tests {
     use super::*;
+
+    #[test]
+    fn reports_internal_code_and_redacts_conflict_details() {
+        let error = at_stage("exact_canonical_writer", memeloop_token_center::error::AppError::Internal { code: "exact_project_failed", facts: Default::default() });
+        assert_eq!(safe_failure(error.as_ref())["diagnostic"], "exact_project_failed");
+        let error = at_stage("exact_canonical_writer", memeloop_token_center::error::AppError::Conflict("private-source-and-credentials".into()));
+        let report = safe_failure(error.as_ref());
+        assert_eq!(report["diagnostic"], "conflict");
+        assert!(!report.to_string().contains("private-source"));
+    }
 
     #[test]
     fn reports_static_stages_without_error_payload_or_credentials() {
