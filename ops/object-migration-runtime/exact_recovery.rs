@@ -61,7 +61,7 @@ pub(super) async fn run(plan_path: &std::path::Path, receipt_path: &std::path::P
         .max_connections(2)
         .connect(&config.database_url)
         .await?;
-    let state = memeloop_token_center::AppState::initialize(config)
+    let state = memeloop_token_center::AppState::initialize_for_maintenance(config)
         .await
         .map_err(|e| at_stage("exact_initialize", e))?;
     verify_source(&state.archive, &plan.request)
@@ -105,7 +105,7 @@ pub(super) async fn run(plan_path: &std::path::Path, receipt_path: &std::path::P
             .await?;
         }
     }
-    let row = sqlx::query("SELECT o.projected_at, o.semantic_snapshot_json, r.request_object, r.response_object FROM conversation_projection_outbox o JOIN request_records r ON r.id = o.request_id AND r.tenant_id = o.tenant_id AND r.key_id = o.key_id WHERE o.request_id = $1 AND o.tenant_id = $2 AND o.key_id = $3")
+    let row = sqlx::query("SELECT o.projected_at, o.semantic_snapshot_json, r.request_object, r.response_object FROM conversation_projection_outbox o JOIN request_record_locators l ON l.id = o.request_id AND l.tenant_id = o.tenant_id AND l.key_id = o.key_id JOIN request_records r ON r.id = l.id AND r.created_at = l.created_at AND r.tenant_id = l.tenant_id AND r.key_id = l.key_id WHERE o.request_id = $1 AND o.tenant_id = $2 AND o.key_id = $3")
         .bind(plan.request_id.to_string()).bind(plan.tenant_id.to_string()).bind(plan.key_id.to_string())
         .fetch_one(&pool).await?;
     let current_request: String = row.try_get("request_object")?;

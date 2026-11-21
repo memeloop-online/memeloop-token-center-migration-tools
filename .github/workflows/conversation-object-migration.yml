@@ -42,7 +42,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: memeloop-online/memeloop-token-center
-          ref: 97dccba116e1597738bc56ea7d6cc092e823cc8e
+          ref: 14fbe56e30438e2a2d6e5f19d5714641e8da11ad
           path: .object-runtime
           persist-credentials: false
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -125,6 +125,7 @@ jobs:
           MTC_RUSTFS_TEST_ACCESS_KEY: rustfs-migration-fixture
           MTC_RUSTFS_TEST_SECRET_KEY: synthetic-test-only-secret-49
         run: |
+          cargo test --locked --lib tests::maintenance_initialization_never_starts_customer_recovery_workers -- --exact
           cargo test --locked --bin migrate-conversation-objects
           cargo test --locked --lib db::requests::conversations::archive_readiness_tests::postgres_exact_legacy_body_rebuild_preserves_incomplete_and_financial_receipt -- --exact
           cargo test --locked --lib archive::routing_tests::streamed_legacy_body_uses_current_metadata_backend_and_survives_switchback -- --exact
