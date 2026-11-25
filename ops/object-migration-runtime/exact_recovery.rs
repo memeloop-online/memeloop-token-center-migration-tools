@@ -149,6 +149,9 @@ pub(super) async fn run(plan_path: &std::path::Path, receipt_path: &std::path::P
             } else {
                 Some(plan.expected_projected_at)
             };
+        if current_snapshot.is_some() {
+            return Err("prepared recovery requires a reviewed handover; inspection only".into());
+        }
         let owner = Uuid::now_v7();
         // Persist intent before the CAS so an interrupted result can be resumed
         // after the existing finite lease expires, without changing the plan.
@@ -357,7 +360,7 @@ pub(super) async fn inspect(
         .connect(&config.database_url)
         .await?;
     let receipt = inspect_verified(&pool, &archive, &plan, &identity, &prior_bytes).await?;
-    save_checkpoint(output, &receipt)?;
+    save_inspection_noclobber(output, &receipt)?;
     pool.close().await;
     Ok(())
 }
@@ -406,21 +409,38 @@ async fn inspect_verified(
         )
         .await?;
     }
-    // The shared worker prefers raw roots; verify those selected originals too.
-    for (side, expected) in [("request", &plan.request), ("response", &plan.response)] {
-        if let Some(root) = archive
+    // Record the actual immutable selection, separately from the SQL fallback.
+    let mut selected = serde_json::Map::new();
+    for (side, expected, fallback) in [
+        ("request", &plan.request, &request_locator),
+        ("response", &plan.response, &response_locator),
+    ] {
+        let root = archive
             .raw_capture_reference(plan.tenant_id, plan.request_id, side)
-            .await?
-        {
+            .await?;
+        if let Some(root) = root {
             verify_source(
-                &archive,
+                archive,
                 &Source {
-                    locator: root.object_locator,
+                    locator: root.object_locator.clone(),
                     decoded_bytes: expected.decoded_bytes,
                     decoded_sha256: expected.decoded_sha256.clone(),
                 },
             )
             .await?;
+            selected.insert(side.into(), serde_json::json!({
+                "selection":"raw_root", "reference":root,
+                "reference_blake3":blake3::hash(&serde_json::to_vec(&root)?).to_hex().to_string(),
+                "fallback_locator":fallback
+            }));
+        } else {
+            selected.insert(
+                side.into(),
+                serde_json::json!({
+                    "selection":"request_record", "object_locator":fallback,
+                    "decoded_bytes":expected.decoded_bytes, "decoded_sha256":expected.decoded_sha256
+                }),
+            );
         }
     }
     let snapshot: Option<String> = row.try_get("semantic_snapshot_json")?;
@@ -450,6 +470,7 @@ async fn inspect_verified(
         "snapshot_sha256":snapshot.as_ref().map(|value| format!("{:x}", Sha256::digest(value.as_bytes()))),
         "request":Source {locator:request_locator, ..plan.request.clone()},
         "response":Source {locator:response_locator, ..plan.response.clone()},
+        "selected_sources":selected,
         "sources_verified":true, "ready_for_review":ready,
         "apply_supported":false, "claimed":false, "financial_replay":false,
         "canonical_rebuilt":false, "complete":false
@@ -578,5 +599,42 @@ mod inspection_tests {
             .await
             .unwrap();
         admin.close().await;
+    }
+}
+
+fn save_inspection_noclobber(path: &std::path::Path, value: &serde_json::Value) -> Result<()> {
+    let directory = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+    serde_json::to_writer(temporary.as_file_mut(), value)?;
+    temporary.as_file_mut().write_all(b"\n")?;
+    temporary.as_file().sync_all()?;
+    temporary.persist_noclobber(path)?;
+    std::fs::File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod receipt_publication_tests {
+    use super::*;
+    #[test]
+    fn inspection_publication_never_overwrites_a_prior_or_concurrent_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("handover.json");
+        let results = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                save_inspection_noclobber(&path, &serde_json::json!({"writer":1})).is_ok()
+            });
+            let second = scope.spawn(|| {
+                save_inspection_noclobber(&path, &serde_json::json!({"writer":2})).is_ok()
+            });
+            [first.join().unwrap(), second.join().unwrap()]
+        });
+        assert_eq!(results.into_iter().filter(|won| *won).count(), 1);
+        let original = std::fs::read(&path).unwrap();
+        assert!(save_inspection_noclobber(&path, &serde_json::json!({"writer":3})).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
     }
 }
