@@ -1,7 +1,7 @@
 use super::*;
 use sha2::{Digest, Sha256};
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Source {
     locator: String,
@@ -356,6 +356,19 @@ pub(super) async fn inspect(
         .max_connections(1)
         .connect(&config.database_url)
         .await?;
+    let receipt = inspect_verified(&pool, &archive, &plan, &identity, &prior_bytes).await?;
+    save_checkpoint(output, &receipt)?;
+    pool.close().await;
+    Ok(())
+}
+
+async fn inspect_verified(
+    pool: &PgPool,
+    archive: &ArchiveStore,
+    plan: &Plan,
+    identity: &str,
+    prior_bytes: &[u8],
+) -> Result<serde_json::Value> {
     let mut read = pool.begin().await?;
     sqlx::query("SET TRANSACTION READ ONLY")
         .execute(&mut *read)
@@ -435,13 +448,135 @@ pub(super) async fn inspect(
         "expected_owner":owner, "expected_lease_expires_at":expiry,
         "terminal_owner_present":terminal_owner.is_some(), "terminal_lease_expires_at":terminal_expiry,
         "snapshot_sha256":snapshot.as_ref().map(|value| format!("{:x}", Sha256::digest(value.as_bytes()))),
-        "request":Source {locator:request_locator, ..plan.request},
-        "response":Source {locator:response_locator, ..plan.response},
+        "request":Source {locator:request_locator, ..plan.request.clone()},
+        "response":Source {locator:response_locator, ..plan.response.clone()},
         "sources_verified":true, "ready_for_review":ready,
         "apply_supported":false, "claimed":false, "financial_replay":false,
         "canonical_rebuilt":false, "complete":false
     });
-    save_checkpoint(output, &receipt)?;
-    pool.close().await;
-    Ok(())
+    Ok(receipt)
+}
+
+#[cfg(test)]
+mod inspection_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn exact_inspection_is_read_only_and_changed_sources_do_not_become_ready() {
+        let url = std::env::var("MTC_TEST_POSTGRES_URL").unwrap();
+        let admin = PgPool::connect(&url).await.unwrap();
+        let schema = format!("exact_inspect_{}", Uuid::now_v7().simple());
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(&admin)
+            .await
+            .unwrap();
+        let mut scoped = url::Url::parse(&url).unwrap();
+        scoped
+            .query_pairs_mut()
+            .append_pair("options", &format!("-csearch_path={schema}"));
+        let pool = PgPool::connect(scoped.as_str()).await.unwrap();
+        sqlx::raw_sql("CREATE TABLE conversation_projection_outbox(request_id TEXT PRIMARY KEY, tenant_id TEXT, key_id TEXT, projected_at BIGINT, semantic_snapshot_json TEXT, semantic_payload_snapshot_json TEXT, lease_owner TEXT, lease_expires_at BIGINT, terminal_lease_owner TEXT, terminal_lease_expires_at BIGINT); CREATE TABLE request_record_locators(id TEXT PRIMARY KEY,tenant_id TEXT,key_id TEXT,created_at BIGINT); CREATE TABLE request_records(id TEXT,tenant_id TEXT,key_id TEXT,created_at BIGINT,request_object TEXT,response_object TEXT); CREATE TABLE financial_once(amount BIGINT); INSERT INTO financial_once VALUES(42)")
+            .execute(&pool).await.unwrap();
+        let archive = ArchiveStore::from_config(&Config::for_test("sqlite::memory:".into()))
+            .await
+            .unwrap();
+        let tenant = Uuid::now_v7();
+        let key = Uuid::now_v7();
+        let request = Uuid::now_v7();
+        let inspected_owner = Uuid::now_v7();
+        let source = Bytes::from_static(br#"{"fixture":"original"}"#);
+        for side in ["request", "response"] {
+            archive
+                .put(&format!("inspect/{side}"), source.clone())
+                .await
+                .unwrap();
+        }
+        let plan = Plan {
+            format_version: 1,
+            tenant_id: tenant,
+            key_id: key,
+            request_id: request,
+            expected_projected_at: 42,
+            request: Source {
+                locator: "inspect/request".into(),
+                decoded_bytes: source.len() as u64,
+                decoded_sha256: format!("{:x}", Sha256::digest(&source)),
+            },
+            response: Source {
+                locator: "inspect/response".into(),
+                decoded_bytes: source.len() as u64,
+                decoded_sha256: format!("{:x}", Sha256::digest(&source)),
+            },
+        };
+        sqlx::query("INSERT INTO conversation_projection_outbox VALUES($1,$2,$3,NULL,'{}',NULL,$4,0,NULL,NULL)")
+            .bind(request.to_string()).bind(tenant.to_string()).bind(key.to_string()).bind(inspected_owner.to_string()).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO request_record_locators VALUES($1,$2,$3,123)")
+            .bind(request.to_string())
+            .bind(tenant.to_string())
+            .bind(key.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO request_records VALUES($1,$2,$3,123,'inspect/request','inspect/response')",
+        )
+        .bind(request.to_string())
+        .bind(tenant.to_string())
+        .bind(key.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let before: String =
+            sqlx::query_scalar("SELECT to_jsonb(o)::TEXT FROM conversation_projection_outbox o")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let report = inspect_verified(&pool, &archive, &plan, "same-plan", b"original receipt")
+            .await
+            .unwrap();
+        assert_eq!(report["ready_for_review"], true);
+        assert_eq!(report["expected_owner"], inspected_owner.to_string());
+        assert_eq!(report["apply_supported"], false);
+        assert_eq!(report["claimed"], false);
+        let after: String =
+            sqlx::query_scalar("SELECT to_jsonb(o)::TEXT FROM conversation_projection_outbox o")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(before, after);
+        sqlx::query(
+            "UPDATE conversation_projection_outbox SET lease_expires_at=9223372036854775807",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            inspect_verified(&pool, &archive, &plan, "same-plan", b"original receipt")
+                .await
+                .unwrap()["ready_for_review"],
+            false
+        );
+        archive
+            .put("inspect/response", Bytes::from_static(b"changed"))
+            .await
+            .unwrap();
+        assert!(
+            inspect_verified(&pool, &archive, &plan, "same-plan", b"original receipt")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT SUM(amount)::BIGINT FROM financial_once")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            42
+        );
+        pool.close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&admin)
+            .await
+            .unwrap();
+        admin.close().await;
+    }
 }
