@@ -1,7 +1,7 @@
 use super::*;
 use sha2::{Digest, Sha256};
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Source {
     locator: String,
@@ -324,4 +324,124 @@ mod tests {
         );
         assert_eq!(archive.get(&original.locator).await.unwrap(), bytes);
     }
+}
+
+/// Build a separate handover candidate. This never claims, clears a snapshot,
+/// starts application workers, or edits the previous recovery receipt.
+pub(super) async fn inspect(
+    plan_path: &std::path::Path,
+    prior_receipt_path: &std::path::Path,
+    output: &std::path::Path,
+) -> Result<()> {
+    if output.exists() || output == prior_receipt_path || output == plan_path {
+        return Err("inspection output must be a new independent receipt".into());
+    }
+    let plan_bytes = std::fs::read(plan_path)?;
+    let plan: Plan = serde_json::from_slice(&plan_bytes)?;
+    if plan.format_version != 1 || plan.request.locator == plan.response.locator {
+        return Err("invalid exact recovery plan".into());
+    }
+    let prior_bytes = std::fs::read(prior_receipt_path)?;
+    let prior: serde_json::Value = serde_json::from_slice(&prior_bytes)?;
+    let identity = blake3::hash(&plan_bytes).to_hex().to_string();
+    if prior["identity"].as_str() != Some(identity.as_str())
+        || prior["request_id"].as_str() != Some(plan.request_id.to_string().as_str())
+        || prior["claim_intent"].as_bool() != Some(true)
+    {
+        return Err("original receipt does not identify this recovery intent".into());
+    }
+    let config = Config::from_env().map_err(|e| at_stage("inspect_configuration", e))?;
+    let archive = ArchiveStore::from_config(&config).await?;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&config.database_url)
+        .await?;
+    let mut read = pool.begin().await?;
+    sqlx::query("SET TRANSACTION READ ONLY")
+        .execute(&mut *read)
+        .await?;
+    sqlx::query("SET LOCAL statement_timeout='3s'")
+        .execute(&mut *read)
+        .await?;
+    let row = sqlx::query("SELECT l.created_at, o.projected_at, o.semantic_snapshot_json,
+        o.lease_owner, o.lease_expires_at, o.terminal_lease_owner, o.terminal_lease_expires_at,
+        CAST(CASE WHEN o.semantic_payload_snapshot_json IS NOT NULL THEN 1 ELSE 0 END AS BIGINT) AS payload_present,
+        r.request_object, r.response_object
+        FROM conversation_projection_outbox o JOIN request_record_locators l
+          ON l.id=o.request_id AND l.tenant_id=o.tenant_id AND l.key_id=o.key_id
+        JOIN request_records r ON r.id=l.id AND r.created_at=l.created_at
+          AND r.tenant_id=l.tenant_id AND r.key_id=l.key_id
+        WHERE o.request_id=$1 AND o.tenant_id=$2 AND o.key_id=$3")
+        .bind(plan.request_id.to_string()).bind(plan.tenant_id.to_string()).bind(plan.key_id.to_string())
+        .fetch_one(&mut *read).await?;
+    read.commit().await?;
+    let request_locator: String = row.try_get("request_object")?;
+    let response_locator: Option<String> = row.try_get("response_object")?;
+    let response_locator = response_locator.ok_or("inspected response source is absent")?;
+    for (locator, expected) in [
+        (&request_locator, &plan.request),
+        (&response_locator, &plan.response),
+    ] {
+        verify_source(&archive, expected).await?;
+        verify_source(
+            &archive,
+            &Source {
+                locator: locator.clone(),
+                decoded_bytes: expected.decoded_bytes,
+                decoded_sha256: expected.decoded_sha256.clone(),
+            },
+        )
+        .await?;
+    }
+    // The shared worker prefers raw roots; verify those selected originals too.
+    for (side, expected) in [("request", &plan.request), ("response", &plan.response)] {
+        if let Some(root) = archive
+            .raw_capture_reference(plan.tenant_id, plan.request_id, side)
+            .await?
+        {
+            verify_source(
+                &archive,
+                &Source {
+                    locator: root.object_locator,
+                    decoded_bytes: expected.decoded_bytes,
+                    decoded_sha256: expected.decoded_sha256.clone(),
+                },
+            )
+            .await?;
+        }
+    }
+    let snapshot: Option<String> = row.try_get("semantic_snapshot_json")?;
+    let owner: Option<String> = row.try_get("lease_owner")?;
+    let expiry: Option<i64> = row.try_get("lease_expires_at")?;
+    let terminal_owner: Option<String> = row.try_get("terminal_lease_owner")?;
+    let terminal_expiry: Option<i64> = row.try_get("terminal_lease_expires_at")?;
+    let projected: Option<i64> = row.try_get("projected_at")?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as i64;
+    let ready = projected.is_none()
+        && snapshot.as_ref().is_some_and(|value| !value.is_empty())
+        && owner
+            .as_ref()
+            .is_some_and(|value| Uuid::parse_str(value).is_ok())
+        && expiry.is_some_and(|value| value <= now)
+        && (terminal_owner.is_none() || terminal_expiry.is_some_and(|value| value <= now))
+        && row.try_get::<i64, _>("payload_present")? == 0;
+    let receipt = serde_json::json!({
+        "format_version":1, "kind":"exact_recovery_inspection", "identity":identity,
+        "prior_receipt_sha256":format!("{:x}", Sha256::digest(&prior_bytes)),
+        "tenant_id":plan.tenant_id, "key_id":plan.key_id, "request_id":plan.request_id,
+        "created_at":row.try_get::<i64,_>("created_at")?, "expected_projected_at":projected,
+        "expected_owner":owner, "expected_lease_expires_at":expiry,
+        "terminal_owner_present":terminal_owner.is_some(), "terminal_lease_expires_at":terminal_expiry,
+        "snapshot_sha256":snapshot.as_ref().map(|value| format!("{:x}", Sha256::digest(value.as_bytes()))),
+        "request":Source {locator:request_locator, ..plan.request},
+        "response":Source {locator:response_locator, ..plan.response},
+        "sources_verified":true, "ready_for_review":ready,
+        "apply_supported":false, "claimed":false, "financial_replay":false,
+        "canonical_rebuilt":false, "complete":false
+    });
+    save_checkpoint(output, &receipt)?;
+    pool.close().await;
+    Ok(())
 }

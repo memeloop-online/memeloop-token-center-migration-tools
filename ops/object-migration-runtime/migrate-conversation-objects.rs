@@ -228,6 +228,12 @@ struct Args {
     /// Exact, independently verified source identities; only this request is rebuilt.
     #[arg(long)]
     exact_recovery_plan: Option<PathBuf>,
+    /// Inspect one exact recovery without claiming or running its writer.
+    #[arg(long)]
+    exact_recovery_inspect: bool,
+    /// Original recovery receipt read without modification during inspection.
+    #[arg(long)]
+    exact_recovery_prior_receipt: Option<PathBuf>,
     /// Committed semantic-reference audit directories; read only.
     #[arg(long)]
     reference_audit_dir: Vec<PathBuf>,
@@ -1029,9 +1035,18 @@ async fn run(args: Args) -> Result<()> {
             .exact_recovery_plan
             .as_deref()
             .ok_or("exact recovery plan required")?;
+        if args.exact_recovery_inspect {
+            let prior = args.exact_recovery_prior_receipt.as_deref()
+                .ok_or("inspection requires original recovery receipt")?;
+            return exact_recovery::inspect(plan, prior, &args.checkpoint).await;
+        }
+        if args.exact_recovery_prior_receipt.is_some() {
+            return Err("prior receipt is only accepted by read-only inspection".into());
+        }
         return exact_recovery::run(plan, &args.checkpoint).await;
     }
-    if args.exact_recovery_plan.is_some() {
+    if args.exact_recovery_plan.is_some() || args.exact_recovery_inspect
+        || args.exact_recovery_prior_receipt.is_some() {
         return Err("exact-recovery-plan requires recover-exact-conversation".into());
     }
     if args.online_copy && args.phase != Phase::CopyPayloads {
