@@ -98,6 +98,41 @@ async fn rustfs_legacy_plain_and_compressed_sources_preserve_canonical_semantics
     }
     let original = conversation::session_body_from_documents(&request_value, &response_value);
     let migrated = conversation::session_body_from_documents(&rebound[0], &rebound[1]);
+    // Prove that equality covers the intended fields rather than two empty
+    // projections after an unsupported fixture shape.
+    let parts: Vec<_> = original.turns.iter().flat_map(|turn| &turn.parts).collect();
+    assert!(text.len() > 128 * 1024);
+    assert!(
+        parts
+            .iter()
+            .any(|part| part.text.as_deref() == Some(text.as_str()))
+    );
+    assert!(parts.iter().any(|part| {
+        part.kind == "tool_call"
+            && part.tool_name.as_deref() == Some("echo")
+            && part
+                .arguments
+                .as_ref()
+                .and_then(|args| args["input"].as_str())
+                == Some(text.as_str())
+    }));
+    assert!(parts.iter().any(|part| {
+        part.kind == "tool_result"
+            && part
+                .result_content
+                .as_ref()
+                .and_then(serde_json::Value::as_str)
+                == Some(text.as_str())
+    }));
+    assert!(parts.iter().any(|part| {
+        part.kind == "reasoning" && part.text.as_deref() == Some("synthetic available reasoning")
+    }));
+    assert!(
+        parts
+            .iter()
+            .any(|part| { part.text.as_deref() == Some("synthetic partial answer") })
+    );
+    assert_eq!(rebound[1]["status"], "incomplete");
     assert_eq!(original, migrated);
     let (old_atoms, old_nodes) = original.into_prefix();
     let (new_atoms, new_nodes) = migrated.into_prefix();
