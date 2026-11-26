@@ -117,6 +117,14 @@ async fn run_with_review(
             .raw_capture_reference(plan.tenant_id, plan.request_id, side)
             .await?
         {
+            if let Some(review) = reviewed {
+                let selected = &review["selected_sources"][side];
+                if selected["selection"] != "raw_root"
+                    || selected["reference"] != serde_json::to_value(&root)?
+                {
+                    return Err("reviewed selected raw reference changed".into());
+                }
+            }
             verify_source(
                 &state.archive,
                 &Source {
@@ -126,6 +134,10 @@ async fn run_with_review(
                 },
             )
             .await?;
+        } else if reviewed
+            .is_some_and(|review| review["selected_sources"][side]["selection"] != "request_record")
+        {
+            return Err("reviewed selected raw reference disappeared".into());
         }
     }
     let row = sqlx::query("SELECT o.projected_at, o.semantic_snapshot_json, r.request_object, r.response_object FROM conversation_projection_outbox o JOIN request_record_locators l ON l.id = o.request_id AND l.tenant_id = o.tenant_id AND l.key_id = o.key_id JOIN request_records r ON r.id = l.id AND r.created_at = l.created_at AND r.tenant_id = l.tenant_id AND r.key_id = l.key_id WHERE o.request_id = $1 AND o.tenant_id = $2 AND o.key_id = $3")
