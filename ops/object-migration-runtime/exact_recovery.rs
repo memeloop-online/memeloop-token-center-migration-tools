@@ -55,9 +55,16 @@ pub(super) async fn run(plan_path: &std::path::Path, receipt_path: &std::path::P
 async fn run_with_review(
     plan_path: &std::path::Path,
     receipt_path: &std::path::Path,
-    reviewed: Option<&serde_json::Value>,
+    reviewed_input: Option<(&serde_json::Value, &[u8])>,
 ) -> Result<()> {
-    let bytes = std::fs::read(plan_path)?;
+    let current_bytes = std::fs::read(plan_path)?;
+    let bytes = if let Some((_, verified)) = reviewed_input {
+        require_same_plan_bytes(verified, &current_bytes)?;
+        verified.to_vec()
+    } else {
+        current_bytes
+    };
+    let reviewed = reviewed_input.map(|(review, _)| review);
     let plan: Plan = serde_json::from_slice(&bytes)?;
     if plan.format_version != 1 || plan.request.locator == plan.response.locator {
         return Err("invalid exact recovery plan".into());
@@ -79,7 +86,7 @@ async fn run_with_review(
         .await
         .map_err(|e| at_stage("exact_response_source", e))?;
     let identity = blake3::hash(&bytes).to_hex().to_string();
-    let mut receipt: serde_json::Value = if receipt_path.exists() {
+    let mut receipt: serde_json::Value = if reviewed.is_none() && receipt_path.exists() {
         let previous: serde_json::Value =
             serde_json::from_reader(std::fs::File::open(receipt_path)?)?;
         if previous["identity"].as_str() != Some(identity.as_str()) {
@@ -94,6 +101,13 @@ async fn run_with_review(
             "complete":false, "api_readback_verified":false
         })
     };
+    if let Some(review) = reviewed {
+        receipt["intent_id"] = Uuid::now_v7().to_string().into();
+        receipt["reviewed_handover"] = review.clone();
+        // Reserve this output before any completed/claim branch. No existing
+        // receipt can lend its intent or completion status to this invocation.
+        save_inspection_noclobber(receipt_path, &receipt)?;
+    }
     // The ordinary writer prefers durable raw roots. Verify those actual
     // selected sources against exactly the same decoded-byte contract.
     for (side, expected) in [("request", &plan.request), ("response", &plan.response)] {
@@ -150,6 +164,12 @@ async fn run_with_review(
     let current_snapshot: Option<String> = row.try_get("semantic_snapshot_json")?;
     let already_written = current_ack.is_some() && current_snapshot.is_some();
     let projected = if already_written {
+        if reviewed.is_some() {
+            return Err(
+                "completed-unattributed: reviewed invocation did not perform this publication"
+                    .into(),
+            );
+        }
         if receipt["claim_intent"].as_bool() != Some(true) {
             return Err(
                 "unexpected existing canonical content; exact recovery will not overwrite it"
@@ -174,14 +194,7 @@ async fn run_with_review(
         if reviewed.is_some() {
             receipt["lease_owner"] = owner.to_string().into();
         }
-        if reviewed.is_some() {
-            // An interrupted claim is never automatically repeated. The new
-            // intent is durable before the strict owner/snapshot CAS.
-            receipt["reviewed_handover"] = reviewed.cloned().unwrap();
-            save_inspection_noclobber(receipt_path, &receipt)?;
-        } else {
-            save_checkpoint(receipt_path, &receipt)?;
-        }
+        save_checkpoint(receipt_path, &receipt)?;
         let claimed = if let Some(review) = reviewed {
             let snapshot = current_snapshot
                 .as_deref()
@@ -425,7 +438,14 @@ pub(super) async fn resume_reviewed(
     let fresh = inspect_verified(&pool, &archive, &plan, &identity, &prior_bytes).await?;
     pool.close().await;
     validate_reviewed_handover(&review, &fresh)?;
-    run_with_review(plan_path, output, Some(&review)).await
+    run_with_review(plan_path, output, Some((&review, &plan_bytes))).await
+}
+
+fn require_same_plan_bytes(verified: &[u8], current: &[u8]) -> Result<()> {
+    if verified != current {
+        return Err("reviewed plan file changed".into());
+    }
+    Ok(())
 }
 
 fn validate_reviewed_handover(review: &serde_json::Value, fresh: &serde_json::Value) -> Result<()> {
@@ -758,6 +778,8 @@ mod reviewed_handover_tests {
     use super::*;
     #[test]
     fn review_requires_ready_and_exact_unchanged_evidence() {
+        assert!(require_same_plan_bytes(b"original", b"changed").is_err());
+        assert!(require_same_plan_bytes(b"original", b"original").is_ok());
         let review = serde_json::json!({"kind":"exact_recovery_inspection","ready_for_review":true,"expected_owner":"original","snapshot_sha256":"same","request":{"locator":"original"}});
         assert!(validate_reviewed_handover(&review, &review).is_ok());
         for field in ["expected_owner", "snapshot_sha256", "request"] {
