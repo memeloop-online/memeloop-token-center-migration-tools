@@ -42,7 +42,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: memeloop-online/memeloop-token-center
-          ref: ae822ed36837858f436cad4993673bcdf802034a
+          ref: 18d166b11e6dedf21f58db8b8ccbff427bcec14c
           path: .object-runtime
           persist-credentials: false
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -72,6 +72,7 @@ jobs:
           cp ops/object-migration-runtime/reconstruction.rs .object-runtime/src/bin/conversation-object-modules/
           cp ops/object-migration-runtime/inventory.rs .object-runtime/src/bin/conversation-object-modules/
           cp ops/object-migration-runtime/exact_recovery.rs .object-runtime/src/bin/conversation-object-modules/
+          cp ops/object-migration-runtime/exact_recovery_legacy_contract.rs .object-runtime/src/bin/conversation-object-tests/
           cp ops/object-migration-runtime/conversation_object_migration_tests.rs .object-runtime/src/bin/conversation-object-tests/
           sed -i 's|path = "conversation_object_migration_tests.rs"|path = "conversation-object-tests/conversation_object_migration_tests.rs"|' .object-runtime/src/bin/migrate-conversation-objects.rs
       - name: Start isolated RustFS migration target

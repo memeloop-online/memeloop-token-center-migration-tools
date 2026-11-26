@@ -49,6 +49,14 @@ async fn verify_source(archive: &ArchiveStore, expected: &Source) -> Result<()> 
 }
 
 pub(super) async fn run(plan_path: &std::path::Path, receipt_path: &std::path::Path) -> Result<()> {
+    run_with_review(plan_path, receipt_path, None).await
+}
+
+async fn run_with_review(
+    plan_path: &std::path::Path,
+    receipt_path: &std::path::Path,
+    reviewed: Option<&serde_json::Value>,
+) -> Result<()> {
     let bytes = std::fs::read(plan_path)?;
     let plan: Plan = serde_json::from_slice(&bytes)?;
     if plan.format_version != 1 || plan.request.locator == plan.response.locator {
@@ -111,6 +119,13 @@ pub(super) async fn run(plan_path: &std::path::Path, receipt_path: &std::path::P
     let current_request: String = row.try_get("request_object")?;
     let current_response: Option<String> = row.try_get("response_object")?;
     let current_response = current_response.ok_or("exact response source disappeared")?;
+    if let Some(review) = reviewed {
+        if review["request"]["locator"].as_str() != Some(current_request.as_str())
+            || review["response"]["locator"].as_str() != Some(current_response.as_str())
+        {
+            return Err("reviewed source locator changed".into());
+        }
+    }
     // The normal writer may durably bind an equivalent raw-root CAS locator
     // before preparation. Resume only after independently hashing that current
     // selected content against the original immutable plan.
@@ -149,31 +164,75 @@ pub(super) async fn run(plan_path: &std::path::Path, receipt_path: &std::path::P
             } else {
                 Some(plan.expected_projected_at)
             };
-        if current_snapshot.is_some() {
+        if current_snapshot.is_some() && reviewed.is_none() {
             return Err("prepared recovery requires a reviewed handover; inspection only".into());
         }
         let owner = Uuid::now_v7();
         // Persist intent before the CAS so an interrupted result can be resumed
         // after the existing finite lease expires, without changing the plan.
         receipt["claim_intent"] = true.into();
-        save_checkpoint(receipt_path, &receipt)?;
-        let claimed = state
-            .db
-            .claim_exact_session_body_rebuild(
-                plan.tenant_id,
-                plan.key_id,
-                plan.request_id,
-                expected_ack,
-                &current_request,
-                &current_response,
-                owner,
-                current_snapshot.as_deref(),
-                receipt["lease_owner"]
-                    .as_str()
-                    .map(Uuid::parse_str)
-                    .transpose()?,
-            )
-            .await?;
+        if reviewed.is_some() {
+            receipt["lease_owner"] = owner.to_string().into();
+        }
+        if reviewed.is_some() {
+            // An interrupted claim is never automatically repeated. The new
+            // intent is durable before the strict owner/snapshot CAS.
+            receipt["reviewed_handover"] = reviewed.cloned().unwrap();
+            save_inspection_noclobber(receipt_path, &receipt)?;
+        } else {
+            save_checkpoint(receipt_path, &receipt)?;
+        }
+        let claimed = if let Some(review) = reviewed {
+            let snapshot = current_snapshot
+                .as_deref()
+                .ok_or("reviewed snapshot disappeared")?;
+            if review["snapshot_sha256"].as_str()
+                != Some(format!("{:x}", Sha256::digest(snapshot.as_bytes())).as_str())
+            {
+                return Err("reviewed snapshot changed".into());
+            }
+            state
+                .db
+                .claim_reviewed_session_body_rebuild(
+                    plan.tenant_id,
+                    plan.key_id,
+                    plan.request_id,
+                    &current_request,
+                    &current_response,
+                    owner,
+                    snapshot,
+                    Uuid::parse_str(
+                        review["expected_owner"]
+                            .as_str()
+                            .ok_or("reviewed owner missing")?,
+                    )?,
+                    review["created_at"]
+                        .as_i64()
+                        .ok_or("reviewed creation identity missing")?,
+                    review["expected_lease_expires_at"]
+                        .as_i64()
+                        .ok_or("reviewed expiry missing")?,
+                )
+                .await?
+        } else {
+            state
+                .db
+                .claim_exact_session_body_rebuild(
+                    plan.tenant_id,
+                    plan.key_id,
+                    plan.request_id,
+                    expected_ack,
+                    &current_request,
+                    &current_response,
+                    owner,
+                    current_snapshot.as_deref(),
+                    receipt["lease_owner"]
+                        .as_str()
+                        .map(Uuid::parse_str)
+                        .transpose()?,
+                )
+                .await?
+        };
         if !claimed {
             return Err("exact recovery source/acknowledgement/lease CAS did not match".into());
         }
@@ -331,6 +390,57 @@ mod tests {
 
 /// Build a separate handover candidate. This never claims, clears a snapshot,
 /// starts application workers, or edits the previous recovery receipt.
+pub(super) async fn resume_reviewed(
+    plan_path: &std::path::Path,
+    prior_path: &std::path::Path,
+    handover_path: &std::path::Path,
+    output: &std::path::Path,
+) -> Result<()> {
+    if output == plan_path || output == prior_path || output == handover_path {
+        return Err("reviewed intent requires an independent output".into());
+    }
+    if output.exists() {
+        // Preserve an uncertain prior claim rather than selecting another owner.
+        return Err(
+            "existing reviewed intent requires read-only reconciliation; no claim repeated".into(),
+        );
+    }
+    let plan_bytes = std::fs::read(plan_path)?;
+    let plan: Plan = serde_json::from_slice(&plan_bytes)?;
+    let identity = blake3::hash(&plan_bytes).to_hex().to_string();
+    let prior_bytes = std::fs::read(prior_path)?;
+    let prior: serde_json::Value = serde_json::from_slice(&prior_bytes)?;
+    if prior["identity"].as_str() != Some(identity.as_str())
+        || prior["claim_intent"].as_bool() != Some(true)
+    {
+        return Err("original intent does not match reviewed plan".into());
+    }
+    let review: serde_json::Value = serde_json::from_slice(&std::fs::read(handover_path)?)?;
+    let config = Config::from_env()?;
+    let archive = ArchiveStore::from_config(&config).await?;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&config.database_url)
+        .await?;
+    let fresh = inspect_verified(&pool, &archive, &plan, &identity, &prior_bytes).await?;
+    pool.close().await;
+    validate_reviewed_handover(&review, &fresh)?;
+    run_with_review(plan_path, output, Some(&review)).await
+}
+
+fn validate_reviewed_handover(review: &serde_json::Value, fresh: &serde_json::Value) -> Result<()> {
+    if review["kind"] != "exact_recovery_inspection"
+        || review["ready_for_review"] != true
+        || fresh["ready_for_review"] != true
+        || review != fresh
+    {
+        return Err(
+            "reviewed recovery state or selected source changed; inspection required".into(),
+        );
+    }
+    Ok(())
+}
+
 pub(super) async fn inspect(
     plan_path: &std::path::Path,
     prior_receipt_path: &std::path::Path,
@@ -636,5 +746,27 @@ mod receipt_publication_tests {
         let original = std::fs::read(&path).unwrap();
         assert!(save_inspection_noclobber(&path, &serde_json::json!({"writer":3})).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+}
+
+#[cfg(test)]
+#[path = "../conversation-object-tests/exact_recovery_legacy_contract.rs"]
+mod legacy_contract;
+
+#[cfg(test)]
+mod reviewed_handover_tests {
+    use super::*;
+    #[test]
+    fn review_requires_ready_and_exact_unchanged_evidence() {
+        let review = serde_json::json!({"kind":"exact_recovery_inspection","ready_for_review":true,"expected_owner":"original","snapshot_sha256":"same","request":{"locator":"original"}});
+        assert!(validate_reviewed_handover(&review, &review).is_ok());
+        for field in ["expected_owner", "snapshot_sha256", "request"] {
+            let mut changed = review.clone();
+            changed[field] = serde_json::Value::Null;
+            assert!(validate_reviewed_handover(&review, &changed).is_err());
+        }
+        let mut completed = review.clone();
+        completed["ready_for_review"] = false.into();
+        assert!(validate_reviewed_handover(&completed, &completed).is_err());
     }
 }
