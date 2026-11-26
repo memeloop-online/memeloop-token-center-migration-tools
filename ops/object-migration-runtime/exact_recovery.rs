@@ -89,6 +89,7 @@ async fn run_with_review(
     let mut receipt: serde_json::Value = if reviewed.is_none() && receipt_path.exists() {
         let previous: serde_json::Value =
             serde_json::from_reader(std::fs::File::open(receipt_path)?)?;
+        reject_reviewed_receipt_in_ordinary_run(&previous)?;
         if previous["identity"].as_str() != Some(identity.as_str()) {
             return Err("exact recovery receipt belongs to a different plan".into());
         }
@@ -441,6 +442,13 @@ pub(super) async fn resume_reviewed(
     run_with_review(plan_path, output, Some((&review, &plan_bytes))).await
 }
 
+fn reject_reviewed_receipt_in_ordinary_run(receipt: &serde_json::Value) -> Result<()> {
+    if receipt.get("reviewed_handover").is_some() || receipt.get("intent_id").is_some() {
+        return Err("reviewed intent requires read-only reconciliation; ordinary recovery cannot claim or acknowledge it".into());
+    }
+    Ok(())
+}
+
 fn require_same_plan_bytes(verified: &[u8], current: &[u8]) -> Result<()> {
     if verified != current {
         return Err("reviewed plan file changed".into());
@@ -778,6 +786,10 @@ mod reviewed_handover_tests {
     use super::*;
     #[test]
     fn review_requires_ready_and_exact_unchanged_evidence() {
+        for completed in [false, true] {
+            let intent = serde_json::json!({"identity":"same","claim_intent":true,"intent_id":"reviewed","reviewed_handover":{},"canonical_rebuilt":completed,"snapshot":null});
+            assert!(reject_reviewed_receipt_in_ordinary_run(&intent).is_err());
+        }
         assert!(require_same_plan_bytes(b"original", b"changed").is_err());
         assert!(require_same_plan_bytes(b"original", b"original").is_ok());
         let review = serde_json::json!({"kind":"exact_recovery_inspection","ready_for_review":true,"expected_owner":"original","snapshot_sha256":"same","request":{"locator":"original"}});
