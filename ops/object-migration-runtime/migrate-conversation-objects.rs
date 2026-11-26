@@ -57,10 +57,72 @@ fn at_stage(stage: &'static str, cause: impl Into<Failure>) -> Failure {
 fn safe_failure(error: &(dyn std::error::Error + 'static)) -> serde_json::Value {
     let mut stages = Vec::new();
     let mut category = "validation";
+    let mut diagnostic = None;
     let mut current = Some(error);
     while let Some(cause) = current {
         if let Some(context) = cause.downcast_ref::<MigrationFailure>() {
             stages.push(context.stage);
+        }
+        if let Some(error) = cause.downcast_ref::<memeloop_token_center::error::AppError>() {
+            use memeloop_token_center::error::AppError as E;
+            let facts = match error {
+                E::Storage { code, facts } | E::Internal { code, facts }
+                | E::Capacity { code, facts } | E::Upstream { code, facts } => {
+                    diagnostic = Some(*code);
+                    Some(facts)
+                }
+                E::DatabaseUnavailable(failure) => {
+                    diagnostic = Some(failure.code());
+                    None
+                }
+                E::NotFound => { diagnostic = Some("not_found"); None }
+                E::Conflict(_) => { diagnostic = Some("conflict"); None }
+                E::BadRequest(_) => { diagnostic = Some("invalid_request"); None }
+                _ => { diagnostic = Some("unclassified_application_error"); None }
+            };
+            if let Some(facts) = facts {
+                if let Some(stage) = facts.stage { stages.push(stage); }
+                if let Some(kind) = facts.kind { stages.push(kind); }
+                if let Some(phase) = facts.phase { stages.push(phase); }
+            }
+        }
+        if let Some(error) = cause.downcast_ref::<memeloop_token_center::config::ConfigError>() {
+            use memeloop_token_center::config::ConfigError as E;
+            diagnostic = Some(match error {
+                E::InvalidProxyMemoryBudget => "invalid_proxy_memory_budget",
+                E::InvalidResponsesRequestSpool => "invalid_request_spool_path",
+                E::InvalidS3Timeouts => "invalid_s3_timeouts",
+                E::Missing(name) => name,
+                E::WeakKeyPepper => "weak_key_pepper",
+                E::ServiceTokenTooShort => "service_token_too_short",
+                E::InvalidServiceTokenCharacters => "invalid_service_token_characters",
+                E::SecretTooShort(name, _) | E::InvalidSecretCharacters(name) => name,
+                E::InvalidArchiveBackend(_) => "invalid_archive_backend",
+                E::InvalidInteger(name, _) => name,
+                E::InvalidUpstreamHealthConfig(_) => "invalid_upstream_health_config",
+                E::InvalidPricingSourceUrl(name) => name,
+            });
+        }
+        if let Some(error) = cause.downcast_ref::<memeloop_token_center::InitializationError>() {
+            diagnostic = Some(match error {
+                memeloop_token_center::InitializationError::Database(
+                    memeloop_token_center::error::AppError::Storage { code, .. },
+                ) => code,
+                memeloop_token_center::InitializationError::Database(_) => {
+                    "database_initialization"
+                }
+                memeloop_token_center::InitializationError::Archive => "archive_initialization",
+                memeloop_token_center::InitializationError::Plugin => "plugin_initialization",
+                memeloop_token_center::InitializationError::HttpClient => {
+                    "http_client_initialization"
+                }
+                memeloop_token_center::InitializationError::ProxyMemoryBudget => {
+                    "proxy_memory_budget"
+                }
+                memeloop_token_center::InitializationError::TransportProxyGroups => {
+                    "transport_proxy_groups"
+                }
+            });
         }
         if cause.is::<sqlx::Error>() {
             category = "database";
@@ -75,7 +137,7 @@ fn safe_failure(error: &(dyn std::error::Error + 'static)) -> serde_json::Value 
     }
     // Never serialize error Display/Debug: SQL, URLs and object-store errors
     // can contain credentials or source payload. Stages are static literals.
-    serde_json::json!({"event":"migration_failed","stages":stages,"category":category})
+    serde_json::json!({"event":"migration_failed","stages":stages,"category":category,"diagnostic":diagnostic})
 }
 
 #[path = "conversation-object-modules/durable_roots.rs"]
@@ -92,6 +154,9 @@ mod raw_request_refs;
 mod reconstruction;
 #[path = "conversation-object-modules/spools.rs"]
 mod spools;
+
+#[path = "conversation-object-modules/exact_recovery.rs"]
+mod exact_recovery;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum Phase {
@@ -115,6 +180,7 @@ enum Phase {
     SemanticReferenceReadback,
     RawRequestReference,
     CopyRawRequestTarget,
+    RecoverExactConversation,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -159,6 +225,18 @@ struct Args {
     /// One completed request/root and its already-present qualified raw target.
     #[arg(long)]
     raw_reference_plan: Option<PathBuf>,
+    /// Exact, independently verified source identities; only this request is rebuilt.
+    #[arg(long)]
+    exact_recovery_plan: Option<PathBuf>,
+    /// Inspect one exact recovery without claiming or running its writer.
+    #[arg(long)]
+    exact_recovery_inspect: bool,
+    /// Original recovery receipt read without modification during inspection.
+    #[arg(long)]
+    exact_recovery_prior_receipt: Option<PathBuf>,
+    /// Explicit independently reviewed inspection; never adopts a changed owner.
+    #[arg(long)]
+    exact_recovery_reviewed_handover: Option<PathBuf>,
     /// Committed semantic-reference audit directories; read only.
     #[arg(long)]
     reference_audit_dir: Vec<PathBuf>,
@@ -955,6 +1033,35 @@ impl Runner {
 }
 
 async fn run(args: Args) -> Result<()> {
+    if args.phase == Phase::RecoverExactConversation {
+        let plan = args
+            .exact_recovery_plan
+            .as_deref()
+            .ok_or("exact recovery plan required")?;
+        if let Some(handover) = args.exact_recovery_reviewed_handover.as_deref() {
+            if args.exact_recovery_inspect {
+                return Err("inspection and reviewed resume are exclusive".into());
+            }
+            let prior = args
+                .exact_recovery_prior_receipt
+                .as_deref()
+                .ok_or("reviewed resume requires original receipt")?;
+            return exact_recovery::resume_reviewed(plan, prior, handover, &args.checkpoint).await;
+        }
+        if args.exact_recovery_inspect {
+            let prior = args.exact_recovery_prior_receipt.as_deref()
+                .ok_or("inspection requires original recovery receipt")?;
+            return exact_recovery::inspect(plan, prior, &args.checkpoint).await;
+        }
+        if args.exact_recovery_prior_receipt.is_some() {
+            return Err("prior receipt is only accepted by read-only inspection".into());
+        }
+        return exact_recovery::run(plan, &args.checkpoint).await;
+    }
+    if args.exact_recovery_plan.is_some() || args.exact_recovery_inspect
+        || args.exact_recovery_prior_receipt.is_some() || args.exact_recovery_reviewed_handover.is_some() {
+        return Err("exact-recovery-plan requires recover-exact-conversation".into());
+    }
     if args.online_copy && args.phase != Phase::CopyPayloads {
         return Err("--online-copy is only supported for --phase copy-payloads".into());
     }
@@ -1267,7 +1374,8 @@ async fn run(args: Args) -> Result<()> {
         | Phase::SemanticPayloadReferences
         | Phase::SemanticReferenceReadback
         | Phase::RawRequestReference
-        | Phase::CopyRawRequestTarget => {
+        | Phase::CopyRawRequestTarget
+        | Phase::RecoverExactConversation => {
             unreachable!()
         }
     };
@@ -1296,6 +1404,16 @@ mod tests;
 #[cfg(test)]
 mod diagnostic_tests {
     use super::*;
+
+    #[test]
+    fn reports_internal_code_and_redacts_conflict_details() {
+        let error = at_stage("exact_canonical_writer", memeloop_token_center::error::AppError::Internal { code: "exact_project_failed", facts: Default::default() });
+        assert_eq!(safe_failure(error.as_ref())["diagnostic"], "exact_project_failed");
+        let error = at_stage("exact_canonical_writer", memeloop_token_center::error::AppError::Conflict("private-source-and-credentials".into()));
+        let report = safe_failure(error.as_ref());
+        assert_eq!(report["diagnostic"], "conflict");
+        assert!(!report.to_string().contains("private-source"));
+    }
 
     #[test]
     fn reports_static_stages_without_error_payload_or_credentials() {
